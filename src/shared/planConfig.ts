@@ -1,9 +1,9 @@
 import type { SubtitlePresetId } from './subtitlePresets'
 
-export type PlanTier = 'free' | 'starter' | 'creator' | 'studio'
+export type PlanTier = 'free' | 'starter' | 'creator' | 'studio' | 'founder'
 export type ExportQuality = '720p' | '1080p' | '4k'
 
-export const PLAN_TIERS: PlanTier[] = ['free', 'starter', 'creator', 'studio']
+export const PLAN_TIERS: PlanTier[] = ['free', 'starter', 'creator', 'studio', 'founder']
 export const QUALITY_ORDER: ExportQuality[] = ['720p', '1080p', '4k']
 
 export type PlanConfig = {
@@ -12,7 +12,7 @@ export type PlanConfig = {
   priceMonthly: number
   priceLabel: string
   description: string
-  maxRendersPerMonth: number | null
+  maxRendersPerMonth: number
   maxMinutesPerMonth: number | null
   exportQuality: ExportQuality
   watermark: boolean
@@ -22,11 +22,40 @@ export type PlanConfig = {
   advancedEffects: boolean
   lifetime: boolean
   includesFutureFeatures: boolean
-  badge?: 'popular' | null
+  badge?: 'popular' | 'founder' | null
   features: string[]
 }
 
 export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
+  founder: {
+    tier: 'founder',
+    name: 'Founder',
+    priceMonthly: 0,
+    priceLabel: 'Lifetime',
+    description: 'Limited lifetime access for the first 100 builders.',
+    maxRendersPerMonth: 500,
+    maxMinutesPerMonth: null,
+    exportQuality: '4k',
+    watermark: false,
+    priority: true,
+    allowedSubtitlePresets: 'ALL',
+    autoZoomMax: 1.15,
+    advancedEffects: true,
+    lifetime: true,
+    includesFutureFeatures: true,
+    badge: 'founder',
+    features: [
+      'Lifetime access',
+      '500 renders / month',
+      '4K exports',
+      'All subtitle presets',
+      'Full auto zoom up to 1.15',
+      'Priority queue',
+      'Future features included',
+      'Founder badge',
+      'Locked price forever'
+    ]
+  },
   free: {
     tier: 'free',
     name: 'Free',
@@ -34,7 +63,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceLabel: '$0',
     description: 'For trying AutoEditor on small projects.',
     maxRendersPerMonth: 12,
-    maxMinutesPerMonth: 10,
+    maxMinutesPerMonth: null,
     exportQuality: '720p',
     watermark: true,
     priority: false,
@@ -60,7 +89,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceLabel: '$9',
     description: 'For creators publishing regularly.',
     maxRendersPerMonth: 20,
-    maxMinutesPerMonth: 30,
+    maxMinutesPerMonth: null,
     exportQuality: '1080p',
     watermark: false,
     priority: false,
@@ -85,7 +114,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceLabel: '$29',
     description: 'For teams shipping content at scale.',
     maxRendersPerMonth: 100,
-    maxMinutesPerMonth: 120,
+    maxMinutesPerMonth: null,
     exportQuality: '4k',
     watermark: false,
     priority: false,
@@ -110,23 +139,23 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceMonthly: 99,
     priceLabel: '$99',
     description: 'For studios that need priority and scale.',
-    maxRendersPerMonth: null,
+    maxRendersPerMonth: 5000,
     maxMinutesPerMonth: null,
     exportQuality: '4k',
     watermark: false,
     priority: true,
     allowedSubtitlePresets: 'ALL',
-    autoZoomMax: 1.2,
+    autoZoomMax: 1.15,
     advancedEffects: true,
     lifetime: false,
     includesFutureFeatures: false,
     badge: null,
     features: [
       '4K exports',
-      'Unlimited renders',
+      '5000 renders / month',
       'Priority queue',
       'All subtitle styles',
-      'Full zoom control up to 1.20',
+      'Full zoom control up to 1.15',
       'Advanced effects'
     ]
   }
@@ -159,13 +188,14 @@ export const qualityToHeight = (quality: ExportQuality) => {
 export type PlanFeatures = {
   resolution: '720p' | '1080p' | '4K'
   watermark: boolean
+  subtitleAccess: 'all' | 'limited' | 'none'
   subtitles: {
     enabled: boolean
     allowedPresets: SubtitlePresetId[] | 'ALL'
   }
   autoZoomMax: number
   queuePriority: 'priority' | 'standard'
-  rendersPerMonth: number | null
+  rendersPerMonth: number
   lifetime: boolean
   includesFutureFeatures: boolean
 }
@@ -174,9 +204,11 @@ export const getPlanFeatures = (plan: PlanConfig): PlanFeatures => {
   const resolution = plan.exportQuality === '4k' ? '4K' : plan.exportQuality
   const allowedPresets = plan.allowedSubtitlePresets
   const subtitlesEnabled = allowedPresets === 'ALL' ? true : allowedPresets.length > 0
+  const subtitleAccess = allowedPresets === 'ALL' ? 'all' : subtitlesEnabled ? 'limited' : 'none'
   return {
     resolution,
     watermark: plan.watermark,
+    subtitleAccess,
     subtitles: {
       enabled: subtitlesEnabled,
       allowedPresets

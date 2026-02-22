@@ -166,6 +166,8 @@ type EngagementWindow = {
   textDensity: number
   sceneChangeRate: number
   emotionalSpike: number
+  vocalExcitement: number
+  emotionIntensity: number
   score: number
 }
 type EditPlan = {
@@ -189,11 +191,21 @@ type EditOptions = {
 }
 
 const HOOK_MIN = 5
-const HOOK_MAX = 5
+const HOOK_MAX = 10
 const CUT_MIN = 3
-const CUT_MAX = 10
+const CUT_MAX = 5
+const PACE_MIN = 3
+const PACE_MAX = 6
+const CUT_GUARD_SEC = 0.35
+const CUT_LEN_PATTERN = [3.2, 4.4, 3.6, 4.8]
+const CUT_GAP_PATTERN = [1.0, 1.6, 1.2, 0.8]
+const MAX_CUT_RATIO = 0.6
+const ZOOM_HARD_MAX = 1.15
+const ZOOM_MAX_DURATION_RATIO = 0.1
+const ZOOM_EASE_SEC = 0.2
+const STITCH_FADE_SEC = 0.16
 const SILENCE_DB = -30
-const SILENCE_MIN = 0.4
+const SILENCE_MIN = 0.8
 const HOOK_ANALYZE_MAX = 600
 const SCENE_THRESHOLD = 0.45
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
@@ -337,7 +349,9 @@ const normalizeEnergy = (rmsDb: number) => {
 const buildEngagementWindows = (
   durationSeconds: number,
   energySamples: { time: number; rms: number }[],
-  sceneChanges: number[]
+  sceneChanges: number[],
+  faceSamples: { time: number; presence: number }[] = [],
+  textSamples: { time: number; density: number }[] = []
 ): EngagementWindow[] => {
   const totalSeconds = Math.max(0, Math.floor(durationSeconds))
   const energyBySecond = new Array(totalSeconds).fill(0)
@@ -360,22 +374,41 @@ const buildEngagementWindows = (
     if (idx >= 0 && idx < totalSeconds) sceneChangesBySecond[idx] += 1
   }
 
+  const faceBySecond = new Array(totalSeconds).fill(0)
+  for (const sample of faceSamples) {
+    if (sample.time < 0 || sample.time >= totalSeconds) continue
+    const idx = Math.floor(sample.time)
+    const value = Number.isFinite(sample.presence) ? Math.max(0, Math.min(1, sample.presence)) : 0
+    faceBySecond[idx] = Math.max(faceBySecond[idx], value)
+  }
+
+  const textBySecond = new Array(totalSeconds).fill(0)
+  for (const sample of textSamples) {
+    if (sample.time < 0 || sample.time >= totalSeconds) continue
+    const idx = Math.floor(sample.time)
+    const value = Number.isFinite(sample.density) ? Math.max(0, Math.min(1, sample.density)) : 0
+    textBySecond[idx] = Math.max(textBySecond[idx], value)
+  }
+
   const windows: EngagementWindow[] = []
   for (let i = 0; i < totalSeconds; i += 1) {
     const audioEnergy = energyBySecond[i]
     const speechIntensity = Math.min(1, Math.abs(audioEnergy - meanEnergy) / (std || 0.15))
     const sceneChangeRate = Math.min(1, sceneChangesBySecond[i])
     const motionScore = sceneChangeRate
-    const facePresence = 0
-    const textDensity = 0
+    const facePresence = faceBySecond[i] || 0
+    const textDensity = textBySecond[i] || 0
     const emotionalSpike = audioEnergy > meanEnergy + std * 1.5 ? 1 : 0
+    const vocalExcitement = Math.min(1, Math.max(0, (audioEnergy - meanEnergy) / (std + 0.05)))
+    const emotionIntensity = Math.min(1, 0.6 * speechIntensity + 0.25 * vocalExcitement + 0.15 * emotionalSpike)
     const score =
-      0.25 * audioEnergy +
-      0.20 * motionScore +
-      0.20 * speechIntensity +
+      0.2 * audioEnergy +
+      0.2 * speechIntensity +
+      0.15 * motionScore +
       0.15 * facePresence +
-      0.10 * textDensity +
-      0.10 * sceneChangeRate
+      0.15 * emotionIntensity +
+      0.08 * textDensity +
+      0.07 * vocalExcitement
     windows.push({
       time: i,
       audioEnergy,
@@ -385,6 +418,8 @@ const buildEngagementWindows = (
       textDensity,
       sceneChangeRate,
       emotionalSpike,
+      vocalExcitement,
+      emotionIntensity,
       score
     })
   }
@@ -426,8 +461,70 @@ const detectSilences = async (filePath: string, durationSeconds: number) => {
   return silences
 }
 
-const isWindowInsideSegments = (start: number, end: number, segments: Segment[]) => {
-  return segments.some((seg) => start >= seg.start && end <= seg.end)
+let cachedFaceDetectFilter: boolean | null = null
+const hasFaceDetectFilter = () => {
+  if (cachedFaceDetectFilter !== null) return cachedFaceDetectFilter
+  if (!hasFfmpeg()) {
+    cachedFaceDetectFilter = false
+    return cachedFaceDetectFilter
+  }
+  try {
+    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-filters'], { encoding: 'utf8' })
+    if (result.status !== 0) {
+      cachedFaceDetectFilter = false
+      return cachedFaceDetectFilter
+    }
+    const output = String(result.stdout || '')
+    cachedFaceDetectFilter = output.includes('facedetect')
+    return cachedFaceDetectFilter
+  } catch (e) {
+    cachedFaceDetectFilter = false
+    return cachedFaceDetectFilter
+  }
+}
+
+const detectFacePresence = async (filePath: string, durationSeconds: number) => {
+  if (!hasFfmpeg()) return [] as { time: number; presence: number }[]
+  if (!hasFaceDetectFilter()) return [] as { time: number; presence: number }[]
+  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', filePath,
+    '-t', String(analyzeSeconds),
+    '-vf', 'facedetect=mode=fast:scale=1,metadata=print',
+    '-f', 'null',
+    '-'
+  ]
+  const output = await runFfmpegCapture(args).catch(() => '')
+  const lines = output.split(/\r?\n/)
+  const sampleMap = new Map<number, number>()
+  for (const line of lines) {
+    if (!line.includes('lavfi.facedetect')) continue
+    const timeMatch = line.match(/pts_time:([0-9.]+)/)
+    if (!timeMatch) continue
+    const time = Number.parseFloat(timeMatch[1])
+    if (!Number.isFinite(time)) continue
+    const bucket = Math.floor(time)
+    sampleMap.set(bucket, 1)
+  }
+  return Array.from(sampleMap.entries()).map(([time, presence]) => ({ time, presence }))
+}
+
+const detectTextDensity = async (_filePath: string, _durationSeconds: number) => {
+  return [] as { time: number; density: number }[]
+}
+
+const isRangeCoveredBySegments = (start: number, end: number, segments: Segment[]) => {
+  const sorted = segments.slice().sort((a, b) => a.start - b.start)
+  let cursor = start
+  for (const seg of sorted) {
+    if (seg.end <= cursor) continue
+    if (seg.start > cursor) return false
+    if (seg.end >= end) return true
+    cursor = seg.end
+  }
+  return false
 }
 
 const scoreWindow = (start: number, duration: number, windows: EngagementWindow[]) => {
@@ -463,7 +560,7 @@ const pickBestHook = (
     for (let duration = maxDuration; duration >= minDuration; duration -= 1) {
       const end = start + duration
       if (end > durationSeconds) continue
-      if (!isWindowInsideSegments(start, end, segments)) continue
+      if (!isRangeCoveredBySegments(start, end, segments)) continue
       const score = scoreWindow(start, duration, windows)
       if (score > bestScore) {
         bestScore = score
@@ -489,19 +586,151 @@ const subtractRange = (segments: Segment[], range: TimeRange) => {
   return result.filter((seg) => seg.end - seg.start > 0.25)
 }
 
-const splitSegments = (segments: Segment[], minLen: number, maxLen: number) => {
-  const out: Segment[] = []
-  for (const seg of segments) {
-    let start = seg.start
-    const end = seg.end
-    while (end - start > maxLen) {
-      out.push({ ...seg, start, end: start + maxLen })
-      start += maxLen
+const mergeRanges = (ranges: TimeRange[]) => {
+  if (!ranges.length) return []
+  const sorted = ranges.slice().sort((a, b) => a.start - b.start)
+  const merged: TimeRange[] = []
+  let current = { ...sorted[0] }
+  for (let i = 1; i < sorted.length; i += 1) {
+    const next = sorted[i]
+    if (next.start <= current.end) {
+      current.end = Math.max(current.end, next.end)
+    } else {
+      merged.push(current)
+      current = { ...next }
     }
-    if (end - start < minLen && out.length > 0) {
-      out[out.length - 1].end = end
-    } else if (end - start > 0.1) {
-      out.push({ ...seg, start, end })
+  }
+  merged.push(current)
+  return merged
+}
+
+const subtractRanges = (segments: Segment[], ranges: TimeRange[]) => {
+  let result = segments.map((seg) => ({ ...seg }))
+  const ordered = mergeRanges(ranges)
+  for (const range of ordered) {
+    result = subtractRange(result, range)
+  }
+  return result
+}
+
+const buildFaceAbsenceFlags = (windows: EngagementWindow[], minDuration = 2) => {
+  const hasSignal = windows.some((w) => w.facePresence > 0.2)
+  if (!hasSignal) return windows.map(() => false)
+  const flags = windows.map((w) => w.facePresence < 0.2)
+  const output = windows.map(() => false)
+  let runStart: number | null = null
+  for (let i = 0; i <= flags.length; i += 1) {
+    const flag = i < flags.length ? flags[i] : false
+    if (flag && runStart === null) runStart = i
+    if ((!flag || i === flags.length) && runStart !== null) {
+      const runEnd = i
+      if (runEnd - runStart >= minDuration) {
+        for (let j = runStart; j < runEnd; j += 1) output[j] = true
+      }
+      runStart = null
+    }
+  }
+  return output
+}
+
+const detectFillerWindows = (windows: EngagementWindow[], silences: TimeRange[]) => {
+  const isSilentAt = (time: number) => {
+    const windowEnd = time + 1
+    return silences.some((s) => time < s.end && windowEnd > s.start)
+  }
+  return windows.map((w) => {
+    if (isSilentAt(w.time)) return false
+    const lowSpeech = w.speechIntensity < 0.25
+    const lowEnergy = w.audioEnergy < 0.25 && w.audioEnergy > 0.05
+    return lowSpeech && lowEnergy
+  })
+}
+
+const buildBoringFlags = (windows: EngagementWindow[], silences: TimeRange[]) => {
+  const faceAbsent = buildFaceAbsenceFlags(windows, 2)
+  const fillerFlags = detectFillerWindows(windows, silences)
+  const isSilentAt = (time: number) => {
+    const windowEnd = time + 1
+    return silences.some((s) => time < s.end && windowEnd > s.start)
+  }
+  return windows.map((w, idx) => {
+    const silent = isSilentAt(w.time) && w.audioEnergy < 0.15
+    const lowSpeech = w.speechIntensity < 0.25 && w.audioEnergy < 0.2
+    const lowMotion = w.motionScore < 0.2 && w.sceneChangeRate < 0.2
+    const staticVisual = w.motionScore < 0.1 && w.sceneChangeRate < 0.1
+    const emotionalMoment = w.emotionIntensity > 0.6 || w.vocalExcitement > 0.6 || w.emotionalSpike > 0
+    if (emotionalMoment) return false
+    if (silent) return true
+    if (fillerFlags[idx]) return true
+    if (faceAbsent[idx] && (lowSpeech || lowMotion)) return true
+    if (lowSpeech && lowMotion) return true
+    if (staticVisual && w.audioEnergy < 0.2) return true
+    return false
+  })
+}
+
+const buildBoringCuts = (flags: boolean[]) => {
+  const ranges: TimeRange[] = []
+  let runStart: number | null = null
+  for (let i = 0; i <= flags.length; i += 1) {
+    const flag = i < flags.length ? flags[i] : false
+    if (flag && runStart === null) runStart = i
+    if ((!flag || i === flags.length) && runStart !== null) {
+      const runEnd = i
+      const runLen = runEnd - runStart
+      if (runLen >= CUT_MIN) {
+        if (runLen <= CUT_MAX) {
+          ranges.push({ start: runStart, end: runEnd })
+        } else {
+          const maxRemove = runLen * MAX_CUT_RATIO
+          let removed = 0
+          let cursor = runStart + CUT_GUARD_SEC
+          const endLimit = runEnd - CUT_GUARD_SEC
+          let patternIdx = 0
+          while (cursor + CUT_MIN <= endLimit) {
+            let cutLen = CUT_LEN_PATTERN[patternIdx % CUT_LEN_PATTERN.length]
+            cutLen = Math.max(CUT_MIN, Math.min(CUT_MAX, cutLen))
+            let actualLen = Math.min(cutLen, endLimit - cursor)
+            if (actualLen < CUT_MIN) break
+            if (removed + actualLen > maxRemove) {
+              actualLen = Math.max(CUT_MIN, maxRemove - removed)
+              if (actualLen < CUT_MIN) break
+            }
+            ranges.push({ start: cursor, end: cursor + actualLen })
+            removed += actualLen
+            cursor += actualLen + CUT_GAP_PATTERN[patternIdx % CUT_GAP_PATTERN.length]
+            patternIdx += 1
+          }
+        }
+      }
+      runStart = null
+    }
+  }
+  return mergeRanges(ranges)
+}
+
+const applyPacingPattern = (segments: Segment[], minLen: number, maxLen: number) => {
+  const out: Segment[] = []
+  let patternIdx = 0
+  for (const seg of segments) {
+    let cursor = seg.start
+    const end = seg.end
+    while (end - cursor > maxLen) {
+      const target = CUT_LEN_PATTERN[patternIdx % CUT_LEN_PATTERN.length]
+      const jitter = (patternIdx % 2 === 0 ? -0.2 : 0.2)
+      const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
+      const nextEnd = Math.min(end, cursor + desired)
+      out.push({ ...seg, start: cursor, end: nextEnd })
+      cursor = nextEnd
+      patternIdx += 1
+    }
+    const remaining = end - cursor
+    if (remaining > 0.1) {
+      if (remaining < minLen && out.length) {
+        out[out.length - 1].end = end
+      } else {
+        out.push({ ...seg, start: cursor, end })
+      }
     }
   }
   return out
@@ -517,51 +746,20 @@ const buildEditPlan = async (
   const silences = await detectSilences(filePath, durationSeconds).catch(() => [])
   const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
   const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
-  const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges)
+  const faceSamples = await detectFacePresence(filePath, durationSeconds).catch(() => [])
+  const textSamples = await detectTextDensity(filePath, durationSeconds).catch(() => [])
+  const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges, faceSamples, textSamples)
 
-  const boringThreshold = 0.18
-  const isSilentAt = (time: number) => {
-    const windowEnd = time + 1
-    return silences.some((s) => time < s.end && windowEnd > s.start)
-  }
-  const boringWindows = windows.map((w) => {
-    const silent = isSilentAt(w.time)
-    const boring = options.removeBoring
-      ? (silent || (w.audioEnergy < boringThreshold && w.motionScore < 0.2 && w.speechIntensity < 0.2))
-      : false
-    return { time: w.time, isBoring: boring }
-  })
-
-  const removedSegments: TimeRange[] = []
+  const boringFlags = options.removeBoring ? buildBoringFlags(windows, silences) : windows.map(() => false)
+  const removedSegments = options.removeBoring ? buildBoringCuts(boringFlags) : []
   const compressedSegments: TimeRange[] = []
-  const keepSegments: Segment[] = []
 
-  let currentStart = 0
-  let currentBoring = boringWindows.length ? boringWindows[0].isBoring : false
-  for (let i = 1; i <= boringWindows.length; i += 1) {
-    const flag = i < boringWindows.length ? boringWindows[i].isBoring : currentBoring
-    if (i === boringWindows.length || flag !== currentBoring) {
-      const segStart = currentStart
-      const segEnd = i
-      const length = segEnd - segStart
-      if (currentBoring) {
-        if (length >= 2) {
-          removedSegments.push({ start: segStart, end: segEnd })
-        } else {
-          compressedSegments.push({ start: segStart, end: segEnd })
-          keepSegments.push({ start: segStart, end: segEnd, speed: 2 })
-        }
-      } else if (length > 0) {
-        keepSegments.push({ start: segStart, end: segEnd, speed: 1 })
-      }
-      currentStart = i
-      currentBoring = flag
-    }
-  }
+  const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
+  const keepSegments = removedSegments.length ? subtractRanges(baseSegments, removedSegments) : baseSegments
 
-  const minLen = options.aggressiveMode ? 2 : CUT_MIN
-  const maxLen = options.aggressiveMode ? 4 : CUT_MAX
-  const normalizedKeep = splitSegments(
+  const minLen = PACE_MIN
+  const maxLen = PACE_MAX
+  const normalizedKeep = applyPacingPattern(
     keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }],
     minLen,
     maxLen
@@ -588,23 +786,108 @@ const buildEditPlan = async (
 const applySegmentEffects = (
   segments: Segment[],
   windows: EngagementWindow[],
-  options: EditOptions
+  options: EditOptions,
+  hookRange?: TimeRange | null
 ) => {
-  const maxZoomDelta = Math.max(0, (options.autoZoomMax || 1.12) - 1)
+  const hardMaxZoom = Math.min(options.autoZoomMax || ZOOM_HARD_MAX, ZOOM_HARD_MAX)
+  const maxZoomDelta = Math.max(0, hardMaxZoom - 1)
+  const totalDuration = segments.reduce((sum, seg) => {
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    return sum + Math.max(0, (seg.end - seg.start) / speed)
+  }, 0)
+  const maxZoomDuration = totalDuration * ZOOM_MAX_DURATION_RATIO
+  const hasFaceSignal = windows.some((w) => w.facePresence > 0.2)
+
+  const segmentScores = segments.map((seg) => {
+    const relevant = windows.filter((w) => w.time >= seg.start && w.time < seg.end)
+    const avg = (key: keyof EngagementWindow) =>
+      relevant.length ? relevant.reduce((sum, w) => sum + (w[key] as number), 0) / relevant.length : 0
+    const facePresence = avg('facePresence')
+    const emotionIntensity = avg('emotionIntensity')
+    const vocalExcitement = avg('vocalExcitement')
+    const speechIntensity = avg('speechIntensity')
+    const emotionalSpike = avg('emotionalSpike')
+    const isHook = hookRange ? seg.start < hookRange.end && seg.end > hookRange.start : false
+    const emphasisScore = Math.min(1, emotionIntensity * 0.6 + vocalExcitement * 0.3 + emotionalSpike * 0.1)
+    const scoreBoost = isHook ? 0.12 : 0
+    const score = emphasisScore + scoreBoost
+    return {
+      seg,
+      facePresence,
+      speechIntensity,
+      emotionIntensity,
+      vocalExcitement,
+      emotionalSpike,
+      isHook,
+      score
+    }
+  })
+
+  const zoomCandidates = segmentScores
+    .filter((entry) => hasFaceSignal && entry.facePresence >= 0.25)
+    .filter((entry) => {
+      if (options.aggressiveMode) return entry.score >= 0.35
+      if (entry.isHook) return entry.score >= 0.45
+      return entry.score >= 0.55 && entry.speechIntensity >= 0.25
+    })
+    .sort((a, b) => b.score - a.score)
+
+  let remainingZoom = maxZoomDuration
+  const zoomMap = new Map<Segment, number>()
+  for (const entry of zoomCandidates) {
+    if (remainingZoom <= 0) break
+    const speed = entry.seg.speed && entry.seg.speed > 0 ? entry.seg.speed : 1
+    const duration = Math.max(0, (entry.seg.end - entry.seg.start) / speed)
+    if (duration <= 0) continue
+    if (duration > remainingZoom) continue
+    const baseZoom = 0.05 + 0.06 * entry.score + (entry.isHook ? 0.02 : 0)
+    zoomMap.set(entry.seg, Math.min(maxZoomDelta, baseZoom))
+    remainingZoom -= duration
+  }
+
   return segments.map((seg) => {
-    const duration = seg.end - seg.start
-    const spikes = windows.filter((w) => w.time >= seg.start && w.time < seg.end && w.emotionalSpike > 0)
-    const hasSpike = spikes.length > 0
+    const score = segmentScores.find((entry) => entry.seg === seg)
+    const hasSpike = (score?.emotionalSpike ?? 0) > 0.05
+    const calmNarrative = (score?.emotionIntensity ?? 0) < 0.4 && (score?.speechIntensity ?? 0) < 0.3
+    const hookBoost = score?.isHook ? 0.02 : 0
     let zoom = seg.zoom ?? 0
     let brightness = seg.brightness ?? 0
-    if (options.smartZoom && duration > 4) zoom = Math.max(zoom, 0.08)
+    if (hasFaceSignal && options.smartZoom && (!calmNarrative || options.aggressiveMode)) {
+      const desired = zoomMap.get(seg) ?? 0
+      zoom = Math.max(zoom, desired + hookBoost)
+    }
     if (options.emotionalBoost && hasSpike) {
-      zoom = Math.max(zoom, 0.1)
       brightness = Math.max(brightness, 0.03)
     }
-    zoom = Math.min(maxZoomDelta || 0.12, zoom)
-    return { ...seg, zoom, brightness, emphasize: hasSpike }
+    zoom = Math.min(maxZoomDelta || 0, zoom)
+    return { ...seg, zoom, brightness, emphasize: hasSpike || score?.isHook }
   })
+}
+
+const applyZoomEasing = (segments: Segment[]) => {
+  const eased: Segment[] = []
+  for (const seg of segments) {
+    const zoom = seg.zoom ?? 0
+    const duration = seg.end - seg.start
+    if (zoom <= 0 || duration <= ZOOM_EASE_SEC * 2) {
+      eased.push(seg)
+      continue
+    }
+    const ease = Math.min(ZOOM_EASE_SEC, duration / 4)
+    if (ease <= 0) {
+      eased.push(seg)
+      continue
+    }
+    const easeZoom = zoom * 0.4
+    const midStart = seg.start + ease
+    const midEnd = seg.end - ease
+    eased.push({ ...seg, end: midStart, zoom: easeZoom })
+    if (midEnd - midStart > 0.05) {
+      eased.push({ ...seg, start: midStart, end: midEnd, zoom })
+    }
+    eased.push({ ...seg, start: midEnd, zoom: easeZoom })
+  }
+  return eased
 }
 
 const buildAtempoChain = (speed: number) => {
@@ -629,11 +912,14 @@ const buildConcatFilter = (
 ) => {
   const parts: string[] = []
   const scalePad = `scale=${opts.targetWidth}:${opts.targetHeight}:force_original_aspect_ratio=decrease,pad=${opts.targetWidth}:${opts.targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
+  const durations: number[] = []
 
   segments.forEach((seg, idx) => {
     const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
     const zoom = seg.zoom && seg.zoom > 0 ? seg.zoom : 0
     const brightness = seg.brightness && seg.brightness !== 0 ? seg.brightness : 0
+    const segDuration = Math.max(0.01, (seg.end - seg.start) / speed)
+    durations.push(segDuration)
     const vTrim = `trim=start=${seg.start}:end=${seg.end}`
     const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${speed}` : ',setpts=PTS-STARTPTS'
     const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
@@ -641,15 +927,18 @@ const buildConcatFilter = (
     parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
 
     if (opts.withAudio) {
-      const segDuration = Math.max(0.01, seg.end - seg.start)
       const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
       const aNormalize = 'aformat=sample_rates=48000:channel_layouts=stereo'
+      const fadeLen = 0.06
+      const afadeIn = `afade=t=in:st=0:d=${fadeLen}`
+      const afadeOut = `afade=t=out:st=${Math.max(0, segDuration - fadeLen)}:d=${fadeLen}`
       if (opts.hasAudioStream) {
-        const aTrim = `atrim=start=${seg.start}:end=${seg.end}`
-        const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, aNormalize].filter(Boolean).join(',')
+        const guard = 0.04
+        const aTrim = `atrim=start=${Math.max(0, seg.start - guard)}:end=${seg.end + guard}`
+        const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize].filter(Boolean).join(',')
         parts.push(`[0:a]${chain}[a${idx}]`)
       } else {
-        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${segDuration}`, 'asetpts=PTS-STARTPTS', aSpeed, aNormalize]
+        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${segDuration}`, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize]
           .filter(Boolean)
           .join(',')
         parts.push(`${chain}[a${idx}]`)
@@ -657,12 +946,42 @@ const buildConcatFilter = (
     }
   })
 
+  if (segments.length <= 1 || STITCH_FADE_SEC <= 0) {
+    if (opts.withAudio) {
+      const inputs = segments.map((_, idx) => `[v${idx}][a${idx}]`).join('')
+      parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`)
+    } else {
+      const inputs = segments.map((_, idx) => `[v${idx}]`).join('')
+      parts.push(`${inputs}concat=n=${segments.length}:v=1:a=0[outv]`)
+    }
+    return parts.join(';')
+  }
+
+  const fades: number[] = []
+  let cumulative = durations[0] || 0
+  let vPrev = `v0`
+  for (let i = 1; i < segments.length; i += 1) {
+    const fade = Math.min(STITCH_FADE_SEC, (durations[i - 1] || STITCH_FADE_SEC) / 2, (durations[i] || STITCH_FADE_SEC) / 2)
+    const offset = Math.max(0, Number((cumulative - fade).toFixed(3)))
+    const outLabel = `vx${i}`
+    parts.push(`[${vPrev}][v${i}]xfade=transition=fade:duration=${fade}:offset=${offset}[${outLabel}]`)
+    fades.push(fade)
+    vPrev = outLabel
+    cumulative += (durations[i] || 0) - fade
+  }
+
   if (opts.withAudio) {
-    const inputs = segments.map((_, idx) => `[v${idx}][a${idx}]`).join('')
-    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`)
+    let aPrev = `a0`
+    for (let i = 1; i < segments.length; i += 1) {
+      const fade = fades[i - 1] ?? STITCH_FADE_SEC
+      const outLabel = `ax${i}`
+      parts.push(`[${aPrev}][a${i}]acrossfade=d=${fade}:c1=tri:c2=tri[${outLabel}]`)
+      aPrev = outLabel
+    }
+    parts.push(`[${vPrev}]format=yuv420p[outv]`)
+    parts.push(`[${aPrev}]aformat=sample_rates=48000:channel_layouts=stereo[outa]`)
   } else {
-    const inputs = segments.map((_, idx) => `[v${idx}]`).join('')
-    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=0[outv]`)
+    parts.push(`[${vPrev}]format=yuv420p[outv]`)
   }
 
   return parts.join(';')
@@ -1057,7 +1376,40 @@ const processJob = async (
         ? [{ ...hookRange }, ...storySegments]
         : storySegments
       const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
-      const finalSegments = editPlan ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options) : filteredSegments
+      const effectedSegments = editPlan
+        ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options, hookRange)
+        : filteredSegments
+      const finalSegments = editPlan ? applyZoomEasing(effectedSegments) : effectedSegments
+
+      // Enforce zoom duration cap: never exceed ZOOM_MAX_DURATION_RATIO of total duration.
+      try {
+        const totalDuration = durationSeconds || 0
+        const zoomSegments = finalSegments.filter((s) => (s.zoom ?? 0) > 0)
+        const zoomDuration = zoomSegments.reduce((sum, s) => sum + Math.max(0, s.end - s.start), 0)
+        const maxZoomAllowed = Math.max(0, ZOOM_MAX_DURATION_RATIO * totalDuration)
+        if (zoomDuration > maxZoomAllowed && zoomSegments.length) {
+          // Sort by emphasize/score (segments with emphasize should keep zoom first), otherwise by length
+          const prioritized = finalSegments
+            .map((s) => ({ seg: s, score: (s as any).emphasize ? 2 : 0, len: s.end - s.start }))
+            .sort((a, b) => b.score - a.score || b.len - a.len)
+          let running = 0
+          for (const entry of prioritized) {
+            const s = entry.seg
+            const segLen = Math.max(0, s.end - s.start)
+            if ((s.zoom ?? 0) > 0) {
+              if (running + segLen <= maxZoomAllowed) {
+                running += segLen
+                continue
+              }
+              // remove zoom from lower priority segments until under cap
+              s.zoom = 0
+            }
+          }
+        }
+      } catch (e) {
+        // non-fatal
+        console.warn('zoom-cap enforcement failed', e)
+      }
 
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })

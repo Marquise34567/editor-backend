@@ -24,6 +24,7 @@ export type BillingInterval = 'monthly' | 'annual'
 
 const getPriceIdForTier = (tier: PlanTier, interval: BillingInterval, useTrial: boolean) => {
   const { priceIds } = getStripeConfig()
+  if (tier === 'founder') return priceIds.founder || ''
   if (useTrial && tier === 'starter' && priceIds.trial) return priceIds.trial
   const bucket = interval === 'annual' ? priceIds.annual : priceIds.monthly
   if (tier === 'starter') return bucket.starter || ''
@@ -43,13 +44,16 @@ export const createCheckoutUrlForUser = async (
   if (!priceId) return null
   const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
   const customerId = await ensureStripeCustomer(userId, email)
+  const founderOverride = String(process.env.STRIPE_FOUNDER_MODE || '').toLowerCase()
+  const mode = tier === 'founder' && founderOverride === 'payment' ? 'payment' : 'subscription'
   const session = await createCheckoutSession({
     customerId,
+    customerEmail: email,
     priceId,
-    mode: 'subscription',
+    mode,
     successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
     cancelUrl: `${baseUrl}/pricing`,
-    metadata: { userId, plan: tier, interval, trial: useTrial ? 'true' : 'false' }
+    metadata: { userId, plan: tier, planType: tier, interval, trial: useTrial ? 'true' : 'false' }
   })
   return session?.url ?? null
 }
@@ -63,13 +67,16 @@ export const createCheckoutUrlForPrice = async (
   if (!plan || plan === 'free') return null
   const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
   const customerId = await ensureStripeCustomer(userId, email)
+  const founderOverride = String(process.env.STRIPE_FOUNDER_MODE || '').toLowerCase()
+  const mode = plan === 'founder' && founderOverride === 'payment' ? 'payment' : 'subscription'
   const session = await createCheckoutSession({
     customerId,
+    customerEmail: email,
     priceId,
-    mode: 'subscription',
+    mode,
     successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
     cancelUrl: `${baseUrl}/pricing`,
-    metadata: { userId, plan }
+    metadata: { userId, plan, planType: plan }
   })
   return session?.url ?? null
 }

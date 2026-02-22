@@ -19,6 +19,7 @@ export const isStripeEnabled = () => !useMock && !!stripeClient
 
 export const createCheckoutSession = async (args: {
   customerId?: string | null
+  customerEmail?: string | null
   priceId: string
   successUrl: string
   cancelUrl: string
@@ -28,11 +29,15 @@ export const createCheckoutSession = async (args: {
   if (useMock) {
     return { id: `sess_${Math.random().toString(36).slice(2,9)}`, url: `${args.successUrl}?mock_session=1` }
   }
+  if (!args.priceId) {
+    throw new Error('missing_price_id')
+  }
   const mode = args.mode || 'subscription'
   const session = await stripeClient.checkout.sessions.create({
     mode,
     payment_method_types: ['card'],
     customer: args.customerId ?? undefined,
+    customer_email: args.customerId ? undefined : args.customerEmail ?? undefined,
     line_items: [{ price: args.priceId, quantity: 1 }],
     success_url: args.successUrl,
     cancel_url: args.cancelUrl,
