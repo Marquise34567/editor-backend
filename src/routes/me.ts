@@ -7,6 +7,14 @@ import { getPlanFeatures } from '../lib/planFeatures'
 import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
 
 const router = express.Router()
+const DEV_ACCOUNT_EMAILS = (process.env.DEV_ACCOUNT_EMAILS || process.env.DEV_ACCOUNT_EMAIL || '')
+  .split(',')
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean)
+const DEV_ACCOUNT_USER_IDS = (process.env.DEV_ACCOUNT_USER_IDS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean)
 router.get('/', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
@@ -14,6 +22,11 @@ router.get('/', async (req: any, res) => {
   const { subscription, tier, plan } = await getUserPlan(id)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
+  const email = String(user.email || '').toLowerCase()
+  const isDev = Boolean(
+    (email && DEV_ACCOUNT_EMAILS.includes(email)) ||
+      (DEV_ACCOUNT_USER_IDS.length && DEV_ACCOUNT_USER_IDS.includes(user.id))
+  )
   res.json({
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     subscription: subscription
@@ -24,6 +37,7 @@ router.get('/', async (req: any, res) => {
           cancelAtPeriodEnd: subscription.cancelAtPeriodEnd
         }
       : { tier: 'free', status: 'free', currentPeriodEnd: null, cancelAtPeriodEnd: false },
+    flags: { dev: isDev },
     usage: {
       month,
       rendersUsed: usage?.rendersUsed ?? 0,
