@@ -326,14 +326,7 @@ router.get('/:id', async (req: any, res) => {
   }
 })
 
-// mark uploaded (alias)
-router.post('/:id/set-uploaded', async (req: any, res) => {
-  req.url = `/${req.params.id}/complete-upload`
-  return router.handle(req, res, () => {})
-})
-
-// complete upload and start pipeline
-router.post('/:id/complete-upload', async (req: any, res) => {
+const handleCompleteUpload = async (req: any, res: any) => {
   try {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
@@ -351,7 +344,12 @@ router.post('/:id/complete-upload', async (req: any, res) => {
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
-})
+}
+
+// complete upload and start pipeline
+router.post('/:id/complete-upload', handleCompleteUpload)
+// mark uploaded (alias)
+router.post('/:id/set-uploaded', handleCompleteUpload)
 
 router.post('/:id/analyze', async (req: any, res) => {
   try {
