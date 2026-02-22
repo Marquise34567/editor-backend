@@ -220,6 +220,22 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoZoomMax: 1.1
 }
 
+const buildRenderLimitPayload = (
+  plan: { maxRendersPerMonth?: number | null },
+  usage?: { rendersCount?: number | null }
+) => {
+  const maxRenders = plan.maxRendersPerMonth ?? null
+  const rendersUsed = typeof usage?.rendersCount === 'number' ? usage.rendersCount : 0
+  const rendersRemaining = maxRenders === null ? null : Math.max(0, maxRenders - rendersUsed)
+  return {
+    error: 'RENDER_LIMIT_REACHED',
+    message: 'Monthly render limit reached. Upgrade to continue.',
+    rendersRemaining,
+    maxRendersPerMonth: maxRenders,
+    rendersUsed
+  }
+}
+
 const runFfmpegCapture = (args: string[]) => {
   return new Promise<string>((resolve, reject) => {
     const proc = spawn(FFMPEG_BIN, args)
@@ -1634,6 +1650,13 @@ const handleCreateJob = async (req: any, res: any) => {
 
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
+    const monthKey = getMonthKey()
+    const renderUsage = await getRenderUsageForMonth(userId, monthKey)
+    if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
+      if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+        return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
+      }
+    }
     const subtitleRequest = req.body?.subtitles
     if (subtitleRequest?.enabled) {
       const features = getPlanFeatures(tier)
@@ -1771,7 +1794,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
     if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
       if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-        return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
+        return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
       }
     }
 
