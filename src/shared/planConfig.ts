@@ -41,7 +41,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     allowedSubtitlePresets: 'ALL',
     autoZoomMax: 1.15,
     advancedEffects: true,
-    lifetime: false,
+    lifetime: true,
     includesFutureFeatures: true,
     badge: 'founder',
     features: [

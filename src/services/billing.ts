@@ -44,8 +44,7 @@ export const createCheckoutUrlForUser = async (
   if (!priceId) return null
   const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
   const customerId = await ensureStripeCustomer(userId, email)
-  const founderOverride = String(process.env.STRIPE_FOUNDER_MODE || '').toLowerCase()
-  const mode = tier === 'founder' && founderOverride === 'payment' ? 'payment' : 'subscription'
+  const mode = tier === 'founder' ? 'payment' : 'subscription'
   const session = await createCheckoutSession({
     customerId,
     customerEmail: email,
@@ -67,8 +66,7 @@ export const createCheckoutUrlForPrice = async (
   if (!plan || plan === 'free') return null
   const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
   const customerId = await ensureStripeCustomer(userId, email)
-  const founderOverride = String(process.env.STRIPE_FOUNDER_MODE || '').toLowerCase()
-  const mode = plan === 'founder' && founderOverride === 'payment' ? 'payment' : 'subscription'
+  const mode = plan === 'founder' ? 'payment' : 'subscription'
   const session = await createCheckoutSession({
     customerId,
     customerEmail: email,
