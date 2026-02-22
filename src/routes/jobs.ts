@@ -6,7 +6,7 @@ import crypto from 'crypto'
 import { spawn, spawnSync } from 'child_process'
 import { prisma } from '../db/prisma'
 import { supabaseAdmin } from '../supabaseClient'
-import { clampQualityForTier, normalizeQuality, qualityToHeight, type ExportQuality } from '../lib/gating'
+import { clampQualityForTier, normalizeQuality, type ExportQuality } from '../lib/gating'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
@@ -83,6 +83,17 @@ const runFfmpeg = (args: string[]) => {
   })
 }
 
+const formatFfmpegCommand = (args: string[]) => {
+  const quoted = args.map((arg) => {
+    if (arg === '') return '""'
+    if (/[\\s"'`]/.test(arg)) {
+      return `"${arg.replace(/"/g, '\\"')}"`
+    }
+    return arg
+  })
+  return [FFMPEG_BIN, ...quoted].join(' ')
+}
+
 const safeUnlink = (filePath?: string | null) => {
   if (!filePath) return
   try {
@@ -135,6 +146,13 @@ const getDurationSeconds = (filePath: string) => {
 const toMinutes = (seconds?: number | null) => {
   if (!seconds || seconds <= 0) return 0
   return Math.ceil(seconds / 60)
+}
+
+const getTargetDimensions = (quality?: ExportQuality | null) => {
+  if (quality === '4k') return { width: 3840, height: 2160 }
+  if (quality === '1080p') return { width: 1920, height: 1080 }
+  if (quality === '720p') return { width: 1280, height: 720 }
+  return { width: 1280, height: 720 }
 }
 
 type TimeRange = { start: number; end: number }
@@ -227,6 +245,29 @@ const hasAudioStream = (filePath: string) => {
     return /Audio:\s/i.test(output)
   } catch (e) {
     return false
+  }
+}
+
+const probeVideoStream = (filePath: string) => {
+  if (!hasFfprobe()) return null
+  try {
+    const result = spawnSync(
+      FFPROBE_BIN,
+      ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,sample_aspect_ratio,r_frame_rate', '-of', 'json', filePath],
+      { encoding: 'utf8' }
+    )
+    if (result.status !== 0) return null
+    const parsed = JSON.parse(String(result.stdout || '{}'))
+    const stream = Array.isArray(parsed?.streams) ? parsed.streams[0] : null
+    if (!stream) return null
+    return {
+      width: stream.width,
+      height: stream.height,
+      sampleAspectRatio: stream.sample_aspect_ratio,
+      frameRate: stream.r_frame_rate
+    }
+  } catch (e) {
+    return null
   }
 }
 
@@ -563,8 +604,29 @@ const applySegmentEffects = (
   })
 }
 
-const buildConcatFilter = (segments: Segment[], withAudio: boolean) => {
+const buildAtempoChain = (speed: number) => {
+  if (!Number.isFinite(speed) || speed === 1) return ''
+  const chain: number[] = []
+  let remaining = speed
+  while (remaining > 2) {
+    chain.push(2)
+    remaining /= 2
+  }
+  while (remaining < 0.5) {
+    chain.push(0.5)
+    remaining /= 0.5
+  }
+  chain.push(remaining)
+  return chain.map((value) => `atempo=${Number(value.toFixed(3))}`).join(',')
+}
+
+const buildConcatFilter = (
+  segments: Segment[],
+  opts: { withAudio: boolean; hasAudioStream: boolean; targetWidth: number; targetHeight: number }
+) => {
   const parts: string[] = []
+  const scalePad = `scale=${opts.targetWidth}:${opts.targetHeight}:force_original_aspect_ratio=decrease,pad=${opts.targetWidth}:${opts.targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
+
   segments.forEach((seg, idx) => {
     const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
     const zoom = seg.zoom && seg.zoom > 0 ? seg.zoom : 0
@@ -573,20 +635,33 @@ const buildConcatFilter = (segments: Segment[], withAudio: boolean) => {
     const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${speed}` : ',setpts=PTS-STARTPTS'
     const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
     const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
-    parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright}[v${idx}]`)
-    if (withAudio) {
-      const aTrim = `atrim=start=${seg.start}:end=${seg.end}`
-      const aSpeed = speed !== 1 ? `,atempo=${speed}` : ''
-      parts.push(`[0:a]${aTrim},asetpts=PTS-STARTPTS${aSpeed}[a${idx}]`)
+    parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
+
+    if (opts.withAudio) {
+      const segDuration = Math.max(0.01, seg.end - seg.start)
+      const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
+      const aNormalize = 'aformat=sample_rates=48000:channel_layouts=stereo'
+      if (opts.hasAudioStream) {
+        const aTrim = `atrim=start=${seg.start}:end=${seg.end}`
+        const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, aNormalize].filter(Boolean).join(',')
+        parts.push(`[0:a]${chain}[a${idx}]`)
+      } else {
+        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${segDuration}`, 'asetpts=PTS-STARTPTS', aSpeed, aNormalize]
+          .filter(Boolean)
+          .join(',')
+        parts.push(`${chain}[a${idx}]`)
+      }
     }
   })
-  if (withAudio) {
+
+  if (opts.withAudio) {
     const inputs = segments.map((_, idx) => `[v${idx}][a${idx}]`).join('')
-    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[vcat][acat]`)
+    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`)
   } else {
     const inputs = segments.map((_, idx) => `[v${idx}]`).join('')
-    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=0[vcat]`)
+    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=0[outv]`)
   }
+
   return parts.join(';')
 }
 
@@ -965,9 +1040,7 @@ const processJob = async (
     let retentionScore: number | null = null
     let optimizationNotes: string[] = []
     if (hasFfmpeg()) {
-      const height = qualityToHeight(finalQuality)
-      const baseVideoFilters: string[] = []
-      if (height) baseVideoFilters.push(`scale=-2:${height}`)
+      const target = getTargetDimensions(finalQuality)
 
       const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
       const editPlan = storedPlan?.segments ? storedPlan : (durationSeconds ? await buildEditPlan(tmpIn, durationSeconds, options) : null)
@@ -992,7 +1065,8 @@ const processJob = async (
       await updateJob(jobId, { status: 'audio', progress: 68 })
 
       const hasAudio = hasAudioStream(tmpIn)
-      const audioFilters = hasAudio ? buildAudioFilters() : []
+      const withAudio = true
+      const audioFilters = withAudio ? buildAudioFilters() : []
 
       await updateJob(jobId, { status: 'retention', progress: 72 })
       if (editPlan) {
@@ -1004,8 +1078,8 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
-      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
-      if (hasAudio) argsBase.push('-c:a', 'aac')
+      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
+      if (withAudio) argsBase.push('-c:a', 'aac')
 
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
@@ -1013,6 +1087,25 @@ const processJob = async (
         ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
         : ''
       const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
+
+      const probe = probeVideoStream(tmpIn)
+      if (probe && finalSegments.length) {
+        finalSegments.forEach((seg, idx) => {
+          console.log(
+            `[${requestId || 'noid'}] segment ${idx} ${seg.start}-${seg.end} width=${probe.width} height=${probe.height} sar=${probe.sampleAspectRatio} fps=${probe.frameRate}`
+          )
+        })
+      } else if (!probe) {
+        console.warn(`[${requestId || 'noid'}] segment preflight ffprobe unavailable`)
+      }
+
+      const logFfmpegFailure = (label: string, args: string[], err: any) => {
+        const stderr = typeof err?.stderr === 'string' ? err.stderr : ''
+        console.error(`[${requestId || 'noid'}] ffmpeg ${label} failed`, {
+          cmd: formatFfmpegCommand(args),
+          stderr
+        })
+      }
 
       const summarizeFfmpegError = (err: any) => {
         const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : ''
@@ -1025,26 +1118,35 @@ const processJob = async (
 
       try {
         if (hasSegments) {
-          const concatFilter = buildConcatFilter(finalSegments, hasAudio)
-          const baseVideoChain = baseVideoFilters.join(',')
-          const fullVideoChain = [baseVideoChain, subtitleFilter, watermarkFilter].filter(Boolean).join(',')
-          const baseOnlyChain = [baseVideoChain].filter(Boolean).join(',')
-          const videoChains = [fullVideoChain, baseOnlyChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
+          const concatFilter = buildConcatFilter(finalSegments, {
+            withAudio,
+            hasAudioStream: hasAudio,
+            targetWidth: target.width,
+            targetHeight: target.height
+          })
+          const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
 
           const runWithChain = async (videoChain: string) => {
             const filterParts: string[] = [concatFilter]
             if (videoChain) {
-              filterParts.push(`[vcat]${videoChain}[vout]`)
+              filterParts.push(`[outv]${videoChain}[vout]`)
             }
-            if (hasAudio && audioFilters.length > 0) {
-              filterParts.push(`[acat]${audioFilters.join(',')}[aout]`)
+            if (withAudio && audioFilters.length > 0) {
+              filterParts.push(`[outa]${audioFilters.join(',')}[aout]`)
             }
             const filter = filterParts.join(';')
-            const videoMap = videoChain ? '[vout]' : '[vcat]'
-            const audioMap = hasAudio ? (audioFilters.length > 0 ? '[aout]' : '[acat]') : null
+            const videoMap = videoChain ? '[vout]' : '[outv]'
+            const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
             const args = [...argsBase, '-filter_complex', filter, '-map', videoMap]
             if (audioMap) args.push('-map', audioMap)
-            await runFfmpeg([...args, tmpOut])
+            const fullArgs = [...args, tmpOut]
+            try {
+              await runFfmpeg(fullArgs)
+            } catch (err) {
+              logFfmpegFailure('concat', fullArgs, err)
+              throw err
+            }
           }
 
           let lastErr: any = null
@@ -1055,8 +1157,7 @@ const processJob = async (
               ran = true
               if (chain !== fullVideoChain) {
                 const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                const label = chain === baseOnlyChain ? 'without subtitles/watermark' : 'without extra filters'
-                optimizationNotes.push(`Render fallback: ${label} (${reason}).`)
+                optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
               }
               break
             } catch (err) {
@@ -1065,7 +1166,18 @@ const processJob = async (
           }
           if (!ran) throw lastErr || new Error('ffmpeg_failed')
         } else {
-          await runFfmpeg([...argsBase, tmpOut])
+          const fallbackArgs = [
+            ...argsBase,
+            '-vf',
+            `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+            tmpOut
+          ]
+          try {
+            await runFfmpeg(fallbackArgs)
+          } catch (err) {
+            logFfmpegFailure('single', fallbackArgs, err)
+            throw err
+          }
         }
         processed = true
       } catch (err) {
