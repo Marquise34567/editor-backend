@@ -1370,10 +1370,11 @@ const processJob = async (
       await updateJob(jobId, { status: 'story', progress: 55 })
 
       const hookRange = editPlan ? { start: editPlan.hook.start, end: editPlan.hook.start + editPlan.hook.duration } : null
+      const hookSegment = hookRange ? { ...hookRange, speed: 1 } : null
       const baseSegments = editPlan ? editPlan.segments : [{ start: 0, end: durationSeconds || 0 }]
       const storySegments = editPlan ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds) : baseSegments
-      const orderedSegments = editPlan && options.autoHookMove && hookRange
-        ? [{ ...hookRange }, ...storySegments]
+      const orderedSegments = editPlan && options.autoHookMove && hookSegment
+        ? [hookSegment, ...storySegments]
         : storySegments
       const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
       const effectedSegments = editPlan

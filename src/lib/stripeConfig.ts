@@ -1,5 +1,27 @@
 export type StripeMode = 'live' | 'test'
 
+export type StripePriceIds = {
+  monthly: {
+    starter: string
+    creator: string
+    studio: string
+  }
+  annual: {
+    starter: string
+    creator: string
+    studio: string
+  }
+  trial: string
+  founder: string
+}
+
+export type StripeConfig = {
+  mode: StripeMode
+  secretKey: string
+  webhookSecret: string
+  priceIds: StripePriceIds
+}
+
 const normalizeMode = (value?: string) => (String(value || '').toLowerCase() === 'test' ? 'test' : 'live')
 
 const pickByMode = (mode: StripeMode, liveKey: string, testKey: string) => {
@@ -7,7 +29,7 @@ const pickByMode = (mode: StripeMode, liveKey: string, testKey: string) => {
   return process.env[key] || ''
 }
 
-export const getStripeConfig = () => {
+export const getStripeConfig = (): StripeConfig => {
   const mode = normalizeMode(process.env.STRIPE_MODE)
   return {
     mode,
@@ -24,7 +46,8 @@ export const getStripeConfig = () => {
         creator: pickByMode(mode, 'STRIPE_PRICE_ID_CREATOR_ANNUAL', 'STRIPE_TEST_PRICE_ID_CREATOR_ANNUAL'),
         studio: pickByMode(mode, 'STRIPE_PRICE_ID_STUDIO_ANNUAL', 'STRIPE_TEST_PRICE_ID_STUDIO_ANNUAL')
       },
-      trial: pickByMode(mode, 'STRIPE_PRICE_ID_TRIAL', 'STRIPE_TEST_PRICE_ID_TRIAL')
+      trial: pickByMode(mode, 'STRIPE_PRICE_ID_TRIAL', 'STRIPE_TEST_PRICE_ID_TRIAL'),
+      founder: pickByMode(mode, 'STRIPE_PRICE_ID_FOUNDER', 'STRIPE_TEST_PRICE_ID_FOUNDER')
     }
   }
 }
