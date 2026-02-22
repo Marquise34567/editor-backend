@@ -750,20 +750,22 @@ const ensureUsageWithinLimits = async (
   userId: string,
   durationMinutes: number,
   tier: PlanTier,
-  plan: { maxRendersPerMonth: number; maxMinutesPerMonth: number | null }
+  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
 ) => {
   const monthKey = getMonthKey()
   const renderUsage = await getRenderUsageForMonth(userId, monthKey)
   const maxRenders = plan.maxRendersPerMonth
-  if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
-    const requiredPlan = getRequiredPlanForRenders(tier)
-    throw new PlanLimitError(
-      'Monthly render limit reached. Upgrade to continue.',
-      'renders',
-      requiredPlan,
-      undefined,
-      'RENDER_LIMIT_REACHED'
-    )
+  if (maxRenders !== null && maxRenders !== undefined) {
+    if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
+      const requiredPlan = getRequiredPlanForRenders(tier)
+      throw new PlanLimitError(
+        'Monthly render limit reached. Upgrade to continue.',
+        'renders',
+        requiredPlan,
+        undefined,
+        'RENDER_LIMIT_REACHED'
+      )
+    }
   }
   const usage = await getUsageForMonth(userId, monthKey)
   if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
@@ -1295,8 +1297,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const { plan } = await getUserPlan(req.user.id)
     const monthKey = getMonthKey()
     const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
-    if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-      return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
+    if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
+      if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+        return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
+      }
     }
 
     await updateJob(id, { inputPath, status: 'analyzing', progress: 10, requestedQuality: requestedQuality || job.requestedQuality })
