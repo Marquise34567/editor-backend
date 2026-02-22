@@ -1464,7 +1464,16 @@ const processJob = async (
 
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
-      const watermarkFilter = watermarkEnabled
+
+      // Prefer an image watermark if available (uses favicon from frontend/public),
+      // otherwise fall back to a subtle text watermark. The image will be overlaid
+      // at bottom-right with a small inset.
+      const defaultWatermarkImage = path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
+      const watermarkImagePath = process.env.WATERMARK_IMAGE_PATH || defaultWatermarkImage
+      const watermarkImageExists = watermarkEnabled && fs.existsSync(watermarkImagePath)
+      const watermarkFilter = watermarkImageExists
+        ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
+        : watermarkEnabled
         ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
         : ''
       const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
@@ -1506,6 +1515,10 @@ const processJob = async (
             targetHeight: target.height
           })
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          // If using an image watermark we must add the watermark file as a second input
+          // so ffmpeg can reference it as input index 1 in the overlay filter.
+          const argsWithWatermark = [...argsBase]
+          if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
           const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
 
           const runWithChain = async (videoChain: string) => {
@@ -1519,7 +1532,7 @@ const processJob = async (
             const filter = filterParts.join(';')
             const videoMap = videoChain ? '[vout]' : '[outv]'
             const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
-            const args = [...argsBase, '-filter_complex', filter, '-map', videoMap]
+            const args = [...argsWithWatermark, '-filter_complex', filter, '-map', videoMap]
             if (audioMap) args.push('-map', audioMap)
             const fullArgs = [...args, tmpOut]
             try {
