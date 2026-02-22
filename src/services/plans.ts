@@ -7,7 +7,7 @@ export const isActiveSubscriptionStatus = (status?: string | null) =>
 export const coercePlanTier = (tier?: string | null): PlanTier => {
   if (!tier) return 'free'
   const normalized = String(tier).toLowerCase()
-  if (normalized === 'founder') return 'studio'
+  if (normalized === 'founder') return 'founder'
   if (normalized === 'starter') return 'starter'
   if (normalized === 'creator') return 'creator'
   if (normalized === 'studio') return 'studio'

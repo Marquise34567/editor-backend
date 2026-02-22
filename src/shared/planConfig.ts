@@ -30,8 +30,8 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
   founder: {
     tier: 'founder',
     name: 'Founder',
-    priceMonthly: 0,
-    priceLabel: 'Lifetime',
+    priceMonthly: 149,
+    priceLabel: '$149',
     description: 'Limited lifetime access for the first 100 builders.',
     maxRendersPerMonth: 500,
     maxMinutesPerMonth: null,
@@ -41,7 +41,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     allowedSubtitlePresets: 'ALL',
     autoZoomMax: 1.15,
     advancedEffects: true,
-    lifetime: true,
+    lifetime: false,
     includesFutureFeatures: true,
     badge: 'founder',
     features: [

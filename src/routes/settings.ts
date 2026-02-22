@@ -32,17 +32,19 @@ router.get('/', async (req: any, res) => {
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
     const features = getPlanFeatures(tier)
+    const subtitlesEnabled = features.subtitles.enabled
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
     const normalizedQuality = clampQualityForTier(normalizeQuality(settings?.exportQuality), tier)
     const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
     const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
-    const enforcedSubtitle = isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+    const enforcedSubtitle =
+      subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
     const enforcedAutoZoomMax = coerceAutoZoomMax(settings?.autoZoomMax ?? features.autoZoomMax, features.autoZoomMax)
     const enforced = {
       userId,
       watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
-      autoCaptions: settings?.autoCaptions ?? false,
+      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? false) : false,
       autoHookMove: settings?.autoHookMove ?? true,
       removeBoring: settings?.removeBoring ?? true,
       smartZoom: settings?.smartZoom ?? true,
@@ -66,10 +68,14 @@ router.patch('/', async (req: any, res) => {
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
     const features = getPlanFeatures(tier)
+    const subtitlesEnabled = features.subtitles.enabled
     const existing = await prisma.userSettings.findUnique({ where: { userId } })
     const requestedQuality = payload.exportQuality ? normalizeQuality(payload.exportQuality) : normalizeQuality(existing?.exportQuality)
     const existingSubtitle = existing?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
     const requestedSubtitle = payload.subtitleStyle ? normalizeSubtitlePreset(payload.subtitleStyle) : null
+    if (!subtitlesEnabled && (payload.autoCaptions === true || payload.subtitleStyle)) {
+      return sendPlanLimit(res, 'creator', 'subtitles', 'Subtitles are temporarily disabled.')
+    }
     if (features.watermark && payload.watermarkEnabled === false) {
       return sendPlanLimit(res, 'starter', 'watermark', 'Upgrade to remove watermark')
     }
@@ -80,7 +86,7 @@ router.patch('/', async (req: any, res) => {
     if (payload.subtitleStyle && !requestedSubtitle) {
       return res.status(400).json({ error: 'invalid_subtitle_preset' })
     }
-    if (payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, tier)) {
+    if (subtitlesEnabled && payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, tier)) {
       const requiredPlan = getRequiredPlanForSubtitlePreset(requestedSubtitle)
       return sendPlanLimit(res, requiredPlan, 'subtitles', 'Upgrade to unlock subtitle styles')
     }
@@ -99,14 +105,14 @@ router.patch('/', async (req: any, res) => {
     const sanitized = {
       watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, tier),
-      autoCaptions: payload.autoCaptions ?? existing?.autoCaptions ?? false,
+      autoCaptions: subtitlesEnabled ? (payload.autoCaptions ?? existing?.autoCaptions ?? false) : false,
       autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
       removeBoring: payload.removeBoring ?? existing?.removeBoring ?? true,
       smartZoom: payload.smartZoom ?? existing?.smartZoom ?? true,
       emotionalBoost: features.advancedEffects ? (payload.emotionalBoost ?? existing?.emotionalBoost ?? true) : false,
       musicDuck: payload.musicDuck ?? existing?.musicDuck ?? true,
       aggressiveMode: features.advancedEffects ? (payload.aggressiveMode ?? existing?.aggressiveMode ?? false) : false,
-      subtitleStyle: payload.subtitleStyle ?? existingSubtitle,
+      subtitleStyle: subtitlesEnabled ? (payload.subtitleStyle ?? existingSubtitle) : DEFAULT_SUBTITLE_PRESET,
       autoZoomMax: sanitizedAutoZoom
     }
     const updated = await prisma.userSettings.upsert({ where: { userId }, create: { userId, ...sanitized }, update: sanitized })

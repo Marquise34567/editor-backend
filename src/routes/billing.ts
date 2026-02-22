@@ -2,6 +2,7 @@ import express from 'express'
 import { createCheckoutUrlForUser, createPortalUrlForUser, type BillingInterval } from '../services/billing'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
+import { ensureFounderAvailable, FounderSoldOutError } from '../services/founder'
 import { PLAN_TIERS, type PlanTier } from '../shared/planConfig'
 
 const router = express.Router()
@@ -35,10 +36,16 @@ const handleCheckout = async (req: any, res: any) => {
     const interval = parseInterval(req.body?.interval || req.body?.billingInterval)
     const wantTrial = parseBool(req.body?.trial)
     const useTrial = tier === 'starter' && wantTrial
+    if (tier === 'founder') {
+      await ensureFounderAvailable()
+    }
     const url = await createCheckoutUrlForUser(user.id, tier, user.email, interval, useTrial)
     if (!url) return res.status(500).json({ error: 'Missing price config' })
     res.json({ url })
   } catch (err: any) {
+    if (err instanceof FounderSoldOutError) {
+      return res.status(err.status).json({ error: err.code, message: err.message })
+    }
     console.error('create-checkout-session', err)
     res.status(500).json({ error: 'Failed to create session' })
   }

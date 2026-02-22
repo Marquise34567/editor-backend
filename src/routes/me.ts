@@ -3,6 +3,8 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth } from '../services/usage'
 import { getMonthKey } from '../shared/planConfig'
+import { getPlanFeatures } from '../lib/planFeatures'
+import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
 
 const router = express.Router()
 router.get('/', async (req: any, res) => {
@@ -48,6 +50,20 @@ router.get('/plan', async (req: any, res) => {
     stripeCustomerId: subscription?.stripeCustomerId ?? null,
     stripeSubscriptionId: subscription?.stripeSubscriptionId ?? null,
     priceId: subscription?.priceId ?? null
+  })
+})
+
+router.get('/subscription', async (req: any, res) => {
+  const id = req.user?.id
+  if (!id) return res.status(401).json({ error: 'unauthenticated' })
+  const { subscription, tier } = await getUserPlan(id)
+  const features = getPlanFeatures(tier)
+  res.json({
+    plan: tier,
+    status: subscription?.status ?? 'free',
+    currentPeriodEnd: subscription?.currentPeriodEnd ?? null,
+    features,
+    subtitlePresets: SUBTITLE_PRESET_REGISTRY
   })
 })
 

@@ -18,9 +18,14 @@ loadEnv()
 const app = express()
 app.set('trust proxy', 1)
 
-const frontendOrigin = process.env.FRONTEND_URL || 'http://localhost:3000'
-const allowedOrigins = frontendOrigin.split(',').map((o) => o.trim()).filter(Boolean)
-const originSuffixes = (process.env.CORS_ORIGIN_SUFFIXES || '.vercel.app,.railway.app,localhost').split(',')
+const frontendOrigin = process.env.FRONTEND_URL || ''
+const allowedOrigins = [
+  ...frontendOrigin.split(','),
+  'http://localhost:3000',
+  'https://www.autoeditor.app',
+  'https://autoeditor.app'
+].map((o) => o.trim()).filter(Boolean)
+const originSuffixes = (process.env.CORS_ORIGIN_SUFFIXES || '.vercel.app,.railway.app,.autoeditor.app,localhost').split(',')
   .map((o) => o.trim())
   .filter(Boolean)
 app.use(cors({

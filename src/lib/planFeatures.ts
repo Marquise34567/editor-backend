@@ -5,8 +5,8 @@ export type PlanFeatures = {
   tier: PlanTier
   resolution: '720p' | '1080p' | '4K'
   maxResolution: ExportQuality
-  rendersPerMonth: number | null
-  maxRendersPerMonth: number | null
+  rendersPerMonth: number
+  maxRendersPerMonth: number
   watermark: boolean
   queuePriority: 'priority' | 'standard'
   priorityQueue: boolean
@@ -69,7 +69,6 @@ export const getRequiredPlanForAutoZoom = (value: number): PlanTier => {
   if (value <= 1.1) return 'free'
   if (value <= 1.12) return 'starter'
   if (value <= 1.15) return 'creator'
-  if (value <= 1.2) return 'studio'
   return 'studio'
 }
 

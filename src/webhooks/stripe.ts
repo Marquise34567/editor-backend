@@ -1,9 +1,10 @@
 import express from 'express'
 import { stripe } from '../stripeClient'
 import { prisma } from '../db/prisma'
-import { isActiveSubscriptionStatus } from '../services/plans'
+import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
 import { getStripeConfig } from '../lib/stripeConfig'
 import { resolvePlanFromPriceId } from '../lib/stripePlans'
+import { incrementFounderPurchase } from '../services/founder'
 
 const router = express.Router()
 
@@ -29,6 +30,7 @@ router.post('/', async (req: any, res) => {
         const userId = session.metadata?.userId
         const customer = session.customer
         const subscription = session.subscription
+        const metadataTier = coercePlanTier(session.metadata?.plan)
         let priceId: string | null = session?.line_items?.data?.[0]?.price?.id ?? null
         let currentPeriodEnd: Date | null = null
         let status = 'active'
@@ -50,7 +52,7 @@ router.post('/', async (req: any, res) => {
             console.warn('checkout.session.completed: failed to fetch line items', err)
           }
         }
-        const tier = resolvePlanFromPriceId(priceId)
+        const tier = metadataTier !== 'free' ? metadataTier : resolvePlanFromPriceId(priceId)
         if (userId) {
           const existing = await prisma.user.findUnique({ where: { id: userId } })
           if (existing) {
@@ -95,6 +97,9 @@ router.post('/', async (req: any, res) => {
               currentPeriodEnd
             }
           })
+          if (tier === 'founder') {
+            await incrementFounderPurchase()
+          }
         }
         break
       }
