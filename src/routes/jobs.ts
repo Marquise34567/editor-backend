@@ -188,7 +188,7 @@ type EditOptions = {
   autoZoomMax: number
 }
 
-const HOOK_MIN = 3
+const HOOK_MIN = 5
 const HOOK_MAX = 5
 const CUT_MIN = 3
 const CUT_MAX = 10
@@ -452,12 +452,15 @@ const pickBestHook = (
     .forEach((win) => candidates.add(win.time))
   candidates.add(0)
 
+  const maxDuration = Math.min(HOOK_MAX, durationSeconds || HOOK_MAX)
+  const minDuration = Math.min(HOOK_MIN, maxDuration)
+
   let bestStart = 0
-  let bestDuration = Math.min(HOOK_MAX, Math.max(HOOK_MIN, durationSeconds || HOOK_MIN))
+  let bestDuration = Math.max(minDuration, maxDuration)
   let bestScore = -Infinity
 
   for (const start of candidates) {
-    for (let duration = HOOK_MAX; duration >= HOOK_MIN; duration -= 1) {
+    for (let duration = maxDuration; duration >= minDuration; duration -= 1) {
       const end = start + duration
       if (end > durationSeconds) continue
       if (!isWindowInsideSegments(start, end, segments)) continue
