@@ -1,24 +1,55 @@
 import express from 'express'
 import { prisma } from '../db/prisma'
 import { clampQualityForTier, normalizeQuality } from '../lib/gating'
-import { createCheckoutUrlForUser } from '../services/billing'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
+import {
+  getPlanFeatures,
+  getRequiredPlanForAdvancedEffects,
+  getRequiredPlanForAutoZoom,
+  getRequiredPlanForQuality,
+  isSubtitlePresetAllowed
+} from '../lib/planFeatures'
+import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
 
 const router = express.Router()
+
+const coerceAutoZoomMax = (value: any, maxValue: number) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return maxValue
+  const clamped = Math.max(1, Math.min(parsed, maxValue))
+  return Math.round(clamped * 100) / 100
+}
+
+const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message: string) => {
+  return res.status(403).json({ error: 'PLAN_LIMIT_EXCEEDED', requiredPlan, feature, message })
+}
 
 router.get('/', async (req: any, res) => {
   try {
     const userId = req.user.id
     await getOrCreateUser(userId, req.user?.email)
-    const { tier, plan } = await getUserPlan(userId)
+    const { tier } = await getUserPlan(userId)
+    const features = getPlanFeatures(tier)
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
     const normalizedQuality = clampQualityForTier(normalizeQuality(settings?.exportQuality), tier)
+    const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
+    const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
+    const enforcedSubtitle = isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+    const enforcedAutoZoomMax = coerceAutoZoomMax(settings?.autoZoomMax ?? features.autoZoomMax, features.autoZoomMax)
     const enforced = {
       userId,
-      watermarkEnabled: plan.watermark,
+      watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
       autoCaptions: settings?.autoCaptions ?? false,
+      autoHookMove: settings?.autoHookMove ?? true,
+      removeBoring: settings?.removeBoring ?? true,
+      smartZoom: settings?.smartZoom ?? true,
+      emotionalBoost: features.advancedEffects ? (settings?.emotionalBoost ?? true) : false,
+      musicDuck: settings?.musicDuck ?? true,
+      aggressiveMode: features.advancedEffects ? (settings?.aggressiveMode ?? false) : false,
+      subtitleStyle: enforcedSubtitle,
+      autoZoomMax: enforcedAutoZoomMax
     }
     res.json({ settings: enforced })
   } catch (err) {
@@ -31,22 +62,54 @@ router.patch('/', async (req: any, res) => {
   try {
     const userId = req.user.id
     const payload = req.body || {}
-    const user = await getOrCreateUser(userId, req.user?.email)
-    const { tier, plan } = await getUserPlan(userId)
+    await getOrCreateUser(userId, req.user?.email)
+    const { tier } = await getUserPlan(userId)
+    const features = getPlanFeatures(tier)
     const existing = await prisma.userSettings.findUnique({ where: { userId } })
     const requestedQuality = payload.exportQuality ? normalizeQuality(payload.exportQuality) : normalizeQuality(existing?.exportQuality)
-    if (plan.watermark && payload.watermarkEnabled === false) {
-      const checkoutUrl = await createCheckoutUrlForUser(userId, 'starter', user.email).catch(() => null)
-      return res.status(402).json({ error: 'payment_required', message: 'Upgrade to remove watermark', feature: 'watermark', checkoutUrl })
+    const existingSubtitle = existing?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
+    const requestedSubtitle = payload.subtitleStyle ? normalizeSubtitlePreset(payload.subtitleStyle) : null
+    if (features.watermark && payload.watermarkEnabled === false) {
+      return sendPlanLimit(res, 'starter', 'watermark', 'Upgrade to remove watermark')
     }
     if (payload.exportQuality && requestedQuality !== clampQualityForTier(requestedQuality, tier)) {
-      const checkoutUrl = await createCheckoutUrlForUser(userId, 'starter', user.email).catch(() => null)
-      return res.status(402).json({ error: 'payment_required', message: 'Upgrade to export higher quality', feature: 'quality', checkoutUrl })
+      const requiredPlan = getRequiredPlanForQuality(requestedQuality)
+      return sendPlanLimit(res, requiredPlan, 'quality', 'Upgrade to export higher quality')
     }
+    if (payload.subtitleStyle && !requestedSubtitle) {
+      return res.status(400).json({ error: 'invalid_subtitle_preset' })
+    }
+    if (payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, tier)) {
+      return res.status(403).json({
+        error: 'FEATURE_LOCKED',
+        feature: 'subtitles',
+        requiredPlan: 'creator'
+      })
+    }
+    if (payload.autoZoomMax && Number(payload.autoZoomMax) > features.autoZoomMax) {
+      const requiredPlan = getRequiredPlanForAutoZoom(Number(payload.autoZoomMax))
+      return sendPlanLimit(res, requiredPlan, 'autoZoomMax', 'Upgrade to unlock higher auto zoom limits')
+    }
+    const wantsAdvancedEffects = Boolean(payload.emotionalBoost) || Boolean(payload.aggressiveMode)
+    if (wantsAdvancedEffects && !features.advancedEffects) {
+      const requiredPlan = getRequiredPlanForAdvancedEffects()
+      return sendPlanLimit(res, requiredPlan, 'advancedEffects', 'Upgrade to unlock advanced effects')
+    }
+
+    const nextAutoZoom = payload.autoZoomMax ?? existing?.autoZoomMax ?? features.autoZoomMax
+    const sanitizedAutoZoom = coerceAutoZoomMax(nextAutoZoom, features.autoZoomMax)
     const sanitized = {
-      watermarkEnabled: plan.watermark,
+      watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, tier),
       autoCaptions: payload.autoCaptions ?? existing?.autoCaptions ?? false,
+      autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
+      removeBoring: payload.removeBoring ?? existing?.removeBoring ?? true,
+      smartZoom: payload.smartZoom ?? existing?.smartZoom ?? true,
+      emotionalBoost: features.advancedEffects ? (payload.emotionalBoost ?? existing?.emotionalBoost ?? true) : false,
+      musicDuck: payload.musicDuck ?? existing?.musicDuck ?? true,
+      aggressiveMode: features.advancedEffects ? (payload.aggressiveMode ?? existing?.aggressiveMode ?? false) : false,
+      subtitleStyle: payload.subtitleStyle ?? existingSubtitle,
+      autoZoomMax: sanitizedAutoZoom
     }
     const updated = await prisma.userSettings.upsert({ where: { userId }, create: { userId, ...sanitized }, update: sanitized })
     res.json({ settings: updated })

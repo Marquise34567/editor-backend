@@ -19,6 +19,7 @@ enum PlanTier {
   starter
   creator
   studio
+  founder
 }
 
 enum JobStatus {
@@ -28,6 +29,10 @@ enum JobStatus {
   hooking
   cutting
   pacing
+  subtitling
+  audio
+  story
+  retention
   rendering
   completed
   failed
@@ -65,18 +70,39 @@ model Job {
   finalQuality String? @map("final_quality")
   watermarkApplied Boolean @default(false) @map("watermark_applied")
   priority   Boolean @default(false)
+  priorityLevel Int @default(2) @map("priority_level")
   progress   Int      @default(0)
   error      String?
+  analysis   Json?    @map("analysis")
+  retentionScore Int? @map("retention_score")
+  optimizationNotes Json? @map("optimization_notes")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
 
   @@map("jobs")
 }
 
+model FounderInventory {
+  id             String   @id
+  maxPurchases   Int      @default(100) @map("max_purchases")
+  purchasedCount Int      @default(0) @map("purchased_count")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@map("founder_inventory")
+}
+
 model UserSettings {
   userId         String   @id
   defaultPreset  String?
   autoCaptions   Boolean  @default(false)
+  autoHookMove   Boolean  @default(true)
+  removeBoring   Boolean  @default(true)
+  smartZoom      Boolean  @default(true)
+  emotionalBoost Boolean  @default(true)
+  musicDuck      Boolean  @default(true)
+  aggressiveMode Boolean  @default(false)
+  subtitleStyle  String?  @default("basic_clean")
+  autoZoomMax    Float?   @default(1.1)
   watermarkEnabled Boolean @default(true)
   exportQuality  String?  @default("720p")
   createdAt      DateTime @default(now())

@@ -7,11 +7,22 @@ import { spawn, spawnSync } from 'child_process'
 import { prisma } from '../db/prisma'
 import { supabaseAdmin } from '../supabaseClient'
 import { clampQualityForTier, normalizeQuality, qualityToHeight, type ExportQuality } from '../lib/gating'
-import { createCheckoutUrlForUser } from '../services/billing'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
-import { getMonthKey } from '../shared/planConfig'
+import { incrementRenderUsage } from '../services/renderUsage'
+import { getMonthKey, type PlanTier } from '../shared/planConfig'
+import { broadcastJobUpdate } from '../realtime'
+import {
+  getPlanFeatures,
+  getRequiredPlanForAdvancedEffects,
+  getRequiredPlanForAutoZoom,
+  getRequiredPlanForQuality,
+  getRequiredPlanForSubtitlePreset,
+  getRequiredPlanForRenders,
+  isSubtitlePresetAllowed
+} from '../lib/planFeatures'
+import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
 
 const router = express.Router()
 
@@ -62,6 +73,21 @@ const runFfmpeg = (args: string[]) => {
   })
 }
 
+const safeUnlink = (filePath?: string | null) => {
+  if (!filePath) return
+  try {
+    if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
+  } catch (e) {
+    // ignore
+  }
+}
+
+const updateJob = async (jobId: string, data: any) => {
+  const updated = await prisma.job.update({ where: { id: jobId }, data })
+  broadcastJobUpdate(updated.userId, { job: updated })
+  return updated
+}
+
 const getDurationSeconds = (filePath: string) => {
   if (!hasFfprobe()) return null
   try {
@@ -85,10 +111,36 @@ const toMinutes = (seconds?: number | null) => {
 }
 
 type TimeRange = { start: number; end: number }
+type Segment = { start: number; end: number; speed?: number; zoom?: number; brightness?: number; emphasize?: boolean }
+type EngagementWindow = {
+  time: number
+  audioEnergy: number
+  speechIntensity: number
+  motionScore: number
+  facePresence: number
+  textDensity: number
+  sceneChangeRate: number
+  emotionalSpike: number
+  score: number
+}
 type EditPlan = {
-  hook: { start: number; duration: number }
-  segments: TimeRange[]
+  hook: { start: number; duration: number; score: number }
+  segments: Segment[]
   silences: TimeRange[]
+  removedSegments: TimeRange[]
+  compressedSegments: TimeRange[]
+  engagementWindows: EngagementWindow[]
+}
+type EditOptions = {
+  autoHookMove: boolean
+  removeBoring: boolean
+  smartZoom: boolean
+  emotionalBoost: boolean
+  aggressiveMode: boolean
+  autoCaptions: boolean
+  musicDuck: boolean
+  subtitleStyle?: string | null
+  autoZoomMax: number
 }
 
 const HOOK_MIN = 3
@@ -96,9 +148,20 @@ const HOOK_MAX = 5
 const CUT_MIN = 3
 const CUT_MAX = 10
 const SILENCE_DB = -30
-const SILENCE_MIN = 0.6
+const SILENCE_MIN = 0.4
 const HOOK_ANALYZE_MAX = 600
 const SCENE_THRESHOLD = 0.45
+const DEFAULT_EDIT_OPTIONS: EditOptions = {
+  autoHookMove: true,
+  removeBoring: true,
+  smartZoom: true,
+  emotionalBoost: true,
+  aggressiveMode: false,
+  autoCaptions: false,
+  musicDuck: true,
+  subtitleStyle: DEFAULT_SUBTITLE_PRESET,
+  autoZoomMax: 1.1
+}
 
 const runFfmpegCapture = (args: string[]) => {
   return new Promise<string>((resolve, reject) => {
@@ -186,6 +249,69 @@ const detectSceneChanges = async (filePath: string, durationSeconds: number) => 
   return Array.from(times.values()).sort((a, b) => a - b)
 }
 
+const normalizeEnergy = (rmsDb: number) => {
+  if (!Number.isFinite(rmsDb)) return 0
+  const clamped = Math.min(0, Math.max(-60, rmsDb))
+  return (clamped + 60) / 60
+}
+
+const buildEngagementWindows = (
+  durationSeconds: number,
+  energySamples: { time: number; rms: number }[],
+  sceneChanges: number[]
+): EngagementWindow[] => {
+  const totalSeconds = Math.max(0, Math.floor(durationSeconds))
+  const energyBySecond = new Array(totalSeconds).fill(0)
+  for (const sample of energySamples) {
+    if (sample.time < 0 || sample.time >= totalSeconds) continue
+    const idx = Math.floor(sample.time)
+    energyBySecond[idx] = Math.max(energyBySecond[idx], normalizeEnergy(sample.rms))
+  }
+  const meanEnergy = energyBySecond.length
+    ? energyBySecond.reduce((sum, v) => sum + v, 0) / energyBySecond.length
+    : 0
+  const variance = energyBySecond.length
+    ? energyBySecond.reduce((sum, v) => sum + (v - meanEnergy) ** 2, 0) / energyBySecond.length
+    : 0
+  const std = Math.sqrt(variance)
+
+  const sceneChangesBySecond = new Array(totalSeconds).fill(0)
+  for (const change of sceneChanges) {
+    const idx = Math.floor(change)
+    if (idx >= 0 && idx < totalSeconds) sceneChangesBySecond[idx] += 1
+  }
+
+  const windows: EngagementWindow[] = []
+  for (let i = 0; i < totalSeconds; i += 1) {
+    const audioEnergy = energyBySecond[i]
+    const speechIntensity = Math.min(1, Math.abs(audioEnergy - meanEnergy) / (std || 0.15))
+    const sceneChangeRate = Math.min(1, sceneChangesBySecond[i])
+    const motionScore = sceneChangeRate
+    const facePresence = 0
+    const textDensity = 0
+    const emotionalSpike = audioEnergy > meanEnergy + std * 1.5 ? 1 : 0
+    const score =
+      0.25 * audioEnergy +
+      0.20 * motionScore +
+      0.20 * speechIntensity +
+      0.15 * facePresence +
+      0.10 * textDensity +
+      0.10 * sceneChangeRate
+    windows.push({
+      time: i,
+      audioEnergy,
+      speechIntensity,
+      motionScore,
+      facePresence,
+      textDensity,
+      sceneChangeRate,
+      emotionalSpike,
+      score
+    })
+  }
+  return windows
+}
+
 const detectSilences = async (filePath: string, durationSeconds: number) => {
   if (!hasFfprobe()) return [] as TimeRange[]
   const args = [
@@ -221,44 +347,30 @@ const detectSilences = async (filePath: string, durationSeconds: number) => {
   return silences
 }
 
-const isWindowInsideSegments = (start: number, end: number, segments: TimeRange[]) => {
+const isWindowInsideSegments = (start: number, end: number, segments: Segment[]) => {
   return segments.some((seg) => start >= seg.start && end <= seg.end)
 }
 
-const scoreWindow = (
-  start: number,
-  duration: number,
-  energySamples: { time: number; rms: number }[],
-  sceneChanges: number[]
-) => {
+const scoreWindow = (start: number, duration: number, windows: EngagementWindow[]) => {
   const end = start + duration
-  if (!energySamples.length) return -100
-  let sum = 0
-  let count = 0
-  for (const sample of energySamples) {
-    if (sample.time < start || sample.time > end) continue
-    sum += sample.rms
-    count += 1
-  }
-  const avg = count ? sum / count : -100
-  const hasScene = sceneChanges.some((t) => Math.abs(t - start) <= 0.5)
-  return avg + (hasScene ? 3 : 0)
+  const relevant = windows.filter((w) => w.time >= start && w.time < end)
+  if (!relevant.length) return -Infinity
+  const avg = relevant.reduce((sum, w) => sum + w.score, 0) / relevant.length
+  return avg
 }
 
 const pickBestHook = (
   durationSeconds: number,
   segments: TimeRange[],
-  energySamples: { time: number; rms: number }[],
-  sceneChanges: number[]
+  windows: EngagementWindow[]
 ) => {
   const candidates = new Set<number>()
   segments.forEach((seg) => candidates.add(seg.start))
-  sceneChanges.forEach((t) => candidates.add(t))
-  energySamples
+  windows
     .slice()
-    .sort((a, b) => b.rms - a.rms)
+    .sort((a, b) => b.score - a.score)
     .slice(0, 8)
-    .forEach((sample) => candidates.add(sample.time))
+    .forEach((win) => candidates.add(win.time))
   candidates.add(0)
 
   let bestStart = 0
@@ -270,7 +382,7 @@ const pickBestHook = (
       const end = start + duration
       if (end > durationSeconds) continue
       if (!isWindowInsideSegments(start, end, segments)) continue
-      const score = scoreWindow(start, duration, energySamples, sceneChanges)
+      const score = scoreWindow(start, duration, windows)
       if (score > bestScore) {
         bestScore = score
         bestStart = start
@@ -279,35 +391,35 @@ const pickBestHook = (
     }
   }
 
-  return { start: bestStart, duration: bestDuration }
+  return { start: bestStart, duration: bestDuration, score: bestScore }
 }
 
-const subtractRange = (segments: TimeRange[], range: TimeRange) => {
-  const result: TimeRange[] = []
+const subtractRange = (segments: Segment[], range: TimeRange) => {
+  const result: Segment[] = []
   for (const seg of segments) {
     if (range.end <= seg.start || range.start >= seg.end) {
       result.push(seg)
       continue
     }
-    if (range.start > seg.start) result.push({ start: seg.start, end: Math.max(seg.start, range.start) })
-    if (range.end < seg.end) result.push({ start: Math.min(seg.end, range.end), end: seg.end })
+    if (range.start > seg.start) result.push({ ...seg, start: seg.start, end: Math.max(seg.start, range.start) })
+    if (range.end < seg.end) result.push({ ...seg, start: Math.min(seg.end, range.end), end: seg.end })
   }
   return result.filter((seg) => seg.end - seg.start > 0.25)
 }
 
-const splitSegments = (segments: TimeRange[], minLen: number, maxLen: number) => {
-  const out: TimeRange[] = []
+const splitSegments = (segments: Segment[], minLen: number, maxLen: number) => {
+  const out: Segment[] = []
   for (const seg of segments) {
     let start = seg.start
-    let end = seg.end
+    const end = seg.end
     while (end - start > maxLen) {
-      out.push({ start, end: start + maxLen })
+      out.push({ ...seg, start, end: start + maxLen })
       start += maxLen
     }
     if (end - start < minLen && out.length > 0) {
       out[out.length - 1].end = end
     } else if (end - start > 0.1) {
-      out.push({ start, end })
+      out.push({ ...seg, start, end })
     }
   }
   return out
@@ -316,37 +428,115 @@ const splitSegments = (segments: TimeRange[], minLen: number, maxLen: number) =>
 const buildEditPlan = async (
   filePath: string,
   durationSeconds: number,
+  options: EditOptions = DEFAULT_EDIT_OPTIONS,
   onStage?: (stage: 'cutting' | 'hooking' | 'pacing') => void | Promise<void>
 ) => {
   if (onStage) await onStage('cutting')
   const silences = await detectSilences(filePath, durationSeconds)
-  const cuts = silences.filter((s) => (s.end - s.start) >= CUT_MIN)
-  const keep: TimeRange[] = []
-  let cursor = 0
-  for (const silence of cuts) {
-    if (silence.start > cursor) keep.push({ start: cursor, end: silence.start })
-    cursor = Math.max(cursor, silence.end)
-  }
-  if (cursor < durationSeconds) keep.push({ start: cursor, end: durationSeconds })
-
-  const normalizedKeep = splitSegments(keep.length ? keep : [{ start: 0, end: durationSeconds }], CUT_MIN, CUT_MAX)
-  if (onStage) await onStage('hooking')
   const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
   const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
-  const hook = pickBestHook(durationSeconds, normalizedKeep, energySamples, sceneChanges)
-  const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
-  if (onStage) await onStage('pacing')
-  const withoutHook = subtractRange(normalizedKeep, hookRange)
+  const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges)
 
-  return { hook, segments: withoutHook, silences }
+  const boringThreshold = 0.18
+  const isSilentAt = (time: number) => silences.some((s) => time >= s.start && time < s.end)
+  const boringWindows = windows.map((w) => {
+    const silent = isSilentAt(w.time)
+    const boring = options.removeBoring
+      ? (silent || (w.audioEnergy < boringThreshold && w.motionScore < 0.2 && w.speechIntensity < 0.2))
+      : false
+    return { time: w.time, isBoring: boring }
+  })
+
+  const removedSegments: TimeRange[] = []
+  const compressedSegments: TimeRange[] = []
+  const keepSegments: Segment[] = []
+
+  let currentStart = 0
+  let currentBoring = boringWindows.length ? boringWindows[0].isBoring : false
+  for (let i = 1; i <= boringWindows.length; i += 1) {
+    const flag = i < boringWindows.length ? boringWindows[i].isBoring : currentBoring
+    if (i === boringWindows.length || flag !== currentBoring) {
+      const segStart = currentStart
+      const segEnd = i
+      const length = segEnd - segStart
+      if (currentBoring) {
+        if (length >= 2) {
+          removedSegments.push({ start: segStart, end: segEnd })
+        } else {
+          compressedSegments.push({ start: segStart, end: segEnd })
+          keepSegments.push({ start: segStart, end: segEnd, speed: 2 })
+        }
+      } else if (length > 0) {
+        keepSegments.push({ start: segStart, end: segEnd, speed: 1 })
+      }
+      currentStart = i
+      currentBoring = flag
+    }
+  }
+
+  const minLen = options.aggressiveMode ? 2 : CUT_MIN
+  const maxLen = options.aggressiveMode ? 4 : CUT_MAX
+  const normalizedKeep = splitSegments(
+    keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }],
+    minLen,
+    maxLen
+  )
+
+  if (onStage) await onStage('hooking')
+  const hook = pickBestHook(durationSeconds, normalizedKeep, windows)
+  const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
+
+  if (onStage) await onStage('pacing')
+  const withoutHook = options.autoHookMove ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
+  const finalSegments = withoutHook.map((seg) => ({ ...seg }))
+
+  return {
+    hook,
+    segments: finalSegments,
+    silences,
+    removedSegments,
+    compressedSegments,
+    engagementWindows: windows
+  }
 }
 
-const buildConcatFilter = (segments: TimeRange[], withAudio: boolean) => {
+const applySegmentEffects = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  options: EditOptions
+) => {
+  const maxZoomDelta = Math.max(0, (options.autoZoomMax || 1.12) - 1)
+  return segments.map((seg) => {
+    const duration = seg.end - seg.start
+    const spikes = windows.filter((w) => w.time >= seg.start && w.time < seg.end && w.emotionalSpike > 0)
+    const hasSpike = spikes.length > 0
+    let zoom = seg.zoom ?? 0
+    let brightness = seg.brightness ?? 0
+    if (options.smartZoom && duration > 4) zoom = Math.max(zoom, 0.08)
+    if (options.emotionalBoost && hasSpike) {
+      zoom = Math.max(zoom, 0.1)
+      brightness = Math.max(brightness, 0.03)
+    }
+    zoom = Math.min(maxZoomDelta || 0.12, zoom)
+    return { ...seg, zoom, brightness, emphasize: hasSpike }
+  })
+}
+
+const buildConcatFilter = (segments: Segment[], withAudio: boolean) => {
   const parts: string[] = []
   segments.forEach((seg, idx) => {
-    parts.push(`[0:v]trim=start=${seg.start}:end=${seg.end},setpts=PTS-STARTPTS[v${idx}]`)
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    const zoom = seg.zoom && seg.zoom > 0 ? seg.zoom : 0
+    const brightness = seg.brightness && seg.brightness !== 0 ? seg.brightness : 0
+    const vTrim = `trim=start=${seg.start}:end=${seg.end}`
+    const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${speed}` : ',setpts=PTS-STARTPTS'
+    const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
+    const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
+    parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright}[v${idx}]`)
     if (withAudio) {
-      parts.push(`[0:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS[a${idx}]`)
+      const aTrim = `atrim=start=${seg.start}:end=${seg.end}`
+      const aSpeed = speed !== 1 ? `,atempo=${speed}` : ''
+      parts.push(`[0:a]${aTrim},asetpts=PTS-STARTPTS${aSpeed}[a${idx}]`)
     }
   })
   if (withAudio) {
@@ -359,16 +549,140 @@ const buildConcatFilter = (segments: TimeRange[], withAudio: boolean) => {
   return parts.join(';')
 }
 
+const escapeFilterPath = (value: string) => {
+  const escaped = value.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")
+  return `'${escaped}'`
+}
+
+const scoreSegment = (segment: Segment, windows: EngagementWindow[]) => {
+  const relevant = windows.filter((w) => w.time >= segment.start && w.time < segment.end)
+  if (!relevant.length) return 0
+  return relevant.reduce((sum, w) => sum + w.score, 0) / relevant.length
+}
+
+const applyStoryStructure = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  durationSeconds: number
+) => {
+  if (segments.length <= 2) return segments
+  const tailStart = Math.max(0, durationSeconds * 0.6)
+  const tailCandidates = segments
+    .map((seg, idx) => ({ seg, idx, score: scoreSegment(seg, windows) }))
+    .filter((entry) => entry.seg.start >= tailStart)
+  if (!tailCandidates.length) return segments
+  const best = tailCandidates.sort((a, b) => b.score - a.score)[0]
+  if (best.idx === segments.length - 1) return segments
+  const reordered = segments.slice()
+  reordered.splice(best.idx, 1)
+  reordered.push(best.seg)
+  return reordered
+}
+
+const buildSubtitleStyle = (style?: string | null) => {
+  const base = {
+    FontName: 'DejaVu Sans',
+    FontSize: '42',
+    PrimaryColour: '&H00FFFFFF',
+    OutlineColour: '&H80000000',
+    BackColour: '&H00000000',
+    BorderStyle: '1',
+    Outline: '2',
+    Shadow: '0',
+    Alignment: '2'
+  }
+  const styles: Record<string, Partial<typeof base>> = {
+    minimal: {},
+    basicclean: { FontSize: '40', Outline: '1' },
+    clean: { FontSize: '40', Outline: '1' },
+    bold: { FontName: 'DejaVu Sans', FontSize: '48', Outline: '3', Shadow: '1' },
+    boldpop: { FontName: 'DejaVu Sans', FontSize: '48', Outline: '3', Shadow: '1', PrimaryColour: '&H0000FFFF' },
+    neon: { PrimaryColour: '&H00F5FF00', OutlineColour: '&H80000000', Shadow: '2', Outline: '3' },
+    neonglow: { PrimaryColour: '&H00F5FF00', OutlineColour: '&H80000000', Shadow: '2', Outline: '3' },
+    cinematic: { FontName: 'DejaVu Serif', FontSize: '40', Outline: '2', Shadow: '1' },
+    outlineheavy: { FontName: 'DejaVu Serif', FontSize: '40', Outline: '3', Shadow: '1' },
+    highcontrast: { PrimaryColour: '&H0000FFFF', OutlineColour: '&H80000000', Outline: '3' },
+    blackbox: { BorderStyle: '3', BackColour: '&H80000000', Outline: '0', Shadow: '0' },
+    captionbox: { BorderStyle: '3', BackColour: '&H80000000', Outline: '0', Shadow: '0' },
+    karaoke: { FontSize: '46', Outline: '3', Shadow: '1' },
+    karaokehighlight: { FontSize: '46', Outline: '3', Shadow: '1' }
+  }
+  const key = (style || DEFAULT_SUBTITLE_PRESET).toLowerCase().replace(/[\s_-]/g, '')
+  const selection = styles[key] || styles.minimal
+  const merged = { ...base, ...selection }
+  return Object.entries(merged)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(',')
+}
+
+const generateSubtitles = async (inputPath: string, workingDir: string) => {
+  const whisperBin = process.env.WHISPER_BIN
+  if (!whisperBin) return null
+  const model = process.env.WHISPER_MODEL || 'base'
+  const extraArgs = process.env.WHISPER_ARGS ? process.env.WHISPER_ARGS.split(' ') : []
+  const args = extraArgs.length
+    ? extraArgs
+    : ['--model', model, '--output_format', 'srt', '--output_dir', workingDir, '--word_timestamps', 'True']
+  return new Promise<string | null>((resolve) => {
+    const proc = spawn(whisperBin, [inputPath, ...args])
+    proc.on('error', () => resolve(null))
+    proc.on('close', (code) => {
+      if (code !== 0) return resolve(null)
+      const baseName = path.basename(inputPath, path.extname(inputPath))
+      const output = path.join(workingDir, `${baseName}.srt`)
+      if (!fs.existsSync(output)) return resolve(null)
+      resolve(output)
+    })
+  })
+}
+
+const buildAudioFilters = () => {
+  return [
+    'highpass=f=80',
+    'lowpass=f=16000',
+    'afftdn',
+    'acompressor=threshold=-15dB:ratio=3:attack=20:release=250',
+    'loudnorm=I=-14:TP=-1.5:LRA=11'
+  ]
+}
+
+const computeRetentionScore = (segments: Segment[], windows: EngagementWindow[], hookScore: number, captionsEnabled: boolean) => {
+  const lengths = segments.map((seg) => seg.end - seg.start).filter((len) => len > 0)
+  const avgLen = lengths.length ? lengths.reduce((sum, len) => sum + len, 0) / lengths.length : 0
+  const pacingScore = avgLen > 0 ? Math.max(0, 1 - Math.abs(avgLen - 4) / 6) : 0.5
+  const energies = windows.map((w) => w.audioEnergy)
+  const mean = energies.length ? energies.reduce((sum, v) => sum + v, 0) / energies.length : 0
+  const variance = energies.length ? energies.reduce((sum, v) => sum + (v - mean) ** 2, 0) / energies.length : 0
+  const consistency = mean > 0 ? Math.max(0, 1 - Math.sqrt(variance) / (mean + 0.01)) : 0.4
+  const hook = Number.isFinite(hookScore) ? Math.max(0, Math.min(1, hookScore)) : 0.5
+  const subtitleScore = captionsEnabled ? 1 : 0.6
+  const audioScore = 0.85
+  const score = Math.round(100 * (0.25 * hook + 0.2 * consistency + 0.2 * pacingScore + 0.15 * subtitleScore + 0.2 * audioScore))
+  const notes: string[] = []
+  if (avgLen > 6) notes.push('Pacing is slower than short-form optimal; consider aggressive mode.')
+  if (!captionsEnabled) notes.push('Enable auto subtitles for stronger retention.')
+  if (hook < 0.6) notes.push('Hook strength is moderate; consider re-recording the opening.')
+  return { score: Math.max(0, Math.min(100, score)), notes }
+}
+
 class PlanLimitError extends Error {
   status: number
   code: string
   feature: string
+  requiredPlan: string
   checkoutUrl?: string | null
-  constructor(message: string, feature: string, checkoutUrl?: string | null) {
+  constructor(message: string, feature: string, requiredPlan: string, checkoutUrl?: string | null, code?: string) {
     super(message)
-    this.status = 402
-    this.code = 'plan_limit'
+    this.status = 403
+    this.code =
+      code ??
+      (feature === 'renders'
+        ? 'RENDER_LIMIT_REACHED'
+        : feature === 'minutes'
+        ? 'MINUTES_LIMIT_REACHED'
+        : 'PLAN_LIMIT_EXCEEDED')
     this.feature = feature
+    this.requiredPlan = requiredPlan
     this.checkoutUrl = checkoutUrl
   }
 }
@@ -379,26 +693,50 @@ const getRequestedQuality = (value?: string | null, fallback?: string | null): E
   return '720p'
 }
 
-const ensureUsageWithinLimits = async (
-  userId: string,
-  userEmail: string | undefined,
-  durationMinutes: number,
-  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
-) => {
-  const monthKey = getMonthKey()
-  const usage = await getUsageForMonth(userId, monthKey)
-  if (plan.maxRendersPerMonth !== null && (usage?.rendersUsed ?? 0) >= plan.maxRendersPerMonth) {
-    const checkoutUrl = await createCheckoutUrlForUser(userId, 'starter', userEmail).catch(() => null)
-    throw new PlanLimitError('Monthly render limit reached. Upgrade to continue.', 'renders', checkoutUrl)
+  const ensureUsageWithinLimits = async (
+    userId: string,
+    durationMinutes: number,
+    tier: PlanTier,
+    plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
+  ) => {
+    const monthKey = getMonthKey()
+    const usage = await getUsageForMonth(userId, monthKey)
+    if (plan.maxRendersPerMonth !== null && (usage?.rendersUsed ?? 0) >= plan.maxRendersPerMonth) {
+      const requiredPlan = getRequiredPlanForRenders(tier)
+      throw new PlanLimitError('Monthly render limit reached. Upgrade to continue.', 'renders', requiredPlan)
+    }
+    if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
+      const requiredPlan = getRequiredPlanForRenders(tier)
+      throw new PlanLimitError('Monthly minutes limit reached. Upgrade to continue.', 'minutes', requiredPlan)
+    }
+    return { usage, monthKey }
   }
-  if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
-    const checkoutUrl = await createCheckoutUrlForUser(userId, 'starter', userEmail).catch(() => null)
-    throw new PlanLimitError('Monthly minutes limit reached. Upgrade to continue.', 'minutes', checkoutUrl)
+
+const getEditOptionsForUser = async (userId: string) => {
+  const settings = await prisma.userSettings.findUnique({ where: { userId } })
+  const { tier, plan } = await getUserPlan(userId)
+  const features = getPlanFeatures(tier)
+  const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
+  const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
+  const subtitleStyle = isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+  return {
+    options: {
+      autoHookMove: settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove,
+      removeBoring: settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring,
+      smartZoom: settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom,
+      emotionalBoost: features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false,
+      aggressiveMode: features.advancedEffects ? (settings?.aggressiveMode ?? DEFAULT_EDIT_OPTIONS.aggressiveMode) : false,
+      autoCaptions: settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions,
+      musicDuck: settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck,
+      subtitleStyle,
+      autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax
+    } as EditOptions,
+    plan,
+    tier
   }
-  return { usage, monthKey }
 }
 
-const analyzeJob = async (jobId: string, requestId?: string) => {
+const analyzeJob = async (jobId: string, options: EditOptions, requestId?: string) => {
   console.log(`[${requestId || 'noid'}] analyze start ${jobId}`)
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job) throw new Error('not_found')
@@ -407,78 +745,106 @@ const analyzeJob = async (jobId: string, requestId?: string) => {
   await ensureBucket(OUTPUT_BUCKET, false)
   const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).download(job.inputPath)
   if (error) {
-    await prisma.job.update({ where: { id: jobId }, data: { status: 'failed', error: 'download_failed' } })
+    await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
 
   const buf = Buffer.from(await data.arrayBuffer())
   const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
   fs.writeFileSync(tmpIn, buf)
-  const duration = getDurationSeconds(tmpIn)
+  try {
+    const duration = getDurationSeconds(tmpIn)
 
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: 'analyzing', progress: 15, inputDurationSeconds: duration ? Math.round(duration) : null }
-  })
+    await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: duration ? Math.round(duration) : null })
 
-  let editPlan: EditPlan | null = null
-  if (duration) {
-    try {
-      editPlan = await buildEditPlan(tmpIn, duration, async (stage) => {
-        if (stage === 'cutting') {
-          await prisma.job.update({ where: { id: jobId }, data: { status: 'cutting', progress: 25 } })
-        } else if (stage === 'hooking') {
-          await prisma.job.update({ where: { id: jobId }, data: { status: 'hooking', progress: 35 } })
-        } else if (stage === 'pacing') {
-          await prisma.job.update({ where: { id: jobId }, data: { status: 'pacing', progress: 45 } })
-        }
-      })
-    } catch (e) {
-      editPlan = null
+    let editPlan: EditPlan | null = null
+    if (duration) {
+      try {
+        editPlan = await buildEditPlan(tmpIn, duration, options, async (stage) => {
+          if (stage === 'cutting') {
+            await updateJob(jobId, { status: 'cutting', progress: 25 })
+          } else if (stage === 'hooking') {
+            await updateJob(jobId, { status: 'hooking', progress: 35 })
+          } else if (stage === 'pacing') {
+            await updateJob(jobId, { status: 'pacing', progress: 45 })
+          }
+        })
+      } catch (e) {
+        editPlan = null
+      }
     }
-  }
 
-  const analysis = {
-    duration: duration ?? 0,
-    size: buf.length,
-    filename: path.basename(job.inputPath),
-    editPlan
-  }
-  const analysisPath = `${job.userId}/${jobId}/analysis.json`
-  await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(analysisPath, Buffer.from(JSON.stringify(analysis)), { contentType: 'application/json', upsert: true })
-  await prisma.job.update({
-    where: { id: jobId },
-    data: {
+    const analysis = {
+      duration: duration ?? 0,
+      size: buf.length,
+      filename: path.basename(job.inputPath),
+      hook_start_time: editPlan?.hook?.start ?? null,
+      hook_end_time: editPlan?.hook ? editPlan.hook.start + editPlan.hook.duration : null,
+      hook_score: editPlan?.hook?.score ?? null,
+      removed_segments: editPlan?.removedSegments ?? [],
+      compressed_segments: editPlan?.compressedSegments ?? [],
+      editPlan
+    }
+    const analysisPath = `${job.userId}/${jobId}/analysis.json`
+    await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(analysisPath, Buffer.from(JSON.stringify(analysis)), { contentType: 'application/json', upsert: true })
+    await updateJob(jobId, {
       status: editPlan ? 'pacing' : 'analyzing',
       progress: editPlan ? 50 : 30,
-      inputDurationSeconds: duration ? Math.round(duration) : null
-    }
-  })
-  console.log(`[${requestId || 'noid'}] analyze complete ${jobId}`)
-  return analysis
+      inputDurationSeconds: duration ? Math.round(duration) : null,
+      analysis: analysis
+    })
+    console.log(`[${requestId || 'noid'}] analyze complete ${jobId}`)
+    return analysis
+  } finally {
+    safeUnlink(tmpIn)
+  }
 }
 
-const processJob = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
+const processJob = async (
+  jobId: string,
+  user: { id: string; email?: string },
+  requestedQuality: ExportQuality | undefined,
+  options: EditOptions,
+  requestId?: string
+) => {
   console.log(`[${requestId || 'noid'}] process start ${jobId}`)
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job) throw new Error('not_found')
 
   const settings = await prisma.userSettings.findUnique({ where: { userId: user.id } })
   const { tier, plan } = await getUserPlan(user.id)
+  const features = getPlanFeatures(tier)
   const desiredQuality = requestedQuality ?? getRequestedQuality(job.requestedQuality, settings?.exportQuality)
   const finalQuality = clampQualityForTier(desiredQuality, tier)
-  const watermarkEnabled = plan.watermark
+  if (finalQuality !== desiredQuality) {
+    const requiredPlan = getRequiredPlanForQuality(desiredQuality)
+    throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
+  }
+  const rawSubtitleStyle = options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
+  const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
+  if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
+    const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
+    throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan, undefined, 'FEATURE_LOCKED')
+  }
+  const subtitleStyle = rawSubtitleStyle
+  const autoZoomMax = Number(options.autoZoomMax ?? features.autoZoomMax)
+  if (Number.isFinite(autoZoomMax) && autoZoomMax > features.autoZoomMax) {
+    const requiredPlan = getRequiredPlanForAutoZoom(autoZoomMax)
+    throw new PlanLimitError('Upgrade to unlock higher auto zoom limits.', 'autoZoomMax', requiredPlan)
+  }
+  const wantsAdvanced = Boolean(options.emotionalBoost) || Boolean(options.aggressiveMode)
+  if (wantsAdvanced && !features.advancedEffects) {
+    const requiredPlan = getRequiredPlanForAdvancedEffects()
+    throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
+  }
+  const watermarkEnabled = features.watermark
 
-  await prisma.job.update({
-    where: { id: jobId },
-    data: {
-      status: 'rendering',
-      progress: 60,
-      requestedQuality: desiredQuality,
-      finalQuality,
-      watermarkApplied: watermarkEnabled,
-      priority: plan.priority
-    }
+  await updateJob(jobId, {
+    requestedQuality: desiredQuality,
+    finalQuality,
+    watermarkApplied: watermarkEnabled,
+    priority: features.priorityQueue,
+    priorityLevel: features.priorityQueue ? 1 : 2
   })
 
   await ensureBucket(INPUT_BUCKET, true)
@@ -486,122 +852,181 @@ const processJob = async (jobId: string, user: { id: string; email?: string }, r
 
   const input = await supabaseAdmin.storage.from(INPUT_BUCKET).download(job.inputPath)
   if (input.error) {
-    await prisma.job.update({ where: { id: jobId }, data: { status: 'failed', error: 'download_failed' } })
+    await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
   const buf = Buffer.from(await input.data.arrayBuffer())
-  const tmpIn = path.join(os.tmpdir(), `${jobId}-in`)
-  const tmpOut = path.join(os.tmpdir(), `${jobId}-out.mp4`)
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `${jobId}-`))
+  const tmpIn = path.join(workDir, 'input')
+  const tmpOut = path.join(workDir, 'output.mp4')
   fs.writeFileSync(tmpIn, buf)
+  let subtitlePath: string | null = null
+  try {
+    const durationSeconds = job.inputDurationSeconds ?? getDurationSeconds(tmpIn) ?? 0
+    const durationMinutes = toMinutes(durationSeconds)
+    await updateJob(jobId, { inputDurationSeconds: durationSeconds ? Math.round(durationSeconds) : null })
 
-  const durationSeconds = job.inputDurationSeconds ?? getDurationSeconds(tmpIn) ?? 0
-  const durationMinutes = toMinutes(durationSeconds)
-  await prisma.job.update({ where: { id: jobId }, data: { inputDurationSeconds: durationSeconds ? Math.round(durationSeconds) : null } })
+    await ensureUsageWithinLimits(user.id, durationMinutes, tier, plan)
 
-  await ensureUsageWithinLimits(user.id, user.email, durationMinutes, plan)
+    let processed = false
+    let retentionScore: number | null = null
+    let optimizationNotes: string[] = []
+    if (hasFfmpeg()) {
+      const height = qualityToHeight(finalQuality)
+      const baseVideoFilters: string[] = []
+      if (height) baseVideoFilters.push(`scale=-2:${height}`)
 
-  let processed = false
-  if (hasFfmpeg()) {
-    const height = qualityToHeight(finalQuality)
-    const filters: string[] = []
-    if (height) filters.push(`scale=-2:${height}`)
-    if (watermarkEnabled) {
-      filters.push("drawtext=text='AutoEditor':x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6")
-    }
+      const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
+      const editPlan = storedPlan?.segments ? storedPlan : (durationSeconds ? await buildEditPlan(tmpIn, durationSeconds, options) : null)
 
-    const plan = durationSeconds ? await buildEditPlan(tmpIn, durationSeconds) : null
-    const hookRange = plan ? { start: plan.hook.start, end: plan.hook.start + plan.hook.duration } : null
-    const segments = plan
-      ? [hookRange as TimeRange, ...plan.segments]
-      : [{ start: 0, end: durationSeconds || 0 }]
+      await updateJob(jobId, { status: 'story', progress: 55 })
 
-    const validSegments = segments.filter((seg) => seg.end - seg.start > 0.25)
-    const hasAudio = hasAudioStream(tmpIn)
+      const hookRange = editPlan ? { start: editPlan.hook.start, end: editPlan.hook.start + editPlan.hook.duration } : null
+      const baseSegments = editPlan ? editPlan.segments : [{ start: 0, end: durationSeconds || 0 }]
+      const storySegments = editPlan ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds) : baseSegments
+      const orderedSegments = editPlan && options.autoHookMove && hookRange
+        ? [{ ...hookRange }, ...storySegments]
+        : storySegments
+      const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
+      const finalSegments = editPlan ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options) : filteredSegments
 
-    const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
-    if (hasAudio) argsBase.push('-c:a', 'aac')
+      if (options.autoCaptions) {
+        await updateJob(jobId, { status: 'subtitling', progress: 62 })
+        subtitlePath = await generateSubtitles(tmpIn, workDir)
+        if (!subtitlePath) optimizationNotes.push('Auto subtitles skipped: no caption engine available.')
+      }
 
-    try {
-      if (validSegments.length >= 1) {
-        const filterParts: string[] = []
-        const concatFilter = buildConcatFilter(validSegments, hasAudio)
-        filterParts.push(concatFilter)
-        if (filters.length > 0) {
-          if (hasAudio) {
-            filterParts.push(`[vcat]${filters.join(',')}[vout]`)
-            const filter = `${filterParts.join(';')}`
-            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vout]', '-map', '[acat]', tmpOut])
-          } else {
-            filterParts.push(`[vcat]${filters.join(',')}[vout]`)
-            const filter = `${filterParts.join(';')}`
-            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vout]', tmpOut])
+      await updateJob(jobId, { status: 'audio', progress: 68 })
+
+      const hasAudio = hasAudioStream(tmpIn)
+      const audioFilters = hasAudio ? buildAudioFilters() : []
+
+      await updateJob(jobId, { status: 'retention', progress: 72 })
+      if (editPlan) {
+        const retention = computeRetentionScore(finalSegments, editPlan.engagementWindows, editPlan.hook.score, options.autoCaptions)
+        retentionScore = retention.score
+        optimizationNotes = [...optimizationNotes, ...retention.notes]
+      }
+
+      await updateJob(jobId, { status: 'rendering', progress: 80 })
+
+      const hasSegments = finalSegments.length >= 1
+      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
+      if (hasAudio) argsBase.push('-c:a', 'aac')
+
+      const watermarkFilter = watermarkEnabled
+        ? "drawtext=text='AutoEditor':x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6"
+        : ''
+      const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
+
+      try {
+        if (hasSegments) {
+          const filterParts: string[] = []
+          const concatFilter = buildConcatFilter(finalSegments, hasAudio)
+          filterParts.push(concatFilter)
+
+          const videoChain = [baseVideoFilters.join(','), subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          if (videoChain) {
+            filterParts.push(`[vcat]${videoChain}[vout]`)
           }
-        } else {
+          if (hasAudio && audioFilters.length > 0) {
+            filterParts.push(`[acat]${audioFilters.join(',')}[aout]`)
+          }
           const filter = filterParts.join(';')
-          if (hasAudio) {
-            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vcat]', '-map', '[acat]', tmpOut])
-          } else {
-            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vcat]', tmpOut])
-          }
+
+          const videoMap = videoChain ? '[vout]' : '[vcat]'
+          const audioMap = hasAudio ? (audioFilters.length > 0 ? '[aout]' : '[acat]') : null
+          const args = [...argsBase, '-filter_complex', filter, '-map', videoMap]
+          if (audioMap) args.push('-map', audioMap)
+          await runFfmpeg([...args, tmpOut])
+        } else {
+          await runFfmpeg([...argsBase, tmpOut])
         }
-      } else {
-        await runFfmpeg([...argsBase, tmpOut])
-      }
-      processed = true
-    } catch (err) {
-      if (watermarkEnabled) {
-        const noWatermarkFilters = filters.filter((f) => !f.startsWith('drawtext='))
-        const retryArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
-        if (hasAudioStream(tmpIn)) retryArgs.push('-c:a', 'aac')
-        try {
-          if (noWatermarkFilters.length > 0) {
-            await runFfmpeg([...retryArgs, '-vf', noWatermarkFilters.join(','), tmpOut])
-          } else {
+        processed = true
+      } catch (err) {
+        if (watermarkEnabled) {
+          const retryArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
+          if (hasAudioStream(tmpIn)) retryArgs.push('-c:a', 'aac')
+          try {
             await runFfmpeg([...retryArgs, tmpOut])
+            processed = true
+          } catch (retryErr) {
+            processed = false
           }
-          processed = true
-        } catch (retryErr) {
-          processed = false
         }
       }
     }
+
+    if (!processed) {
+      fs.writeFileSync(tmpOut, buf)
+    }
+
+    await updateJob(jobId, { progress: 95 })
+    const outBuf = fs.readFileSync(tmpOut)
+    const outPath = `${job.userId}/${jobId}/output.mp4`
+    const uploadResult = await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(outPath, outBuf, { contentType: 'video/mp4', upsert: true })
+    if (uploadResult.error) {
+      await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
+      throw new Error('upload_failed')
+    }
+
+    await updateJob(jobId, {
+      status: 'completed',
+      progress: 100,
+      outputPath: outPath,
+      finalQuality,
+      watermarkApplied: watermarkEnabled,
+      retentionScore,
+      optimizationNotes: optimizationNotes.length ? optimizationNotes : null
+    })
+
+    const monthKey = getMonthKey()
+    await incrementUsageForMonth(user.id, monthKey, 1, durationMinutes)
+    await incrementRenderUsage(user.id, monthKey, 1)
+    console.log(`[${requestId || 'noid'}] process complete ${jobId}`)
+  } finally {
+    safeUnlink(tmpIn)
+    safeUnlink(tmpOut)
+    safeUnlink(subtitlePath)
   }
-
-  if (!processed) {
-    fs.writeFileSync(tmpOut, buf)
-  }
-
-  await prisma.job.update({ where: { id: jobId }, data: { progress: 95 } })
-  const outBuf = fs.readFileSync(tmpOut)
-  const outPath = `${job.userId}/${jobId}/output.mp4`
-  const uploadResult = await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(outPath, outBuf, { contentType: 'video/mp4', upsert: true })
-  if (uploadResult.error) {
-    await prisma.job.update({ where: { id: jobId }, data: { status: 'failed', error: 'upload_failed' } })
-    throw new Error('upload_failed')
-  }
-
-  await prisma.job.update({
-    where: { id: jobId },
-    data: { status: 'completed', progress: 100, outputPath: outPath, finalQuality, watermarkApplied: watermarkEnabled }
-  })
-
-  const monthKey = getMonthKey()
-  await incrementUsageForMonth(user.id, monthKey, 1, durationMinutes)
-  console.log(`[${requestId || 'noid'}] process complete ${jobId}`)
 }
 
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
   try {
-    await analyzeJob(jobId, requestId)
-    await processJob(jobId, user, requestedQuality, requestId)
+    const { options } = await getEditOptionsForUser(user.id)
+    await analyzeJob(jobId, options, requestId)
+    await processJob(jobId, user, requestedQuality, options, requestId)
   } catch (err: any) {
     if (err instanceof PlanLimitError) {
-      await prisma.job.update({ where: { id: jobId }, data: { status: 'failed', error: err.code } })
+      await updateJob(jobId, { status: 'failed', error: err.code })
       return
     }
     console.error(`[${requestId || 'noid'}] pipeline error`, err)
-    await prisma.job.update({ where: { id: jobId }, data: { status: 'failed', error: String(err?.message || err) } })
+    await updateJob(jobId, { status: 'failed', error: String(err?.message || err) })
   }
+}
+
+type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string }
+const pipelineQueue: QueueItem[] = []
+let activePipelines = 0
+const MAX_PIPELINES = Number(process.env.JOB_CONCURRENCY || 1)
+
+const processQueue = () => {
+  while (activePipelines < MAX_PIPELINES && pipelineQueue.length > 0) {
+    const next = pipelineQueue.shift()
+    if (!next) return
+    activePipelines += 1
+    void runPipeline(next.jobId, next.user, next.requestedQuality, next.requestId)
+      .finally(() => {
+        activePipelines = Math.max(0, activePipelines - 1)
+        processQueue()
+      })
+  }
+}
+
+const enqueuePipeline = (item: QueueItem) => {
+  pipelineQueue.push(item)
+  processQueue()
 }
 
 const handleCreateJob = async (req: any, res: any) => {
@@ -614,6 +1039,22 @@ const handleCreateJob = async (req: any, res: any) => {
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
 
     await getOrCreateUser(userId, req.user?.email)
+    const { plan, tier } = await getUserPlan(userId)
+    const subtitleRequest = req.body?.subtitles
+    if (subtitleRequest?.enabled) {
+      const features = getPlanFeatures(tier)
+      const allowedPresets = features.subtitles.allowedPresets
+      const selectedPreset = normalizeSubtitlePreset(subtitleRequest?.preset)
+      if (allowedPresets !== 'ALL') {
+        if (!selectedPreset || !allowedPresets.includes(selectedPreset)) {
+          return res.status(403).json({
+            error: 'FEATURE_LOCKED',
+            feature: 'subtitles',
+            requiredPlan: 'creator'
+          })
+        }
+      }
+    }
     await ensureBucket(INPUT_BUCKET, true)
 
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
@@ -626,7 +1067,8 @@ const handleCreateJob = async (req: any, res: any) => {
         status: 'queued',
         inputPath,
         progress: 0,
-        requestedQuality: desiredQuality
+        requestedQuality: desiredQuality,
+        priorityLevel: plan.priority ? 1 : 2
       }
     })
 
@@ -680,13 +1122,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const inputPath = req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
-    await prisma.job.update({
-      where: { id },
-      data: { inputPath, status: 'analyzing', progress: 10, requestedQuality: requestedQuality || job.requestedQuality }
-    })
+    await updateJob(id, { inputPath, status: 'analyzing', progress: 10, requestedQuality: requestedQuality || job.requestedQuality })
 
     res.json({ ok: true })
-    void runPipeline(id, { id: req.user.id, email: req.user?.email }, requestedQuality as ExportQuality | undefined, req.requestId)
+    enqueuePipeline({ jobId: id, user: { id: req.user.id, email: req.user?.email }, requestedQuality: requestedQuality as ExportQuality | undefined, requestId: req.requestId })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -702,7 +1141,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
-    const analysis = await analyzeJob(id, req.requestId)
+    const { options } = await getEditOptionsForUser(req.user.id)
+    const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
   } catch (err) {
     console.error('analyze error', err)
@@ -718,15 +1158,22 @@ router.post('/:id/process', async (req: any, res) => {
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
-    await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, req.requestId)
+    const { options } = await getEditOptionsForUser(req.user.id)
+    await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
   } catch (err: any) {
     if (err instanceof PlanLimitError) {
-      return res.status(err.status).json({ error: err.code, message: err.message, feature: err.feature, checkoutUrl: err.checkoutUrl })
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
     }
     console.error('process error', err)
     try {
-      await prisma.job.update({ where: { id: req.params.id }, data: { status: 'failed', error: String(err) } })
+      await updateJob(req.params.id, { status: 'failed', error: String(err) })
     } catch (e) {
       // ignore
     }
