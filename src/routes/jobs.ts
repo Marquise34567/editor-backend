@@ -10,7 +10,7 @@ import { clampQualityForTier, normalizeQuality, qualityToHeight, type ExportQual
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
-import { incrementRenderUsage } from '../services/renderUsage'
+import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
 import { getMonthKey, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import {
@@ -687,32 +687,49 @@ const getRequestedQuality = (value?: string | null, fallback?: string | null): E
   return '720p'
 }
 
-  const ensureUsageWithinLimits = async (
-    userId: string,
-    durationMinutes: number,
-    tier: PlanTier,
-    plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
-  ) => {
-    const monthKey = getMonthKey()
-    const usage = await getUsageForMonth(userId, monthKey)
-    if (plan.maxRendersPerMonth !== null && (usage?.rendersUsed ?? 0) >= plan.maxRendersPerMonth) {
-      const requiredPlan = getRequiredPlanForRenders(tier)
-      throw new PlanLimitError('Monthly render limit reached. Upgrade to continue.', 'renders', requiredPlan)
-    }
-    if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
-      const requiredPlan = getRequiredPlanForRenders(tier)
-      throw new PlanLimitError('Monthly minutes limit reached. Upgrade to continue.', 'minutes', requiredPlan)
-    }
-    return { usage, monthKey }
+const ensureUsageWithinLimits = async (
+  userId: string,
+  durationMinutes: number,
+  tier: PlanTier,
+  plan: { maxRendersPerMonth: number; maxMinutesPerMonth: number | null }
+) => {
+  const monthKey = getMonthKey()
+  const features = getPlanFeatures(tier)
+  const renderUsage = await getRenderUsageForMonth(userId, monthKey)
+  const maxRenders = plan.maxRendersPerMonth
+  if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
+    const requiredPlan = getRequiredPlanForRenders(tier)
+    throw new PlanLimitError(
+      'Monthly render limit reached. Upgrade to continue.',
+      'renders',
+      requiredPlan,
+      undefined,
+      'RENDER_LIMIT_REACHED'
+    )
   }
+  const usage = await getUsageForMonth(userId, monthKey)
+  if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
+    const requiredPlan = getRequiredPlanForRenders(tier)
+    throw new PlanLimitError(
+      'Monthly minutes limit reached. Upgrade to continue.',
+      'minutes',
+      requiredPlan,
+      undefined,
+      'MINUTES_LIMIT_REACHED'
+    )
+  }
+  return { usage, monthKey }
+}
 
 const getEditOptionsForUser = async (userId: string) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
   const { tier, plan } = await getUserPlan(userId)
   const features = getPlanFeatures(tier)
+  const subtitlesEnabled = features.subtitles.enabled
   const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
-  const subtitleStyle = isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+  const subtitleStyle =
+    subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
   return {
     options: {
       autoHookMove: settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove,
@@ -720,7 +737,7 @@ const getEditOptionsForUser = async (userId: string) => {
       smartZoom: settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom,
       emotionalBoost: features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false,
       aggressiveMode: features.advancedEffects ? (settings?.aggressiveMode ?? DEFAULT_EDIT_OPTIONS.aggressiveMode) : false,
-      autoCaptions: settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions,
+      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false,
       musicDuck: settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck,
       subtitleStyle,
       autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax
@@ -816,9 +833,14 @@ const processJob = async (
   }
   const rawSubtitleStyle = options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
-  if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
-    const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
-    throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
+  if (options.autoCaptions) {
+    if (!features.subtitles.enabled) {
+      throw new PlanLimitError('Subtitles are temporarily disabled.', 'subtitles', 'creator')
+    }
+    if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
+      const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
+      throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
+    }
   }
   const subtitleStyle = rawSubtitleStyle
   const autoZoomMax = Number(options.autoZoomMax ?? features.autoZoomMax)
@@ -1000,7 +1022,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
   }
 }
 
-type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string }
+type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string; priorityLevel: number }
 const pipelineQueue: QueueItem[] = []
 let activePipelines = 0
 const MAX_PIPELINES = Number(process.env.JOB_CONCURRENCY || 1)
@@ -1019,7 +1041,12 @@ const processQueue = () => {
 }
 
 const enqueuePipeline = (item: QueueItem) => {
-  pipelineQueue.push(item)
+  const index = pipelineQueue.findIndex((queued) => queued.priorityLevel > item.priorityLevel)
+  if (index === -1) {
+    pipelineQueue.push(item)
+  } else {
+    pipelineQueue.splice(index, 0, item)
+  }
   processQueue()
 }
 
@@ -1035,24 +1062,32 @@ const handleCreateJob = async (req: any, res: any) => {
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
     const subtitleRequest = req.body?.subtitles
-      if (subtitleRequest?.enabled) {
-        const features = getPlanFeatures(tier)
-        const allowedPresets = features.subtitles.allowedPresets
-        const selectedPreset = normalizeSubtitlePreset(subtitleRequest?.preset)
-        if (subtitleRequest?.preset && !selectedPreset) {
-          return res.status(400).json({ error: 'invalid_subtitle_preset' })
-        }
-        if (subtitleRequest?.preset && allowedPresets !== 'ALL') {
-          if (!selectedPreset || !allowedPresets.includes(selectedPreset)) {
-            const requiredPlan = getRequiredPlanForSubtitlePreset(selectedPreset)
-            return res.status(403).json({
-              error: 'PLAN_LIMIT_EXCEEDED',
-              feature: 'subtitles',
-              requiredPlan
-            })
-          }
+    if (subtitleRequest?.enabled) {
+      const features = getPlanFeatures(tier)
+      if (!features.subtitles.enabled) {
+        return res.status(403).json({
+          error: 'PLAN_LIMIT_EXCEEDED',
+          feature: 'subtitles',
+          requiredPlan: 'creator',
+          message: 'Subtitles are temporarily disabled.'
+        })
+      }
+      const allowedPresets = features.subtitles.allowedPresets
+      const selectedPreset = normalizeSubtitlePreset(subtitleRequest?.preset)
+      if (subtitleRequest?.preset && !selectedPreset) {
+        return res.status(400).json({ error: 'invalid_subtitle_preset' })
+      }
+      if (subtitleRequest?.preset && allowedPresets !== 'ALL') {
+        if (!selectedPreset || !allowedPresets.includes(selectedPreset)) {
+          const requiredPlan = getRequiredPlanForSubtitlePreset(selectedPreset)
+          return res.status(403).json({
+            error: 'PLAN_LIMIT_EXCEEDED',
+            feature: 'subtitles',
+            requiredPlan
+          })
         }
       }
+    }
     await ensureBucket(INPUT_BUCKET, true)
 
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
@@ -1094,7 +1129,16 @@ router.get('/', async (req: any, res) => {
   try {
     const userId = req.user.id
     const jobs = await prisma.job.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } })
-    res.json({ jobs })
+    const payload = jobs.map((job) => ({
+      id: job.id,
+      status: job.status === 'completed' ? 'ready' : job.status,
+      createdAt: job.createdAt,
+      requestedQuality: job.requestedQuality,
+      watermark: job.watermarkApplied,
+      inputPath: job.inputPath,
+      progress: job.progress
+    }))
+    res.json({ jobs: payload })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -1106,7 +1150,36 @@ router.get('/:id', async (req: any, res) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
-    res.json({ job })
+    const jobPayload: any = {
+      ...job,
+      status: job.status === 'completed' ? 'ready' : job.status,
+      watermark: job.watermarkApplied,
+      steps: [
+        { key: 'queued', label: 'Queued' },
+        { key: 'uploading', label: 'Uploading' },
+        { key: 'analyzing', label: 'Analyzing' },
+        { key: 'hooking', label: 'Hook' },
+        { key: 'cutting', label: 'Cuts' },
+        { key: 'pacing', label: 'Pacing' },
+        { key: 'story', label: 'Story' },
+        { key: 'subtitling', label: 'Subtitles' },
+        { key: 'rendering', label: 'Rendering' },
+        { key: 'ready', label: 'Ready' }
+      ]
+    }
+    if (job.status === 'completed' && job.outputPath) {
+      try {
+        await ensureBucket(OUTPUT_BUCKET, false)
+        const expires = 60 * 10
+        const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(job.outputPath, expires)
+        if (!error && data?.signedUrl) {
+          jobPayload.outputUrl = data.signedUrl
+        }
+      } catch (err) {
+        // ignore signed URL failures; client can fallback to output-url endpoint
+      }
+    }
+    res.json({ job: jobPayload })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -1120,10 +1193,23 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const inputPath = req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
+    const { tier, plan } = await getUserPlan(req.user.id)
+    const monthKey = getMonthKey()
+    const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
+    if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+      return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
+    }
+
     await updateJob(id, { inputPath, status: 'analyzing', progress: 10, requestedQuality: requestedQuality || job.requestedQuality })
 
     res.json({ ok: true })
-    enqueuePipeline({ jobId: id, user: { id: req.user.id, email: req.user?.email }, requestedQuality: requestedQuality as ExportQuality | undefined, requestId: req.requestId })
+    enqueuePipeline({
+      jobId: id,
+      user: { id: req.user.id, email: req.user?.email },
+      requestedQuality: requestedQuality as ExportQuality | undefined,
+      requestId: req.requestId,
+      priorityLevel: job.priorityLevel ?? 2
+    })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
