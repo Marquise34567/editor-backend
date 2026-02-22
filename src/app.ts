@@ -1,0 +1,83 @@
+import express from 'express'
+import cors from 'cors'
+import bodyParser from 'body-parser'
+import crypto from 'crypto'
+import { loadEnv } from './lib/loadEnv'
+import billingRoutes from './routes/billing'
+import jobsRoutes from './routes/jobs'
+import webhookRoutes from './webhooks/stripe'
+import meRoutes from './routes/me'
+import settingsRoutes from './routes/settings'
+import { requireAuth } from './middleware/requireAuth'
+import { checkDb, isStubDb } from './db/prisma'
+import { rateLimit } from './middleware/rateLimit'
+
+loadEnv()
+const app = express()
+app.set('trust proxy', 1)
+
+const frontendOrigin = process.env.FRONTEND_URL || 'http://localhost:3000'
+const allowedOrigins = frontendOrigin.split(',').map((o) => o.trim()).filter(Boolean)
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    return cb(new Error('Not allowed by CORS'))
+  },
+  credentials: true
+}))
+
+app.use((req, res, next) => {
+  const id = crypto.randomUUID().slice(0, 12)
+  ;(req as any).requestId = id
+  res.setHeader('x-request-id', id)
+  const started = Date.now()
+  res.on('finish', () => {
+    const ms = Date.now() - started
+    console.log(`[${id}] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`)
+  })
+  next()
+})
+
+app.post('/webhooks/stripe', rateLimit({ windowMs: 60_000, max: 120 }), bodyParser.raw({ type: '*/*' }), (req, res, next) => {
+  ;(req as any).rawBody = req.body
+  next()
+}, webhookRoutes)
+
+app.post('/api/billing/webhook', rateLimit({ windowMs: 60_000, max: 120 }), bodyParser.raw({ type: '*/*' }), (req, res, next) => {
+  ;(req as any).rawBody = req.body
+  next()
+}, webhookRoutes)
+
+app.use(express.json({ limit: '10mb' }))
+
+app.use('/api/billing', requireAuth, billingRoutes)
+app.use('/api/jobs', requireAuth, jobsRoutes)
+app.use('/api/me', requireAuth, meRoutes)
+app.use('/api/settings', requireAuth, settingsRoutes)
+
+app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
+  const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'
+  const time = new Date().toISOString()
+  await checkDb()
+  res.json({ ok: true, version, time, db: isStubDb() ? 'stub' : 'prisma' })
+})
+
+app.get('/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
+  const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'
+  const time = new Date().toISOString()
+  await checkDb()
+  res.json({ ok: true, version, time, db: isStubDb() ? 'stub' : 'prisma' })
+})
+
+app.use((err: any, req: any, res: any, next: any) => {
+  const requestId = req?.requestId
+  console.error('Unhandled error', requestId, err)
+  res.status(err?.status || 500).json({
+    error: err?.code || 'server_error',
+    message: err?.message || 'Internal error',
+    requestId
+  })
+})
+
+export default app

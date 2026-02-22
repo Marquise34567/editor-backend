@@ -1,0 +1,155 @@
+import express from 'express'
+import { stripe } from '../stripeClient'
+import { prisma } from '../db/prisma'
+import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
+import { type PlanTier } from '../shared/planConfig'
+import { getStripeConfig } from '../lib/stripeConfig'
+
+const router = express.Router()
+
+// raw body is handled in index.ts for this route
+router.post('/', async (req: any, res) => {
+  if (!stripe) return res.status(500).send('Stripe not configured')
+  const sig = req.headers['stripe-signature'] as string | undefined
+  const { webhookSecret } = getStripeConfig()
+  if (!sig || !webhookSecret) return res.status(400).send('Missing signature or webhook secret')
+
+  let event
+  try {
+    event = stripe.webhooks.constructEvent(req.rawBody, sig, webhookSecret)
+  } catch (err: any) {
+    console.error('Webhook signature verification failed.', err.message)
+    return res.status(400).send(`Webhook Error: ${err.message}`)
+  }
+
+  try {
+    switch (event.type) {
+      case 'checkout.session.completed': {
+        const session = event.data.object as any
+        const userId = session.metadata?.userId
+        const tier = coercePlanTier(session.metadata?.tier)
+        const customer = session.customer
+        const subscription = session.subscription
+        if (userId) {
+          const existing = await prisma.user.findUnique({ where: { id: userId } })
+          if (existing) {
+            await prisma.user.update({ where: { id: userId }, data: { stripeCustomerId: String(customer), stripeSubscriptionId: String(subscription), planStatus: 'active' } })
+          } else {
+            const email = session.customer_email || `${userId}@autoeditor.local`
+            await prisma.user.create({ data: { id: userId, email, stripeCustomerId: String(customer), stripeSubscriptionId: String(subscription), planStatus: 'active' } })
+          }
+          await prisma.subscription.upsert({
+            where: { userId },
+            create: {
+              userId,
+              stripeCustomerId: String(customer),
+              stripeSubscriptionId: String(subscription),
+              status: 'active',
+              planTier: tier,
+              priceId: session?.display_items?.[0]?.price?.id ?? null,
+              currentPeriodEnd: null,
+              cancelAtPeriodEnd: false
+            },
+            update: {
+              stripeCustomerId: String(customer),
+              stripeSubscriptionId: String(subscription),
+              status: 'active',
+              planTier: tier
+            }
+          })
+        }
+        break
+      }
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated': {
+        const subscription = event.data.object as any
+        const customerId = subscription.customer
+        const status = subscription.status
+        const priceId = subscription.items?.data?.[0]?.price?.id
+        const currentPeriodEnd = subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : undefined
+        const mapped =
+          status === 'active' || status === 'trialing'
+            ? 'active'
+            : status === 'past_due' || status === 'unpaid' || status === 'incomplete'
+            ? 'past_due'
+            : 'canceled'
+        const tier: PlanTier = resolveTierFromPrice(priceId)
+        const shouldBeFree = !isActiveSubscriptionStatus(status)
+        await prisma.user.updateMany({ where: { stripeCustomerId: String(customerId) }, data: { stripeSubscriptionId: subscription.id, planStatus: mapped, stripePriceId: priceId, currentPeriodEnd } })
+        const user = await prisma.user.findUnique({ where: { stripeCustomerId: String(customerId) } })
+        if (user) {
+          await prisma.subscription.upsert({
+            where: { userId: user.id },
+            create: {
+              userId: user.id,
+              stripeCustomerId: String(customerId),
+              stripeSubscriptionId: subscription.id,
+              status,
+              priceId,
+              planTier: shouldBeFree ? 'free' : tier,
+              currentPeriodEnd,
+              cancelAtPeriodEnd: !!subscription.cancel_at_period_end
+            },
+            update: {
+              stripeSubscriptionId: subscription.id,
+              status,
+              priceId,
+              planTier: shouldBeFree ? 'free' : tier,
+              currentPeriodEnd,
+              cancelAtPeriodEnd: !!subscription.cancel_at_period_end
+            }
+          })
+        }
+        break
+      }
+      case 'customer.subscription.deleted': {
+        const subscription = event.data.object as any
+        const customerId = subscription.customer
+        await prisma.user.updateMany({ where: { stripeCustomerId: String(customerId) }, data: { planStatus: 'canceled', stripeSubscriptionId: null } })
+        await prisma.subscription.updateMany({
+          where: { stripeCustomerId: String(customerId) },
+          data: { status: 'canceled', planTier: 'free', stripeSubscriptionId: null }
+        })
+        break
+      }
+      case 'invoice.payment_succeeded': {
+        const invoice = event.data.object as any
+        const subId = invoice.subscription
+        if (subId) {
+          await prisma.user.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { planStatus: 'active' } })
+          await prisma.subscription.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { status: 'active' } })
+        }
+        break
+      }
+      case 'invoice.payment_failed': {
+        const invoice = event.data.object as any
+        const subId = invoice.subscription
+        if (subId) {
+          await prisma.user.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { planStatus: 'past_due' } })
+          await prisma.subscription.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { status: 'past_due', planTier: 'free' } })
+        }
+        break
+      }
+      default:
+        console.log('Unhandled stripe event', event.type)
+    }
+    res.json({ received: true })
+  } catch (err) {
+    console.error('Error handling webhook', err)
+    res.status(500).send('server error')
+  }
+})
+
+export default router
+
+const resolveTierFromPrice = (priceId?: string | null): PlanTier => {
+  if (!priceId) return 'free'
+  const { priceIds } = getStripeConfig()
+  const starters = [priceIds.monthly.starter, priceIds.annual.starter, priceIds.trial].filter(Boolean)
+  const creators = [priceIds.monthly.creator, priceIds.annual.creator].filter(Boolean)
+  const studios = [priceIds.monthly.studio, priceIds.annual.studio].filter(Boolean)
+  if (starters.includes(priceId)) return 'starter'
+  if (creators.includes(priceId)) return 'creator'
+  if (studios.includes(priceId)) return 'studio'
+  return 'free'
+}
