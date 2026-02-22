@@ -1,5 +1,12 @@
 import { supabaseAdmin } from '../supabaseClient'
 import { getMonthKey } from '../shared/planConfig'
+import { getUsageForMonth } from './usage'
+
+const isMissingUsageTable = (error: any) => {
+  const code = error?.code || error?.details?.code
+  const message = String(error?.message || '')
+  return code === 'PGRST205' || message.includes("Could not find the table 'public.usage'")
+}
 
 export const getRenderUsageForMonth = async (
   userId: string,
@@ -13,6 +20,10 @@ export const getRenderUsageForMonth = async (
       .eq('month', monthKey)
       .maybeSingle()
     if (error) {
+      if (isMissingUsageTable(error)) {
+        const usage = await getUsageForMonth(userId, monthKey)
+        return { rendersCount: usage?.rendersUsed ?? 0 }
+      }
       console.warn('usage lookup failed', error)
     }
     if (data && typeof data.renders_count === 'number') {
@@ -27,11 +38,19 @@ export const getRenderUsageForMonth = async (
       .select('renders_count')
       .maybeSingle()
     if (upsertError) {
+      if (isMissingUsageTable(upsertError)) {
+        const usage = await getUsageForMonth(userId, monthKey)
+        return { rendersCount: usage?.rendersUsed ?? 0 }
+      }
       console.warn('usage upsert failed', upsertError)
       return { rendersCount: 0 }
     }
     return { rendersCount: typeof created?.renders_count === 'number' ? created.renders_count : 0 }
-  } catch (err) {
+  } catch (err: any) {
+    if (isMissingUsageTable(err)) {
+      const usage = await getUsageForMonth(userId, monthKey)
+      return { rendersCount: usage?.rendersUsed ?? 0 }
+    }
     console.warn('usage tracking failed', err)
     return { rendersCount: 0 }
   }
@@ -50,6 +69,7 @@ export const incrementRenderUsage = async (
       .eq('month', monthKey)
       .maybeSingle()
     if (error) {
+      if (isMissingUsageTable(error)) return
       console.warn('usage lookup failed', error)
     }
     const current = Number(data?.renders_count ?? 0)
@@ -58,9 +78,11 @@ export const incrementRenderUsage = async (
       .from('usage')
       .upsert({ user_id: userId, month: monthKey, renders_count: next, updated_at: new Date().toISOString() }, { onConflict: 'user_id,month' })
     if (upsertError) {
+      if (isMissingUsageTable(upsertError)) return
       console.warn('usage upsert failed', upsertError)
     }
-  } catch (err) {
+  } catch (err: any) {
+    if (isMissingUsageTable(err)) return
     console.warn('usage tracking failed', err)
   }
 }

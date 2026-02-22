@@ -28,6 +28,9 @@ const router = express.Router()
 
 const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
 const OUTPUT_BUCKET = process.env.SUPABASE_BUCKET_OUTPUT || process.env.SUPABASE_BUCKET_OUTPUTS || 'outputs'
+const FFMPEG_BIN = process.env.FFMPEG_BIN || process.env.FFMPEG_PATH || 'ffmpeg'
+const FFPROBE_BIN = process.env.FFPROBE_BIN || process.env.FFPROBE_PATH || 'ffprobe'
+const FFMPEG_LOG_LIMIT = 8000
 
 const bucketChecks: Record<string, Promise<void> | null> = {}
 
@@ -46,7 +49,7 @@ const ensureBucket = async (name: string, isPublic: boolean) => {
 
 const hasFfmpeg = () => {
   try {
-    const result = spawnSync('ffmpeg', ['-version'], { stdio: 'ignore' })
+    const result = spawnSync(FFMPEG_BIN, ['-version'], { stdio: 'ignore' })
     return result.status === 0
   } catch (e) {
     return false
@@ -55,7 +58,7 @@ const hasFfmpeg = () => {
 
 const hasFfprobe = () => {
   try {
-    const result = spawnSync('ffprobe', ['-version'], { stdio: 'ignore' })
+    const result = spawnSync(FFPROBE_BIN, ['-version'], { stdio: 'ignore' })
     return result.status === 0
   } catch (e) {
     return false
@@ -64,11 +67,18 @@ const hasFfprobe = () => {
 
 const runFfmpeg = (args: string[]) => {
   return new Promise<void>((resolve, reject) => {
-    const proc = spawn('ffmpeg', args)
+    const proc = spawn(FFMPEG_BIN, args)
+    let stderr = ''
+    proc.stderr.on('data', (data) => {
+      if (stderr.length >= FFMPEG_LOG_LIMIT) return
+      stderr += data.toString()
+    })
     proc.on('error', (err) => reject(err))
     proc.on('close', (code) => {
       if (code === 0) return resolve()
-      reject(new Error(`ffmpeg_failed_${code}`))
+      const err: any = new Error(`ffmpeg_failed_${code}`)
+      err.stderr = stderr
+      reject(err)
     })
   })
 }
@@ -89,17 +99,34 @@ const updateJob = async (jobId: string, data: any) => {
 }
 
 const getDurationSeconds = (filePath: string) => {
-  if (!hasFfprobe()) return null
   try {
-    const result = spawnSync(
-      'ffprobe',
-      ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', filePath],
-      { encoding: 'utf8' }
-    )
-    if (result.status !== 0) return null
-    const value = String(result.stdout || '').trim()
-    const parsed = Number.parseFloat(value)
-    return Number.isFinite(parsed) ? parsed : null
+    if (hasFfprobe()) {
+      const result = spawnSync(
+        FFPROBE_BIN,
+        ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', filePath],
+        { encoding: 'utf8' }
+      )
+      if (result.status === 0) {
+        const value = String(result.stdout || '').trim()
+        const parsed = Number.parseFloat(value)
+        if (Number.isFinite(parsed) && parsed > 0) return parsed
+      }
+    }
+  } catch (e) {
+    // ignore and fall back to ffmpeg
+  }
+  if (!hasFfmpeg()) return null
+  try {
+    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`
+    const match = output.match(/Duration:\s*([0-9]+):([0-9]+):([0-9.]+)/)
+    if (!match) return null
+    const hours = Number.parseInt(match[1], 10)
+    const minutes = Number.parseInt(match[2], 10)
+    const seconds = Number.parseFloat(match[3])
+    if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) return null
+    const total = hours * 3600 + minutes * 60 + seconds
+    return Number.isFinite(total) && total > 0 ? total : null
   } catch (e) {
     return null
   }
@@ -165,9 +192,10 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
 
 const runFfmpegCapture = (args: string[]) => {
   return new Promise<string>((resolve, reject) => {
-    const proc = spawn('ffmpeg', args)
+    const proc = spawn(FFMPEG_BIN, args)
     let stderr = ''
     proc.stderr.on('data', (data) => {
+      if (stderr.length >= FFMPEG_LOG_LIMIT) return
       stderr += data.toString()
     })
     proc.on('error', (err) => reject(err))
@@ -180,13 +208,23 @@ const runFfmpegCapture = (args: string[]) => {
 
 const hasAudioStream = (filePath: string) => {
   try {
-    const result = spawnSync(
-      'ffprobe',
-      ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
-      { encoding: 'utf8' }
-    )
-    if (result.status !== 0) return false
-    return String(result.stdout || '').trim().length > 0
+    if (hasFfprobe()) {
+      const result = spawnSync(
+        FFPROBE_BIN,
+        ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
+        { encoding: 'utf8' }
+      )
+      if (result.status !== 0) return false
+      return String(result.stdout || '').trim().length > 0
+    }
+  } catch (e) {
+    // ignore and fall back to ffmpeg
+  }
+  if (!hasFfmpeg()) return false
+  try {
+    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
+    const output = `${result.stderr || ''}\n${result.stdout || ''}`
+    return /Audio:\s/i.test(output)
   } catch (e) {
     return false
   }
@@ -313,7 +351,7 @@ const buildEngagementWindows = (
 }
 
 const detectSilences = async (filePath: string, durationSeconds: number) => {
-  if (!hasFfprobe()) return [] as TimeRange[]
+  if (!hasFfmpeg()) return [] as TimeRange[]
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -432,13 +470,16 @@ const buildEditPlan = async (
   onStage?: (stage: 'cutting' | 'hooking' | 'pacing') => void | Promise<void>
 ) => {
   if (onStage) await onStage('cutting')
-  const silences = await detectSilences(filePath, durationSeconds)
+  const silences = await detectSilences(filePath, durationSeconds).catch(() => [])
   const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
   const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
   const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges)
 
   const boringThreshold = 0.18
-  const isSilentAt = (time: number) => silences.some((s) => time >= s.start && time < s.end)
+  const isSilentAt = (time: number) => {
+    const windowEnd = time + 1
+    return silences.some((s) => time < s.end && windowEnd > s.start)
+  }
   const boringWindows = windows.map((w) => {
     const silent = isSilentAt(w.time)
     const boring = options.removeBoring
@@ -552,6 +593,24 @@ const buildConcatFilter = (segments: Segment[], withAudio: boolean) => {
 const escapeFilterPath = (value: string) => {
   const escaped = value.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")
   return `'${escaped}'`
+}
+
+let cachedFontFile: string | null | undefined
+const getSystemFontFile = () => {
+  if (cachedFontFile !== undefined) return cachedFontFile
+  const candidates = process.platform === 'win32'
+    ? ['C:\\\\Windows\\\\Fonts\\\\arial.ttf', 'C:\\\\Windows\\\\Fonts\\\\segoeui.ttf', 'C:\\\\Windows\\\\Fonts\\\\calibri.ttf']
+    : process.platform === 'darwin'
+      ? ['/System/Library/Fonts/Supplemental/Arial.ttf', '/System/Library/Fonts/Supplemental/Helvetica.ttf', '/Library/Fonts/Arial.ttf']
+      : ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf', '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf', '/usr/share/fonts/truetype/freefont/FreeSans.ttf']
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) {
+      cachedFontFile = candidate
+      return cachedFontFile
+    }
+  }
+  cachedFontFile = null
+  return cachedFontFile
 }
 
 const scoreSegment = (segment: Segment, windows: EngagementWindow[]) => {
@@ -691,13 +750,12 @@ const ensureUsageWithinLimits = async (
   userId: string,
   durationMinutes: number,
   tier: PlanTier,
-  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
+  plan: { maxRendersPerMonth: number; maxMinutesPerMonth: number | null }
 ) => {
   const monthKey = getMonthKey()
-  const features = getPlanFeatures(tier)
   const renderUsage = await getRenderUsageForMonth(userId, monthKey)
   const maxRenders = plan.maxRendersPerMonth
-  if (maxRenders !== null && (renderUsage?.rendersCount ?? 0) >= maxRenders) {
+  if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
     const requiredPlan = getRequiredPlanForRenders(tier)
     throw new PlanLimitError(
       'Monthly render limit reached. Upgrade to continue.',
@@ -751,6 +809,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
   console.log(`[${requestId || 'noid'}] analyze start ${jobId}`)
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job) throw new Error('not_found')
+  if (!hasFfmpeg()) {
+    await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
+    throw new Error('ffmpeg_missing')
+  }
 
   await ensureBucket(INPUT_BUCKET, true)
   await ensureBucket(OUTPUT_BUCKET, false)
@@ -765,8 +827,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
   fs.writeFileSync(tmpIn, buf)
   try {
     const duration = getDurationSeconds(tmpIn)
+    if (!duration || !Number.isFinite(duration) || duration <= 0) {
+      await updateJob(jobId, { status: 'failed', error: 'duration_unavailable' })
+      throw new Error('duration_unavailable')
+    }
 
-    await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: duration ? Math.round(duration) : null })
+    await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: Math.round(duration) })
 
     let editPlan: EditPlan | null = null
     if (duration) {
@@ -821,6 +887,10 @@ const processJob = async (
   console.log(`[${requestId || 'noid'}] process start ${jobId}`)
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job) throw new Error('not_found')
+  if (!hasFfmpeg()) {
+    await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
+    throw new Error('ffmpeg_missing')
+  }
 
   const settings = await prisma.userSettings.findUnique({ where: { userId: user.id } })
   const { tier, plan } = await getUserPlan(user.id)
@@ -878,9 +948,14 @@ const processJob = async (
   fs.writeFileSync(tmpIn, buf)
   let subtitlePath: string | null = null
   try {
-    const durationSeconds = job.inputDurationSeconds ?? getDurationSeconds(tmpIn) ?? 0
+    const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
+    const durationSeconds = storedDuration ?? getDurationSeconds(tmpIn) ?? 0
+    if (!durationSeconds || durationSeconds <= 0) {
+      await updateJob(jobId, { status: 'failed', error: 'duration_unavailable' })
+      throw new Error('duration_unavailable')
+    }
     const durationMinutes = toMinutes(durationSeconds)
-    await updateJob(jobId, { inputDurationSeconds: durationSeconds ? Math.round(durationSeconds) : null })
+    await updateJob(jobId, { inputDurationSeconds: Math.round(durationSeconds) })
 
     await ensureUsageWithinLimits(user.id, durationMinutes, tier, plan)
 
@@ -930,51 +1005,75 @@ const processJob = async (
       const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
       if (hasAudio) argsBase.push('-c:a', 'aac')
 
+      const watermarkFont = getSystemFontFile()
+      const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
       const watermarkFilter = watermarkEnabled
-        ? "drawtext=text='AutoEditor':x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6"
+        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
         : ''
       const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
 
+      const summarizeFfmpegError = (err: any) => {
+        const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : ''
+        const message = err?.message ? String(err.message) : 'ffmpeg_failed'
+        if (!stderr) return message
+        const trimmed = stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ')
+        const combined = `${message}: ${trimmed}`
+        return combined.length > 200 ? combined.slice(0, 200) : combined
+      }
+
       try {
         if (hasSegments) {
-          const filterParts: string[] = []
           const concatFilter = buildConcatFilter(finalSegments, hasAudio)
-          filterParts.push(concatFilter)
+          const baseVideoChain = baseVideoFilters.join(',')
+          const fullVideoChain = [baseVideoChain, subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          const baseOnlyChain = [baseVideoChain].filter(Boolean).join(',')
+          const videoChains = [fullVideoChain, baseOnlyChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
 
-          const videoChain = [baseVideoFilters.join(','), subtitleFilter, watermarkFilter].filter(Boolean).join(',')
-          if (videoChain) {
-            filterParts.push(`[vcat]${videoChain}[vout]`)
+          const runWithChain = async (videoChain: string) => {
+            const filterParts: string[] = [concatFilter]
+            if (videoChain) {
+              filterParts.push(`[vcat]${videoChain}[vout]`)
+            }
+            if (hasAudio && audioFilters.length > 0) {
+              filterParts.push(`[acat]${audioFilters.join(',')}[aout]`)
+            }
+            const filter = filterParts.join(';')
+            const videoMap = videoChain ? '[vout]' : '[vcat]'
+            const audioMap = hasAudio ? (audioFilters.length > 0 ? '[aout]' : '[acat]') : null
+            const args = [...argsBase, '-filter_complex', filter, '-map', videoMap]
+            if (audioMap) args.push('-map', audioMap)
+            await runFfmpeg([...args, tmpOut])
           }
-          if (hasAudio && audioFilters.length > 0) {
-            filterParts.push(`[acat]${audioFilters.join(',')}[aout]`)
-          }
-          const filter = filterParts.join(';')
 
-          const videoMap = videoChain ? '[vout]' : '[vcat]'
-          const audioMap = hasAudio ? (audioFilters.length > 0 ? '[aout]' : '[acat]') : null
-          const args = [...argsBase, '-filter_complex', filter, '-map', videoMap]
-          if (audioMap) args.push('-map', audioMap)
-          await runFfmpeg([...args, tmpOut])
+          let lastErr: any = null
+          let ran = false
+          for (const chain of videoChains) {
+            try {
+              await runWithChain(chain)
+              ran = true
+              if (chain !== fullVideoChain) {
+                const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
+                const label = chain === baseOnlyChain ? 'without subtitles/watermark' : 'without extra filters'
+                optimizationNotes.push(`Render fallback: ${label} (${reason}).`)
+              }
+              break
+            } catch (err) {
+              lastErr = err
+            }
+          }
+          if (!ran) throw lastErr || new Error('ffmpeg_failed')
         } else {
           await runFfmpeg([...argsBase, tmpOut])
         }
         processed = true
       } catch (err) {
-        if (watermarkEnabled) {
-          const retryArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
-          if (hasAudioStream(tmpIn)) retryArgs.push('-c:a', 'aac')
-          try {
-            await runFfmpeg([...retryArgs, tmpOut])
-            processed = true
-          } catch (retryErr) {
-            processed = false
-          }
-        }
+        processed = false
+        throw err
       }
     }
 
     if (!processed) {
-      fs.writeFileSync(tmpOut, buf)
+      throw new Error('render_failed')
     }
 
     await updateJob(jobId, { progress: 95 })
@@ -1193,10 +1292,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const inputPath = req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
-    const { tier, plan } = await getUserPlan(req.user.id)
+    const { plan } = await getUserPlan(req.user.id)
     const monthKey = getMonthKey()
     const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
-    if (plan.maxRendersPerMonth !== null && (renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+    if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
       return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
     }
 
