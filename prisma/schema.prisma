@@ -97,6 +97,7 @@ model UserSettings {
   autoCaptions   Boolean  @default(false)
   autoHookMove   Boolean  @default(true)
   removeBoring   Boolean  @default(true)
+  onlyCuts       Boolean  @default(false)
   smartZoom      Boolean  @default(true)
   emotionalBoost Boolean  @default(true)
   musicDuck      Boolean  @default(true)

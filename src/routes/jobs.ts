@@ -181,6 +181,7 @@ type EditPlan = {
 type EditOptions = {
   autoHookMove: boolean
   removeBoring: boolean
+  onlyCuts: boolean
   smartZoom: boolean
   emotionalBoost: boolean
   aggressiveMode: boolean
@@ -203,7 +204,7 @@ const MAX_CUT_RATIO = 0.6
 const ZOOM_HARD_MAX = 1.15
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
-const STITCH_FADE_SEC = 0.16
+const STITCH_FADE_SEC = 0.08
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const HOOK_ANALYZE_MAX = 600
@@ -211,6 +212,7 @@ const SCENE_THRESHOLD = 0.45
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
+  onlyCuts: false,
   smartZoom: true,
   emotionalBoost: true,
   aggressiveMode: false,
@@ -775,18 +777,16 @@ const buildEditPlan = async (
 
   const minLen = PACE_MIN
   const maxLen = PACE_MAX
-  const normalizedKeep = applyPacingPattern(
-    keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }],
-    minLen,
-    maxLen
-  )
+  const pacingInput = keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }]
+  const normalizedKeep = options.onlyCuts ? pacingInput : applyPacingPattern(pacingInput, minLen, maxLen)
 
   if (onStage) await onStage('hooking')
   const hook = pickBestHook(durationSeconds, normalizedKeep, windows)
   const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
 
   if (onStage) await onStage('pacing')
-  const withoutHook = options.autoHookMove ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
+  const shouldMoveHook = options.autoHookMove && !options.onlyCuts
+  const withoutHook = shouldMoveHook ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
   const finalSegments = withoutHook.map((seg) => ({ ...seg }))
 
   return {
@@ -945,7 +945,7 @@ const buildConcatFilter = (
     if (opts.withAudio) {
       const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
       const aNormalize = 'aformat=sample_rates=48000:channel_layouts=stereo'
-      const fadeLen = 0.06
+      const fadeLen = 0.04
       const afadeIn = `afade=t=in:st=0:d=${fadeLen}`
       const afadeOut = `afade=t=out:st=${Math.max(0, segDuration - fadeLen)}:d=${fadeLen}`
       if (opts.hasAudioStream) {
@@ -1203,15 +1203,18 @@ const getEditOptionsForUser = async (userId: string) => {
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
   const subtitleStyle =
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+  const onlyCuts = settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts
+  const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   return {
     options: {
-      autoHookMove: settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove,
-      removeBoring: settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring,
-      smartZoom: settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom,
-      emotionalBoost: features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false,
-      aggressiveMode: features.advancedEffects ? (settings?.aggressiveMode ?? DEFAULT_EDIT_OPTIONS.aggressiveMode) : false,
-      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false,
-      musicDuck: settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck,
+      autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
+      removeBoring,
+      onlyCuts,
+      smartZoom: onlyCuts ? false : (settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
+      emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
+      aggressiveMode: onlyCuts ? false : (features.advancedEffects ? (settings?.aggressiveMode ?? DEFAULT_EDIT_OPTIONS.aggressiveMode) : false),
+      autoCaptions: onlyCuts ? false : (subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false),
+      musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
       subtitleStyle,
       autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax
     } as EditOptions,
@@ -1392,15 +1395,17 @@ const processJob = async (
       const baseSegments: Segment[] = editPlan
         ? editPlan.segments
         : [{ start: 0, end: durationSeconds || 0, speed: 1 }]
-      const storySegments = editPlan ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds) : baseSegments
-      const orderedSegments = editPlan && options.autoHookMove && hookSegment
+      const storySegments = editPlan && !options.onlyCuts
+        ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
+        : baseSegments
+      const orderedSegments = editPlan && options.autoHookMove && !options.onlyCuts && hookSegment
         ? [hookSegment, ...storySegments]
         : storySegments
       const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
-      const effectedSegments = editPlan
+      const effectedSegments = editPlan && !options.onlyCuts
         ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options, hookRange)
         : filteredSegments
-      const finalSegments = editPlan ? applyZoomEasing(effectedSegments) : effectedSegments
+      const finalSegments = editPlan && !options.onlyCuts ? applyZoomEasing(effectedSegments) : effectedSegments
 
       // Enforce zoom duration cap: never exceed ZOOM_MAX_DURATION_RATIO of total duration.
       try {
