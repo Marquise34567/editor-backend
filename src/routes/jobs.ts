@@ -691,13 +691,13 @@ const ensureUsageWithinLimits = async (
   userId: string,
   durationMinutes: number,
   tier: PlanTier,
-  plan: { maxRendersPerMonth: number; maxMinutesPerMonth: number | null }
+  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
 ) => {
   const monthKey = getMonthKey()
   const features = getPlanFeatures(tier)
   const renderUsage = await getRenderUsageForMonth(userId, monthKey)
   const maxRenders = plan.maxRendersPerMonth
-  if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
+  if (maxRenders !== null && (renderUsage?.rendersCount ?? 0) >= maxRenders) {
     const requiredPlan = getRequiredPlanForRenders(tier)
     throw new PlanLimitError(
       'Monthly render limit reached. Upgrade to continue.',
@@ -1196,7 +1196,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const { tier, plan } = await getUserPlan(req.user.id)
     const monthKey = getMonthKey()
     const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
-    if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+    if (plan.maxRendersPerMonth !== null && (renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
       return res.status(403).json({ error: 'RENDER_LIMIT_REACHED' })
     }
 
