@@ -84,6 +84,160 @@ const toMinutes = (seconds?: number | null) => {
   return Math.ceil(seconds / 60)
 }
 
+type TimeRange = { start: number; end: number }
+type EditPlan = {
+  hook: { start: number; duration: number }
+  segments: TimeRange[]
+  silences: TimeRange[]
+}
+
+const HOOK_MIN = 3
+const HOOK_MAX = 5
+const CUT_MIN = 3
+const CUT_MAX = 10
+const SILENCE_DB = -30
+const SILENCE_MIN = 0.6
+
+const runFfmpegCapture = (args: string[]) => {
+  return new Promise<string>((resolve, reject) => {
+    const proc = spawn('ffmpeg', args)
+    let stderr = ''
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString()
+    })
+    proc.on('error', (err) => reject(err))
+    proc.on('close', (code) => {
+      if (code === 0) return resolve(stderr)
+      reject(new Error(`ffmpeg_failed_${code}`))
+    })
+  })
+}
+
+const hasAudioStream = (filePath: string) => {
+  try {
+    const result = spawnSync(
+      'ffprobe',
+      ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
+      { encoding: 'utf8' }
+    )
+    if (result.status !== 0) return false
+    return String(result.stdout || '').trim().length > 0
+  } catch (e) {
+    return false
+  }
+}
+
+const detectSilences = async (filePath: string, durationSeconds: number) => {
+  if (!hasFfprobe()) return [] as TimeRange[]
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', filePath,
+    '-af', `silencedetect=noise=${SILENCE_DB}dB:d=${SILENCE_MIN}`,
+    '-f', 'null',
+    '-'
+  ]
+  const output = await runFfmpegCapture(args)
+  const lines = output.split(/\r?\n/)
+  const silences: TimeRange[] = []
+  let currentStart: number | null = null
+  for (const line of lines) {
+    if (line.includes('silence_start:')) {
+      const match = line.match(/silence_start:\s*([0-9.]+)/)
+      if (match) currentStart = Number.parseFloat(match[1])
+    }
+    if (line.includes('silence_end:')) {
+      const match = line.match(/silence_end:\s*([0-9.]+)/)
+      if (match) {
+        const end = Number.parseFloat(match[1])
+        const start = currentStart ?? Math.max(0, end - SILENCE_MIN)
+        silences.push({ start, end })
+        currentStart = null
+      }
+    }
+  }
+  if (currentStart !== null && durationSeconds) {
+    silences.push({ start: currentStart, end: durationSeconds })
+  }
+  return silences
+}
+
+const subtractRange = (segments: TimeRange[], range: TimeRange) => {
+  const result: TimeRange[] = []
+  for (const seg of segments) {
+    if (range.end <= seg.start || range.start >= seg.end) {
+      result.push(seg)
+      continue
+    }
+    if (range.start > seg.start) result.push({ start: seg.start, end: Math.max(seg.start, range.start) })
+    if (range.end < seg.end) result.push({ start: Math.min(seg.end, range.end), end: seg.end })
+  }
+  return result.filter((seg) => seg.end - seg.start > 0.25)
+}
+
+const splitSegments = (segments: TimeRange[], minLen: number, maxLen: number) => {
+  const out: TimeRange[] = []
+  for (const seg of segments) {
+    let start = seg.start
+    let end = seg.end
+    while (end - start > maxLen) {
+      out.push({ start, end: start + maxLen })
+      start += maxLen
+    }
+    if (end - start < minLen && out.length > 0) {
+      out[out.length - 1].end = end
+    } else if (end - start > 0.1) {
+      out.push({ start, end })
+    }
+  }
+  return out
+}
+
+const buildEditPlan = async (filePath: string, durationSeconds: number) => {
+  const silences = await detectSilences(filePath, durationSeconds)
+  const cuts = silences.filter((s) => (s.end - s.start) >= CUT_MIN)
+  const keep: TimeRange[] = []
+  let cursor = 0
+  for (const silence of cuts) {
+    if (silence.start > cursor) keep.push({ start: cursor, end: silence.start })
+    cursor = Math.max(cursor, silence.end)
+  }
+  if (cursor < durationSeconds) keep.push({ start: cursor, end: durationSeconds })
+
+  const normalizedKeep = splitSegments(keep, CUT_MIN, CUT_MAX)
+
+  let hookStart = 0
+  let hookDuration = Math.min(HOOK_MAX, Math.max(HOOK_MIN, durationSeconds || HOOK_MIN))
+  const firstSegment = normalizedKeep.find((seg) => seg.end - seg.start >= HOOK_MIN)
+  if (firstSegment) {
+    hookStart = firstSegment.start
+    hookDuration = Math.min(HOOK_MAX, firstSegment.end - firstSegment.start)
+  }
+  const hook = { start: hookStart, duration: hookDuration }
+  const hookRange: TimeRange = { start: hookStart, end: hookStart + hookDuration }
+  const withoutHook = subtractRange(normalizedKeep, hookRange)
+
+  return { hook, segments: withoutHook, silences }
+}
+
+const buildConcatFilter = (segments: TimeRange[], withAudio: boolean) => {
+  const parts: string[] = []
+  segments.forEach((seg, idx) => {
+    parts.push(`[0:v]trim=start=${seg.start}:end=${seg.end},setpts=PTS-STARTPTS[v${idx}]`)
+    if (withAudio) {
+      parts.push(`[0:a]atrim=start=${seg.start}:end=${seg.end},asetpts=PTS-STARTPTS[a${idx}]`)
+    }
+  })
+  if (withAudio) {
+    const inputs = segments.map((_, idx) => `[v${idx}][a${idx}]`).join('')
+    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[vcat][acat]`)
+  } else {
+    const inputs = segments.map((_, idx) => `[v${idx}]`).join('')
+    parts.push(`${inputs}concat=n=${segments.length}:v=1:a=0[vcat]`)
+  }
+  return parts.join(';')
+}
+
 class PlanLimitError extends Error {
   status: number
   code: string
@@ -141,7 +295,21 @@ const analyzeJob = async (jobId: string, requestId?: string) => {
   fs.writeFileSync(tmpIn, buf)
   const duration = getDurationSeconds(tmpIn)
 
-  const analysis = { duration: duration ?? 0, size: buf.length, filename: path.basename(job.inputPath) }
+  let editPlan: EditPlan | null = null
+  if (duration) {
+    try {
+      editPlan = await buildEditPlan(tmpIn, duration)
+    } catch (e) {
+      editPlan = null
+    }
+  }
+
+  const analysis = {
+    duration: duration ?? 0,
+    size: buf.length,
+    filename: path.basename(job.inputPath),
+    editPlan
+  }
   const analysisPath = `${job.userId}/${jobId}/analysis.json`
   await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(analysisPath, Buffer.from(JSON.stringify(analysis)), { contentType: 'application/json', upsert: true })
   await prisma.job.update({
@@ -202,17 +370,57 @@ const processJob = async (jobId: string, user: { id: string; email?: string }, r
     if (watermarkEnabled) {
       filters.push("drawtext=text='AutoEditor':x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6")
     }
-    const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-c:a', 'aac']
-    const withFilters = filters.length > 0 ? [...argsBase, '-vf', filters.join(','), tmpOut] : [...argsBase, tmpOut]
+
+    const plan = durationSeconds ? await buildEditPlan(tmpIn, durationSeconds) : null
+    const hookRange = plan ? { start: plan.hook.start, end: plan.hook.start + plan.hook.duration } : null
+    const segments = plan
+      ? [hookRange as TimeRange, ...plan.segments]
+      : [{ start: 0, end: durationSeconds || 0 }]
+
+    const validSegments = segments.filter((seg) => seg.end - seg.start > 0.25)
+    const hasAudio = hasAudioStream(tmpIn)
+
+    const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
+    if (hasAudio) argsBase.push('-c:a', 'aac')
+
     try {
-      await runFfmpeg(withFilters)
+      if (validSegments.length >= 1) {
+        const filterParts: string[] = []
+        const concatFilter = buildConcatFilter(validSegments, hasAudio)
+        filterParts.push(concatFilter)
+        if (filters.length > 0) {
+          if (hasAudio) {
+            filterParts.push(`[vcat]${filters.join(',')}[vout]`)
+            const filter = `${filterParts.join(';')}`
+            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vout]', '-map', '[acat]', tmpOut])
+          } else {
+            filterParts.push(`[vcat]${filters.join(',')}[vout]`)
+            const filter = `${filterParts.join(';')}`
+            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vout]', tmpOut])
+          }
+        } else {
+          const filter = filterParts.join(';')
+          if (hasAudio) {
+            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vcat]', '-map', '[acat]', tmpOut])
+          } else {
+            await runFfmpeg([...argsBase, '-filter_complex', filter, '-map', '[vcat]', tmpOut])
+          }
+        }
+      } else {
+        await runFfmpeg([...argsBase, tmpOut])
+      }
       processed = true
     } catch (err) {
       if (watermarkEnabled) {
         const noWatermarkFilters = filters.filter((f) => !f.startsWith('drawtext='))
-        const retryArgs = noWatermarkFilters.length > 0 ? [...argsBase, '-vf', noWatermarkFilters.join(','), tmpOut] : [...argsBase, tmpOut]
+        const retryArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23']
+        if (hasAudioStream(tmpIn)) retryArgs.push('-c:a', 'aac')
         try {
-          await runFfmpeg(retryArgs)
+          if (noWatermarkFilters.length > 0) {
+            await runFfmpeg([...retryArgs, '-vf', noWatermarkFilters.join(','), tmpOut])
+          } else {
+            await runFfmpeg([...retryArgs, tmpOut])
+          }
           processed = true
         } catch (retryErr) {
           processed = false
