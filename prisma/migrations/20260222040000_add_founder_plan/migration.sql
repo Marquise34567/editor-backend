@@ -1,0 +1,11 @@
+ALTER TYPE "PlanTier" ADD VALUE IF NOT EXISTS 'founder';
+
+ALTER TABLE "jobs" ADD COLUMN IF NOT EXISTS "priority_level" INTEGER NOT NULL DEFAULT 2;
+
+CREATE TABLE IF NOT EXISTS "founder_inventory" (
+  "id" TEXT NOT NULL,
+  "max_purchases" INTEGER NOT NULL DEFAULT 100,
+  "purchased_count" INTEGER NOT NULL DEFAULT 0,
+  "updated_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "founder_inventory_pkey" PRIMARY KEY ("id")
+);

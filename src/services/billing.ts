@@ -4,6 +4,7 @@ import { getEnv } from '../lib/env'
 import { getStripeConfig } from '../lib/stripeConfig'
 import { getOrCreateUser } from './users'
 import { type PlanTier } from '../shared/planConfig'
+import { resolvePlanFromPriceId } from '../lib/stripePlans'
 
 const env = getEnv()
 
@@ -45,9 +46,30 @@ export const createCheckoutUrlForUser = async (
   const session = await createCheckoutSession({
     customerId,
     priceId,
+    mode: 'subscription',
     successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
     cancelUrl: `${baseUrl}/pricing`,
-    metadata: { userId, tier, interval, trial: useTrial ? 'true' : 'false' }
+    metadata: { userId, plan: tier, interval, trial: useTrial ? 'true' : 'false' }
+  })
+  return session?.url ?? null
+}
+
+export const createCheckoutUrlForPrice = async (
+  userId: string,
+  priceId: string,
+  email?: string | null
+) => {
+  const plan = resolvePlanFromPriceId(priceId)
+  if (!plan || plan === 'free') return null
+  const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
+  const customerId = await ensureStripeCustomer(userId, email)
+  const session = await createCheckoutSession({
+    customerId,
+    priceId,
+    mode: 'subscription',
+    successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancelUrl: `${baseUrl}/pricing`,
+    metadata: { userId, plan }
   })
   return session?.url ?? null
 }

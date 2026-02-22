@@ -674,13 +674,7 @@ class PlanLimitError extends Error {
   constructor(message: string, feature: string, requiredPlan: string, checkoutUrl?: string | null, code?: string) {
     super(message)
     this.status = 403
-    this.code =
-      code ??
-      (feature === 'renders'
-        ? 'RENDER_LIMIT_REACHED'
-        : feature === 'minutes'
-        ? 'MINUTES_LIMIT_REACHED'
-        : 'PLAN_LIMIT_EXCEEDED')
+    this.code = code ?? 'PLAN_LIMIT_EXCEEDED'
     this.feature = feature
     this.requiredPlan = requiredPlan
     this.checkoutUrl = checkoutUrl
@@ -824,7 +818,7 @@ const processJob = async (
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
   if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
     const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
-    throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan, undefined, 'FEATURE_LOCKED')
+    throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
   }
   const subtitleStyle = rawSubtitleStyle
   const autoZoomMax = Number(options.autoZoomMax ?? features.autoZoomMax)
@@ -1041,20 +1035,24 @@ const handleCreateJob = async (req: any, res: any) => {
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
     const subtitleRequest = req.body?.subtitles
-    if (subtitleRequest?.enabled) {
-      const features = getPlanFeatures(tier)
-      const allowedPresets = features.subtitles.allowedPresets
-      const selectedPreset = normalizeSubtitlePreset(subtitleRequest?.preset)
-      if (allowedPresets !== 'ALL') {
-        if (!selectedPreset || !allowedPresets.includes(selectedPreset)) {
-          return res.status(403).json({
-            error: 'FEATURE_LOCKED',
-            feature: 'subtitles',
-            requiredPlan: 'creator'
-          })
+      if (subtitleRequest?.enabled) {
+        const features = getPlanFeatures(tier)
+        const allowedPresets = features.subtitles.allowedPresets
+        const selectedPreset = normalizeSubtitlePreset(subtitleRequest?.preset)
+        if (subtitleRequest?.preset && !selectedPreset) {
+          return res.status(400).json({ error: 'invalid_subtitle_preset' })
+        }
+        if (subtitleRequest?.preset && allowedPresets !== 'ALL') {
+          if (!selectedPreset || !allowedPresets.includes(selectedPreset)) {
+            const requiredPlan = getRequiredPlanForSubtitlePreset(selectedPreset)
+            return res.status(403).json({
+              error: 'PLAN_LIMIT_EXCEEDED',
+              feature: 'subtitles',
+              requiredPlan
+            })
+          }
         }
       }
-    }
     await ensureBucket(INPUT_BUCKET, true)
 
     const settings = await prisma.userSettings.findUnique({ where: { userId } })

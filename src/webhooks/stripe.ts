@@ -1,9 +1,9 @@
 import express from 'express'
 import { stripe } from '../stripeClient'
 import { prisma } from '../db/prisma'
-import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
-import { type PlanTier } from '../shared/planConfig'
+import { isActiveSubscriptionStatus } from '../services/plans'
 import { getStripeConfig } from '../lib/stripeConfig'
+import { resolvePlanFromPriceId } from '../lib/stripePlans'
 
 const router = express.Router()
 
@@ -27,34 +27,72 @@ router.post('/', async (req: any, res) => {
       case 'checkout.session.completed': {
         const session = event.data.object as any
         const userId = session.metadata?.userId
-        const tier = coercePlanTier(session.metadata?.tier)
         const customer = session.customer
         const subscription = session.subscription
+        let priceId: string | null = session?.line_items?.data?.[0]?.price?.id ?? null
+        let currentPeriodEnd: Date | null = null
+        let status = 'active'
+        if (!priceId && subscription) {
+          try {
+            const sub = await stripe.subscriptions.retrieve(String(subscription))
+            priceId = sub.items?.data?.[0]?.price?.id ?? null
+            currentPeriodEnd = sub.current_period_end ? new Date(sub.current_period_end * 1000) : null
+            status = sub.status || status
+          } catch (err) {
+            console.warn('checkout.session.completed: failed to fetch subscription for priceId', err)
+          }
+        }
+        if (!priceId && session?.id) {
+          try {
+            const lineItems = await stripe.checkout.sessions.listLineItems(String(session.id), { limit: 1 })
+            priceId = lineItems.data?.[0]?.price?.id ?? null
+          } catch (err) {
+            console.warn('checkout.session.completed: failed to fetch line items', err)
+          }
+        }
+        const tier = resolvePlanFromPriceId(priceId)
         if (userId) {
           const existing = await prisma.user.findUnique({ where: { id: userId } })
           if (existing) {
-            await prisma.user.update({ where: { id: userId }, data: { stripeCustomerId: String(customer), stripeSubscriptionId: String(subscription), planStatus: 'active' } })
+            await prisma.user.update({
+              where: { id: userId },
+              data: {
+                stripeCustomerId: String(customer),
+                stripeSubscriptionId: subscription ? String(subscription) : null,
+                planStatus: 'active'
+              }
+            })
           } else {
             const email = session.customer_email || `${userId}@autoeditor.local`
-            await prisma.user.create({ data: { id: userId, email, stripeCustomerId: String(customer), stripeSubscriptionId: String(subscription), planStatus: 'active' } })
+            await prisma.user.create({
+              data: {
+                id: userId,
+                email,
+                stripeCustomerId: String(customer),
+                stripeSubscriptionId: subscription ? String(subscription) : null,
+                planStatus: 'active'
+              }
+            })
           }
           await prisma.subscription.upsert({
             where: { userId },
             create: {
               userId,
               stripeCustomerId: String(customer),
-              stripeSubscriptionId: String(subscription),
-              status: 'active',
+              stripeSubscriptionId: subscription ? String(subscription) : null,
+              status,
               planTier: tier,
-              priceId: session?.display_items?.[0]?.price?.id ?? null,
-              currentPeriodEnd: null,
+              priceId,
+              currentPeriodEnd,
               cancelAtPeriodEnd: false
             },
             update: {
               stripeCustomerId: String(customer),
-              stripeSubscriptionId: String(subscription),
-              status: 'active',
-              planTier: tier
+              stripeSubscriptionId: subscription ? String(subscription) : null,
+              status,
+              planTier: tier,
+              priceId,
+              currentPeriodEnd
             }
           })
         }
@@ -73,7 +111,7 @@ router.post('/', async (req: any, res) => {
             : status === 'past_due' || status === 'unpaid' || status === 'incomplete'
             ? 'past_due'
             : 'canceled'
-        const tier: PlanTier = resolveTierFromPrice(priceId)
+        const tier = resolvePlanFromPriceId(priceId)
         const shouldBeFree = !isActiveSubscriptionStatus(status)
         await prisma.user.updateMany({ where: { stripeCustomerId: String(customerId) }, data: { stripeSubscriptionId: subscription.id, planStatus: mapped, stripePriceId: priceId, currentPeriodEnd } })
         const user = await prisma.user.findUnique({ where: { stripeCustomerId: String(customerId) } })
@@ -141,15 +179,3 @@ router.post('/', async (req: any, res) => {
 })
 
 export default router
-
-const resolveTierFromPrice = (priceId?: string | null): PlanTier => {
-  if (!priceId) return 'free'
-  const { priceIds } = getStripeConfig()
-  const starters = [priceIds.monthly.starter, priceIds.annual.starter, priceIds.trial].filter(Boolean)
-  const creators = [priceIds.monthly.creator, priceIds.annual.creator].filter(Boolean)
-  const studios = [priceIds.monthly.studio, priceIds.annual.studio].filter(Boolean)
-  if (starters.includes(priceId)) return 'starter'
-  if (creators.includes(priceId)) return 'creator'
-  if (studios.includes(priceId)) return 'studio'
-  return 'free'
-}

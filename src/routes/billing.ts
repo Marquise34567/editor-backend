@@ -38,7 +38,7 @@ const handleCheckout = async (req: any, res: any) => {
     const url = await createCheckoutUrlForUser(user.id, tier, user.email, interval, useTrial)
     if (!url) return res.status(500).json({ error: 'Missing price config' })
     res.json({ url })
-  } catch (err) {
+  } catch (err: any) {
     console.error('create-checkout-session', err)
     res.status(500).json({ error: 'Failed to create session' })
   }

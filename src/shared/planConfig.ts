@@ -1,3 +1,5 @@
+import type { SubtitlePresetId } from './subtitlePresets'
+
 export type PlanTier = 'free' | 'starter' | 'creator' | 'studio'
 export type ExportQuality = '720p' | '1080p' | '4k'
 
@@ -15,6 +17,11 @@ export type PlanConfig = {
   exportQuality: ExportQuality
   watermark: boolean
   priority: boolean
+  allowedSubtitlePresets: SubtitlePresetId[] | 'ALL'
+  autoZoomMax: number
+  advancedEffects: boolean
+  lifetime: boolean
+  includesFutureFeatures: boolean
   badge?: 'popular' | null
   features: string[]
 }
@@ -31,13 +38,19 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     exportQuality: '720p',
     watermark: true,
     priority: false,
+    allowedSubtitlePresets: ['basic_clean'],
+    autoZoomMax: 1.1,
+    advancedEffects: false,
+    lifetime: false,
+    includesFutureFeatures: false,
     badge: null,
     features: [
       '720p exports',
       '12 renders / month',
-      '10 min videos',
-      'Subtle watermark',
-      'Standard queue'
+      'Watermark',
+      'Standard queue',
+      'Subtitles: 1 preset',
+      'Auto zoom max 1.10'
     ]
   },
   starter: {
@@ -51,13 +64,18 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     exportQuality: '1080p',
     watermark: false,
     priority: false,
+    allowedSubtitlePresets: ['basic_clean', 'bold_pop', 'caption_box'],
+    autoZoomMax: 1.12,
+    advancedEffects: false,
+    lifetime: false,
+    includesFutureFeatures: false,
     badge: null,
     features: [
       '1080p exports',
       '20 renders / month',
-      '30 min videos',
       'No watermark',
-      'Standard queue'
+      'Subtitles: 3 presets',
+      'Auto zoom max 1.12'
     ]
   },
   creator: {
@@ -71,13 +89,19 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     exportQuality: '4k',
     watermark: false,
     priority: false,
+    allowedSubtitlePresets: 'ALL',
+    autoZoomMax: 1.15,
+    advancedEffects: false,
+    lifetime: false,
+    includesFutureFeatures: false,
     badge: 'popular',
     features: [
       '4K exports',
       '100 renders / month',
-      '120 min videos',
       'No watermark',
-      'Standard queue'
+      'Subtitles: All presets',
+      'Karaoke highlight',
+      'Auto zoom max 1.15'
     ]
   },
   studio: {
@@ -87,17 +111,23 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceLabel: '$99',
     description: 'For studios that need priority and scale.',
     maxRendersPerMonth: null,
-    maxMinutesPerMonth: 999,
+    maxMinutesPerMonth: null,
     exportQuality: '4k',
     watermark: false,
     priority: true,
+    allowedSubtitlePresets: 'ALL',
+    autoZoomMax: 1.2,
+    advancedEffects: true,
+    lifetime: false,
+    includesFutureFeatures: false,
     badge: null,
     features: [
       '4K exports',
       'Unlimited renders',
-      '999 min videos',
-      'No watermark',
-      'Priority queue'
+      'Priority queue',
+      'All subtitle styles',
+      'Full zoom control up to 1.20',
+      'Advanced effects'
     ]
   }
 }
@@ -124,6 +154,39 @@ export const qualityToHeight = (quality: ExportQuality) => {
   if (quality === '4k') return 2160
   if (quality === '1080p') return 1080
   return 720
+}
+
+export type PlanFeatures = {
+  resolution: '720p' | '1080p' | '4K'
+  watermark: boolean
+  subtitles: {
+    enabled: boolean
+    allowedPresets: SubtitlePresetId[] | 'ALL'
+  }
+  autoZoomMax: number
+  queuePriority: 'priority' | 'standard'
+  rendersPerMonth: number | null
+  lifetime: boolean
+  includesFutureFeatures: boolean
+}
+
+export const getPlanFeatures = (plan: PlanConfig): PlanFeatures => {
+  const resolution = plan.exportQuality === '4k' ? '4K' : plan.exportQuality
+  const allowedPresets = plan.allowedSubtitlePresets
+  const subtitlesEnabled = allowedPresets === 'ALL' ? true : allowedPresets.length > 0
+  return {
+    resolution,
+    watermark: plan.watermark,
+    subtitles: {
+      enabled: subtitlesEnabled,
+      allowedPresets
+    },
+    autoZoomMax: plan.autoZoomMax,
+    queuePriority: plan.priority ? 'priority' : 'standard',
+    rendersPerMonth: plan.maxRendersPerMonth,
+    lifetime: plan.lifetime,
+    includesFutureFeatures: plan.includesFutureFeatures
+  }
 }
 
 export const getMonthKey = (date: Date = new Date()) => {

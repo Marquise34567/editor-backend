@@ -8,6 +8,7 @@ import {
   getRequiredPlanForAdvancedEffects,
   getRequiredPlanForAutoZoom,
   getRequiredPlanForQuality,
+  getRequiredPlanForSubtitlePreset,
   isSubtitlePresetAllowed
 } from '../lib/planFeatures'
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
@@ -80,11 +81,8 @@ router.patch('/', async (req: any, res) => {
       return res.status(400).json({ error: 'invalid_subtitle_preset' })
     }
     if (payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, tier)) {
-      return res.status(403).json({
-        error: 'FEATURE_LOCKED',
-        feature: 'subtitles',
-        requiredPlan: 'creator'
-      })
+      const requiredPlan = getRequiredPlanForSubtitlePreset(requestedSubtitle)
+      return sendPlanLimit(res, requiredPlan, 'subtitles', 'Upgrade to unlock subtitle styles')
     }
     if (payload.autoZoomMax && Number(payload.autoZoomMax) > features.autoZoomMax) {
       const requiredPlan = getRequiredPlanForAutoZoom(Number(payload.autoZoomMax))

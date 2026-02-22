@@ -15,6 +15,7 @@ class StubDB {
   lessons = new Map<string, any>()
   settings = new Map<string, any>()
   exports = new Map<string, any>()
+  founderInventoryStore = new Map<string, any>()
 
   async $queryRaw() { return 1 }
 
@@ -56,7 +57,7 @@ class StubDB {
   job = {
     create: async ({ data }: any) => {
       const id = data.id || `job-${Math.random().toString(36).slice(2,9)}`
-      const rec = { id, ...data, createdAt: new Date(), updatedAt: new Date() }
+      const rec = { id, priorityLevel: data.priorityLevel ?? 2, ...data, createdAt: new Date(), updatedAt: new Date() }
       this.jobs.set(id, rec)
       return rec
     },
@@ -213,6 +214,49 @@ class StubDB {
       const next = { ...existing, ...data, updatedAt: new Date() }
       this.exports.set(userId, next)
       return next
+    }
+  }
+
+  founderInventory = {
+    findUnique: async ({ where }: any) => {
+      const id = where?.id
+      if (!id) return null
+      return this.founderInventoryStore.get(id) ?? null
+    },
+    upsert: async ({ where, update, create }: any) => {
+      const id = where?.id ?? create?.id
+      if (!id) return null
+      const existing = this.founderInventoryStore.get(id)
+      if (existing) {
+        const updated = { ...existing, ...update, updatedAt: new Date() }
+        this.founderInventoryStore.set(id, updated)
+        return updated
+      }
+      const created = { ...create, updatedAt: new Date() }
+      this.founderInventoryStore.set(id, created)
+      return created
+    },
+    updateMany: async ({ where, data }: any) => {
+      const id = where?.id
+      const max = where?.purchasedCount?.lt
+      let count = 0
+      if (id) {
+        const existing = this.founderInventoryStore.get(id)
+        if (existing) {
+          if (typeof max === 'number' && (existing.purchasedCount ?? 0) >= max) {
+            return { count: 0 }
+          }
+          const updated = {
+            ...existing,
+            ...data,
+            purchasedCount: (existing.purchasedCount ?? 0) + (data?.purchasedCount?.increment ?? 0),
+            updatedAt: new Date()
+          }
+          this.founderInventoryStore.set(id, updated)
+          count = 1
+        }
+      }
+      return { count }
     }
   }
 }

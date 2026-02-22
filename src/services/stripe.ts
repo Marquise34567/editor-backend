@@ -22,13 +22,15 @@ export const createCheckoutSession = async (args: {
   priceId: string
   successUrl: string
   cancelUrl: string
+  mode?: 'subscription' | 'payment'
   metadata?: Record<string,string>
 }) => {
   if (useMock) {
     return { id: `sess_${Math.random().toString(36).slice(2,9)}`, url: `${args.successUrl}?mock_session=1` }
   }
+  const mode = args.mode || 'subscription'
   const session = await stripeClient.checkout.sessions.create({
-    mode: 'subscription',
+    mode,
     payment_method_types: ['card'],
     customer: args.customerId ?? undefined,
     line_items: [{ price: args.priceId, quantity: 1 }],
