@@ -97,6 +97,8 @@ const CUT_MIN = 3
 const CUT_MAX = 10
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.6
+const HOOK_ANALYZE_MAX = 600
+const SCENE_THRESHOLD = 0.45
 
 const runFfmpegCapture = (args: string[]) => {
   return new Promise<string>((resolve, reject) => {
@@ -125,6 +127,63 @@ const hasAudioStream = (filePath: string) => {
   } catch (e) {
     return false
   }
+}
+
+const detectAudioEnergy = async (filePath: string, durationSeconds: number) => {
+  if (!hasFfmpeg() || !hasAudioStream(filePath)) return [] as { time: number; rms: number }[]
+  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', filePath,
+    '-t', String(analyzeSeconds),
+    '-af', 'astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level',
+    '-f', 'null',
+    '-'
+  ]
+  const output = await runFfmpegCapture(args)
+  const lines = output.split(/\r?\n/)
+  const sampleMap = new Map<number, number>()
+  for (const line of lines) {
+    if (!line.includes('lavfi.astats.Overall.RMS_level')) continue
+    const timeMatch = line.match(/pts_time:([0-9.]+)/)
+    const rmsMatch = line.match(/lavfi\.astats\.Overall\.RMS_level=([0-9.\-]+)/)
+    if (!timeMatch || !rmsMatch) continue
+    const time = Number.parseFloat(timeMatch[1])
+    const rms = Number.parseFloat(rmsMatch[1])
+    if (!Number.isFinite(time) || !Number.isFinite(rms)) continue
+    const bucket = Math.floor(time)
+    const prev = sampleMap.get(bucket)
+    if (prev === undefined || rms > prev) sampleMap.set(bucket, rms)
+  }
+  return Array.from(sampleMap.entries())
+    .map(([time, rms]) => ({ time, rms }))
+    .sort((a, b) => a.time - b.time)
+}
+
+const detectSceneChanges = async (filePath: string, durationSeconds: number) => {
+  if (!hasFfmpeg()) return [] as number[]
+  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-i', filePath,
+    '-t', String(analyzeSeconds),
+    '-vf', `select='gt(scene,${SCENE_THRESHOLD})',showinfo`,
+    '-f', 'null',
+    '-'
+  ]
+  const output = await runFfmpegCapture(args)
+  const times = new Set<number>()
+  for (const line of output.split(/\r?\n/)) {
+    if (!line.includes('pts_time:')) continue
+    const match = line.match(/pts_time:([0-9.]+)/)
+    if (match) {
+      const time = Number.parseFloat(match[1])
+      if (Number.isFinite(time)) times.add(time)
+    }
+  }
+  return Array.from(times.values()).sort((a, b) => a - b)
 }
 
 const detectSilences = async (filePath: string, durationSeconds: number) => {
@@ -160,6 +219,67 @@ const detectSilences = async (filePath: string, durationSeconds: number) => {
     silences.push({ start: currentStart, end: durationSeconds })
   }
   return silences
+}
+
+const isWindowInsideSegments = (start: number, end: number, segments: TimeRange[]) => {
+  return segments.some((seg) => start >= seg.start && end <= seg.end)
+}
+
+const scoreWindow = (
+  start: number,
+  duration: number,
+  energySamples: { time: number; rms: number }[],
+  sceneChanges: number[]
+) => {
+  const end = start + duration
+  if (!energySamples.length) return -100
+  let sum = 0
+  let count = 0
+  for (const sample of energySamples) {
+    if (sample.time < start || sample.time > end) continue
+    sum += sample.rms
+    count += 1
+  }
+  const avg = count ? sum / count : -100
+  const hasScene = sceneChanges.some((t) => Math.abs(t - start) <= 0.5)
+  return avg + (hasScene ? 3 : 0)
+}
+
+const pickBestHook = (
+  durationSeconds: number,
+  segments: TimeRange[],
+  energySamples: { time: number; rms: number }[],
+  sceneChanges: number[]
+) => {
+  const candidates = new Set<number>()
+  segments.forEach((seg) => candidates.add(seg.start))
+  sceneChanges.forEach((t) => candidates.add(t))
+  energySamples
+    .slice()
+    .sort((a, b) => b.rms - a.rms)
+    .slice(0, 8)
+    .forEach((sample) => candidates.add(sample.time))
+  candidates.add(0)
+
+  let bestStart = 0
+  let bestDuration = Math.min(HOOK_MAX, Math.max(HOOK_MIN, durationSeconds || HOOK_MIN))
+  let bestScore = -Infinity
+
+  for (const start of candidates) {
+    for (let duration = HOOK_MAX; duration >= HOOK_MIN; duration -= 1) {
+      const end = start + duration
+      if (end > durationSeconds) continue
+      if (!isWindowInsideSegments(start, end, segments)) continue
+      const score = scoreWindow(start, duration, energySamples, sceneChanges)
+      if (score > bestScore) {
+        bestScore = score
+        bestStart = start
+        bestDuration = duration
+      }
+    }
+  }
+
+  return { start: bestStart, duration: bestDuration }
 }
 
 const subtractRange = (segments: TimeRange[], range: TimeRange) => {
@@ -204,17 +324,11 @@ const buildEditPlan = async (filePath: string, durationSeconds: number) => {
   }
   if (cursor < durationSeconds) keep.push({ start: cursor, end: durationSeconds })
 
-  const normalizedKeep = splitSegments(keep, CUT_MIN, CUT_MAX)
-
-  let hookStart = 0
-  let hookDuration = Math.min(HOOK_MAX, Math.max(HOOK_MIN, durationSeconds || HOOK_MIN))
-  const firstSegment = normalizedKeep.find((seg) => seg.end - seg.start >= HOOK_MIN)
-  if (firstSegment) {
-    hookStart = firstSegment.start
-    hookDuration = Math.min(HOOK_MAX, firstSegment.end - firstSegment.start)
-  }
-  const hook = { start: hookStart, duration: hookDuration }
-  const hookRange: TimeRange = { start: hookStart, end: hookStart + hookDuration }
+  const normalizedKeep = splitSegments(keep.length ? keep : [{ start: 0, end: durationSeconds }], CUT_MIN, CUT_MAX)
+  const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
+  const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
+  const hook = pickBestHook(durationSeconds, normalizedKeep, energySamples, sceneChanges)
+  const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
   const withoutHook = subtractRange(normalizedKeep, hookRange)
 
   return { hook, segments: withoutHook, silences }
