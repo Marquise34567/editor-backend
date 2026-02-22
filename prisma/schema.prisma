@@ -25,6 +25,9 @@ enum JobStatus {
   queued
   uploading
   analyzing
+  hooking
+  cutting
+  pacing
   rendering
   completed
   failed

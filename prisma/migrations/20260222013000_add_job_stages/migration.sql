@@ -1,0 +1,3 @@
+ALTER TYPE "JobStatus" ADD VALUE IF NOT EXISTS 'hooking';
+ALTER TYPE "JobStatus" ADD VALUE IF NOT EXISTS 'cutting';
+ALTER TYPE "JobStatus" ADD VALUE IF NOT EXISTS 'pacing';

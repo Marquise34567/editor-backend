@@ -313,7 +313,12 @@ const splitSegments = (segments: TimeRange[], minLen: number, maxLen: number) =>
   return out
 }
 
-const buildEditPlan = async (filePath: string, durationSeconds: number) => {
+const buildEditPlan = async (
+  filePath: string,
+  durationSeconds: number,
+  onStage?: (stage: 'cutting' | 'hooking' | 'pacing') => void | Promise<void>
+) => {
+  if (onStage) await onStage('cutting')
   const silences = await detectSilences(filePath, durationSeconds)
   const cuts = silences.filter((s) => (s.end - s.start) >= CUT_MIN)
   const keep: TimeRange[] = []
@@ -325,10 +330,12 @@ const buildEditPlan = async (filePath: string, durationSeconds: number) => {
   if (cursor < durationSeconds) keep.push({ start: cursor, end: durationSeconds })
 
   const normalizedKeep = splitSegments(keep.length ? keep : [{ start: 0, end: durationSeconds }], CUT_MIN, CUT_MAX)
+  if (onStage) await onStage('hooking')
   const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
   const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
   const hook = pickBestHook(durationSeconds, normalizedKeep, energySamples, sceneChanges)
   const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
+  if (onStage) await onStage('pacing')
   const withoutHook = subtractRange(normalizedKeep, hookRange)
 
   return { hook, segments: withoutHook, silences }
@@ -409,10 +416,23 @@ const analyzeJob = async (jobId: string, requestId?: string) => {
   fs.writeFileSync(tmpIn, buf)
   const duration = getDurationSeconds(tmpIn)
 
+  await prisma.job.update({
+    where: { id: jobId },
+    data: { status: 'analyzing', progress: 15, inputDurationSeconds: duration ? Math.round(duration) : null }
+  })
+
   let editPlan: EditPlan | null = null
   if (duration) {
     try {
-      editPlan = await buildEditPlan(tmpIn, duration)
+      editPlan = await buildEditPlan(tmpIn, duration, async (stage) => {
+        if (stage === 'cutting') {
+          await prisma.job.update({ where: { id: jobId }, data: { status: 'cutting', progress: 25 } })
+        } else if (stage === 'hooking') {
+          await prisma.job.update({ where: { id: jobId }, data: { status: 'hooking', progress: 35 } })
+        } else if (stage === 'pacing') {
+          await prisma.job.update({ where: { id: jobId }, data: { status: 'pacing', progress: 45 } })
+        }
+      })
     } catch (e) {
       editPlan = null
     }
@@ -428,7 +448,11 @@ const analyzeJob = async (jobId: string, requestId?: string) => {
   await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(analysisPath, Buffer.from(JSON.stringify(analysis)), { contentType: 'application/json', upsert: true })
   await prisma.job.update({
     where: { id: jobId },
-    data: { status: 'analyzing', progress: 35, inputDurationSeconds: duration ? Math.round(duration) : null }
+    data: {
+      status: editPlan ? 'pacing' : 'analyzing',
+      progress: editPlan ? 50 : 30,
+      inputDurationSeconds: duration ? Math.round(duration) : null
+    }
   })
   console.log(`[${requestId || 'noid'}] analyze complete ${jobId}`)
   return analysis
@@ -449,7 +473,7 @@ const processJob = async (jobId: string, user: { id: string; email?: string }, r
     where: { id: jobId },
     data: {
       status: 'rendering',
-      progress: 40,
+      progress: 60,
       requestedQuality: desiredQuality,
       finalQuality,
       watermarkApplied: watermarkEnabled,
