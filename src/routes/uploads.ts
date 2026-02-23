@@ -4,12 +4,30 @@ import { r2 } from '../lib/r2'
 import crypto from 'crypto'
 import { enqueuePipeline, updateJob } from './jobs'
 import bodyParser from 'body-parser'
+import { supabaseAdmin } from '../supabaseClient'
 
 const router = express.Router()
+const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
+
+const logAwsError = (label: string, err: any) => {
+  console.error(label, {
+    name: err?.name,
+    message: err?.message,
+    code: err?.code || err?.Code,
+    stack: err?.stack,
+    metadata: err?.$metadata,
+    raw: err
+  })
+}
+
+const r2NotConfigured = (res: any) => {
+  return res.status(503).json({ error: 'R2_NOT_CONFIGURED', missing: r2.missingEnvVars || [] })
+}
 
 // POST /api/uploads/presign
 router.post('/presign', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const { jobId, filename, contentType } = req.body
@@ -23,7 +41,7 @@ router.post('/presign', async (req: any, res) => {
       const uploadUrl = await r2.generateUploadUrl(key, contentType || 'application/octet-stream')
       return res.json({ uploadUrl, key, bucket: r2.bucket })
     } catch (e: any) {
-      console.error('presign failed', e?.message || e)
+      logAwsError('presign failed', e)
       return res.status(500).json({ error: 'PRESIGN_FAILED', details: String(e?.message || e) })
     }
   } catch (err: any) {
@@ -35,6 +53,7 @@ router.post('/presign', async (req: any, res) => {
 // POST /api/uploads/complete
 router.post('/complete', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const { jobId, uploadId, parts } = req.body
@@ -48,7 +67,7 @@ router.post('/complete', async (req: any, res) => {
       try {
         await r2.completeMultipartUpload({ Key: key, UploadId: uploadId, Parts: parts })
       } catch (e: any) {
-        console.error('completeMultipartUpload failed', e?.message || e)
+        logAwsError('completeMultipartUpload failed', e)
         return res.status(500).json({ error: 'R2_COMPLETE_FAILED', details: String(e?.message || e) })
       }
     } else {
@@ -57,27 +76,12 @@ router.post('/complete', async (req: any, res) => {
         const exists = await r2.objectExists(key)
         if (!exists) return res.status(404).json({ error: 'R2_OBJECT_MISSING' })
       } catch (e: any) {
-        console.error('headObject failed', e?.message || e)
+        logAwsError('headObject failed', e)
         return res.status(500).json({ error: 'R2_HEAD_FAILED', details: String(e?.message || e) })
       }
     }
 
-    // Construct public URL if possible
-    const account = process.env.R2_ACCOUNT_ID || ''
-    const bucket = process.env.R2_BUCKET || r2.bucket || ''
-    let publicUrl = ''
-    if (account && bucket) {
-      publicUrl = `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}`
-    } else if (process.env.R2_PUBLIC_BASE_URL) {
-      publicUrl = `${process.env.R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`
-    } else if (r2.endpoint) {
-      publicUrl = `${r2.endpoint.replace(/\/$/, '')}/${key}`
-    } else {
-      publicUrl = key
-    }
-
-    const bucketEnv = process.env.R2_BUCKET || r2.bucket || ''
-    await updateJob(jobId, { storageProvider: 'r2', inputKey: key, inputBucket: bucketEnv, inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    await updateJob(jobId, { inputPath: key, status: 'queued', progress: 1 })
     // trigger processing asynchronously
     setImmediate(() => {
       try {
@@ -96,6 +100,7 @@ router.post('/complete', async (req: any, res) => {
 // POST /api/uploads/create - initiate multipart upload and return presigned part URLs
 router.post('/create', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const { jobId } = req.body
@@ -129,7 +134,7 @@ router.post('/create', async (req: any, res) => {
       uploadId = create.UploadId as string
       if (!uploadId) throw new Error('no_upload_id')
     } catch (e: any) {
-      console.error('createMultipartUpload failed', e?.message || e)
+      logAwsError('createMultipartUpload failed', e)
       return res.status(500).json({ error: 'R2_CREATE_FAILED', details: String(e?.message || e) })
     }
 
@@ -140,7 +145,7 @@ router.post('/create', async (req: any, res) => {
         const url = await r2.getPresignedUploadPartUrl({ Key: key, UploadId: uploadId, PartNumber: partNumber })
         presignedParts.push({ partNumber, url })
       } catch (e: any) {
-        console.error('getPresignedUploadPartUrl failed', e?.message || e)
+        logAwsError('getPresignedUploadPartUrl failed', e)
         // Abort on failure
         try { await r2.abortMultipartUpload({ Key: key, UploadId: uploadId }) } catch (e) {}
         return res.status(500).json({ error: 'R2_SIGN_PARTS_FAILED', details: String(e?.message || e) })
@@ -168,6 +173,7 @@ router.post('/create', async (req: any, res) => {
 // POST /api/uploads/sign-part - compatibility endpoint for legacy clients
 router.post('/sign-part', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const jobId = req.body?.jobId as string | undefined
@@ -188,7 +194,7 @@ router.post('/sign-part', async (req: any, res) => {
     })
     return res.json({ url })
   } catch (err: any) {
-    console.error('uploads.sign-part error', err)
+    logAwsError('uploads.sign-part error', err)
     return res.status(500).json({ error: 'server_error' })
   }
 })
@@ -196,6 +202,7 @@ router.post('/sign-part', async (req: any, res) => {
 // POST /api/uploads/abort
 router.post('/abort', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const { key, uploadId } = req.body
@@ -204,7 +211,7 @@ router.post('/abort', async (req: any, res) => {
       await r2.abortMultipartUpload({ Key: key, UploadId: uploadId })
       return res.json({ ok: true })
     } catch (e: any) {
-      console.error('abortMultipartUpload failed', e?.message || e)
+      logAwsError('abortMultipartUpload failed', e)
       return res.status(500).json({ error: 'R2_ABORT_FAILED', details: String(e?.message || e) })
     }
   } catch (err: any) {
@@ -229,18 +236,23 @@ router.post('/proxy', bodyParser.raw({ type: '*/*', limit: '3gb' }), async (req:
     const contentType = req.headers['content-type'] || 'application/octet-stream'
     const body = req.body as Buffer
     if (!body || body.length === 0) return res.status(400).json({ error: 'missing_body' })
-    try {
-      await r2.uploadBuffer({ Key: key, Body: Buffer.from(body), ContentType: String(contentType) })
-    } catch (e: any) {
-      console.error('proxy upload failed', e?.message || e)
-      return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(e?.message || e) })
+    if (r2.isConfigured) {
+      try {
+        await r2.uploadBuffer({ Key: key, Body: Buffer.from(body), ContentType: String(contentType) })
+      } catch (e: any) {
+        logAwsError('proxy upload failed', e)
+        return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(e?.message || e) })
+      }
+    } else {
+      const { error } = await supabaseAdmin.storage
+        .from(INPUT_BUCKET)
+        .upload(key, Buffer.from(body), { contentType: String(contentType), upsert: true })
+      if (error) {
+        console.error('proxy upload failed (supabase fallback)', error)
+        return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(error.message || error) })
+      }
     }
-    // update job and enqueue
-    const account = process.env.R2_ACCOUNT_ID || ''
-    const bucket = process.env.R2_BUCKET || r2.bucket || ''
-    const publicUrl = account && bucket ? `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}` : `${r2.endpoint.replace(/\/$/, '')}/${key}`
-    const bucketEnv = process.env.R2_BUCKET || r2.bucket || ''
-    await updateJob(jobId, { storageProvider: 'r2', inputKey: key, inputBucket: bucketEnv, inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    await updateJob(jobId, { inputPath: key, status: 'queued', progress: 1 })
     setImmediate(() => enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 }))
     return res.json({ ok: true, key })
   } catch (err: any) {

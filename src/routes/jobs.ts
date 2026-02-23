@@ -53,6 +53,48 @@ const ensureBucket = async (name: string, isPublic: boolean) => {
   return bucketChecks[name]
 }
 
+const downloadObjectToFile = async ({ key, destPath }: { key: string; destPath: string }) => {
+  if (r2.isConfigured) {
+    try {
+      await r2.getObjectToFile({ Key: key, destPath })
+      return
+    } catch (err) {
+      console.warn('R2 download failed, trying Supabase fallback', err)
+    }
+  }
+  const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).download(key)
+  if (error || !data) throw error || new Error('download_failed')
+  const bytes = Buffer.from(await data.arrayBuffer())
+  fs.writeFileSync(destPath, bytes)
+}
+
+const uploadBufferToOutput = async ({ key, body, contentType }: { key: string; body: Buffer; contentType?: string }) => {
+  if (r2.isConfigured) {
+    await r2.uploadBuffer({ Key: key, Body: body, ContentType: contentType })
+    return
+  }
+  const { error } = await supabaseAdmin.storage
+    .from(OUTPUT_BUCKET)
+    .upload(key, body, { contentType: contentType || 'application/octet-stream', upsert: true })
+  if (error) throw error
+}
+
+const getSignedOutputUrl = async ({ key, expiresIn }: { key: string; expiresIn: number }) => {
+  if (r2.isConfigured) return r2.getPresignedGetUrl({ Key: key, expiresIn })
+  const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(key, expiresIn)
+  if (error || !data?.signedUrl) throw error || new Error('signed_url_failed')
+  return data.signedUrl
+}
+
+const deleteOutputObject = async (key: string) => {
+  if (r2.isConfigured) {
+    await r2.deleteObject({ Key: key })
+    return
+  }
+  const { error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).remove([key])
+  if (error) throw error
+}
+
 const hasFfmpeg = () => {
   try {
     const result = spawnSync(FFMPEG_BIN, ['-version'], { stdio: 'ignore' })
@@ -1258,20 +1300,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
   const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
   try {
-    // Verify the object exists in R2 before attempting to download
-    try {
-      const exists = await r2.objectExists(job.inputPath)
-      if (!exists) {
-        await updateJob(jobId, { status: 'failed', error: 'Input file missing in R2' })
-        throw new Error('Input file missing in R2')
-      }
-    } catch (e) {
-      console.error('r2 head check failed', e)
-      await updateJob(jobId, { status: 'failed', error: 'Input file missing in R2' })
-      throw new Error('Input file missing in R2')
-    }
-
-    await r2.getObjectToFile({ Key: job.inputPath, destPath: tmpIn })
+    await downloadObjectToFile({ key: job.inputPath, destPath: tmpIn })
   } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
@@ -1284,6 +1313,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     }
 
     await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: Math.round(duration) })
+    await ensureBucket(OUTPUT_BUCKET, false)
 
     // Generate a low-res proxy and analyze the proxy to save CPU/time.
     const tmpProxy = path.join(os.tmpdir(), `${jobId}-proxy.mp4`)
@@ -1294,7 +1324,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       try {
         const proxyBuf = fs.readFileSync(tmpProxy)
         try {
-          await r2.uploadBuffer({ Key: proxyBucketPath, Body: proxyBuf, ContentType: 'video/mp4' })
+          await uploadBufferToOutput({ key: proxyBucketPath, body: proxyBuf, contentType: 'video/mp4' })
           await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
         } catch (e) {
           console.warn('proxy upload failed', e)
@@ -1343,7 +1373,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     }
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
-      await r2.uploadBuffer({ Key: analysisPath, Body: Buffer.from(JSON.stringify(analysis)), ContentType: 'application/json' })
+      await uploadBufferToOutput({ key: analysisPath, body: Buffer.from(JSON.stringify(analysis)), contentType: 'application/json' })
     } catch (e) {
       console.warn('analysis upload failed', e)
     }
@@ -1423,7 +1453,7 @@ const processJob = async (
   const tmpIn = path.join(workDir, 'input')
   const tmpOut = path.join(workDir, 'output.mp4')
   try {
-    await r2.getObjectToFile({ Key: job.inputPath, destPath: tmpIn })
+    await downloadObjectToFile({ key: job.inputPath, destPath: tmpIn })
   } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
@@ -1654,7 +1684,7 @@ const processJob = async (
     const outBuf = fs.readFileSync(tmpOut)
     const outPath = `${job.userId}/${jobId}/output.mp4`
     try {
-      await r2.uploadBuffer({ Key: outPath, Body: outBuf, ContentType: 'video/mp4' })
+      await uploadBufferToOutput({ key: outPath, body: outBuf, contentType: 'video/mp4' })
     } catch (e) {
       await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
       throw new Error('upload_failed')
@@ -1804,6 +1834,10 @@ const handleCreateJob = async (req: any, res: any) => {
       }
     })
 
+    if (!r2.isConfigured) {
+      return res.json({ job, uploadUrl: null, inputPath, bucket: INPUT_BUCKET })
+    }
+
     try {
       // Generate an R2 presigned PUT URL for direct upload
       const uploadUrl = await r2.generateUploadUrl(inputPath, 'video/mp4')
@@ -1826,6 +1860,9 @@ router.post('/create', handleCreateJob)
 // Generate a presigned upload URL for direct-to-R2 PUT upload
 router.post('/:id/upload-url', async (req: any, res) => {
   try {
+    if (!r2.isConfigured) {
+      return res.status(503).json({ error: 'R2_NOT_CONFIGURED', missing: r2.missingEnvVars || [] })
+    }
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
     const jobId = req.params.id
@@ -1839,42 +1876,6 @@ router.post('/:id/upload-url', async (req: any, res) => {
     return res.json({ uploadUrl, key })
   } catch (err) {
     console.error('upload-url error', err)
-    res.status(500).json({ error: 'server_error' })
-  }
-})
-
-// Complete upload: called by frontend after successful PUT to R2
-router.post('/:id/complete-upload', async (req: any, res) => {
-  try {
-    const userId = req.user?.id
-    if (!userId) return res.status(401).json({ error: 'unauthorized' })
-    const jobId = req.params.id
-    const { key } = req.body
-    if (!jobId || !key) return res.status(400).json({ error: 'missing_params' })
-    const job = await prisma.job.findUnique({ where: { id: jobId } })
-    if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
-
-    // Construct public URL for R2 object
-    const account = process.env.R2_ACCOUNT_ID || ''
-    const bucket = process.env.R2_BUCKET || r2.bucket || ''
-    let publicUrl = ''
-    if (account && bucket) {
-      publicUrl = `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}`
-    } else if (process.env.R2_PUBLIC_BASE_URL) {
-      publicUrl = `${process.env.R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`
-    } else if (r2.endpoint) {
-      publicUrl = `${r2.endpoint.replace(/\/$/, '')}/${key}`
-    } else {
-      publicUrl = key
-    }
-
-    const bucketEnv = process.env.R2_BUCKET || r2.bucket || ''
-    await updateJob(jobId, { storageProvider: 'r2', inputKey: key, inputBucket: bucketEnv, inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
-    // Enqueue pipeline to start processing
-    enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
-    res.json({ ok: true })
-  } catch (err) {
-    console.error('complete-upload error', err)
     res.status(500).json({ error: 'server_error' })
   }
 })
@@ -1937,7 +1938,7 @@ router.get('/:id', async (req: any, res) => {
         await ensureBucket(OUTPUT_BUCKET, false)
         const expires = 60 * 10
         try {
-          const signed = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+          const signed = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
           jobPayload.outputUrl = signed
         } catch (err) {
           // ignore signed URL failures; client can fallback to output-url endpoint
@@ -1969,7 +1970,7 @@ router.post('/:id/download-url', async (req: any, res) => {
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
     try {
-      const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+      const url = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
 
       // schedule auto-delete 1 minute after user requests download
       try {
@@ -1977,7 +1978,7 @@ router.post('/:id/download-url', async (req: any, res) => {
         if (keyToDelete) {
           setTimeout(async () => {
             try {
-              await r2.deleteObject({ Key: keyToDelete })
+              await deleteOutputObject(keyToDelete)
               try {
                 await updateJob(id, { outputPath: null })
               } catch (e) {
@@ -2013,9 +2014,8 @@ router.post('/:id/proxy-url', async (req: any, res) => {
     if (!proxyPath) return res.status(404).json({ error: 'proxy_not_available' })
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
-    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(proxyPath, expires)
-    if (error) return res.status(500).json({ error: 'signed_url_failed' })
-    return res.json({ url: data.signedUrl })
+    const url = await getSignedOutputUrl({ key: proxyPath, expiresIn: expires })
+    return res.json({ url })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -2026,7 +2026,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
-    const inputPath = req.body?.inputPath || job.inputPath
+    const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
     const { plan } = await getUserPlan(req.user.id)
@@ -2115,7 +2115,7 @@ router.get('/:id/output-url', async (req: any, res) => {
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
     try {
-      const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+      const url = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
 
       // schedule auto-delete 1 minute after user requests download
       try {
@@ -2123,7 +2123,7 @@ router.get('/:id/output-url', async (req: any, res) => {
         if (keyToDelete) {
           setTimeout(async () => {
             try {
-              await r2.deleteObject({ Key: keyToDelete })
+              await deleteOutputObject(keyToDelete)
               try {
                 await updateJob(id, { outputPath: null })
               } catch (e) {

@@ -50,8 +50,29 @@ R2 (Cloudflare) configuration:
 	- `R2_BUCKET`
 	- `R2_PUBLIC_BASE_URL` (optional) — public base URL for reads if you use a custom domain
 
-The server will validate these variables at boot and will throw an error if any are missing.
+If these variables are not set, the API now falls back to Supabase storage for upload/download paths (R2 multipart endpoints return `R2_NOT_CONFIGURED`).
+
+R2 bucket CORS policy (required for browser multipart uploads):
+
+Apply this JSON in Cloudflare R2 bucket CORS settings:
+
+```json
+[
+  {
+    "AllowedOrigins": [
+      "https://www.autoeditor.app",
+      "https://autoeditor.app",
+      "http://localhost:8080"
+    ],
+    "AllowedMethods": ["PUT", "GET", "HEAD", "POST"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]
+```
 
 Deployment:
 - Use Railway for the server. Set environment variables per `.env.example` in Railway.
 - Set up a Stripe webhook in the Stripe dashboard pointing to your deployed `/webhooks/stripe` URL and copy the signing secret to `STRIPE_WEBHOOK_SECRET`.
+- If Railway build shows `failed to stat ... /secrets/R2_ACCESS_KEY_ID`, remove file-based secret references and set `R2_ACCESS_KEY_ID` as a normal environment variable value in Railway.
