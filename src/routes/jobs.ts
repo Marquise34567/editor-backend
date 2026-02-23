@@ -39,6 +39,25 @@ type FfmpegRunResult = {
 }
 
 const bucketChecks: Record<string, Promise<void> | null> = {}
+const RETRY_BASE_DELAY_MS = 350
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const withRetries = async <T>(label: string, attempts: number, run: () => Promise<T>): Promise<T> => {
+  let lastError: any = null
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await run()
+    } catch (error: any) {
+      lastError = error
+      if (attempt >= attempts) break
+      const waitMs = RETRY_BASE_DELAY_MS * attempt
+      console.warn(`${label} failed (attempt ${attempt}/${attempts}), retrying in ${waitMs}ms`, error?.message || error)
+      await delay(waitMs)
+    }
+  }
+  throw lastError
+}
 
 const ensureBucket = async (name: string, isPublic: boolean) => {
   if (bucketChecks[name]) return bucketChecks[name]
@@ -61,27 +80,35 @@ const ensureBucket = async (name: string, isPublic: boolean) => {
 const downloadObjectToFile = async ({ key, destPath }: { key: string; destPath: string }) => {
   if (r2.isConfigured) {
     try {
-      await r2.getObjectToFile({ Key: key, destPath })
+      await withRetries(`r2_download:${key}`, 3, async () => {
+        await r2.getObjectToFile({ Key: key, destPath })
+      })
       return
     } catch (err) {
       console.warn('R2 download failed, trying Supabase fallback', err)
     }
   }
-  const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).download(key)
-  if (error || !data) throw error || new Error('download_failed')
-  const bytes = Buffer.from(await data.arrayBuffer())
-  fs.writeFileSync(destPath, bytes)
+  await withRetries(`supabase_download:${key}`, 3, async () => {
+    const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).download(key)
+    if (error || !data) throw error || new Error('download_failed')
+    const bytes = Buffer.from(await data.arrayBuffer())
+    fs.writeFileSync(destPath, bytes)
+  })
 }
 
 const uploadBufferToOutput = async ({ key, body, contentType }: { key: string; body: Buffer; contentType?: string }) => {
   if (r2.isConfigured) {
-    await r2.uploadBuffer({ Key: key, Body: body, ContentType: contentType })
+    await withRetries(`r2_upload:${key}`, 3, async () => {
+      await r2.uploadBuffer({ Key: key, Body: body, ContentType: contentType })
+    })
     return
   }
-  const { error } = await supabaseAdmin.storage
-    .from(OUTPUT_BUCKET)
-    .upload(key, body, { contentType: contentType || 'application/octet-stream', upsert: true })
-  if (error) throw error
+  await withRetries(`supabase_upload:${key}`, 3, async () => {
+    const { error } = await supabaseAdmin.storage
+      .from(OUTPUT_BUCKET)
+      .upload(key, body, { contentType: contentType || 'application/octet-stream', upsert: true })
+    if (error) throw error
+  })
 }
 
 const getSignedOutputUrl = async ({ key, expiresIn }: { key: string; expiresIn: number }) => {
@@ -544,6 +571,8 @@ const refineSegmentsForRetention = (
           end,
           (window) => 0.7 * window.score + 0.2 * window.speechIntensity + 0.1 * window.vocalExcitement
         )
+        // If a segment already has strong retention signals, keep it mostly intact.
+        if (segmentScore >= 0.64) break
         const headScore = averageWindowMetric(
           windows,
           start,
@@ -926,10 +955,12 @@ const buildBoringFlags = (windows: EngagementWindow[], silences: TimeRange[]) =>
     const lowSpeech = w.speechIntensity < 0.25 && w.audioEnergy < 0.2
     const lowMotion = w.motionScore < 0.2 && w.sceneChangeRate < 0.2
     const staticVisual = w.motionScore < 0.1 && w.sceneChangeRate < 0.1
+    const strongWindow = w.score > 0.62 || (w.speechIntensity > 0.58 && w.vocalExcitement > 0.5)
     const retentionRisk = 1 - (0.55 * w.score + 0.18 * w.speechIntensity + 0.15 * w.vocalExcitement + 0.12 * w.emotionIntensity)
     const lowRetention = retentionRisk > 0.64 && w.score < 0.35
     const weakWindow = w.score < 0.3 && w.speechIntensity < 0.35 && w.vocalExcitement < 0.35
     const emotionalMoment = w.emotionIntensity > 0.6 || w.vocalExcitement > 0.6 || w.emotionalSpike > 0
+    if (strongWindow) return false
     if (emotionalMoment) return false
     if (silent) return true
     if (fillerFlags[idx]) return true
@@ -1148,14 +1179,15 @@ const applySegmentEffects = (
     const score = segmentScores.find((entry) => entry.seg === seg)
     const hasSpike = (score?.emotionalSpike ?? 0) > 0.05
     const calmNarrative = (score?.emotionIntensity ?? 0) < 0.4 && (score?.speechIntensity ?? 0) < 0.3
+    const alreadyStrong = (score?.score ?? 0) >= 0.72 && (score?.speechIntensity ?? 0) >= 0.45
     const hookBoost = score?.isHook ? 0.02 : 0
     let zoom = seg.zoom ?? 0
     let brightness = seg.brightness ?? 0
-    if (hasFaceSignal && options.smartZoom && (!calmNarrative || options.aggressiveMode)) {
+    if (!alreadyStrong && hasFaceSignal && options.smartZoom && (!calmNarrative || options.aggressiveMode)) {
       const desired = zoomMap.get(seg) ?? 0
       zoom = Math.max(zoom, desired + hookBoost)
     }
-    if (options.emotionalBoost && hasSpike) {
+    if (!alreadyStrong && options.emotionalBoost && hasSpike) {
       brightness = Math.max(brightness, 0.03)
     }
     zoom = Math.min(maxZoomDelta || 0, zoom)
@@ -1733,7 +1765,16 @@ const processJob = async (
       const target = getTargetDimensions(finalQuality)
 
       const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
-      const editPlan = storedPlan?.segments ? storedPlan : (durationSeconds ? await buildEditPlan(tmpIn, durationSeconds, options) : null)
+      let editPlan: EditPlan | null = storedPlan?.segments ? storedPlan : null
+      if (!editPlan && durationSeconds) {
+        try {
+          editPlan = await buildEditPlan(tmpIn, durationSeconds, options)
+        } catch (err) {
+          console.warn(`[${requestId || 'noid'}] edit-plan generation failed, falling back to conservative render`, err)
+          editPlan = null
+          optimizationNotes.push('AI edit plan fallback: conservative render mode used.')
+        }
+      }
 
       await updateJob(jobId, { status: 'story', progress: 55 })
 
@@ -1932,7 +1973,21 @@ const processJob = async (
         processed = true
       } catch (err) {
         processed = false
-        throw err
+        const emergencyArgs = [
+          ...argsBase,
+          '-vf',
+          `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+          tmpOut
+        ]
+        try {
+          await runFfmpeg(emergencyArgs)
+          processed = true
+          const reason = summarizeFfmpegError(err)
+          optimizationNotes.push(`Emergency fallback render used (${reason}).`)
+        } catch (emergencyErr) {
+          logFfmpegFailure('emergency', emergencyArgs, emergencyErr)
+          throw err
+        }
       }
     }
 
