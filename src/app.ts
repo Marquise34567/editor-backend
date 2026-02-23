@@ -2,6 +2,8 @@ import express from 'express'
 import cors from 'cors'
 import bodyParser from 'body-parser'
 import crypto from 'crypto'
+import fs from 'fs'
+import path from 'path'
 import { loadEnv } from './lib/loadEnv'
 import billingRoutes from './routes/billing'
 import checkoutRoutes from './routes/checkout'
@@ -20,13 +22,20 @@ import { rateLimit } from './middleware/rateLimit'
 loadEnv()
 const app = express()
 app.set('trust proxy', 1)
+const localOutputsDir = path.join(process.cwd(), 'outputs')
+if (!fs.existsSync(localOutputsDir)) {
+  fs.mkdirSync(localOutputsDir, { recursive: true })
+}
 
 const allowedOrigins = [
   'https://www.autoeditor.app',
   'https://autoeditor.app',
   'http://localhost:5173',
+  'http://127.0.0.1:5173',
   'http://localhost:3000',
-  'http://localhost:8080'
+  'http://127.0.0.1:3000',
+  'http://localhost:8080',
+  'http://127.0.0.1:8080'
 ]
 
 // Central origin check used by CORS middleware (handles null/undefined origin safely)
@@ -90,6 +99,7 @@ app.use(express.json({ limit: '10mb' }))
 
 app.use('/api/public', publicRoutes)
 app.use('/api/debug', debugRoutes)
+app.use('/outputs', express.static(localOutputsDir))
 app.use('/api/billing', requireAuth, billingRoutes)
 app.use('/api', requireAuth, checkoutRoutes)
 app.use('/api/jobs', requireAuth, jobsRoutes)

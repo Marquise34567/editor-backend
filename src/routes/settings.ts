@@ -1,5 +1,5 @@
 import express from 'express'
-import { prisma } from '../db/prisma'
+import { isStubDb, prisma } from '../db/prisma'
 import { clampQualityForTier, normalizeQuality } from '../lib/gating'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
@@ -44,11 +44,13 @@ const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message:
 
 router.get('/', async (req: any, res) => {
   try {
-    // Defensive env validation for production
-    const requiredEnvs = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY']
-    const missing = requiredEnvs.filter((k) => !process.env[k])
-    if (missing.length > 0) {
-      return res.status(500).json({ error: 'misconfigured', message: 'Missing env vars', missing })
+    // Require full env only in production with a real DB. Stub mode should stay usable in local dev.
+    if (process.env.NODE_ENV === 'production' && !isStubDb()) {
+      const requiredEnvs = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY']
+      const missing = requiredEnvs.filter((k) => !process.env[k])
+      if (missing.length > 0) {
+        return res.status(500).json({ error: 'misconfigured', message: 'Missing env vars', missing })
+      }
     }
 
     const userId = req.user?.id

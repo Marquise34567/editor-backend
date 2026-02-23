@@ -14,6 +14,7 @@ import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
 import { getMonthKey, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
+import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import {
   getPlanFeatures,
   getRequiredPlanForAdvancedEffects,
@@ -29,9 +30,13 @@ const router = express.Router()
 
 const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
 const OUTPUT_BUCKET = process.env.SUPABASE_BUCKET_OUTPUT || process.env.SUPABASE_BUCKET_OUTPUTS || 'outputs'
-const FFMPEG_BIN = process.env.FFMPEG_BIN || process.env.FFMPEG_PATH || 'ffmpeg'
-const FFPROBE_BIN = process.env.FFPROBE_BIN || process.env.FFPROBE_PATH || 'ffprobe'
-const FFMPEG_LOG_LIMIT = 8000
+const FFMPEG_LOG_LIMIT = 120000
+
+type FfmpegRunResult = {
+  exitCode: number | null
+  stdout: string
+  stderr: string
+}
 
 const bucketChecks: Record<string, Promise<void> | null> = {}
 
@@ -97,7 +102,7 @@ const deleteOutputObject = async (key: string) => {
 
 const hasFfmpeg = () => {
   try {
-    const result = spawnSync(FFMPEG_BIN, ['-version'], { stdio: 'ignore' })
+    const result = spawnSync(FFMPEG_PATH, ['-version'], { stdio: 'ignore' })
     return result.status === 0
   } catch (e) {
     return false
@@ -106,42 +111,54 @@ const hasFfmpeg = () => {
 
 const hasFfprobe = () => {
   try {
-    const result = spawnSync(FFPROBE_BIN, ['-version'], { stdio: 'ignore' })
+    const result = spawnSync(FFPROBE_PATH, ['-version'], { stdio: 'ignore' })
     return result.status === 0
   } catch (e) {
     return false
   }
 }
 
-const runFfmpeg = (args: string[]) => {
-  return new Promise<void>((resolve, reject) => {
-    const proc = spawn(FFMPEG_BIN, args)
+const runFfmpegProcess = (args: string[]) => {
+  return new Promise<FfmpegRunResult>((resolve, reject) => {
+    const proc = spawn(FFMPEG_PATH, args, { stdio: 'pipe' })
+    let stdout = ''
     let stderr = ''
+    proc.stdout.on('data', (data) => {
+      if (stdout.length >= FFMPEG_LOG_LIMIT) return
+      stdout += data.toString()
+    })
     proc.stderr.on('data', (data) => {
       if (stderr.length >= FFMPEG_LOG_LIMIT) return
       stderr += data.toString()
     })
     proc.on('error', (err) => reject(err))
-    proc.on('close', (code) => {
-      if (code === 0) return resolve()
-      const err: any = new Error(`ffmpeg_failed_${code}`)
-      err.stderr = stderr
-      reject(err)
-    })
+    proc.on('close', (exitCode) => resolve({ exitCode, stdout, stderr }))
   })
 }
 
-// helper: run ffmpeg and capture stderr output (already exists as runFfmpegCapture)
+const runFfmpeg = async (args: string[]) => {
+  const result = await runFfmpegProcess(args)
+  if (result.exitCode === 0) return result
+  const err: any = new Error(`ffmpeg_failed_${result.exitCode}`)
+  err.exitCode = result.exitCode
+  err.stdout = result.stdout
+  err.stderr = result.stderr
+  err.command = formatFfmpegCommand(args)
+  throw err
+}
 
 const formatFfmpegCommand = (args: string[]) => {
-  const quoted = args.map((arg) => {
-    if (arg === '') return '""'
-    if (/[\\s"'`]/.test(arg)) {
-      return `"${arg.replace(/"/g, '\\"')}"`
-    }
-    return arg
-  })
-  return [FFMPEG_BIN, ...quoted].join(' ')
+  return formatCommand(FFMPEG_PATH, args)
+}
+
+const formatFfmpegFailure = (err: any) => {
+  const message = err?.message ? String(err.message) : 'ffmpeg_failed'
+  const exitCode = err?.exitCode !== undefined && err?.exitCode !== null ? `exit=${err.exitCode}` : 'exit=unknown'
+  const stderr = err?.stderr ? String(err.stderr).trim() : ''
+  const stdout = err?.stdout ? String(err.stdout).trim() : ''
+  const detail = [stderr, stdout].filter(Boolean).join('\n')
+  const combined = `${message} (${exitCode})${detail ? `\n${detail}` : ''}`
+  return combined.length > 3500 ? combined.slice(0, 3500) : combined
 }
 
 const safeUnlink = (filePath?: string | null) => {
@@ -163,7 +180,7 @@ const getDurationSeconds = (filePath: string) => {
   try {
     if (hasFfprobe()) {
       const result = spawnSync(
-        FFPROBE_BIN,
+        FFPROBE_PATH,
         ['-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nk=1:nw=1', filePath],
         { encoding: 'utf8' }
       )
@@ -178,7 +195,7 @@ const getDurationSeconds = (filePath: string) => {
   }
   if (!hasFfmpeg()) return null
   try {
-    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
+    const result = spawnSync(FFMPEG_PATH, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
     const output = `${result.stderr || ''}\n${result.stdout || ''}`
     const match = output.match(/Duration:\s*([0-9]+):([0-9]+):([0-9.]+)/)
     if (!match) return null
@@ -288,27 +305,16 @@ const buildRenderLimitPayload = (
   }
 }
 
-const runFfmpegCapture = (args: string[]) => {
-  return new Promise<string>((resolve, reject) => {
-    const proc = spawn(FFMPEG_BIN, args)
-    let stderr = ''
-    proc.stderr.on('data', (data) => {
-      if (stderr.length >= FFMPEG_LOG_LIMIT) return
-      stderr += data.toString()
-    })
-    proc.on('error', (err) => reject(err))
-    proc.on('close', (code) => {
-      if (code === 0) return resolve(stderr)
-      reject(new Error(`ffmpeg_failed_${code}`))
-    })
-  })
+const runFfmpegCapture = async (args: string[]) => {
+  const result = await runFfmpeg(args)
+  return [result.stderr, result.stdout].filter(Boolean).join('\n')
 }
 
 const hasAudioStream = (filePath: string) => {
   try {
     if (hasFfprobe()) {
       const result = spawnSync(
-        FFPROBE_BIN,
+        FFPROBE_PATH,
         ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', filePath],
         { encoding: 'utf8' }
       )
@@ -320,7 +326,7 @@ const hasAudioStream = (filePath: string) => {
   }
   if (!hasFfmpeg()) return false
   try {
-    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
+    const result = spawnSync(FFMPEG_PATH, ['-hide_banner', '-i', filePath], { encoding: 'utf8' })
     const output = `${result.stderr || ''}\n${result.stdout || ''}`
     return /Audio:\s/i.test(output)
   } catch (e) {
@@ -332,7 +338,7 @@ const probeVideoStream = (filePath: string) => {
   if (!hasFfprobe()) return null
   try {
     const result = spawnSync(
-      FFPROBE_BIN,
+      FFPROBE_PATH,
       ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,sample_aspect_ratio,r_frame_rate', '-of', 'json', filePath],
       { encoding: 'utf8' }
     )
@@ -537,7 +543,7 @@ const hasFaceDetectFilter = () => {
     return cachedFaceDetectFilter
   }
   try {
-    const result = spawnSync(FFMPEG_BIN, ['-hide_banner', '-filters'], { encoding: 'utf8' })
+    const result = spawnSync(FFMPEG_PATH, ['-hide_banner', '-filters'], { encoding: 'utf8' })
     if (result.status !== 0) {
       cachedFaceDetectFilter = false
       return cachedFaceDetectFilter
@@ -1299,12 +1305,26 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
   }
 
   const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
+  const absTmpIn = path.resolve(tmpIn)
   try {
     await downloadObjectToFile({ key: job.inputPath, destPath: tmpIn })
   } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
+  if (!fs.existsSync(tmpIn)) {
+    await updateJob(jobId, { status: 'failed', error: 'input_file_missing_after_download' })
+    throw new Error('input_file_missing_after_download')
+  }
+  const inStats = fs.statSync(tmpIn)
+  if (!inStats.isFile() || inStats.size <= 0) {
+    await updateJob(jobId, { status: 'failed', error: 'input_file_empty_after_download' })
+    throw new Error('input_file_empty_after_download')
+  }
+  console.log(`[${requestId || 'noid'}] analyze input`, {
+    inputPath: absTmpIn,
+    inputBytes: inStats.size
+  })
   try {
     const duration = getDurationSeconds(tmpIn)
     if (!duration || !Number.isFinite(duration) || duration <= 0) {
@@ -1452,12 +1472,28 @@ const processJob = async (
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `${jobId}-`))
   const tmpIn = path.join(workDir, 'input')
   const tmpOut = path.join(workDir, 'output.mp4')
+  const absTmpIn = path.resolve(tmpIn)
+  const absTmpOut = path.resolve(tmpOut)
   try {
     await downloadObjectToFile({ key: job.inputPath, destPath: tmpIn })
   } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
+  if (!fs.existsSync(tmpIn)) {
+    await updateJob(jobId, { status: 'failed', error: 'input_file_missing_after_download' })
+    throw new Error('input_file_missing_after_download')
+  }
+  const inStats = fs.statSync(tmpIn)
+  if (!inStats.isFile() || inStats.size <= 0) {
+    await updateJob(jobId, { status: 'failed', error: 'input_file_empty_after_download' })
+    throw new Error('input_file_empty_after_download')
+  }
+  console.log(`[${requestId || 'noid'}] process paths`, {
+    inputPath: absTmpIn,
+    outputPath: absTmpOut,
+    inputBytes: inStats.size
+  })
   let subtitlePath: string | null = null
   try {
     const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
@@ -1474,220 +1510,52 @@ const processJob = async (
     let processed = false
     let retentionScore: number | null = null
     let optimizationNotes: string[] = []
-    if (hasFfmpeg()) {
-      const target = getTargetDimensions(finalQuality)
-
-      const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
-      const editPlan = storedPlan?.segments ? storedPlan : (durationSeconds ? await buildEditPlan(tmpIn, durationSeconds, options) : null)
-
-      await updateJob(jobId, { status: 'story', progress: 55 })
-
-      const hookRange: TimeRange | null = editPlan
-        ? { start: editPlan.hook.start, end: editPlan.hook.start + editPlan.hook.duration }
-        : null
-      const hookSegment: Segment | null = hookRange ? { ...hookRange, speed: 1 } : null
-      const baseSegments: Segment[] = editPlan
-        ? editPlan.segments
-        : [{ start: 0, end: durationSeconds || 0, speed: 1 }]
-      const storySegments = editPlan && !options.onlyCuts
-        ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
-        : baseSegments
-      const orderedSegments = editPlan && options.autoHookMove && !options.onlyCuts && hookSegment
-        ? [hookSegment, ...storySegments]
-        : storySegments
-      const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
-      const effectedSegments = editPlan && !options.onlyCuts
-        ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options, hookRange)
-        : filteredSegments
-      const finalSegments = editPlan && !options.onlyCuts ? applyZoomEasing(effectedSegments) : effectedSegments
-
-      // Enforce zoom duration cap: never exceed ZOOM_MAX_DURATION_RATIO of total duration.
-      try {
-        const totalDuration = durationSeconds || 0
-        const zoomSegments = finalSegments.filter((s) => (s.zoom ?? 0) > 0)
-        const zoomDuration = zoomSegments.reduce((sum, s) => sum + Math.max(0, s.end - s.start), 0)
-        const maxZoomAllowed = Math.max(0, ZOOM_MAX_DURATION_RATIO * totalDuration)
-        if (zoomDuration > maxZoomAllowed && zoomSegments.length) {
-          // Sort by emphasize/score (segments with emphasize should keep zoom first), otherwise by length
-          const prioritized = finalSegments
-            .map((s) => ({ seg: s, score: (s as any).emphasize ? 2 : 0, len: s.end - s.start }))
-            .sort((a, b) => b.score - a.score || b.len - a.len)
-          let running = 0
-          for (const entry of prioritized) {
-            const s = entry.seg
-            const segLen = Math.max(0, s.end - s.start)
-            if ((s.zoom ?? 0) > 0) {
-              if (running + segLen <= maxZoomAllowed) {
-                running += segLen
-                continue
-              }
-              // remove zoom from lower priority segments until under cap
-              s.zoom = 0
-            }
-          }
-        }
-      } catch (e) {
-        // non-fatal
-        console.warn('zoom-cap enforcement failed', e)
-      }
-
-      if (options.autoCaptions) {
-        await updateJob(jobId, { status: 'subtitling', progress: 62 })
-        subtitlePath = await generateSubtitles(tmpIn, workDir)
-        if (!subtitlePath) optimizationNotes.push('Auto subtitles skipped: no caption engine available.')
-      }
-
-      await updateJob(jobId, { status: 'audio', progress: 68 })
-
-      const hasAudio = hasAudioStream(tmpIn)
-      const withAudio = true
-      const audioFilters = withAudio ? buildAudioFilters() : []
-
-      await updateJob(jobId, { status: 'retention', progress: 72 })
-      if (editPlan) {
-        const retention = computeRetentionScore(finalSegments, editPlan.engagementWindows, editPlan.hook.score, options.autoCaptions)
-        retentionScore = retention.score
-        optimizationNotes = [...optimizationNotes, ...retention.notes]
-      }
-
-      await updateJob(jobId, { status: 'rendering', progress: 80 })
-
-      const hasSegments = finalSegments.length >= 1
-      const ffPreset = (options as any)?.fastMode
-        ? 'superfast'
-        : (process.env.FFMPEG_PRESET || 'medium')
-      const defaultCrf = finalQuality === '4k' ? '18' : finalQuality === '1080p' ? '20' : '22'
-      const ffCrf = (options as any)?.fastMode
-        ? '28'
-        : (process.env.FFMPEG_CRF || defaultCrf)
-      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', ffPreset, '-crf', ffCrf, '-threads', '0', '-pix_fmt', 'yuv420p']
-      if (withAudio) argsBase.push('-c:a', 'aac')
-
-      const watermarkFont = getSystemFontFile()
-      const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
-
-      // Prefer an image watermark if available (uses favicon from frontend/public),
-      // otherwise fall back to a subtle text watermark. The image will be overlaid
-      // at bottom-right with a small inset.
-      const defaultWatermarkImage = path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
-      const watermarkImagePath = process.env.WATERMARK_IMAGE_PATH || defaultWatermarkImage
-      const watermarkImageExists = watermarkEnabled && fs.existsSync(watermarkImagePath)
-      const watermarkFilter = watermarkImageExists
-        ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
-        : watermarkEnabled
-        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
-        : ''
-      const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
-
-      const probe = probeVideoStream(tmpIn)
-      if (probe && finalSegments.length) {
-        finalSegments.forEach((seg, idx) => {
-          console.log(
-            `[${requestId || 'noid'}] segment ${idx} ${seg.start}-${seg.end} width=${probe.width} height=${probe.height} sar=${probe.sampleAspectRatio} fps=${probe.frameRate}`
-          )
-        })
-      } else if (!probe) {
-        console.warn(`[${requestId || 'noid'}] segment preflight ffprobe unavailable`)
-      }
-
-      const logFfmpegFailure = (label: string, args: string[], err: any) => {
-        const stderr = typeof err?.stderr === 'string' ? err.stderr : ''
-        console.error(`[${requestId || 'noid'}] ffmpeg ${label} failed`, {
-          cmd: formatFfmpegCommand(args),
-          stderr
-        })
-      }
-
-      const summarizeFfmpegError = (err: any) => {
-        const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : ''
-        const message = err?.message ? String(err.message) : 'ffmpeg_failed'
-        if (!stderr) return message
-        const trimmed = stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ')
-        const combined = `${message}: ${trimmed}`
-        return combined.length > 200 ? combined.slice(0, 200) : combined
-      }
-
-      try {
-        if (hasSegments) {
-          const concatFilter = buildConcatFilter(finalSegments, {
-            withAudio,
-            hasAudioStream: hasAudio,
-            targetWidth: target.width,
-            targetHeight: target.height
-          })
-          const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
-          // If using an image watermark we must add the watermark file as a second input
-          // so ffmpeg can reference it as input index 1 in the overlay filter.
-          const argsWithWatermark = [...argsBase]
-          if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
-          const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
-
-          const runWithChain = async (videoChain: string) => {
-            const filterParts: string[] = [concatFilter]
-            if (videoChain) {
-              filterParts.push(`[outv]${videoChain}[vout]`)
-            }
-            if (withAudio && audioFilters.length > 0) {
-              filterParts.push(`[outa]${audioFilters.join(',')}[aout]`)
-            }
-            const filter = filterParts.join(';')
-            const videoMap = videoChain ? '[vout]' : '[outv]'
-            const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
-            const args = [...argsWithWatermark, '-filter_complex', filter, '-map', videoMap]
-            if (audioMap) args.push('-map', audioMap)
-            const fullArgs = [...args, tmpOut]
-            try {
-              await runFfmpeg(fullArgs)
-            } catch (err) {
-              logFfmpegFailure('concat', fullArgs, err)
-              throw err
-            }
-          }
-
-          let lastErr: any = null
-          let ran = false
-          for (const chain of videoChains) {
-            try {
-              await runWithChain(chain)
-              ran = true
-              if (chain !== fullVideoChain) {
-                const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
-              }
-              break
-            } catch (err) {
-              lastErr = err
-            }
-          }
-          if (!ran) throw lastErr || new Error('ffmpeg_failed')
-        } else {
-          const fallbackArgs = [
-            ...argsBase,
-            '-vf',
-            `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
-            tmpOut
-          ]
-          try {
-            await runFfmpeg(fallbackArgs)
-          } catch (err) {
-            logFfmpegFailure('single', fallbackArgs, err)
-            throw err
-          }
-        }
-        processed = true
-      } catch (err) {
-        processed = false
-        throw err
-      }
+    await updateJob(jobId, { status: 'rendering', progress: 80 })
+    const hasAudio = hasAudioStream(tmpIn)
+    const minimalArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-vf', 'scale=720:-2', '-preset', 'fast', '-crf', '23', '-movflags', '+faststart', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']
+    if (hasAudio) minimalArgs.push('-c:a', 'aac')
+    minimalArgs.push(tmpOut)
+    console.log(`[${requestId || 'noid'}] ffmpeg minimal proof`, {
+      command: formatFfmpegCommand(minimalArgs)
+    })
+    try {
+      await runFfmpeg(minimalArgs)
+      processed = true
+      optimizationNotes.push('Minimal proof edit pipeline executed: ffmpeg -i input.mp4 -vf scale=720:-2 -preset fast -crf 23 output.mp4')
+    } catch (err: any) {
+      const failedReason = formatFfmpegFailure(err)
+      await updateJob(jobId, { status: 'failed', error: failedReason })
+      console.error(`[${requestId || 'noid'}] ffmpeg minimal proof failed`, {
+        command: formatFfmpegCommand(minimalArgs),
+        exitCode: err?.exitCode,
+        stderr: err?.stderr,
+        stdout: err?.stdout
+      })
+      throw err
     }
 
     if (!processed) {
       throw new Error('render_failed')
     }
 
+    if (!fs.existsSync(tmpOut)) {
+      await updateJob(jobId, { status: 'failed', error: 'output_file_missing_after_render' })
+      throw new Error('output_file_missing_after_render')
+    }
+    const tmpOutStats = fs.statSync(tmpOut)
+    if (!tmpOutStats.isFile() || tmpOutStats.size <= 0) {
+      await updateJob(jobId, { status: 'failed', error: 'output_file_empty_after_render' })
+      throw new Error('output_file_empty_after_render')
+    }
+
     await updateJob(jobId, { progress: 95 })
     const outBuf = fs.readFileSync(tmpOut)
     const outPath = `${job.userId}/${jobId}/output.mp4`
+    const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
+    fs.mkdirSync(localOutDir, { recursive: true })
+    const localOutPath = path.join(localOutDir, 'output.mp4')
+    fs.copyFileSync(tmpOut, localOutPath)
+    console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
     try {
       await uploadBufferToOutput({ key: outPath, body: outBuf, contentType: 'video/mp4' })
     } catch (e) {
@@ -1718,6 +1586,10 @@ const processJob = async (
 
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
   try {
+    if (!hasFfmpeg()) {
+      await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
+      throw new Error('ffmpeg_missing')
+    }
     const { options } = await getEditOptionsForUser(user.id)
     await analyzeJob(jobId, options, requestId)
     await processJob(jobId, user, requestedQuality, options, requestId)
@@ -1727,7 +1599,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       return
     }
     console.error(`[${requestId || 'noid'}] pipeline error`, err)
-    await updateJob(jobId, { status: 'failed', error: String(err?.message || err) })
+    await updateJob(jobId, { status: 'failed', error: formatFfmpegFailure(err) })
   }
 }
 
@@ -2104,7 +1976,7 @@ router.post('/:id/process', async (req: any, res) => {
     }
     console.error('process error', err)
     try {
-      await updateJob(req.params.id, { status: 'failed', error: String(err) })
+      await updateJob(req.params.id, { status: 'failed', error: formatFfmpegFailure(err) })
     } catch (e) {
       // ignore
     }
