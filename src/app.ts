@@ -28,19 +28,35 @@ const allowedOrigins = [
   'http://localhost:3000'
 ]
 
-app.use(cors({
-  origin: (origin, cb) => {
+// Central origin check used by CORS middleware (handles null/undefined origin safely)
+const originCallback = (origin: any, cb: any) => {
+  try {
+    // Allow requests with no origin (server-to-server, curl, etc.)
     if (!origin) return cb(null, true)
     if (allowedOrigins.includes(origin)) return cb(null, true)
-    return cb(new Error('Not allowed by CORS'))
-  },
+    // Build a CORS-specific error so downstream error middleware can respond safely
+    const err: any = new Error('Not allowed by CORS')
+    err.type = 'cors'
+    err.origin = origin
+    console.warn(`CORS blocked origin: ${origin}`)
+    return cb(err)
+  } catch (e) {
+    console.error('Error while checking CORS origin', e)
+    return cb(e)
+  }
+}
+
+// Register CORS globally before routes
+app.use(cors({
+  origin: originCallback,
   credentials: true,
   allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  optionsSuccessStatus: 204
 }))
 
-// Ensure OPTIONS preflight responses are handled quickly for all routes
-app.options('*', cors({ origin: allowedOrigins, credentials: true, optionsSuccessStatus: 204 }))
+// Ensure OPTIONS preflight responses are handled quickly for all routes using same origin logic
+app.options('*', cors({ origin: originCallback, credentials: true, optionsSuccessStatus: 204 }))
 
 app.use((req, res, next) => {
   const id = crypto.randomUUID().slice(0, 12)
@@ -97,10 +113,22 @@ app.get('/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) =>
 
 app.use((err: any, req: any, res: any, next: any) => {
   const requestId = req?.requestId
+  // If this is a CORS rejection, return a friendly 403 JSON response
+  if (err && (err.type === 'cors' || err.message === 'Not allowed by CORS')) {
+    const origin = err.origin || req.get('origin') || null
+    console.warn('[CORS] Blocked request', { origin, path: req?.originalUrl, requestId })
+    return res.status(403).json({ error: 'CORS_BLOCKED', origin })
+  }
+
   // Log full stack for debugging in Railway logs (avoid logging sensitive headers)
   console.error('Unhandled error', requestId, err?.stack || err)
   const message = err?.message || 'Internal error'
   res.status(err?.status || 500).json({ error: 'internal_error', message, path: req?.originalUrl, requestId })
+})
+
+// Lightweight health endpoint for debug use
+app.get('/api/debug/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
+  res.json({ ok: true })
 })
 
 export default app
