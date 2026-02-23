@@ -1,4 +1,4 @@
-import { S3Client, CreateMultipartUploadCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, PutObjectCommand, GetObjectCommand, UploadPartCommand } from '@aws-sdk/client-s3'
+import { S3Client, CreateMultipartUploadCommand, CompleteMultipartUploadCommand, AbortMultipartUploadCommand, PutObjectCommand, GetObjectCommand, UploadPartCommand, DeleteObjectCommand } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import fs from 'fs'
 import stream from 'stream'
@@ -60,6 +60,12 @@ export const r2 = {
   getPresignedGetUrl: async ({ Key, expiresIn = 600 }: { Key: string; expiresIn?: number }) => {
     const cmd = new GetObjectCommand({ Bucket: bucket, Key })
     return getSignedUrl(client, cmd, { expiresIn })
+  }
+
+  ,
+  deleteObject: async ({ Key }: { Key: string }) => {
+    const cmd = new DeleteObjectCommand({ Bucket: bucket, Key })
+    return client.send(cmd)
   }
 }
 
