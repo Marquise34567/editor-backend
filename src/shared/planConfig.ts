@@ -62,7 +62,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     priceMonthly: 0,
     priceLabel: '$0',
     description: 'For trying AutoEditor on small projects.',
-    maxRendersPerMonth: 12,
+    maxRendersPerMonth: 30,
     maxMinutesPerMonth: null,
     exportQuality: '720p',
     watermark: true,
@@ -75,7 +75,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     badge: null,
     features: [
       '720p exports',
-      '12 renders / month',
+      '1 render / day (free tier)',
       'Watermark',
       'Standard queue',
       'Subtitles: 1 preset',

@@ -6,38 +6,53 @@ import { FFMPEG_PATH, formatCommand } from './lib/ffmpeg'
 
 const PORT = Number(process.env.PORT || 4000)
 const STARTUP_LOG_LIMIT = 64 * 1024
+const REQUIRE_FFMPEG_ON_STARTUP = /^(1|true|yes)$/i.test(
+  String(process.env.REQUIRE_FFMPEG_ON_STARTUP || '').trim()
+)
 
 const server = createServer(app)
 initRealtime(server)
 
-const verifyFfmpegOrExit = async () => {
+const reportFfmpegStartupIssue = (message: string, cmd: string, output: string) => {
+  if (REQUIRE_FFMPEG_ON_STARTUP) {
+    console.error(message)
+    console.error('[startup] Command:', cmd)
+    if (output) console.error(output)
+    console.error('[startup] REQUIRE_FFMPEG_ON_STARTUP is set, exiting')
+    return false
+  }
+
+  console.warn(message)
+  console.warn('[startup] Command:', cmd)
+  if (output) console.warn(output)
+  console.warn('[startup] Continuing without FFmpeg; processing routes may fail until FFmpeg is available')
+  return true
+}
+
+const verifyFfmpegOnStartup = async () => {
   const args = ['-version']
   const cmd = formatCommand(FFMPEG_PATH, args)
-  await new Promise<void>((resolve, reject) => {
+  return new Promise<boolean>((resolve) => {
     exec(cmd, { maxBuffer: STARTUP_LOG_LIMIT }, (error, stdout, stderr) => {
       const output = `${stdout || ''}${stderr || ''}`.trim()
       if (error) {
-        console.error('[startup] Fatal: FFmpeg check failed')
-        console.error('[startup] Command:', cmd)
-        if (output) console.error(output)
-        return reject(error)
+        return resolve(reportFfmpegStartupIssue('[startup] FFmpeg check failed', cmd, output))
       }
       if (!output) {
-        console.error('[startup] Fatal: FFmpeg check returned no output')
-        console.error('[startup] Command:', cmd)
-        return reject(new Error('ffmpeg_version_output_missing'))
+        return resolve(
+          reportFfmpegStartupIssue('[startup] FFmpeg check returned no output', cmd, output)
+        )
       }
       console.log('[startup] FFmpeg version output:')
       console.log(output)
-      resolve()
+      resolve(true)
     })
-  }).catch(() => {
-    process.exit(1)
   })
 }
 
 const start = async () => {
-  await verifyFfmpegOrExit()
+  const ffmpegOk = await verifyFfmpegOnStartup()
+  if (!ffmpegOk) process.exit(1)
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`)
   })

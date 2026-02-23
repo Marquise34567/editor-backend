@@ -82,6 +82,18 @@ class StubDB {
       const userId = where?.userId
       return Array.from(this.jobs.values()).filter((j:any)=>!userId || j.userId===userId)
     },
+    count: async ({ where }: any = {}) => {
+      const userId = where?.userId
+      const createdAtGte = where?.createdAt?.gte ? new Date(where.createdAt.gte).getTime() : null
+      const createdAtLt = where?.createdAt?.lt ? new Date(where.createdAt.lt).getTime() : null
+      return Array.from(this.jobs.values()).filter((j: any) => {
+        if (userId && j.userId !== userId) return false
+        const createdAt = new Date(j.createdAt || 0).getTime()
+        if (createdAtGte !== null && createdAt < createdAtGte) return false
+        if (createdAtLt !== null && createdAt >= createdAtLt) return false
+        return true
+      }).length
+    },
     findUnique: async ({ where }: any) => this.jobs.get(where.id) ?? null,
     update: async ({ where, data }: any) => {
       const id = where.id

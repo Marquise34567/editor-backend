@@ -12,6 +12,7 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
+import { getRenderAttemptsForDay } from '../services/dailyRenderUsage'
 import { getMonthKey, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
@@ -249,8 +250,20 @@ const getTargetDimensions = (quality?: ExportQuality | null) => {
   return { width: 1280, height: 720 }
 }
 
+const getVerticalTargetDimensions = (quality?: ExportQuality | null) => {
+  const horizontal = getTargetDimensions(quality)
+  return { width: horizontal.height, height: horizontal.width }
+}
+
 type TimeRange = { start: number; end: number }
 type Segment = { start: number; end: number; speed?: number; zoom?: number; brightness?: number; emphasize?: boolean }
+type WebcamFocus = { x: number; y: number }
+type RenderMode = 'standard' | 'vertical'
+type RenderConfig = {
+  mode: RenderMode
+  verticalClipCount: number
+  webcamFocus: WebcamFocus | null
+}
 type EngagementWindow = {
   time: number
   audioEnergy: number
@@ -305,6 +318,9 @@ const HOOK_ANALYZE_MAX = 600
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
+const MAX_VERTICAL_CLIPS = 3
+const MIN_VERTICAL_CLIP_SECONDS = 8
+const FREE_DAILY_RENDER_LIMIT = 1
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -316,6 +332,70 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   musicDuck: true,
   subtitleStyle: DEFAULT_SUBTITLE_PRESET,
   autoZoomMax: 1.1
+}
+
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+
+const parseRenderMode = (value?: any): RenderMode => {
+  const raw = String(value || '').trim().toLowerCase()
+  return raw === 'vertical' ? 'vertical' : 'standard'
+}
+
+const parseVerticalClipCount = (value?: any) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(parsed)) return 1
+  return clamp(parsed, 1, MAX_VERTICAL_CLIPS)
+}
+
+const parseWebcamFocus = (value?: any): WebcamFocus | null => {
+  if (!value || typeof value !== 'object') return null
+  const x = Number((value as any).x)
+  const y = Number((value as any).y)
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+  return {
+    x: clamp(x, 0, 1),
+    y: clamp(y, 0, 1)
+  }
+}
+
+const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
+  const mode = parseRenderMode(body?.renderMode || body?.mode)
+  if (mode !== 'vertical') {
+    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null }
+  }
+  return {
+    mode: 'vertical',
+    verticalClipCount: parseVerticalClipCount(body?.verticalClipCount),
+    webcamFocus: parseWebcamFocus(body?.webcamFocus)
+  }
+}
+
+const parseRenderConfigFromAnalysis = (analysis?: any): RenderConfig => {
+  const mode = parseRenderMode(analysis?.renderMode)
+  if (mode !== 'vertical') {
+    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null }
+  }
+  return {
+    mode: 'vertical',
+    verticalClipCount: parseVerticalClipCount(analysis?.vertical?.clipCount),
+    webcamFocus: parseWebcamFocus(analysis?.vertical?.webcamFocus)
+  }
+}
+
+const getVerticalOutputPathsFromAnalysis = (analysis?: any) => {
+  const raw = analysis?.verticalOutputPaths
+  if (!Array.isArray(raw)) return [] as string[]
+  return raw
+    .map((value: any) => String(value || '').trim())
+    .filter((value: string) => value.length > 0)
+}
+
+const getOutputPathsForJob = (job: any) => {
+  const analysis = job?.analysis as any
+  const verticalPaths = getVerticalOutputPathsFromAnalysis(analysis)
+  if (verticalPaths.length > 0) return verticalPaths
+  if (job?.outputPath) return [job.outputPath]
+  return [] as string[]
 }
 
 const buildRenderLimitPayload = (
@@ -331,6 +411,19 @@ const buildRenderLimitPayload = (
     rendersRemaining,
     maxRendersPerMonth: maxRenders,
     rendersUsed
+  }
+}
+
+const buildDailyRenderLimitPayload = (usage?: { rendersCount?: number | null; dayKey?: string | null }) => {
+  const rendersUsed = typeof usage?.rendersCount === 'number' ? usage.rendersCount : FREE_DAILY_RENDER_LIMIT
+  return {
+    error: 'DAILY_RENDER_LIMIT_REACHED',
+    code: 'DAILY_RENDER_LIMIT_REACHED',
+    message: 'Free plan includes 1 render per day. Upgrade to unlock more renders.',
+    rendersRemainingToday: Math.max(0, FREE_DAILY_RENDER_LIMIT - rendersUsed),
+    maxRendersPerDay: FREE_DAILY_RENDER_LIMIT,
+    rendersUsedToday: rendersUsed,
+    day: usage?.dayKey ?? null
   }
 }
 
@@ -1013,6 +1106,34 @@ const buildBoringCuts = (flags: boolean[]) => {
   return mergeRanges(ranges)
 }
 
+const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds: number) => {
+  if (!windows.length || durationSeconds < 45) return [] as TimeRange[]
+  const candidates = windows
+    .filter((window) => window.time >= 8 && window.time <= Math.max(8, durationSeconds - 6))
+    .map((window) => ({
+      start: Math.max(0, window.time - 1),
+      end: Math.min(durationSeconds, window.time + 2.2),
+      score:
+        0.64 * window.score +
+        0.18 * window.speechIntensity +
+        0.12 * window.vocalExcitement +
+        0.06 * window.emotionIntensity
+    }))
+    .sort((a, b) => a.score - b.score)
+
+  const desired = clamp(Math.floor(durationSeconds / 110) + 1, 1, 3)
+  const selected: TimeRange[] = []
+  for (const candidate of candidates) {
+    if (selected.length >= desired) break
+    const overlaps = selected.some(
+      (existing) => candidate.start < existing.end + 5 && candidate.end > existing.start - 5
+    )
+    if (overlaps) continue
+    selected.push({ start: candidate.start, end: candidate.end })
+  }
+  return mergeRanges(selected)
+}
+
 const applyPacingPattern = (
   segments: Segment[],
   minLen: number,
@@ -1078,7 +1199,10 @@ const buildEditPlan = async (
   const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges, faceSamples, textSamples)
 
   const boringFlags = options.removeBoring ? buildBoringFlags(windows, silences) : windows.map(() => false)
-  const removedSegments = options.removeBoring ? buildBoringCuts(boringFlags) : []
+  const detectedRemovedSegments = options.removeBoring ? buildBoringCuts(boringFlags) : []
+  const removedSegments = options.removeBoring
+    ? (detectedRemovedSegments.length ? detectedRemovedSegments : buildStrategicFallbackCuts(windows, durationSeconds))
+    : []
   const compressedSegments: TimeRange[] = []
 
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
@@ -1239,7 +1363,7 @@ const buildAtempoChain = (speed: number) => {
 
 const buildConcatFilter = (
   segments: Segment[],
-  opts: { withAudio: boolean; hasAudioStream: boolean; targetWidth: number; targetHeight: number }
+  opts: { withAudio: boolean; hasAudioStream: boolean; targetWidth: number; targetHeight: number; enableFades?: boolean }
 ) => {
   const parts: string[] = []
   const scalePad = `scale=${opts.targetWidth}:${opts.targetHeight}:force_original_aspect_ratio=decrease,pad=${opts.targetWidth}:${opts.targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
@@ -1277,7 +1401,8 @@ const buildConcatFilter = (
     }
   })
 
-  if (segments.length <= 1 || STITCH_FADE_SEC <= 0) {
+  const enableFades = opts.enableFades !== false
+  if (segments.length <= 1 || STITCH_FADE_SEC <= 0 || !enableFades) {
     if (opts.withAudio) {
       const inputs = segments.map((_, idx) => `[v${idx}][a${idx}]`).join('')
       parts.push(`${inputs}concat=n=${segments.length}:v=1:a=1[outv][outa]`)
@@ -1431,6 +1556,96 @@ const generateProxy = async (inputPath: string, outPath: string, opts?: { width?
   await runFfmpeg(args)
 }
 
+const buildVerticalClipRanges = (durationSeconds: number, requestedCount: number) => {
+  const total = Math.max(0, durationSeconds || 0)
+  if (total <= 0) return [{ start: 0, end: 0 }]
+  let clipCount = clamp(requestedCount || 1, 1, MAX_VERTICAL_CLIPS)
+  const maxFeasibleByLength = Math.max(1, Math.floor(total / MIN_VERTICAL_CLIP_SECONDS))
+  clipCount = Math.min(clipCount, maxFeasibleByLength)
+  const chunk = total / clipCount
+  const ranges: TimeRange[] = []
+  for (let index = 0; index < clipCount; index += 1) {
+    const start = Number((index * chunk).toFixed(3))
+    const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
+    if (end - start > 0.2) ranges.push({ start, end })
+  }
+  return ranges.length ? ranges : [{ start: 0, end: total }]
+}
+
+const renderVerticalClip = async ({
+  inputPath,
+  outputPath,
+  start,
+  end,
+  width,
+  height,
+  webcamFocus,
+  withAudio
+}: {
+  inputPath: string
+  outputPath: string
+  start: number
+  end: number
+  width: number
+  height: number
+  webcamFocus: WebcamFocus
+  withAudio: boolean
+}) => {
+  const topHeight = Math.round(height * 0.38)
+  const bottomHeight = Math.max(1, height - topHeight)
+  const x = clamp(webcamFocus.x, 0, 1)
+  const y = clamp(webcamFocus.y, 0, 1)
+  const focusX = Number(x.toFixed(4))
+  const focusY = Number(y.toFixed(4))
+  const cropXExpr = `min(max(0,${focusX}*iw-${width}/2),iw-${width})`
+  const cropYExpr = `min(max(0,${focusY}*ih-${topHeight}/2),ih-${topHeight})`
+
+  const topFilter = `scale=${width}:${topHeight}:force_original_aspect_ratio=increase,crop=${width}:${topHeight}:${cropXExpr}:${cropYExpr},setsar=1,format=yuv420p`
+  const bottomFilter = `scale=${width}:${bottomHeight}:force_original_aspect_ratio=decrease,pad=${width}:${bottomHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
+
+  const filterParts = [
+    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,${topFilter}[top]`,
+    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,${bottomFilter}[bottom]`,
+    '[top][bottom]vstack=inputs=2[outv]'
+  ]
+  if (withAudio) {
+    filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]`)
+  }
+
+  const args = [
+    '-y',
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    inputPath,
+    '-movflags',
+    '+faststart',
+    '-c:v',
+    'libx264',
+    '-preset',
+    process.env.FFMPEG_PRESET || 'medium',
+    '-crf',
+    process.env.FFMPEG_CRF || '20',
+    '-threads',
+    '0',
+    '-pix_fmt',
+    'yuv420p',
+    '-filter_complex',
+    filterParts.join(';'),
+    '-map',
+    '[outv]'
+  ]
+  if (withAudio) {
+    args.push('-map', '[outa]', '-c:a', 'aac')
+  } else {
+    args.push('-an')
+  }
+  args.push(outputPath)
+  await runFfmpeg(args)
+}
+
 const buildAudioFilters = () => {
   return [
     'highpass=f=80',
@@ -1489,18 +1704,20 @@ const ensureUsageWithinLimits = async (
   plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
 ) => {
   const monthKey = getMonthKey()
-  const renderUsage = await getRenderUsageForMonth(userId, monthKey)
-  const maxRenders = plan.maxRendersPerMonth
-  if (maxRenders !== null && maxRenders !== undefined) {
-    if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
-      const requiredPlan = getRequiredPlanForRenders(tier)
-      throw new PlanLimitError(
-        'Monthly render limit reached. Upgrade to continue.',
-        'renders',
-        requiredPlan,
-        undefined,
-        'RENDER_LIMIT_REACHED'
-      )
+  if (tier !== 'free') {
+    const renderUsage = await getRenderUsageForMonth(userId, monthKey)
+    const maxRenders = plan.maxRendersPerMonth
+    if (maxRenders !== null && maxRenders !== undefined) {
+      if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
+        const requiredPlan = getRequiredPlanForRenders(tier)
+        throw new PlanLimitError(
+          'Monthly render limit reached. Upgrade to continue.',
+          'renders',
+          requiredPlan,
+          undefined,
+          'RENDER_LIMIT_REACHED'
+        )
+      }
     }
   }
   const usage = await getUsageForMonth(userId, monthKey)
@@ -1629,8 +1846,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
     // preserve any proxyPath that was uploaded earlier so the frontend can preview
     const freshJob = await prisma.job.findUnique({ where: { id: jobId } })
-    const existingProxyPath = (freshJob?.analysis as any)?.proxyPath ?? null
+    const existingAnalysis = (freshJob?.analysis as any) || (job.analysis as any) || {}
+    const existingProxyPath = existingAnalysis?.proxyPath ?? null
+    const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis)
     const analysis = {
+      ...existingAnalysis,
       duration: duration ?? 0,
       size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
       filename: path.basename(job.inputPath),
@@ -1640,7 +1860,14 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       removed_segments: editPlan?.removedSegments ?? [],
       compressed_segments: editPlan?.compressedSegments ?? [],
       editPlan,
-      proxyPath: existingProxyPath
+      proxyPath: existingProxyPath,
+      renderMode: renderConfig.mode,
+      vertical: renderConfig.mode === 'vertical'
+        ? {
+            clipCount: renderConfig.verticalClipCount,
+            webcamFocus: renderConfig.webcamFocus
+          }
+        : null
     }
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -1708,6 +1935,7 @@ const processJob = async (
     throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
   }
   const watermarkEnabled = features.watermark
+  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any)
 
   await updateJob(jobId, {
     requestedQuality: desiredQuality,
@@ -1905,12 +2133,6 @@ const processJob = async (
 
       try {
         if (hasSegments) {
-          const concatFilter = buildConcatFilter(finalSegments, {
-            withAudio,
-            hasAudioStream: hasAudio,
-            targetWidth: target.width,
-            targetHeight: target.height
-          })
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
           // If using an image watermark we must add the watermark file as a second input
           // so ffmpeg can reference it as input index 1 in the overlay filter.
@@ -1918,7 +2140,14 @@ const processJob = async (
           if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
           const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
 
-          const runWithChain = async (videoChain: string) => {
+          const runWithChain = async (videoChain: string, enableFades: boolean) => {
+            const concatFilter = buildConcatFilter(finalSegments, {
+              withAudio,
+              hasAudioStream: hasAudio,
+              targetWidth: target.width,
+              targetHeight: target.height,
+              enableFades
+            })
             const filterParts: string[] = [concatFilter]
             if (videoChain) {
               filterParts.push(`[outv]${videoChain}[vout]`)
@@ -1943,19 +2172,29 @@ const processJob = async (
           let lastErr: any = null
           let ran = false
           for (const chain of videoChains) {
-            try {
-              await runWithChain(chain)
-              ran = true
-              if (chain !== fullVideoChain) {
-                const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
+            for (const enableFades of [true, false]) {
+              try {
+                await runWithChain(chain, enableFades)
+                ran = true
+                if (chain !== fullVideoChain) {
+                  const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
+                  optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
+                }
+                if (!enableFades) {
+                  const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
+                  optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
+                }
+                break
+              } catch (err) {
+                lastErr = err
               }
-              break
-            } catch (err) {
-              lastErr = err
             }
+            if (ran) break
           }
-          if (!ran) throw lastErr || new Error('ffmpeg_failed')
+          if (!ran) {
+            const reason = summarizeFfmpegError(lastErr)
+            throw new Error(`edited_render_failed:${reason}`)
+          }
         } else {
           const fallbackArgs = [
             ...argsBase,
@@ -2006,28 +2245,84 @@ const processJob = async (
     }
 
     await updateJob(jobId, { progress: 95 })
-    const outBuf = fs.readFileSync(tmpOut)
-    const outPath = `${job.userId}/${jobId}/output.mp4`
+
+    const outputPaths: string[] = []
     const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
     fs.mkdirSync(localOutDir, { recursive: true })
-    const localOutPath = path.join(localOutDir, 'output.mp4')
-    fs.copyFileSync(tmpOut, localOutPath)
-    console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
-    try {
-      await uploadBufferToOutput({ key: outPath, body: outBuf, contentType: 'video/mp4' })
-    } catch (e) {
-      await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
-      throw new Error('upload_failed')
+    if (renderConfig.mode === 'vertical') {
+      const editedDuration = getDurationSeconds(tmpOut) ?? durationSeconds
+      const clipRanges = buildVerticalClipRanges(editedDuration || 0, renderConfig.verticalClipCount)
+      const webcamFocus = renderConfig.webcamFocus ?? { x: 0.5, y: 0.5 }
+      const verticalTarget = getVerticalTargetDimensions(finalQuality)
+      const renderedClipPaths: string[] = []
+      const hasEditedAudio = hasAudioStream(tmpOut)
+      for (let idx = 0; idx < clipRanges.length; idx += 1) {
+        const range = clipRanges[idx]
+        const localClipPath = path.join(localOutDir, `vertical-clip-${idx + 1}.mp4`)
+        await renderVerticalClip({
+          inputPath: tmpOut,
+          outputPath: localClipPath,
+          start: range.start,
+          end: range.end,
+          width: verticalTarget.width,
+          height: verticalTarget.height,
+          webcamFocus,
+          withAudio: hasEditedAudio
+        })
+        const clipStats = fs.statSync(localClipPath)
+        if (!clipStats.isFile() || clipStats.size <= 0) {
+          throw new Error(`vertical_clip_empty_${idx + 1}`)
+        }
+        renderedClipPaths.push(localClipPath)
+      }
+      for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
+        const clipPath = renderedClipPaths[idx]
+        const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
+        const body = fs.readFileSync(clipPath)
+        await uploadBufferToOutput({ key, body, contentType: 'video/mp4' })
+        outputPaths.push(key)
+      }
+    } else {
+      const outBuf = fs.readFileSync(tmpOut)
+      const outPath = `${job.userId}/${jobId}/output.mp4`
+      const localOutPath = path.join(localOutDir, 'output.mp4')
+      fs.copyFileSync(tmpOut, localOutPath)
+      console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
+      try {
+        await uploadBufferToOutput({ key: outPath, body: outBuf, contentType: 'video/mp4' })
+      } catch (e) {
+        await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
+        throw new Error('upload_failed')
+      }
+      outputPaths.push(outPath)
+    }
+
+    if (!outputPaths.length) {
+      await updateJob(jobId, { status: 'failed', error: 'output_upload_missing' })
+      throw new Error('output_upload_missing')
+    }
+
+    const nextAnalysis = {
+      ...((job.analysis as any) || {}),
+      renderMode: renderConfig.mode,
+      vertical: renderConfig.mode === 'vertical'
+        ? {
+            clipCount: outputPaths.length,
+            webcamFocus: renderConfig.webcamFocus
+          }
+        : null,
+      verticalOutputPaths: renderConfig.mode === 'vertical' ? outputPaths : null
     }
 
     await updateJob(jobId, {
       status: 'completed',
       progress: 100,
-      outputPath: outPath,
+      outputPath: outputPaths[0],
       finalQuality,
       watermarkApplied: watermarkEnabled,
       retentionScore,
-      optimizationNotes: optimizationNotes.length ? optimizationNotes : null
+      optimizationNotes: optimizationNotes.length ? optimizationNotes : null,
+      analysis: nextAnalysis
     })
 
     const monthKey = getMonthKey()
@@ -2105,6 +2400,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const id = crypto.randomUUID()
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
+    const renderConfig = parseRenderConfigFromRequest(req.body)
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -2117,11 +2413,18 @@ const handleCreateJob = async (req: any, res: any) => {
 
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
-    const monthKey = getMonthKey()
-    const renderUsage = await getRenderUsageForMonth(userId, monthKey)
-    if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
-      if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-        return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
+    if (tier === 'free') {
+      const dailyUsage = await getRenderAttemptsForDay(userId)
+      if ((dailyUsage?.rendersCount ?? 0) >= FREE_DAILY_RENDER_LIMIT) {
+        return res.status(403).json(buildDailyRenderLimitPayload(dailyUsage))
+      }
+    } else {
+      const monthKey = getMonthKey()
+      const renderUsage = await getRenderUsageForMonth(userId, monthKey)
+      if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
+        if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+          return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
+        }
       }
     }
     const subtitleRequest = req.body?.subtitles
@@ -2164,7 +2467,17 @@ const handleCreateJob = async (req: any, res: any) => {
         inputPath,
         progress: 0,
         requestedQuality: desiredQuality,
-        priorityLevel: plan.priority ? 1 : 2
+        priorityLevel: plan.priority ? 1 : 2,
+        analysis: {
+          renderMode: renderConfig.mode,
+          vertical: renderConfig.mode === 'vertical'
+            ? {
+                clipCount: renderConfig.verticalClipCount,
+                webcamFocus: renderConfig.webcamFocus
+              }
+            : null,
+          verticalOutputPaths: null
+        }
       }
     })
 
@@ -2226,7 +2539,8 @@ router.get('/', async (req: any, res) => {
       requestedQuality: job.requestedQuality,
       watermark: job.watermarkApplied,
       inputPath: job.inputPath,
-      progress: job.progress
+      progress: job.progress,
+      renderMode: parseRenderMode((job.analysis as any)?.renderMode)
     }))
     res.json({ jobs: payload })
   } catch (err) {
@@ -2249,11 +2563,16 @@ router.get('/:id', async (req: any, res) => {
       // any intermediate states are processing
       return 'PROCESSING'
     }
+    const normalizedStatus = job.status === 'completed' ? 'ready' : job.status
 
     const jobPayload: any = {
       ...job,
-      status: mapStatus(job.status),
+      // Keep the detailed pipeline status for the editor UI.
+      status: normalizedStatus,
+      // Legacy coarse-grained status for older clients.
+      legacyStatus: mapStatus(job.status),
       watermark: job.watermarkApplied,
+      renderMode: parseRenderMode((job.analysis as any)?.renderMode),
       steps: [
         { key: 'queued', label: 'Queued' },
         { key: 'uploading', label: 'Uploading' },
@@ -2262,18 +2581,28 @@ router.get('/:id', async (req: any, res) => {
         { key: 'cutting', label: 'Cuts' },
         { key: 'pacing', label: 'Pacing' },
         { key: 'story', label: 'Story' },
+        { key: 'audio', label: 'Audio' },
+        { key: 'retention', label: 'Retention' },
         { key: 'subtitling', label: 'Subtitles' },
         { key: 'rendering', label: 'Rendering' },
         { key: 'ready', label: 'Ready' }
       ]
     }
-    if (job.status === 'completed' && job.outputPath) {
+    const outputPaths = getOutputPathsForJob(job)
+    if (job.status === 'completed' && outputPaths.length > 0) {
       try {
         await ensureBucket(OUTPUT_BUCKET, false)
         const expires = 60 * 10
         try {
-          const signed = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
-          jobPayload.outputUrl = signed
+          const signedUrls: string[] = []
+          for (const outputPath of outputPaths) {
+            const signed = await getSignedOutputUrl({ key: outputPath, expiresIn: expires })
+            signedUrls.push(signed)
+          }
+          if (signedUrls.length > 0) {
+            jobPayload.outputUrls = signedUrls
+            jobPayload.outputUrl = signedUrls[0]
+          }
         } catch (err) {
           // ignore signed URL failures; client can fallback to output-url endpoint
         }
@@ -2281,9 +2610,13 @@ router.get('/:id', async (req: any, res) => {
         // ignore
       }
     }
-    if (job.outputPath) {
+    if (outputPaths.length > 0) {
       try {
-        jobPayload.fileName = path.basename(job.outputPath)
+        jobPayload.fileName = path.basename(outputPaths[0])
+        jobPayload.outputFiles = outputPaths.map((outputPath) => ({
+          key: outputPath,
+          fileName: path.basename(outputPath)
+        }))
       } catch (e) {
         // ignore
       }
@@ -2299,16 +2632,21 @@ router.post('/:id/download-url', async (req: any, res) => {
   try {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
-    if (!job || job.userId !== req.user.id || !job.outputPath) return res.status(404).json({ error: 'not_found' })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
     if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+    const outputPaths = getOutputPathsForJob(job)
+    if (!outputPaths.length) return res.status(404).json({ error: 'not_found' })
+    const requestedClip = Number.parseInt(String(req.body?.clip ?? req.query?.clip ?? '1'), 10)
+    const clipIndex = Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0
+    const selectedOutputPath = outputPaths[clipIndex]
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
     try {
-      const url = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
+      const url = await getSignedOutputUrl({ key: selectedOutputPath, expiresIn: expires })
 
       // schedule auto-delete 1 minute after user requests download
       try {
-        const keyToDelete = job.outputPath
+        const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
         if (keyToDelete) {
           setTimeout(async () => {
             try {
@@ -2363,12 +2701,14 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
-    const { plan } = await getUserPlan(req.user.id)
-    const monthKey = getMonthKey()
-    const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
-    if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
-      if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-        return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
+    const { plan, tier } = await getUserPlan(req.user.id)
+    if (tier !== 'free') {
+      const monthKey = getMonthKey()
+      const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
+      if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
+        if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
+          return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
+        }
       }
     }
 
@@ -2445,15 +2785,20 @@ router.get('/:id/output-url', async (req: any, res) => {
   try {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
-    if (!job || job.userId !== req.user.id || !job.outputPath) return res.status(404).json({ error: 'not_found' })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const outputPaths = getOutputPathsForJob(job)
+    if (!outputPaths.length) return res.status(404).json({ error: 'not_found' })
+    const requestedClip = Number.parseInt(String(req.query?.clip ?? '1'), 10)
+    const clipIndex = Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0
+    const selectedOutputPath = outputPaths[clipIndex]
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
     try {
-      const url = await getSignedOutputUrl({ key: job.outputPath, expiresIn: expires })
+      const url = await getSignedOutputUrl({ key: selectedOutputPath, expiresIn: expires })
 
       // schedule auto-delete 1 minute after user requests download
       try {
-        const keyToDelete = job.outputPath
+        const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
         if (keyToDelete) {
           setTimeout(async () => {
             try {

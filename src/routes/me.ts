@@ -2,6 +2,7 @@ import express from 'express'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth } from '../services/usage'
+import { getRenderAttemptsForDay } from '../services/dailyRenderUsage'
 import { getMonthKey } from '../shared/planConfig'
 import { getPlanFeatures } from '../lib/planFeatures'
 import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
@@ -22,6 +23,7 @@ router.get('/', async (req: any, res) => {
   const { subscription, tier, plan } = await getUserPlan(id)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
+  const dailyUsage = tier === 'free' ? await getRenderAttemptsForDay(id) : null
   const email = String(user.email || '').toLowerCase()
   const isDev = Boolean(
     (email && DEV_ACCOUNT_EMAILS.includes(email)) ||
@@ -43,8 +45,16 @@ router.get('/', async (req: any, res) => {
       rendersUsed: usage?.rendersUsed ?? 0,
       minutesUsed: usage?.minutesUsed ?? 0
     },
+    usageDaily: dailyUsage
+      ? {
+          day: dailyUsage.dayKey,
+          rendersUsed: dailyUsage.rendersCount,
+          rendersLimit: 1
+        }
+      : null,
     limits: {
-      maxRendersPerMonth: plan.maxRendersPerMonth,
+      maxRendersPerMonth: tier === 'free' ? null : plan.maxRendersPerMonth,
+      maxRendersPerDay: tier === 'free' ? 1 : null,
       maxMinutesPerMonth: plan.maxMinutesPerMonth,
       exportQuality: plan.exportQuality,
       watermark: plan.watermark,
