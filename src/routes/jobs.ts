@@ -12,8 +12,7 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
-import { getRenderModeUsageForMonth } from '../services/renderModeUsage'
-import { getMonthKey, type PlanTier } from '../shared/planConfig'
+import { PLAN_CONFIG, getMonthKey, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { isDevAccount } from '../lib/devAccounts'
@@ -275,11 +274,13 @@ const getVerticalTargetDimensions = (quality?: ExportQuality | null) => {
 type TimeRange = { start: number; end: number }
 type Segment = { start: number; end: number; speed?: number; zoom?: number; brightness?: number; emphasize?: boolean }
 type WebcamFocus = { x: number; y: number }
+type WebcamCrop = { x: number; y: number; width: number; height: number }
 type RenderMode = 'standard' | 'vertical'
 type RenderConfig = {
   mode: RenderMode
   verticalClipCount: number
   webcamFocus: WebcamFocus | null
+  webcamCrop: WebcamCrop | null
 }
 type EngagementWindow = {
   time: number
@@ -341,7 +342,8 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MAX_VERTICAL_CLIPS = 3
 const MIN_VERTICAL_CLIP_SECONDS = 8
-const FREE_VERTICAL_MONTHLY_RENDER_LIMIT = 1
+const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
+const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -379,27 +381,51 @@ const parseWebcamFocus = (value?: any): WebcamFocus | null => {
   }
 }
 
+const parseWebcamCrop = (value?: any): WebcamCrop | null => {
+  if (!value || typeof value !== 'object') return null
+  const x = Number((value as any).x)
+  const y = Number((value as any).y)
+  const width = Number((value as any).width)
+  const height = Number((value as any).height)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null
+  const clampedX = clamp(x, 0, 1 - MIN_WEBCAM_CROP_RATIO)
+  const clampedY = clamp(y, 0, 1 - MIN_WEBCAM_CROP_RATIO)
+  const maxWidth = 1 - clampedX
+  const maxHeight = 1 - clampedY
+  const clampedWidth = clamp(width, MIN_WEBCAM_CROP_RATIO, maxWidth)
+  const clampedHeight = clamp(height, MIN_WEBCAM_CROP_RATIO, maxHeight)
+  if (clampedWidth <= 0 || clampedHeight <= 0) return null
+  return {
+    x: Number(clampedX.toFixed(4)),
+    y: Number(clampedY.toFixed(4)),
+    width: Number(clampedWidth.toFixed(4)),
+    height: Number(clampedHeight.toFixed(4))
+  }
+}
+
 const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
   const mode = parseRenderMode(body?.renderMode || body?.mode)
   if (mode !== 'vertical') {
-    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null }
+    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null, webcamCrop: null }
   }
   return {
     mode: 'vertical',
     verticalClipCount: parseVerticalClipCount(body?.verticalClipCount),
-    webcamFocus: parseWebcamFocus(body?.webcamFocus)
+    webcamFocus: parseWebcamFocus(body?.webcamFocus),
+    webcamCrop: parseWebcamCrop(body?.webcamCrop)
   }
 }
 
 const parseRenderConfigFromAnalysis = (analysis?: any): RenderConfig => {
   const mode = parseRenderMode(analysis?.renderMode)
   if (mode !== 'vertical') {
-    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null }
+    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null, webcamCrop: null }
   }
   return {
     mode: 'vertical',
     verticalClipCount: parseVerticalClipCount(analysis?.vertical?.clipCount),
-    webcamFocus: parseWebcamFocus(analysis?.vertical?.webcamFocus)
+    webcamFocus: parseWebcamFocus(analysis?.vertical?.webcamFocus),
+    webcamCrop: parseWebcamCrop(analysis?.vertical?.webcamCrop)
   }
 }
 
@@ -435,21 +461,8 @@ const buildRenderLimitPayload = (
   }
 }
 
-const buildVerticalRenderLimitPayload = (usage?: { rendersCount?: number | null; monthKey?: string | null }) => {
-  const rendersUsed = typeof usage?.rendersCount === 'number' ? usage.rendersCount : FREE_VERTICAL_MONTHLY_RENDER_LIMIT
-  return {
-    error: 'VERTICAL_RENDER_LIMIT_REACHED',
-    code: 'VERTICAL_RENDER_LIMIT_REACHED',
-    message: 'Free plan includes 1 vertical render per month. Upgrade to unlock more vertical renders.',
-    rendersRemainingVertical: Math.max(0, FREE_VERTICAL_MONTHLY_RENDER_LIMIT - rendersUsed),
-    maxVerticalRendersPerMonth: FREE_VERTICAL_MONTHLY_RENDER_LIMIT,
-    verticalRendersUsed: rendersUsed,
-    month: usage?.monthKey ?? getMonthKey()
-  }
-}
-
 type RenderLimitViolation = {
-  code: 'RENDER_LIMIT_REACHED' | 'VERTICAL_RENDER_LIMIT_REACHED'
+  code: 'RENDER_LIMIT_REACHED'
   payload: Record<string, any>
   requiredPlan: PlanTier
 }
@@ -468,37 +481,24 @@ const getRenderLimitViolation = async ({
   email,
   tier,
   plan,
-  renderMode,
+  renderMode: _renderMode,
   allowAtLimitForFree = false
 }: RenderLimitCheckArgs): Promise<RenderLimitViolation | null> => {
   if (isDevAccount(userId, email)) return null
   const requiredPlan = getRequiredPlanForRenders(tier)
 
   if (tier === 'free') {
-    if (renderMode === 'vertical') {
-      const verticalUsage = await getRenderModeUsageForMonth(userId, 'vertical')
-      const limitHit = allowAtLimitForFree
-        ? verticalUsage.rendersCount > FREE_VERTICAL_MONTHLY_RENDER_LIMIT
-        : verticalUsage.rendersCount >= FREE_VERTICAL_MONTHLY_RENDER_LIMIT
-      if (limitHit) {
-        return {
-          code: 'VERTICAL_RENDER_LIMIT_REACHED',
-          payload: buildVerticalRenderLimitPayload(verticalUsage),
-          requiredPlan
-        }
-      }
-      return null
-    }
-
-    const standardLimit = typeof plan.maxRendersPerMonth === 'number' ? plan.maxRendersPerMonth : 10
-    const standardUsage = await getRenderModeUsageForMonth(userId, 'standard')
+    const monthKey = getMonthKey()
+    const standardLimit = typeof plan.maxRendersPerMonth === 'number' ? plan.maxRendersPerMonth : FREE_MONTHLY_RENDER_LIMIT
+    const standardUsage = await getRenderUsageForMonth(userId, monthKey)
+    const used = standardUsage?.rendersCount ?? 0
     const limitHit = allowAtLimitForFree
-      ? standardUsage.rendersCount > standardLimit
-      : standardUsage.rendersCount >= standardLimit
+      ? used > standardLimit
+      : used >= standardLimit
     if (limitHit) {
       return {
         code: 'RENDER_LIMIT_REACHED',
-        payload: buildRenderLimitPayload({ maxRendersPerMonth: standardLimit }, standardUsage),
+        payload: buildRenderLimitPayload({ maxRendersPerMonth: standardLimit }, { rendersCount: used }),
         requiredPlan
       }
     }
@@ -1765,6 +1765,7 @@ const renderVerticalClip = async ({
   width,
   height,
   webcamFocus,
+  webcamCrop,
   withAudio
 }: {
   inputPath: string
@@ -1773,19 +1774,28 @@ const renderVerticalClip = async ({
   end: number
   width: number
   height: number
-  webcamFocus: WebcamFocus
+  webcamFocus: WebcamFocus | null
+  webcamCrop: WebcamCrop | null
   withAudio: boolean
 }) => {
   const topHeight = Math.round(height * 0.38)
   const bottomHeight = Math.max(1, height - topHeight)
-  const x = clamp(webcamFocus.x, 0, 1)
-  const y = clamp(webcamFocus.y, 0, 1)
-  const focusX = Number(x.toFixed(4))
-  const focusY = Number(y.toFixed(4))
-  const cropXExpr = `min(max(0,${focusX}*iw-${width}/2),iw-${width})`
-  const cropYExpr = `min(max(0,${focusY}*ih-${topHeight}/2),ih-${topHeight})`
-
-  const topFilter = `scale=${width}:${topHeight}:force_original_aspect_ratio=increase,crop=${width}:${topHeight}:${cropXExpr}:${cropYExpr},setsar=1,format=yuv420p`
+  const focusX = Number(clamp(webcamFocus?.x ?? 0.5, 0, 1).toFixed(4))
+  const focusY = Number(clamp(webcamFocus?.y ?? 0.5, 0, 1).toFixed(4))
+  const topFilter = webcamCrop
+    ? [
+        `crop=iw*${webcamCrop.width}:ih*${webcamCrop.height}:iw*${webcamCrop.x}:ih*${webcamCrop.y}`,
+        `scale=${width}:${topHeight}:force_original_aspect_ratio=decrease`,
+        `pad=${width}:${topHeight}:(ow-iw)/2:(oh-ih)/2`,
+        'setsar=1',
+        'format=yuv420p'
+      ].join(',')
+    : [
+        `scale=${width}:${topHeight}:force_original_aspect_ratio=increase`,
+        `crop=${width}:${topHeight}:(in_w-out_w)*${focusX}:(in_h-out_h)*${focusY}`,
+        'setsar=1',
+        'format=yuv420p'
+      ].join(',')
   const bottomFilter = `scale=${width}:${bottomHeight}:force_original_aspect_ratio=decrease,pad=${width}:${bottomHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
 
   const filterParts = [
@@ -2099,7 +2109,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       vertical: renderConfig.mode === 'vertical'
         ? {
             clipCount: renderConfig.verticalClipCount,
-            webcamFocus: renderConfig.webcamFocus
+            webcamFocus: renderConfig.webcamFocus,
+            webcamCrop: renderConfig.webcamCrop
           }
         : null
     }
@@ -2504,6 +2515,7 @@ const processJob = async (
       const editedDuration = getDurationSeconds(tmpOut) ?? durationSeconds
       const clipRanges = buildVerticalClipRanges(editedDuration || 0, renderConfig.verticalClipCount)
       const webcamFocus = renderConfig.webcamFocus ?? { x: 0.5, y: 0.5 }
+      const webcamCrop = renderConfig.webcamCrop ?? null
       const verticalTarget = getVerticalTargetDimensions(finalQuality)
       const renderedClipPaths: string[] = []
       const hasEditedAudio = hasAudioStream(tmpOut)
@@ -2518,6 +2530,7 @@ const processJob = async (
           width: verticalTarget.width,
           height: verticalTarget.height,
           webcamFocus,
+          webcamCrop,
           withAudio: hasEditedAudio
         })
         const clipStats = fs.statSync(localClipPath)
@@ -2557,7 +2570,8 @@ const processJob = async (
       vertical: renderConfig.mode === 'vertical'
         ? {
             clipCount: outputPaths.length,
-            webcamFocus: renderConfig.webcamFocus
+            webcamFocus: renderConfig.webcamFocus,
+            webcamCrop: renderConfig.webcamCrop
           }
         : null,
       verticalOutputPaths: renderConfig.mode === 'vertical' ? outputPaths : null
@@ -2841,7 +2855,8 @@ const handleCreateJob = async (req: any, res: any) => {
           vertical: renderConfig.mode === 'vertical'
             ? {
                 clipCount: renderConfig.verticalClipCount,
-                webcamFocus: renderConfig.webcamFocus
+                webcamFocus: renderConfig.webcamFocus,
+                webcamCrop: renderConfig.webcamCrop
               }
             : null,
           verticalOutputPaths: null

@@ -75,8 +75,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     badge: null,
     features: [
       '720p exports',
-      '10 standard renders / month',
-      '1 vertical render / month',
+      '10 renders / month',
       'Watermark',
       'Standard queue',
       'Subtitles: 1 preset',

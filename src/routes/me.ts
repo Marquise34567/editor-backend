@@ -10,8 +10,6 @@ import { isDevAccount } from '../lib/devAccounts'
 
 const router = express.Router()
 
-const FREE_VERTICAL_MONTHLY_RENDER_LIMIT = 1
-
 router.get('/', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
@@ -22,7 +20,7 @@ router.get('/', async (req: any, res) => {
   const standardModeUsage = await getRenderModeUsageForMonth(id, 'standard')
   const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
   const isDev = isDevAccount(user.id, user.email)
-  const rendersUsed = tier === 'free' ? standardModeUsage.rendersCount : (usage?.rendersUsed ?? 0)
+  const rendersUsed = usage?.rendersUsed ?? 0
 
   res.json({
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
@@ -49,11 +47,7 @@ router.get('/', async (req: any, res) => {
     limits: {
       maxRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
       maxRendersPerDay: null,
-      maxVerticalRendersPerMonth: isDev
-        ? null
-        : tier === 'free'
-          ? FREE_VERTICAL_MONTHLY_RENDER_LIMIT
-          : plan.maxRendersPerMonth,
+      maxVerticalRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
       maxMinutesPerMonth: plan.maxMinutesPerMonth,
       exportQuality: plan.exportQuality,
       watermark: plan.watermark,
