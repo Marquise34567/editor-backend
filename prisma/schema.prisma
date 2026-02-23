@@ -95,6 +95,7 @@ model UserSettings {
   userId         String   @id
   defaultPreset  String?
   autoCaptions   Boolean  @default(false)
+  autoDownload   Boolean  @default(false)
   autoHookMove   Boolean  @default(true)
   removeBoring   Boolean  @default(true)
   onlyCuts       Boolean  @default(false)

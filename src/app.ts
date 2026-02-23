@@ -6,6 +6,7 @@ import { loadEnv } from './lib/loadEnv'
 import billingRoutes from './routes/billing'
 import checkoutRoutes from './routes/checkout'
 import jobsRoutes from './routes/jobs'
+import uploadsRoutes from './routes/uploads'
 import webhookRoutes from './webhooks/stripe'
 import meRoutes from './routes/me'
 import settingsRoutes from './routes/settings'
@@ -79,6 +80,7 @@ app.use('/api/public', publicRoutes)
 app.use('/api/billing', requireAuth, billingRoutes)
 app.use('/api', requireAuth, checkoutRoutes)
 app.use('/api/jobs', requireAuth, jobsRoutes)
+app.use('/api/uploads', requireAuth, uploadsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
 app.use('/api/admin', adminRoutes)

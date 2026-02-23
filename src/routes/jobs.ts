@@ -6,6 +6,7 @@ import crypto from 'crypto'
 import { spawn, spawnSync } from 'child_process'
 import { prisma } from '../db/prisma'
 import { supabaseAdmin } from '../supabaseClient'
+import r2 from '../lib/r2'
 import { clampQualityForTier, normalizeQuality, type ExportQuality } from '../lib/gating'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
@@ -105,7 +106,7 @@ const safeUnlink = (filePath?: string | null) => {
   }
 }
 
-const updateJob = async (jobId: string, data: any) => {
+export const updateJob = async (jobId: string, data: any) => {
   const updated = await prisma.job.update({ where: { id: jobId }, data })
   broadcastJobUpdate(updated.userId, { job: updated })
   return updated
@@ -1250,17 +1251,13 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     throw new Error('ffmpeg_missing')
   }
 
-  await ensureBucket(INPUT_BUCKET, true)
-  await ensureBucket(OUTPUT_BUCKET, false)
-  const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).download(job.inputPath)
-  if (error) {
+  const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
+  try {
+    await r2.getObjectToFile({ Key: job.inputPath, destPath: tmpIn })
+  } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
-
-  const buf = Buffer.from(await data.arrayBuffer())
-  const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
-  fs.writeFileSync(tmpIn, buf)
   try {
     const duration = getDurationSeconds(tmpIn)
     if (!duration || !Number.isFinite(duration) || duration <= 0) {
@@ -1278,9 +1275,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       const proxyBucketPath = `${job.userId}/${jobId}/proxy.mp4`
       try {
         const proxyBuf = fs.readFileSync(tmpProxy)
-        await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(proxyBucketPath, proxyBuf, { contentType: 'video/mp4', upsert: true })
-        // persist proxy path so frontend can request preview quickly
-        await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
+        try {
+          await r2.uploadBuffer({ Key: proxyBucketPath, Body: proxyBuf, ContentType: 'video/mp4' })
+          await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
+        } catch (e) {
+          console.warn('proxy upload failed', e)
+        }
       } catch (e) {
         // non-fatal: continue analysis even if upload fails
         console.warn('proxy upload failed', e)
@@ -1310,7 +1310,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
     const analysis = {
       duration: duration ?? 0,
-      size: buf.length,
+      size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
       filename: path.basename(job.inputPath),
       hook_start_time: editPlan?.hook?.start ?? null,
       hook_end_time: editPlan?.hook ? editPlan.hook.start + editPlan.hook.duration : null,
@@ -1320,7 +1320,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       editPlan
     }
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
-    await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(analysisPath, Buffer.from(JSON.stringify(analysis)), { contentType: 'application/json', upsert: true })
+    try {
+      await r2.uploadBuffer({ Key: analysisPath, Body: Buffer.from(JSON.stringify(analysis)), ContentType: 'application/json' })
+    } catch (e) {
+      console.warn('analysis upload failed', e)
+    }
     await updateJob(jobId, {
       status: editPlan ? 'pacing' : 'analyzing',
       progress: editPlan ? 50 : 30,
@@ -1393,16 +1397,15 @@ const processJob = async (
   await ensureBucket(INPUT_BUCKET, true)
   await ensureBucket(OUTPUT_BUCKET, false)
 
-  const input = await supabaseAdmin.storage.from(INPUT_BUCKET).download(job.inputPath)
-  if (input.error) {
-    await updateJob(jobId, { status: 'failed', error: 'download_failed' })
-    throw new Error('download_failed')
-  }
-  const buf = Buffer.from(await input.data.arrayBuffer())
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `${jobId}-`))
   const tmpIn = path.join(workDir, 'input')
   const tmpOut = path.join(workDir, 'output.mp4')
-  fs.writeFileSync(tmpIn, buf)
+  try {
+    await r2.getObjectToFile({ Key: job.inputPath, destPath: tmpIn })
+  } catch (e) {
+    await updateJob(jobId, { status: 'failed', error: 'download_failed' })
+    throw new Error('download_failed')
+  }
   let subtitlePath: string | null = null
   try {
     const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
@@ -1628,8 +1631,9 @@ const processJob = async (
     await updateJob(jobId, { progress: 95 })
     const outBuf = fs.readFileSync(tmpOut)
     const outPath = `${job.userId}/${jobId}/output.mp4`
-    const uploadResult = await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(outPath, outBuf, { contentType: 'video/mp4', upsert: true })
-    if (uploadResult.error) {
+    try {
+      await r2.uploadBuffer({ Key: outPath, Body: outBuf, ContentType: 'video/mp4' })
+    } catch (e) {
       await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
       throw new Error('upload_failed')
     }
@@ -1696,7 +1700,7 @@ const processQueue = () => {
   }
 }
 
-const enqueuePipeline = (item: QueueItem) => {
+export const enqueuePipeline = (item: QueueItem) => {
   const index = pipelineQueue.findIndex((queued) => queued.priorityLevel > item.priorityLevel)
   if (index === -1) {
     pipelineQueue.push(item)
@@ -1844,12 +1848,14 @@ router.get('/:id', async (req: any, res) => {
       try {
         await ensureBucket(OUTPUT_BUCKET, false)
         const expires = 60 * 10
-        const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(job.outputPath, expires)
-        if (!error && data?.signedUrl) {
-          jobPayload.outputUrl = data.signedUrl
+        try {
+          const signed = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+          jobPayload.outputUrl = signed
+        } catch (err) {
+          // ignore signed URL failures; client can fallback to output-url endpoint
         }
       } catch (err) {
-        // ignore signed URL failures; client can fallback to output-url endpoint
+        // ignore
       }
     }
     if (job.outputPath) {
@@ -1874,9 +1880,12 @@ router.post('/:id/download-url', async (req: any, res) => {
     if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
-    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(job.outputPath, expires)
-    if (error) return res.status(500).json({ error: 'signed_url_failed' })
-    return res.json({ url: data.signedUrl })
+    try {
+      const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+      return res.json({ url })
+    } catch (err) {
+      return res.status(500).json({ error: 'signed_url_failed' })
+    }
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -1971,9 +1980,12 @@ router.get('/:id/output-url', async (req: any, res) => {
     if (!job || job.userId !== req.user.id || !job.outputPath) return res.status(404).json({ error: 'not_found' })
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
-    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(job.outputPath, expires)
-    if (error) return res.status(500).json({ error: 'signed_url_failed' })
-    res.json({ url: data.signedUrl })
+    try {
+      const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+      res.json({ url })
+    } catch (err) {
+      res.status(500).json({ error: 'signed_url_failed' })
+    }
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
