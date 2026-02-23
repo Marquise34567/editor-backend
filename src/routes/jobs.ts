@@ -1717,12 +1717,22 @@ export const enqueuePipeline = (item: QueueItem) => {
 
 const handleCreateJob = async (req: any, res: any) => {
   try {
-    const userId = req.user.id
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized', message: 'Login required' })
     const { filename, inputPath: providedPath, requestedQuality } = req.body
     if (!filename && !providedPath) return res.status(400).json({ error: 'filename required' })
     const id = crypto.randomUUID()
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
+
+    // Ensure Supabase admin client envs are present for signed upload URLs
+    const missingEnvs: string[] = []
+    if (!process.env.SUPABASE_URL) missingEnvs.push('SUPABASE_URL')
+    if (!process.env.SUPABASE_SERVICE_ROLE_KEY) missingEnvs.push('SUPABASE_SERVICE_ROLE_KEY')
+    if (missingEnvs.length > 0) {
+      console.error('jobs.create misconfigured, missing envs', missingEnvs)
+      return res.status(500).json({ error: 'misconfigured', message: 'Missing env vars for storage', missing: missingEnvs })
+    }
 
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
@@ -1786,9 +1796,10 @@ const handleCreateJob = async (req: any, res: any) => {
       console.warn('createSignedUploadUrl not available or failed, returning job only', e)
       return res.json({ job, uploadUrl: null, inputPath, bucket: INPUT_BUCKET })
     }
-  } catch (err) {
-    console.error('create job', err)
-    res.status(500).json({ error: 'server_error' })
+  } catch (err: any) {
+    console.error('create job error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    res.status(500).json({ error: 'server_error', message, path: '/api/jobs/create' })
   }
 }
 
