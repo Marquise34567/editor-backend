@@ -44,7 +44,30 @@ app.use(cors({
     }
     return cb(new Error('Not allowed by CORS'))
   },
-  credentials: true
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
+}))
+
+// Ensure OPTIONS preflight responses are handled quickly for all routes
+app.options('*', cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    try {
+      const hostname = new URL(origin).hostname
+      if (originSuffixes.some((suffix) => hostname === suffix || hostname.endsWith(suffix))) {
+        return cb(null, true)
+      }
+    } catch (e) {
+      // ignore parse errors
+    }
+    return cb(new Error('Not allowed by CORS'))
+  },
+  credentials: true,
+  allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  optionsSuccessStatus: 204
 }))
 
 app.use((req, res, next) => {
@@ -101,12 +124,10 @@ app.get('/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) =>
 
 app.use((err: any, req: any, res: any, next: any) => {
   const requestId = req?.requestId
-  console.error('Unhandled error', requestId, err)
-  res.status(err?.status || 500).json({
-    error: err?.code || 'server_error',
-    message: err?.message || 'Internal error',
-    requestId
-  })
+  // Log full stack for debugging in Railway logs (avoid logging sensitive headers)
+  console.error('Unhandled error', requestId, err?.stack || err)
+  const message = err?.message || 'Internal error'
+  res.status(err?.status || 500).json({ error: 'internal_error', message, path: req?.originalUrl, requestId })
 })
 
 export default app

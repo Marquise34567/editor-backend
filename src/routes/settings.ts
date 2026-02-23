@@ -28,7 +28,16 @@ const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message:
 
 router.get('/', async (req: any, res) => {
   try {
-    const userId = req.user.id
+    // Defensive env validation for production
+    const requiredEnvs = ['DATABASE_URL', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY']
+    const missing = requiredEnvs.filter((k) => !process.env[k])
+    if (missing.length > 0) {
+      return res.status(500).json({ error: 'misconfigured', message: 'Missing env vars', missing })
+    }
+
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized', message: 'Login required' })
+
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
     const features = getPlanFeatures(tier)
@@ -57,9 +66,11 @@ router.get('/', async (req: any, res) => {
       autoZoomMax: enforcedAutoZoomMax
     }
     res.json({ settings: enforced })
-  } catch (err) {
-    console.error('get settings', err)
-    res.status(500).json({ error: 'server_error' })
+  } catch (err: any) {
+    // Log full stack to Railway logs for diagnosis (do not log auth tokens)
+    console.error('get settings error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    res.status(500).json({ error: 'server_error', message, path: '/api/settings' })
   }
 })
 
@@ -121,9 +132,10 @@ router.patch('/', async (req: any, res) => {
     }
     const updated = await prisma.userSettings.upsert({ where: { userId }, create: { userId, ...sanitized }, update: sanitized })
     res.json({ settings: updated })
-  } catch (err) {
-    console.error('save settings', err)
-    res.status(500).json({ error: 'server_error' })
+  } catch (err: any) {
+    console.error('save settings error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    res.status(500).json({ error: 'server_error', message, path: '/api/settings' })
   }
 })
 
