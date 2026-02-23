@@ -74,6 +74,7 @@ model Job {
   progress   Int      @default(0)
   error      String?
   analysis   Json?    @map("analysis")
+  renderSettings Json? @map("render_settings")
   retentionScore Int? @map("retention_score")
   optimizationNotes Json? @map("optimization_notes")
   createdAt  DateTime @default(now()) @map("created_at")

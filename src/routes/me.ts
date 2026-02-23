@@ -17,7 +17,7 @@ router.get('/', async (req: any, res) => {
   const { subscription, tier, plan } = await getUserPlan(id)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
-  const standardModeUsage = await getRenderModeUsageForMonth(id, 'standard')
+  const horizontalModeUsage = await getRenderModeUsageForMonth(id, 'horizontal')
   const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
   const isDev = isDevAccount(user.id, user.email)
   const rendersUsed = usage?.rendersUsed ?? 0
@@ -40,7 +40,8 @@ router.get('/', async (req: any, res) => {
     },
     usageByMode: {
       month,
-      standardRendersUsed: standardModeUsage.rendersCount,
+      horizontalRendersUsed: horizontalModeUsage.rendersCount,
+      standardRendersUsed: horizontalModeUsage.rendersCount,
       verticalRendersUsed: verticalModeUsage.rendersCount
     },
     usageDaily: null,

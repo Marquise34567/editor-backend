@@ -266,21 +266,30 @@ const getTargetDimensions = (quality?: ExportQuality | null) => {
   return { width: 1280, height: 720 }
 }
 
-const getVerticalTargetDimensions = (quality?: ExportQuality | null) => {
-  const horizontal = getTargetDimensions(quality)
-  return { width: horizontal.height, height: horizontal.width }
-}
-
 type TimeRange = { start: number; end: number }
 type Segment = { start: number; end: number; speed?: number; zoom?: number; brightness?: number; emphasize?: boolean }
-type WebcamFocus = { x: number; y: number }
 type WebcamCrop = { x: number; y: number; width: number; height: number }
-type RenderMode = 'standard' | 'vertical'
+type HorizontalFitMode = 'cover' | 'contain'
+type HorizontalModeOutput = 'quality' | 'source' | { width: number; height: number }
+type HorizontalModeSettings = {
+  output: HorizontalModeOutput
+  fit: HorizontalFitMode
+}
+type VerticalFitMode = 'cover' | 'contain'
+type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
+type VerticalModeSettings = {
+  enabled: boolean
+  output: { width: number; height: number }
+  webcamCrop: VerticalWebcamCrop | null
+  topHeightPx: number | null
+  bottomFit: VerticalFitMode
+}
+type RenderMode = 'horizontal' | 'vertical'
 type RenderConfig = {
   mode: RenderMode
   verticalClipCount: number
-  webcamFocus: WebcamFocus | null
-  webcamCrop: WebcamCrop | null
+  horizontalMode: HorizontalModeSettings
+  verticalMode: VerticalModeSettings | null
 }
 type EngagementWindow = {
   time: number
@@ -315,6 +324,17 @@ type EditOptions = {
   subtitleStyle?: string | null
   autoZoomMax: number
 }
+type PacingNiche = 'high_energy' | 'education' | 'talking_head' | 'story'
+type PacingProfile = {
+  niche: PacingNiche
+  minLen: number
+  maxLen: number
+  earlyTarget: number
+  middleTarget: number
+  lateTarget: number
+  jitter: number
+  speedCap: number
+}
 
 const HOOK_MIN = 5
 const HOOK_MAX = 20
@@ -336,6 +356,7 @@ const ZOOM_EASE_SEC = 0.2
 const STITCH_FADE_SEC = 0.08
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
+const SILENCE_KEEP_PADDING_SEC = 0.2
 const HOOK_ANALYZE_MAX = 600
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
@@ -344,6 +365,9 @@ const MAX_VERTICAL_CLIPS = 3
 const MIN_VERTICAL_CLIP_SECONDS = 8
 const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
 const MIN_WEBCAM_CROP_RATIO = 0.03
+const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
+const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
+const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.4
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -361,7 +385,61 @@ const clamp = (value: number, min: number, max: number) => Math.min(max, Math.ma
 
 const parseRenderMode = (value?: any): RenderMode => {
   const raw = String(value || '').trim().toLowerCase()
-  return raw === 'vertical' ? 'vertical' : 'standard'
+  if (raw === 'vertical') return 'vertical'
+  if (raw === 'horizontal' || raw === 'standard') return 'horizontal'
+  return 'horizontal'
+}
+
+const parseHorizontalFitMode = (value?: any, fallback: HorizontalFitMode = 'contain'): HorizontalFitMode => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'cover') return 'cover'
+  if (raw === 'contain') return 'contain'
+  return fallback
+}
+
+const parseHorizontalOutput = (value?: any): HorizontalModeOutput => {
+  if (value === null || value === undefined || value === '' || value === 'quality') return 'quality'
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'source') return 'source'
+  if (raw && raw !== '[object object]') return 'quality'
+  if (!value || typeof value !== 'object') return 'quality'
+  const width = Number((value as any).width)
+  const height = Number((value as any).height)
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return 'quality'
+  if (width <= 0 || height <= 0) return 'quality'
+  return {
+    width: Math.round(clamp(width, 240, 4320)),
+    height: Math.round(clamp(height, 240, 7680))
+  }
+}
+
+const parseHorizontalModeSettings = (value?: any): Partial<HorizontalModeSettings> | null => {
+  if (!value || typeof value !== 'object') return null
+  return {
+    output: parseHorizontalOutput((value as any).output),
+    fit: parseHorizontalFitMode((value as any).fit, 'contain')
+  }
+}
+
+const defaultHorizontalModeSettings = (): HorizontalModeSettings => ({
+  output: 'quality',
+  fit: 'contain'
+})
+
+const buildHorizontalModeSettings = (value?: any): HorizontalModeSettings => {
+  const defaults = defaultHorizontalModeSettings()
+  const parsed = parseHorizontalModeSettings(value)
+  return {
+    ...defaults,
+    ...(parsed || {})
+  }
+}
+
+const parseVerticalFitMode = (value?: any, fallback: VerticalFitMode = 'cover'): VerticalFitMode => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'contain') return 'contain'
+  if (raw === 'cover') return 'cover'
+  return fallback
 }
 
 const parseVerticalClipCount = (value?: any) => {
@@ -370,23 +448,12 @@ const parseVerticalClipCount = (value?: any) => {
   return clamp(parsed, 1, MAX_VERTICAL_CLIPS)
 }
 
-const parseWebcamFocus = (value?: any): WebcamFocus | null => {
-  if (!value || typeof value !== 'object') return null
-  const x = Number((value as any).x)
-  const y = Number((value as any).y)
-  if (!Number.isFinite(x) || !Number.isFinite(y)) return null
-  return {
-    x: clamp(x, 0, 1),
-    y: clamp(y, 0, 1)
-  }
-}
-
 const parseWebcamCrop = (value?: any): WebcamCrop | null => {
   if (!value || typeof value !== 'object') return null
   const x = Number((value as any).x)
   const y = Number((value as any).y)
-  const width = Number((value as any).width)
-  const height = Number((value as any).height)
+  const width = Number((value as any).width ?? (value as any).w)
+  const height = Number((value as any).height ?? (value as any).h)
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height)) return null
   const clampedX = clamp(x, 0, 1 - MIN_WEBCAM_CROP_RATIO)
   const clampedY = clamp(y, 0, 1 - MIN_WEBCAM_CROP_RATIO)
@@ -403,30 +470,214 @@ const parseWebcamCrop = (value?: any): WebcamCrop | null => {
   }
 }
 
-const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
-  const mode = parseRenderMode(body?.renderMode || body?.mode)
-  if (mode !== 'vertical') {
-    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null, webcamCrop: null }
-  }
+const parseVerticalWebcamCrop = (value?: any): VerticalWebcamCrop | null => {
+  if (!value || typeof value !== 'object') return null
+  const x = Number((value as any).x)
+  const y = Number((value as any).y)
+  const w = Number((value as any).w ?? (value as any).width)
+  const h = Number((value as any).h ?? (value as any).height)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h)) return null
+  if (w <= 0 || h <= 0) return null
   return {
-    mode: 'vertical',
-    verticalClipCount: parseVerticalClipCount(body?.verticalClipCount),
-    webcamFocus: parseWebcamFocus(body?.webcamFocus),
-    webcamCrop: parseWebcamCrop(body?.webcamCrop)
+    x: Number(x.toFixed(4)),
+    y: Number(y.toFixed(4)),
+    w: Number(w.toFixed(4)),
+    h: Number(h.toFixed(4))
   }
 }
 
-const parseRenderConfigFromAnalysis = (analysis?: any): RenderConfig => {
-  const mode = parseRenderMode(analysis?.renderMode)
-  if (mode !== 'vertical') {
-    return { mode: 'standard', verticalClipCount: 1, webcamFocus: null, webcamCrop: null }
+const parseVerticalOutput = (value?: any) => {
+  if (!value || typeof value !== 'object') {
+    return { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT }
+  }
+  const width = Number((value as any).width)
+  const height = Number((value as any).height)
+  if (!Number.isFinite(width) || !Number.isFinite(height)) {
+    return { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT }
   }
   return {
-    mode: 'vertical',
-    verticalClipCount: parseVerticalClipCount(analysis?.vertical?.clipCount),
-    webcamFocus: parseWebcamFocus(analysis?.vertical?.webcamFocus),
-    webcamCrop: parseWebcamCrop(analysis?.vertical?.webcamCrop)
+    width: Math.round(clamp(width, 240, 4320)),
+    height: Math.round(clamp(height, 426, 7680))
   }
+}
+
+const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> | null => {
+  if (!value || typeof value !== 'object') return null
+  const topHeightPxRaw = Number((value as any).topHeightPx)
+  return {
+    enabled: (value as any).enabled !== false,
+    output: parseVerticalOutput((value as any).output),
+    webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
+    topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
+    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover')
+  }
+}
+
+const legacyWebcamCropToVerticalCrop = (value: WebcamCrop | null): VerticalWebcamCrop | null => {
+  if (!value) return null
+  return {
+    x: Number(value.x.toFixed(4)),
+    y: Number(value.y.toFixed(4)),
+    w: Number(value.width.toFixed(4)),
+    h: Number(value.height.toFixed(4))
+  }
+}
+
+const defaultVerticalModeSettings = (): VerticalModeSettings => ({
+  enabled: true,
+  output: { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT },
+  webcamCrop: null,
+  topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
+  bottomFit: 'cover'
+})
+
+const buildVerticalModeSettings = ({
+  value,
+  legacyCrop
+}: {
+  value?: any
+  legacyCrop?: VerticalWebcamCrop | null
+}): VerticalModeSettings => {
+  const parsed = parseVerticalModeSettings(value)
+  const defaults = defaultVerticalModeSettings()
+  const merged: VerticalModeSettings = {
+    ...defaults,
+    ...(parsed || {}),
+    output: {
+      ...defaults.output,
+      ...((parsed?.output as any) || {})
+    }
+  }
+  if (!merged.webcamCrop && legacyCrop) {
+    merged.webcamCrop = legacyCrop
+  }
+  return merged
+}
+
+const parseLegacyVerticalCrop = (value?: any): VerticalWebcamCrop | null => {
+  const absolute = parseVerticalWebcamCrop(value)
+  if (absolute) return absolute
+  const normalized = parseWebcamCrop(value)
+  return legacyWebcamCropToVerticalCrop(normalized)
+}
+
+const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
+  const hasExplicitMode = body?.renderMode !== undefined || body?.mode !== undefined
+  const explicitMode = parseRenderMode(body?.renderMode || body?.mode)
+  const legacyVerticalMode = body?.verticalMode?.enabled === true
+  const mode: RenderMode = hasExplicitMode ? explicitMode : (legacyVerticalMode ? 'vertical' : 'horizontal')
+  const horizontalMode = buildHorizontalModeSettings(body?.horizontalMode)
+  if (mode !== 'vertical') {
+    return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
+  }
+  const legacyCrop = parseLegacyVerticalCrop(body?.webcamCrop)
+  return {
+    mode: 'vertical',
+    verticalClipCount: parseVerticalClipCount(body?.verticalClipCount),
+    horizontalMode,
+    verticalMode: buildVerticalModeSettings({
+      value: body?.verticalMode,
+      legacyCrop
+    })
+  }
+}
+
+const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): RenderConfig => {
+  const modeSource = renderSettings?.renderMode ?? analysis?.renderMode
+  const hasExplicitMode = modeSource !== undefined && modeSource !== null && String(modeSource).trim().length > 0
+  const mode: RenderMode = hasExplicitMode
+    ? parseRenderMode(modeSource)
+    : (renderSettings?.verticalMode?.enabled === true || analysis?.verticalMode?.enabled === true ? 'vertical' : 'horizontal')
+  const horizontalMode = buildHorizontalModeSettings(renderSettings?.horizontalMode ?? analysis?.horizontalMode)
+  if (mode !== 'vertical') {
+    return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
+  }
+  const legacyCrop = parseLegacyVerticalCrop(analysis?.vertical?.webcamCrop)
+  return {
+    mode: 'vertical',
+    verticalClipCount: parseVerticalClipCount(
+      renderSettings?.verticalClipCount ?? analysis?.verticalClipCount ?? analysis?.vertical?.clipCount
+    ),
+    horizontalMode,
+    verticalMode: buildVerticalModeSettings({
+      value: renderSettings?.verticalMode ?? analysis?.verticalMode ?? analysis?.vertical?.mode,
+      legacyCrop
+    })
+  }
+}
+
+const buildPersistedRenderSettings = (renderConfig: RenderConfig) => {
+  return {
+    renderMode: renderConfig.mode,
+    horizontalMode: renderConfig.horizontalMode,
+    verticalClipCount: renderConfig.mode === 'vertical' ? renderConfig.verticalClipCount : 1,
+    verticalMode: renderConfig.mode === 'vertical' ? renderConfig.verticalMode : null
+  }
+}
+
+const buildPersistedRenderAnalysis = ({
+  existing,
+  renderConfig,
+  outputPaths
+}: {
+  existing?: any
+  renderConfig: RenderConfig
+  outputPaths?: string[] | null
+}) => {
+  const verticalCrop = renderConfig.verticalMode?.webcamCrop
+    ? {
+        x: renderConfig.verticalMode.webcamCrop.x,
+        y: renderConfig.verticalMode.webcamCrop.y,
+        width: renderConfig.verticalMode.webcamCrop.w,
+        height: renderConfig.verticalMode.webcamCrop.h
+      }
+    : null
+  return {
+    ...(existing || {}),
+    renderMode: renderConfig.mode,
+    horizontalMode: renderConfig.horizontalMode,
+    verticalMode: renderConfig.mode === 'vertical' ? renderConfig.verticalMode : null,
+    verticalClipCount: renderConfig.mode === 'vertical' ? renderConfig.verticalClipCount : 1,
+    // Legacy fields kept for backward-compatible clients.
+    vertical: renderConfig.mode === 'vertical'
+      ? {
+          clipCount: outputPaths?.length ?? renderConfig.verticalClipCount,
+          webcamCrop: verticalCrop,
+          mode: renderConfig.verticalMode
+        }
+      : null,
+    verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
+  }
+}
+
+const resolveHorizontalTargetDimensions = ({
+  horizontalMode,
+  qualityTarget,
+  sourceWidth,
+  sourceHeight
+}: {
+  horizontalMode: HorizontalModeSettings
+  qualityTarget: { width: number; height: number }
+  sourceWidth?: number | null
+  sourceHeight?: number | null
+}) => {
+  const modeOutput = horizontalMode.output
+  if (modeOutput === 'source') {
+    if (Number.isFinite(sourceWidth) && Number.isFinite(sourceHeight) && sourceWidth && sourceHeight) {
+      return {
+        width: Math.round(clamp(Number(sourceWidth), 240, 4320)),
+        height: Math.round(clamp(Number(sourceHeight), 240, 7680))
+      }
+    }
+    return qualityTarget
+  }
+  if (modeOutput && typeof modeOutput === 'object') {
+    return {
+      width: Math.round(clamp(modeOutput.width, 240, 4320)),
+      height: Math.round(clamp(modeOutput.height, 240, 7680))
+    }
+  }
+  return qualityTarget
 }
 
 const getVerticalOutputPathsFromAnalysis = (analysis?: any) => {
@@ -995,6 +1246,15 @@ const pickBestHook = (
     .sort((a, b) => b.score - a.score)
     .slice(0, 12)
     .forEach((win) => candidates.add(Math.max(0, win.time - 1)))
+  windows
+    .slice()
+    .sort((a, b) => {
+      const aCombo = 0.6 * a.emotionIntensity + 0.4 * a.sceneChangeRate
+      const bCombo = 0.6 * b.emotionIntensity + 0.4 * b.sceneChangeRate
+      return bCombo - aCombo
+    })
+    .slice(0, 10)
+    .forEach((win) => candidates.add(Math.max(0, win.time - 1)))
   ;[0, 1, 2].forEach((start) => candidates.add(start))
   for (let start = 0; start <= Math.max(0, durationSeconds - HOOK_MIN); start += 2) {
     candidates.add(start)
@@ -1025,8 +1285,10 @@ const pickBestHook = (
       const avgSpeech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
       const avgEmotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
       const avgExcitement = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
+      const avgMotion = averageWindowMetric(windows, start, end, (window) => window.sceneChangeRate)
       const avgFace = averageWindowMetric(windows, start, end, (window) => window.facePresence)
       const hasSpike = averageWindowMetric(windows, start, end, (window) => window.emotionalSpike) > 0.05
+      const emotionalMotionBlend = Math.min(1, 0.62 * avgEmotion + 0.38 * avgMotion)
       const urgency = clamp01(1 - start / urgencyWindow)
       const earlyBoost = 0.16 * urgency
       const latePenalty =
@@ -1037,9 +1299,11 @@ const pickBestHook = (
       const mediumHookBonus = duration >= 8 && duration <= 16 ? 0.02 : 0
       const score =
         baseScore +
+        0.13 * emotionalMotionBlend +
         0.11 * avgExcitement +
         0.09 * avgEmotion +
         0.06 * avgSpeech +
+        0.05 * avgMotion +
         0.04 * avgFace +
         (hasSpike ? 0.08 : 0) +
         mediumHookBonus +
@@ -1266,35 +1530,222 @@ const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds
   return mergeRanges(selected)
 }
 
+const buildRangesFromFlags = (flags: boolean[], minDurationSeconds = 1) => {
+  const out: TimeRange[] = []
+  let runStart: number | null = null
+  for (let i = 0; i <= flags.length; i += 1) {
+    const flag = i < flags.length ? flags[i] : false
+    if (flag && runStart === null) runStart = i
+    if ((!flag || i === flags.length) && runStart !== null) {
+      const runEnd = i
+      if (runEnd - runStart >= minDurationSeconds) out.push({ start: runStart, end: runEnd })
+      runStart = null
+    }
+  }
+  return out
+}
+
+const buildSilenceTrimCuts = (silences: TimeRange[], durationSeconds: number, aggressiveMode = false) => {
+  if (!silences.length || durationSeconds <= 0) return [] as TimeRange[]
+  const keepPadding = aggressiveMode ? 0.14 : SILENCE_KEEP_PADDING_SEC
+  const minTrim = aggressiveMode ? 0.32 : 0.45
+  const edgePadding = aggressiveMode ? 0.4 : 0.55
+  const trims: TimeRange[] = []
+  for (const silence of silences) {
+    const rawStart = clamp(silence.start, 0, durationSeconds)
+    const rawEnd = clamp(silence.end, 0, durationSeconds)
+    if (rawEnd - rawStart < SILENCE_MIN) continue
+    let start = rawStart + keepPadding
+    let end = rawEnd - keepPadding
+    if (start < edgePadding) start = edgePadding
+    if (end > durationSeconds - edgePadding) end = durationSeconds - edgePadding
+    if (end - start < minTrim) continue
+    trims.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3))
+    })
+  }
+  return mergeRanges(trims)
+}
+
+const buildContinuityProtectionRanges = (windows: EngagementWindow[], aggressiveMode = false) => {
+  if (!windows.length) return [] as TimeRange[]
+  const total = windows.length
+  const activeWindows = windows.filter((window) => (
+    window.audioEnergy > 0.02 ||
+    window.sceneChangeRate > 0 ||
+    window.speechIntensity > 0.05 ||
+    window.score > 0.08
+  ))
+  const basis = activeWindows.length ? activeWindows : windows
+  const avgScene = basis.reduce((sum, window) => sum + window.sceneChangeRate, 0) / basis.length
+  const avgSpeech = basis.reduce((sum, window) => sum + window.speechIntensity, 0) / basis.length
+  const sceneFloor = clamp(avgScene + (aggressiveMode ? 0.02 : 0.06), 0.24, 0.72)
+  const speechFloor = clamp(avgSpeech + 0.04, aggressiveMode ? 0.34 : 0.38, 0.82)
+  const emotionFloor = aggressiveMode ? 0.62 : 0.66
+  const preserveFlags = windows.map((window) => {
+    const sceneAnchor = window.sceneChangeRate >= sceneFloor
+    const speechAnchor = window.speechIntensity >= speechFloor
+    const emotionalAnchor = window.emotionIntensity >= emotionFloor || window.emotionalSpike > 0
+    const strongAnchor = window.score >= (aggressiveMode ? 0.72 : 0.68)
+    return sceneAnchor || speechAnchor || emotionalAnchor || strongAnchor
+  })
+  return buildRangesFromFlags(preserveFlags, 1).map((range) => ({
+    start: Math.max(0, range.start - 0.15),
+    end: Math.min(total, range.end + 0.15)
+  }))
+}
+
+const applyContinuityGuardsToCuts = (
+  candidateCuts: TimeRange[],
+  windows: EngagementWindow[],
+  aggressiveMode = false
+) => {
+  if (!candidateCuts.length) return [] as TimeRange[]
+  const protectionRanges = buildContinuityProtectionRanges(windows, aggressiveMode)
+  if (!protectionRanges.length) return mergeRanges(candidateCuts)
+  const removable = candidateCuts.map((range) => ({ start: range.start, end: range.end, speed: 1 }))
+  const guarded = subtractRanges(removable, protectionRanges)
+  const minCut = aggressiveMode ? 0.28 : 0.34
+  return mergeRanges(
+    guarded
+      .filter((range) => range.end - range.start >= minCut)
+      .map((range) => ({
+        start: Number(range.start.toFixed(3)),
+        end: Number(range.end.toFixed(3))
+      }))
+  )
+}
+
+const inferPacingProfile = (
+  windows: EngagementWindow[],
+  durationSeconds: number,
+  aggressiveMode: boolean
+): PacingProfile => {
+  const profiles: Record<PacingNiche, Omit<PacingProfile, 'niche'>> = {
+    high_energy: {
+      minLen: 4.2,
+      maxLen: 8.4,
+      earlyTarget: 5,
+      middleTarget: 5.7,
+      lateTarget: 5.2,
+      jitter: 0.3,
+      speedCap: 1.38
+    },
+    education: {
+      minLen: 4.9,
+      maxLen: 9.6,
+      earlyTarget: 5.6,
+      middleTarget: 6.4,
+      lateTarget: 5.8,
+      jitter: 0.22,
+      speedCap: 1.3
+    },
+    talking_head: {
+      minLen: 5.4,
+      maxLen: 10.2,
+      earlyTarget: 5.9,
+      middleTarget: 6.9,
+      lateTarget: 6.1,
+      jitter: 0.18,
+      speedCap: 1.26
+    },
+    story: {
+      minLen: 4.8,
+      maxLen: 9.8,
+      earlyTarget: 5.5,
+      middleTarget: 6.5,
+      lateTarget: 5.9,
+      jitter: 0.24,
+      speedCap: 1.32
+    }
+  }
+  if (!windows.length || durationSeconds <= 0) {
+    const fallback = profiles.story
+    return { niche: 'story', ...fallback }
+  }
+
+  const activeWindows = windows.filter((window) => (
+    window.audioEnergy > 0.02 ||
+    window.sceneChangeRate > 0 ||
+    window.speechIntensity > 0.05 ||
+    window.score > 0.08
+  ))
+  const basis = activeWindows.length ? activeWindows : windows
+  const total = basis.length
+  const avgScene = basis.reduce((sum, window) => sum + window.sceneChangeRate, 0) / total
+  const avgSpeech = basis.reduce((sum, window) => sum + window.speechIntensity, 0) / total
+  const avgEmotion = basis.reduce((sum, window) => sum + window.emotionIntensity, 0) / total
+  const spikeRatio = basis.filter((window) => window.emotionalSpike > 0).length / total
+
+  let niche: PacingNiche = 'story'
+  if (avgScene > 0.42 || avgEmotion > 0.55 || spikeRatio > 0.16) {
+    niche = 'high_energy'
+  } else if (avgSpeech > 0.58 && avgScene < 0.24) {
+    niche = 'talking_head'
+  } else if (avgSpeech > 0.48 && avgScene < 0.34) {
+    niche = 'education'
+  }
+
+  const base = profiles[niche]
+  const shortFormFactor = durationSeconds < 55 ? 0.7 : durationSeconds < 90 ? 0.35 : 0
+  const aggressiveShift = aggressiveMode ? 0.55 : 0
+  const minLen = Number(clamp(base.minLen - aggressiveShift * 0.6 - shortFormFactor * 0.2, 3.8, PACE_MAX).toFixed(2))
+  const maxLen = Number(clamp(base.maxLen - aggressiveShift * 0.8 - shortFormFactor * 0.5, minLen + 1, 11).toFixed(2))
+  const speedCap = Number(clamp(base.speedCap + (aggressiveMode ? 0.1 : 0), 1.2, 1.5).toFixed(3))
+  return {
+    niche,
+    minLen,
+    maxLen,
+    earlyTarget: Math.max(minLen, base.earlyTarget - aggressiveShift * 0.5),
+    middleTarget: Math.max(minLen, base.middleTarget - aggressiveShift * 0.5),
+    lateTarget: Math.max(minLen, base.lateTarget - aggressiveShift * 0.5),
+    jitter: base.jitter + (aggressiveMode ? 0.04 : 0),
+    speedCap
+  }
+}
+
 const applyPacingPattern = (
   segments: Segment[],
   minLen: number,
   maxLen: number,
   windows: EngagementWindow[],
   durationSeconds: number,
-  aggressiveMode: boolean
+  aggressiveMode: boolean,
+  profile: PacingProfile
 ) => {
   const pickPacingSpeed = (start: number, end: number) => {
     const engagement = averageWindowMetric(windows, start, end, (window) => window.score)
     const speech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+    const scene = averageWindowMetric(windows, start, end, (window) => window.sceneChangeRate)
     const excitement = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
     const phase = durationSeconds > 0 ? start / durationSeconds : 0
     let speed = 1
-    if (engagement < 0.28) {
+    if (engagement < 0.28 || (scene < 0.18 && speech < 0.34)) {
       speed = aggressiveMode ? 1.38 : 1.26
     } else if (engagement < 0.4) {
       speed = aggressiveMode ? 1.26 : 1.16
     } else if (engagement < 0.52 && speech < 0.32) {
       speed = aggressiveMode ? 1.16 : 1.08
     }
+    if (profile.niche === 'high_energy' && scene < 0.32) {
+      speed += 0.06
+    } else if (profile.niche === 'talking_head' && speech > 0.55) {
+      speed = Math.max(1, speed - 0.05)
+    } else if (profile.niche === 'education' && speech > 0.5) {
+      speed = Math.max(1, speed - 0.04)
+    }
+    if (scene > 0.6) {
+      speed = Math.max(1, speed - 0.06)
+    }
     if (excitement > 0.72) {
       speed = Math.max(1, speed - 0.08)
     }
     // Preserve opening/closing cadence so the video doesn't feel rushed at key narrative points.
     if (phase < 0.12 || phase > 0.9) {
-      speed = Math.min(speed, 1.08)
+      speed = Math.min(speed, profile.niche === 'high_energy' ? 1.12 : 1.08)
     }
-    return Number(clamp(speed, 1, aggressiveMode ? 1.45 : 1.32).toFixed(3))
+    return Number(clamp(speed, 1, profile.speedCap).toFixed(3))
   }
 
   const out: Segment[] = []
@@ -1305,14 +1756,18 @@ const applyPacingPattern = (
     while (end - cursor > maxLen) {
       const previewEnd = Math.min(end, cursor + 4)
       const engagement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.score)
+      const speech = averageWindowMetric(windows, cursor, previewEnd, (window) => window.speechIntensity)
+      const scene = averageWindowMetric(windows, cursor, previewEnd, (window) => window.sceneChangeRate)
       const excitement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.vocalExcitement)
       const phase = durationSeconds > 0 ? cursor / durationSeconds : 0
-      let target = phase < 0.2 ? 5.8 : phase > 0.82 ? 5.6 : 6.8
+      let target = phase < 0.2 ? profile.earlyTarget : phase > 0.82 ? profile.lateTarget : profile.middleTarget
       if (engagement < 0.28) target -= 1.1
       else if (engagement > 0.72) target += 1.0
+      if (scene > 0.58) target -= 0.35
+      if (speech > 0.62 && profile.niche !== 'high_energy') target += 0.35
       if (excitement > 0.7) target -= 0.55
       if (aggressiveMode) target -= 0.65
-      const jitter = patternIdx % 2 === 0 ? -0.25 : 0.25
+      const jitter = patternIdx % 2 === 0 ? -profile.jitter : profile.jitter
       const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
       const nextEnd = Math.min(end, cursor + desired)
       const speed = pickPacingSpeed(cursor, nextEnd)
@@ -1330,6 +1785,106 @@ const applyPacingPattern = (
       }
     }
   }
+  return out
+}
+
+const maintainSceneChangeFrequency = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  aggressiveMode: boolean
+) => {
+  if (segments.length <= 1 || !windows.length) return segments
+  const activeWindows = windows.filter((window) => (
+    window.audioEnergy > 0.02 ||
+    window.sceneChangeRate > 0 ||
+    window.speechIntensity > 0.05 ||
+    window.score > 0.08
+  ))
+  const basis = activeWindows.length ? activeWindows : windows
+  const baselineSceneRate = basis.reduce((sum, window) => sum + window.sceneChangeRate, 0) / basis.length
+  if (baselineSceneRate <= 0.05) return segments
+  const weightedScene = segments.reduce((sum, seg) => {
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    const runtime = Math.max(0.1, (seg.end - seg.start) / speed)
+    const scene = averageWindowMetric(windows, seg.start, seg.end, (window) => window.sceneChangeRate)
+    return sum + runtime * scene
+  }, 0)
+  const totalRuntime = segments.reduce((sum, seg) => {
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    return sum + Math.max(0.1, (seg.end - seg.start) / speed)
+  }, 0)
+  const keptSceneRate = totalRuntime > 0 ? weightedScene / totalRuntime : baselineSceneRate
+  const minimumTarget = baselineSceneRate * (aggressiveMode ? 0.78 : 0.82)
+  if (keptSceneRate >= minimumTarget) return segments
+
+  const out = segments.map((seg) => ({ ...seg }))
+  const speedCap = aggressiveMode ? 1.5 : 1.36
+  const entries = out
+    .map((seg, idx) => ({
+      idx,
+      seg,
+      scene: averageWindowMetric(windows, seg.start, seg.end, (window) => window.sceneChangeRate),
+      score: averageWindowMetric(windows, seg.start, seg.end, (window) => window.score)
+    }))
+    .sort((a, b) => a.scene - b.scene || a.score - b.score)
+
+  let deficit = minimumTarget - keptSceneRate
+  for (const entry of entries) {
+    if (deficit <= 0) break
+    if (entry.scene >= baselineSceneRate) continue
+    const current = entry.seg.speed && entry.seg.speed > 0 ? entry.seg.speed : 1
+    const delta = clamp((baselineSceneRate - entry.scene) * 0.35, 0.04, aggressiveMode ? 0.14 : 0.1)
+    const next = Number(clamp(current + delta, 1, speedCap).toFixed(3))
+    if (next <= current + 0.01) continue
+    out[entry.idx].speed = next
+    deficit -= 0.04
+  }
+  return out
+}
+
+const stabilizeSpeechIntensity = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  aggressiveMode: boolean
+) => {
+  if (segments.length <= 1) return segments
+  const scored = segments.map((seg, idx) => {
+    const current = seg.speed && seg.speed > 0 ? seg.speed : 1
+    return {
+      idx,
+      seg,
+      current,
+      speech: averageWindowMetric(windows, seg.start, seg.end, (window) => window.speechIntensity),
+      scene: averageWindowMetric(windows, seg.start, seg.end, (window) => window.sceneChangeRate),
+      score: averageWindowMetric(windows, seg.start, seg.end, (window) => window.score)
+    }
+  })
+  const sortedSpeech = scored.map((entry) => entry.speech).sort((a, b) => a - b)
+  const medianSpeech = sortedSpeech.length
+    ? sortedSpeech[Math.floor(sortedSpeech.length / 2)]
+    : 0.4
+  const maxStep = aggressiveMode ? 0.17 : 0.13
+  const speedCap = aggressiveMode ? 1.48 : 1.34
+  const out = segments.map((seg) => ({ ...seg }))
+  let prevSpeed = scored[0]?.current ?? 1
+
+  for (const entry of scored) {
+    let target = entry.current
+    const lowSpeech = entry.speech < Math.max(0.18, medianSpeech * 0.74)
+    const weakEngagement = entry.score < (aggressiveMode ? 0.48 : 0.44)
+    if (lowSpeech && weakEngagement) {
+      target = Math.min(speedCap, target + (entry.scene < 0.25 ? 0.09 : 0.06))
+    } else if (entry.speech > Math.max(0.62, medianSpeech * 1.25)) {
+      target = Math.max(1, target - 0.05)
+    }
+    if (entry.idx > 0 && Math.abs(target - prevSpeed) > maxStep) {
+      target = prevSpeed + Math.sign(target - prevSpeed) * maxStep
+    }
+    const rounded = Number(clamp(target, 1, speedCap).toFixed(3))
+    out[entry.idx].speed = rounded
+    prevSpeed = rounded
+  }
+
   return out
 }
 
@@ -1354,6 +1909,10 @@ const buildEditPlan = async (
   tasks.push(detectTextDensity(filePath, durationSeconds).catch(() => []))
   const [silences, energySamples, sceneChanges, faceSamples, textSamples] = await Promise.all(tasks)
   const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges, faceSamples, textSamples)
+  const pacingProfile = inferPacingProfile(windows, durationSeconds, options.aggressiveMode)
+  const silenceTrimCuts = options.removeBoring
+    ? buildSilenceTrimCuts(silences, durationSeconds, options.aggressiveMode)
+    : []
 
   const boringFlags = options.removeBoring
     ? buildBoringFlags(windows, silences, options.aggressiveMode)
@@ -1361,25 +1920,33 @@ const buildEditPlan = async (
   const detectedRemovedSegments = options.removeBoring
     ? buildBoringCuts(boringFlags, options.aggressiveMode)
     : []
+  const fallbackRemovedSegments = options.removeBoring && !detectedRemovedSegments.length
+    ? buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode)
+    : []
+  const candidateRemovedSegments = mergeRanges([
+    ...(detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments),
+    ...silenceTrimCuts
+  ])
   const removedSegments = options.removeBoring
-    ? (detectedRemovedSegments.length
-      ? detectedRemovedSegments
-      : buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode))
+    ? applyContinuityGuardsToCuts(candidateRemovedSegments, windows, options.aggressiveMode)
     : []
   const compressedSegments: TimeRange[] = []
 
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
   const keepSegments = removedSegments.length ? subtractRanges(baseSegments, removedSegments) : baseSegments
 
-  const minLen = PACE_MIN
-  const maxLen = PACE_MAX
+  const minLen = pacingProfile.minLen
+  const maxLen = pacingProfile.maxLen
   const pacingInput = keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }]
   const pacedSegments = options.onlyCuts
     ? pacingInput
-    : applyPacingPattern(pacingInput, minLen, maxLen, windows, durationSeconds, options.aggressiveMode)
+    : applyPacingPattern(pacingInput, minLen, maxLen, windows, durationSeconds, options.aggressiveMode, pacingProfile)
+  const speechStabilizedSegments = options.onlyCuts
+    ? pacedSegments
+    : stabilizeSpeechIntensity(pacedSegments, windows, options.aggressiveMode)
   const normalizedKeep = options.onlyCuts
-    ? enforceSegmentLengths(pacedSegments, minLen, maxLen, windows)
-    : refineSegmentsForRetention(pacedSegments, windows, minLen, maxLen)
+    ? enforceSegmentLengths(speechStabilizedSegments, minLen, maxLen, windows)
+    : refineSegmentsForRetention(speechStabilizedSegments, windows, minLen, maxLen)
 
   if (onStage) await onStage('hooking')
   const hook = pickBestHook(durationSeconds, normalizedKeep, windows)
@@ -1389,10 +1956,16 @@ const buildEditPlan = async (
   const shouldMoveHook = options.autoHookMove && !options.onlyCuts
   const withoutHook = shouldMoveHook ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
   const finalSegments = enforceSegmentLengths(withoutHook.map((seg) => ({ ...seg })), minLen, maxLen, windows)
+  const sceneBalancedSegments = options.onlyCuts
+    ? finalSegments
+    : maintainSceneChangeFrequency(finalSegments, windows, options.aggressiveMode)
+  const speechBalancedSegments = options.onlyCuts
+    ? sceneBalancedSegments
+    : stabilizeSpeechIntensity(sceneBalancedSegments, windows, options.aggressiveMode)
 
   return {
     hook,
-    segments: finalSegments,
+    segments: speechBalancedSegments,
     silences,
     removedSegments,
     compressedSegments,
@@ -1423,15 +1996,25 @@ const applySegmentEffects = (
     const emotionIntensity = avg('emotionIntensity')
     const vocalExcitement = avg('vocalExcitement')
     const speechIntensity = avg('speechIntensity')
+    const motionScore = avg('motionScore')
     const emotionalSpike = avg('emotionalSpike')
     const isHook = hookRange ? seg.start < hookRange.end && seg.end > hookRange.start : false
-    const emphasisScore = Math.min(1, emotionIntensity * 0.6 + vocalExcitement * 0.3 + emotionalSpike * 0.1)
+    const emphasisScore = Math.min(
+      1,
+      emotionIntensity * 0.38 +
+      vocalExcitement * 0.2 +
+      speechIntensity * 0.18 +
+      motionScore * 0.16 +
+      emotionalSpike * 0.08
+    )
+    const speechEmphasis = speechIntensity > 0.58 ? 0.06 : 0
     const scoreBoost = isHook ? 0.12 : 0
-    const score = emphasisScore + scoreBoost
+    const score = emphasisScore + scoreBoost + speechEmphasis
     return {
       seg,
       facePresence,
       speechIntensity,
+      motionScore,
       emotionIntensity,
       vocalExcitement,
       emotionalSpike,
@@ -1439,13 +2022,17 @@ const applySegmentEffects = (
       score
     }
   })
+  const speechBaseline = segmentScores.length
+    ? segmentScores.reduce((sum, entry) => sum + entry.speechIntensity, 0) / segmentScores.length
+    : 0.4
 
   const zoomCandidates = segmentScores
     .filter((entry) => hasFaceSignal && entry.facePresence >= 0.25)
     .filter((entry) => {
-      if (options.aggressiveMode) return entry.score >= 0.35
-      if (entry.isHook) return entry.score >= 0.45
-      return entry.score >= 0.55 && entry.speechIntensity >= 0.25
+      if (options.aggressiveMode) return entry.score >= 0.33 || entry.speechIntensity >= 0.58
+      if (entry.isHook) return entry.score >= 0.42
+      const hasSpeechOrMotion = entry.speechIntensity >= speechBaseline * 0.72 || entry.motionScore >= 0.42
+      return entry.score >= 0.52 && hasSpeechOrMotion
     })
     .sort((a, b) => b.score - a.score)
 
@@ -1457,7 +2044,8 @@ const applySegmentEffects = (
     const duration = Math.max(0, (entry.seg.end - entry.seg.start) / speed)
     if (duration <= 0) continue
     if (duration > remainingZoom) continue
-    const baseZoom = 0.05 + 0.06 * entry.score + (entry.isHook ? 0.02 : 0)
+    const speechFactor = Math.min(1, entry.speechIntensity / Math.max(0.2, speechBaseline))
+    const baseZoom = 0.045 + 0.05 * entry.score + 0.015 * speechFactor + (entry.isHook ? 0.02 : 0)
     zoomMap.set(entry.seg, Math.min(maxZoomDelta, baseZoom))
     remainingZoom -= duration
   }
@@ -1465,8 +2053,10 @@ const applySegmentEffects = (
   return segments.map((seg) => {
     const score = segmentScores.find((entry) => entry.seg === seg)
     const hasSpike = (score?.emotionalSpike ?? 0) > 0.05
-    const calmNarrative = (score?.emotionIntensity ?? 0) < 0.4 && (score?.speechIntensity ?? 0) < 0.3
-    const alreadyStrong = (score?.score ?? 0) >= 0.72 && (score?.speechIntensity ?? 0) >= 0.45
+    const speechPeak = (score?.speechIntensity ?? 0) >= Math.max(0.58, speechBaseline * 1.2)
+    const motionEmphasis = (score?.motionScore ?? 0) > 0.5 && (score?.emotionIntensity ?? 0) > 0.48
+    const calmNarrative = (score?.emotionIntensity ?? 0) < 0.4 && (score?.speechIntensity ?? 0) < 0.3 && (score?.motionScore ?? 0) < 0.25
+    const alreadyStrong = (score?.score ?? 0) >= 0.74 && (score?.speechIntensity ?? 0) >= 0.45
     const hookBoost = score?.isHook ? 0.02 : 0
     let zoom = seg.zoom ?? 0
     let brightness = seg.brightness ?? 0
@@ -1474,11 +2064,11 @@ const applySegmentEffects = (
       const desired = zoomMap.get(seg) ?? 0
       zoom = Math.max(zoom, desired + hookBoost)
     }
-    if (!alreadyStrong && options.emotionalBoost && hasSpike) {
-      brightness = Math.max(brightness, 0.03)
+    if (!alreadyStrong && options.emotionalBoost && (hasSpike || speechPeak)) {
+      brightness = Math.max(brightness, speechPeak ? 0.02 : 0.03)
     }
     zoom = Math.min(maxZoomDelta || 0, zoom)
-    return { ...seg, zoom, brightness, emphasize: hasSpike || score?.isHook }
+    return { ...seg, zoom, brightness, emphasize: Boolean(hasSpike || speechPeak || motionEmphasis || score?.isHook) }
   })
 }
 
@@ -1526,10 +2116,17 @@ const buildAtempoChain = (speed: number) => {
 
 const buildConcatFilter = (
   segments: Segment[],
-  opts: { withAudio: boolean; hasAudioStream: boolean; targetWidth: number; targetHeight: number; enableFades?: boolean }
+  opts: {
+    withAudio: boolean
+    hasAudioStream: boolean
+    targetWidth: number
+    targetHeight: number
+    fit: HorizontalFitMode
+    enableFades?: boolean
+  }
 ) => {
   const parts: string[] = []
-  const scalePad = `scale=${opts.targetWidth}:${opts.targetHeight}:force_original_aspect_ratio=decrease,pad=${opts.targetWidth}:${opts.targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
+  const scalePad = buildFrameFitFilter(opts.fit, opts.targetWidth, opts.targetHeight)
   const durations: number[] = []
 
   segments.forEach((seg, idx) => {
@@ -1757,55 +2354,174 @@ const buildVerticalClipRanges = (durationSeconds: number, requestedCount: number
   return ranges.length ? ranges : [{ start: 0, end: total }]
 }
 
+const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
+  if (fit === 'cover') {
+    return [
+      `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+      `crop=${width}:${height}`,
+      'setsar=1',
+      'format=yuv420p'
+    ].join(',')
+  }
+  return [
+    `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+    'setsar=1',
+    'format=yuv420p'
+  ].join(',')
+}
+
+const computeVerticalTopHeightPx = (mode: VerticalModeSettings, outputHeight: number) => {
+  const explicitTop = Number(mode?.topHeightPx)
+  let topHeight = Number.isFinite(explicitTop) && explicitTop > 0
+    ? explicitTop
+    : outputHeight * DEFAULT_VERTICAL_TOP_HEIGHT_PCT
+  topHeight = Math.round(topHeight)
+  return Math.round(clamp(topHeight, 200, Math.max(200, outputHeight - 200)))
+}
+
+const normalizeVerticalCropToSource = ({
+  crop,
+  sourceWidth,
+  sourceHeight
+}: {
+  crop: VerticalWebcamCrop | null
+  sourceWidth: number
+  sourceHeight: number
+}) => {
+  const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
+  const defaultY = Math.round(clamp(sourceHeight * 0.05, 0, Math.max(0, sourceHeight - defaultHeight)))
+  let x = 0
+  let y = defaultY
+  let w = sourceWidth
+  let h = defaultHeight
+
+  if (crop) {
+    const rawValues = [crop.x, crop.y, crop.w, crop.h]
+    if (rawValues.some((value) => !Number.isFinite(value))) {
+      throw new Error('invalid_webcam_crop_values')
+    }
+    const isNormalized = crop.w <= 1.0001 && crop.h <= 1.0001 && crop.x >= -0.0001 && crop.y >= -0.0001
+    if (isNormalized) {
+      x = crop.x * sourceWidth
+      y = crop.y * sourceHeight
+      w = crop.w * sourceWidth
+      h = crop.h * sourceHeight
+    } else {
+      x = crop.x
+      y = crop.y
+      w = crop.w
+      h = crop.h
+    }
+  }
+
+  x = clamp(x, 0, Math.max(0, sourceWidth - 2))
+  y = clamp(y, 0, Math.max(0, sourceHeight - 2))
+  w = clamp(w, 2, sourceWidth - x)
+  h = clamp(h, 2, sourceHeight - y)
+  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h) || w <= 1 || h <= 1) {
+    throw new Error('invalid_webcam_crop_values')
+  }
+  return {
+    x: Math.round(x),
+    y: Math.round(y),
+    w: Math.round(w),
+    h: Math.round(h)
+  }
+}
+
+const buildVerticalBottomFilter = (fit: VerticalFitMode, outWidth: number, outHeight: number) => {
+  if (fit === 'contain') {
+    return [
+      `scale=w=${outWidth}:h=${outHeight}:force_original_aspect_ratio=decrease`,
+      `pad=${outWidth}:${outHeight}:(ow-iw)/2:(oh-ih)/2`,
+      'setsar=1',
+      'format=yuv420p'
+    ].join(',')
+  }
+  return [
+    `scale=w=${outWidth}:h=${outHeight}:force_original_aspect_ratio=increase`,
+    `crop=w=${outWidth}:h=${outHeight}`,
+    'setsar=1',
+    'format=yuv420p'
+  ].join(',')
+}
+
+const buildVerticalStackedFilterGraph = ({
+  start,
+  end,
+  crop,
+  outputWidth,
+  outputHeight,
+  topHeight,
+  bottomFit,
+  withAudio
+}: {
+  start: number
+  end: number
+  crop: VerticalWebcamCrop
+  outputWidth: number
+  outputHeight: number
+  topHeight: number
+  bottomFit: VerticalFitMode
+  withAudio: boolean
+}) => {
+  const bottomHeight = Math.max(1, outputHeight - topHeight)
+  const filters = [
+    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,split=2[vfull][vweb]`,
+    [
+      `[vweb]crop=w=${crop.w}:h=${crop.h}:x=${crop.x}:y=${crop.y}`,
+      `scale=w=${outputWidth}:h=${topHeight}:force_original_aspect_ratio=increase`,
+      `crop=w=${outputWidth}:h=${topHeight}`,
+      'setsar=1',
+      'format=yuv420p[top]'
+    ].join(','),
+    `[vfull]${buildVerticalBottomFilter(bottomFit, outputWidth, bottomHeight)}[bottom]`,
+    '[top][bottom]vstack=inputs=2[outv]'
+  ]
+  if (withAudio) {
+    filters.push('[0:a]atrim=start=' + start + ':end=' + end + ',asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]')
+  }
+  return filters.join(';')
+}
+
 const renderVerticalClip = async ({
   inputPath,
   outputPath,
   start,
   end,
-  width,
-  height,
-  webcamFocus,
-  webcamCrop,
+  verticalMode,
+  sourceWidth,
+  sourceHeight,
   withAudio
 }: {
   inputPath: string
   outputPath: string
   start: number
   end: number
-  width: number
-  height: number
-  webcamFocus: WebcamFocus | null
-  webcamCrop: WebcamCrop | null
+  verticalMode: VerticalModeSettings
+  sourceWidth: number
+  sourceHeight: number
   withAudio: boolean
 }) => {
-  const topHeight = Math.round(height * 0.38)
-  const bottomHeight = Math.max(1, height - topHeight)
-  const focusX = Number(clamp(webcamFocus?.x ?? 0.5, 0, 1).toFixed(4))
-  const focusY = Number(clamp(webcamFocus?.y ?? 0.5, 0, 1).toFixed(4))
-  const topFilter = webcamCrop
-    ? [
-        `crop=iw*${webcamCrop.width}:ih*${webcamCrop.height}:iw*${webcamCrop.x}:ih*${webcamCrop.y}`,
-        `scale=${width}:${topHeight}:force_original_aspect_ratio=decrease`,
-        `pad=${width}:${topHeight}:(ow-iw)/2:(oh-ih)/2`,
-        'setsar=1',
-        'format=yuv420p'
-      ].join(',')
-    : [
-        `scale=${width}:${topHeight}:force_original_aspect_ratio=increase`,
-        `crop=${width}:${topHeight}:(in_w-out_w)*${focusX}:(in_h-out_h)*${focusY}`,
-        'setsar=1',
-        'format=yuv420p'
-      ].join(',')
-  const bottomFilter = `scale=${width}:${bottomHeight}:force_original_aspect_ratio=decrease,pad=${width}:${bottomHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`
-
-  const filterParts = [
-    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,${topFilter}[top]`,
-    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,${bottomFilter}[bottom]`,
-    '[top][bottom]vstack=inputs=2[outv]'
-  ]
-  if (withAudio) {
-    filterParts.push(`[0:a]atrim=start=${start}:end=${end},asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]`)
-  }
+  const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
+  const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
+  const topHeight = computeVerticalTopHeightPx(verticalMode, outputHeight)
+  const sourceCrop = normalizeVerticalCropToSource({
+    crop: verticalMode.webcamCrop,
+    sourceWidth,
+    sourceHeight
+  })
+  const filterComplex = buildVerticalStackedFilterGraph({
+    start,
+    end,
+    crop: sourceCrop,
+    outputWidth,
+    outputHeight,
+    topHeight,
+    bottomFit: parseVerticalFitMode(verticalMode.bottomFit, 'cover'),
+    withAudio
+  })
 
   const args = [
     '-y',
@@ -1828,7 +2544,7 @@ const renderVerticalClip = async ({
     '-pix_fmt',
     'yuv420p',
     '-filter_complex',
-    filterParts.join(';'),
+    filterComplex,
     '-map',
     '[outv]'
   ]
@@ -2092,28 +2808,23 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const freshJob = await prisma.job.findUnique({ where: { id: jobId } })
     const existingAnalysis = (freshJob?.analysis as any) || (job.analysis as any) || {}
     const existingProxyPath = existingAnalysis?.proxyPath ?? null
-    const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis)
-    const analysis = {
-      ...existingAnalysis,
-      duration: duration ?? 0,
-      size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
-      filename: path.basename(job.inputPath),
-      hook_start_time: editPlan?.hook?.start ?? null,
-      hook_end_time: editPlan?.hook ? editPlan.hook.start + editPlan.hook.duration : null,
-      hook_score: editPlan?.hook?.score ?? null,
-      removed_segments: editPlan?.removedSegments ?? [],
-      compressed_segments: editPlan?.compressedSegments ?? [],
-      editPlan,
-      proxyPath: existingProxyPath,
-      renderMode: renderConfig.mode,
-      vertical: renderConfig.mode === 'vertical'
-        ? {
-            clipCount: renderConfig.verticalClipCount,
-            webcamFocus: renderConfig.webcamFocus,
-            webcamCrop: renderConfig.webcamCrop
-          }
-        : null
-    }
+    const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis, (freshJob as any)?.renderSettings ?? (job as any)?.renderSettings)
+    const analysis = buildPersistedRenderAnalysis({
+      existing: {
+        ...existingAnalysis,
+        duration: duration ?? 0,
+        size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
+        filename: path.basename(job.inputPath),
+        hook_start_time: editPlan?.hook?.start ?? null,
+        hook_end_time: editPlan?.hook ? editPlan.hook.start + editPlan.hook.duration : null,
+        hook_score: editPlan?.hook?.score ?? null,
+        removed_segments: editPlan?.removedSegments ?? [],
+        compressed_segments: editPlan?.compressedSegments ?? [],
+        editPlan,
+        proxyPath: existingProxyPath
+      },
+      renderConfig
+    })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
       await uploadBufferToOutput({ key: analysisPath, body: Buffer.from(JSON.stringify(analysis)), contentType: 'application/json' })
@@ -2124,6 +2835,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       status: editPlan ? 'pacing' : 'analyzing',
       progress: editPlan ? 50 : 30,
       inputDurationSeconds: duration ? Math.round(duration) : null,
+      renderSettings: buildPersistedRenderSettings(renderConfig),
       analysis: analysis
     })
     console.log(`[${requestId || 'noid'}] analyze complete ${jobId}`)
@@ -2157,30 +2869,32 @@ const processJob = async (
     const requiredPlan = getRequiredPlanForQuality(desiredQuality)
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
   }
+  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
   const rawSubtitleStyle = options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
-  if (options.autoCaptions) {
-    if (!features.subtitles.enabled) {
-      throw new PlanLimitError('Subtitles are temporarily disabled.', 'subtitles', 'creator')
+  if (renderConfig.mode === 'horizontal') {
+    if (options.autoCaptions) {
+      if (!features.subtitles.enabled) {
+        throw new PlanLimitError('Subtitles are temporarily disabled.', 'subtitles', 'creator')
+      }
+      if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
+        const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
+        throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
+      }
     }
-    if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
-      const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
-      throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
+    const autoZoomMax = Number(options.autoZoomMax ?? features.autoZoomMax)
+    if (Number.isFinite(autoZoomMax) && autoZoomMax > features.autoZoomMax) {
+      const requiredPlan = getRequiredPlanForAutoZoom(autoZoomMax)
+      throw new PlanLimitError('Upgrade to unlock higher auto zoom limits.', 'autoZoomMax', requiredPlan)
+    }
+    const wantsAdvanced = Boolean(options.emotionalBoost) || Boolean(options.aggressiveMode)
+    if (wantsAdvanced && !features.advancedEffects) {
+      const requiredPlan = getRequiredPlanForAdvancedEffects()
+      throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
     }
   }
   const subtitleStyle = rawSubtitleStyle
-  const autoZoomMax = Number(options.autoZoomMax ?? features.autoZoomMax)
-  if (Number.isFinite(autoZoomMax) && autoZoomMax > features.autoZoomMax) {
-    const requiredPlan = getRequiredPlanForAutoZoom(autoZoomMax)
-    throw new PlanLimitError('Upgrade to unlock higher auto zoom limits.', 'autoZoomMax', requiredPlan)
-  }
-  const wantsAdvanced = Boolean(options.emotionalBoost) || Boolean(options.aggressiveMode)
-  if (wantsAdvanced && !features.advancedEffects) {
-    const requiredPlan = getRequiredPlanForAdvancedEffects()
-    throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
-  }
-  const watermarkEnabled = features.watermark
-  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any)
+  const watermarkEnabled = renderConfig.mode === 'horizontal' ? features.watermark : false
 
   await updateJob(jobId, {
     requestedQuality: desiredQuality,
@@ -2231,11 +2945,106 @@ const processJob = async (
 
     await ensureUsageWithinLimits(user.id, user.email, durationMinutes, tier, plan, renderConfig.mode)
 
+    if (renderConfig.mode === 'vertical') {
+      const sourceStream = probeVideoStream(tmpIn)
+      if (!sourceStream?.width || !sourceStream?.height) {
+        throw new Error('vertical_source_dimensions_unavailable')
+      }
+      const resolvedVerticalMode = renderConfig.verticalMode
+        ? {
+            ...defaultVerticalModeSettings(),
+            ...renderConfig.verticalMode,
+            output: {
+              ...defaultVerticalModeSettings().output,
+              ...(renderConfig.verticalMode.output || {})
+            }
+          }
+        : defaultVerticalModeSettings()
+      const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount)
+      const renderedClipPaths: string[] = []
+      const outputPaths: string[] = []
+      const hasInputAudio = hasAudioStream(tmpIn)
+      const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
+      fs.mkdirSync(localOutDir, { recursive: true })
+
+      await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: false })
+
+      for (let idx = 0; idx < clipRanges.length; idx += 1) {
+        const range = clipRanges[idx]
+        const localClipPath = path.join(localOutDir, `vertical-clip-${idx + 1}.mp4`)
+        await renderVerticalClip({
+          inputPath: tmpIn,
+          outputPath: localClipPath,
+          start: range.start,
+          end: range.end,
+          verticalMode: resolvedVerticalMode,
+          sourceWidth: sourceStream.width,
+          sourceHeight: sourceStream.height,
+          withAudio: hasInputAudio
+        })
+        const clipStats = fs.statSync(localClipPath)
+        if (!clipStats.isFile() || clipStats.size <= 0) {
+          throw new Error(`vertical_clip_empty_${idx + 1}`)
+        }
+        renderedClipPaths.push(localClipPath)
+      }
+
+      await updateJob(jobId, { progress: 95 })
+
+      for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
+        const clipPath = renderedClipPaths[idx]
+        const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
+        await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
+        outputPaths.push(key)
+      }
+
+      if (!outputPaths.length) {
+        await updateJob(jobId, { status: 'failed', error: 'output_upload_missing' })
+        throw new Error('output_upload_missing')
+      }
+
+      const finalRenderConfig: RenderConfig = {
+        ...renderConfig,
+        verticalMode: resolvedVerticalMode
+      }
+      const nextAnalysis = buildPersistedRenderAnalysis({
+        existing: (job.analysis as any) || {},
+        renderConfig: finalRenderConfig,
+        outputPaths
+      })
+
+      await updateJob(jobId, {
+        status: 'completed',
+        progress: 100,
+        outputPath: outputPaths[0],
+        finalQuality,
+        watermarkApplied: false,
+        retentionScore: null,
+        optimizationNotes: null,
+        renderSettings: buildPersistedRenderSettings(finalRenderConfig),
+        analysis: nextAnalysis
+      })
+
+      const monthKey = getMonthKey()
+      await incrementUsageForMonth(user.id, monthKey, 1, durationMinutes)
+      await incrementRenderUsage(user.id, monthKey, 1)
+      console.log(`[${requestId || 'noid'}] process complete ${jobId}`)
+      return
+    }
+
     let processed = false
     let retentionScore: number | null = null
     let optimizationNotes: string[] = []
     if (hasFfmpeg()) {
-      const target = getTargetDimensions(finalQuality)
+      const qualityTarget = getTargetDimensions(finalQuality)
+      const sourceProbe = probeVideoStream(tmpIn)
+      const target = resolveHorizontalTargetDimensions({
+        horizontalMode: renderConfig.horizontalMode,
+        qualityTarget,
+        sourceWidth: sourceProbe?.width,
+        sourceHeight: sourceProbe?.height
+      })
+      const horizontalFit = parseHorizontalFitMode(renderConfig.horizontalMode.fit, 'contain')
 
       const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
       let editPlan: EditPlan | null = storedPlan?.segments ? storedPlan : null
@@ -2365,7 +3174,7 @@ const processJob = async (
         : ''
       const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
 
-      const probe = probeVideoStream(tmpIn)
+      const probe = sourceProbe
       if (probe && finalSegments.length) {
         finalSegments.forEach((seg, idx) => {
           console.log(
@@ -2408,6 +3217,7 @@ const processJob = async (
               hasAudioStream: hasAudio,
               targetWidth: target.width,
               targetHeight: target.height,
+              fit: horizontalFit,
               enableFades
             })
             const filterParts: string[] = [concatFilter]
@@ -2461,7 +3271,7 @@ const processJob = async (
           const fallbackArgs = [
             ...argsBase,
             '-vf',
-            `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+            buildFrameFitFilter(horizontalFit, target.width, target.height),
             tmpOut
           ]
           try {
@@ -2477,7 +3287,7 @@ const processJob = async (
         const emergencyArgs = [
           ...argsBase,
           '-vf',
-          `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+          buildFrameFitFilter(horizontalFit, target.width, target.height),
           tmpOut
         ]
         try {
@@ -2511,71 +3321,28 @@ const processJob = async (
     const outputPaths: string[] = []
     const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
     fs.mkdirSync(localOutDir, { recursive: true })
-    if (renderConfig.mode === 'vertical') {
-      const editedDuration = getDurationSeconds(tmpOut) ?? durationSeconds
-      const clipRanges = buildVerticalClipRanges(editedDuration || 0, renderConfig.verticalClipCount)
-      const webcamFocus = renderConfig.webcamFocus ?? { x: 0.5, y: 0.5 }
-      const webcamCrop = renderConfig.webcamCrop ?? null
-      const verticalTarget = getVerticalTargetDimensions(finalQuality)
-      const renderedClipPaths: string[] = []
-      const hasEditedAudio = hasAudioStream(tmpOut)
-      for (let idx = 0; idx < clipRanges.length; idx += 1) {
-        const range = clipRanges[idx]
-        const localClipPath = path.join(localOutDir, `vertical-clip-${idx + 1}.mp4`)
-        await renderVerticalClip({
-          inputPath: tmpOut,
-          outputPath: localClipPath,
-          start: range.start,
-          end: range.end,
-          width: verticalTarget.width,
-          height: verticalTarget.height,
-          webcamFocus,
-          webcamCrop,
-          withAudio: hasEditedAudio
-        })
-        const clipStats = fs.statSync(localClipPath)
-        if (!clipStats.isFile() || clipStats.size <= 0) {
-          throw new Error(`vertical_clip_empty_${idx + 1}`)
-        }
-        renderedClipPaths.push(localClipPath)
-      }
-      for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
-        const clipPath = renderedClipPaths[idx]
-        const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
-        await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
-        outputPaths.push(key)
-      }
-    } else {
-      const outPath = `${job.userId}/${jobId}/output.mp4`
-      const localOutPath = path.join(localOutDir, 'output.mp4')
-      fs.copyFileSync(tmpOut, localOutPath)
-      console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
-      try {
-        await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
-      } catch (e) {
-        await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
-        throw new Error('upload_failed')
-      }
-      outputPaths.push(outPath)
+    const outPath = `${job.userId}/${jobId}/output.mp4`
+    const localOutPath = path.join(localOutDir, 'output.mp4')
+    fs.copyFileSync(tmpOut, localOutPath)
+    console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
+    try {
+      await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
+    } catch (e) {
+      await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
+      throw new Error('upload_failed')
     }
+    outputPaths.push(outPath)
 
     if (!outputPaths.length) {
       await updateJob(jobId, { status: 'failed', error: 'output_upload_missing' })
       throw new Error('output_upload_missing')
     }
 
-    const nextAnalysis = {
-      ...((job.analysis as any) || {}),
-      renderMode: renderConfig.mode,
-      vertical: renderConfig.mode === 'vertical'
-        ? {
-            clipCount: outputPaths.length,
-            webcamFocus: renderConfig.webcamFocus,
-            webcamCrop: renderConfig.webcamCrop
-          }
-        : null,
-      verticalOutputPaths: renderConfig.mode === 'vertical' ? outputPaths : null
-    }
+    const nextAnalysis = buildPersistedRenderAnalysis({
+      existing: (job.analysis as any) || {},
+      renderConfig,
+      outputPaths
+    })
 
     await updateJob(jobId, {
       status: 'completed',
@@ -2585,6 +3352,7 @@ const processJob = async (
       watermarkApplied: watermarkEnabled,
       retentionScore,
       optimizationNotes: optimizationNotes.length ? optimizationNotes : null,
+      renderSettings: buildPersistedRenderSettings(renderConfig),
       analysis: nextAnalysis
     })
 
@@ -2850,17 +3618,8 @@ const handleCreateJob = async (req: any, res: any) => {
         progress: 0,
         requestedQuality: desiredQuality,
         priorityLevel: plan.priority ? 1 : 2,
-        analysis: {
-          renderMode: renderConfig.mode,
-          vertical: renderConfig.mode === 'vertical'
-            ? {
-                clipCount: renderConfig.verticalClipCount,
-                webcamFocus: renderConfig.webcamFocus,
-                webcamCrop: renderConfig.webcamCrop
-              }
-            : null,
-          verticalOutputPaths: null
-        }
+        renderSettings: buildPersistedRenderSettings(renderConfig),
+        analysis: buildPersistedRenderAnalysis({ renderConfig, outputPaths: null })
       }
     })
 
@@ -2923,7 +3682,7 @@ router.get('/', async (req: any, res) => {
       watermark: job.watermarkApplied,
       inputPath: job.inputPath,
       progress: job.progress,
-      renderMode: parseRenderMode((job.analysis as any)?.renderMode)
+      renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
     }))
     res.json({ jobs: payload })
   } catch (err) {
@@ -2955,7 +3714,7 @@ router.get('/:id', async (req: any, res) => {
       // Legacy coarse-grained status for older clients.
       legacyStatus: mapStatus(job.status),
       watermark: job.watermarkApplied,
-      renderMode: parseRenderMode((job.analysis as any)?.renderMode),
+      renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode,
       steps: [
         { key: 'queued', label: 'Queued' },
         { key: 'uploading', label: 'Uploading' },
@@ -3085,7 +3844,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
     const { plan, tier } = await getUserPlan(req.user.id)
-    const renderMode = parseRenderConfigFromAnalysis(job.analysis as any).mode
+    const renderMode = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
     const renderLimitViolation = await getRenderLimitViolation({
       userId: req.user.id,
       email: req.user?.email,

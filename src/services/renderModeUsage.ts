@@ -1,11 +1,13 @@
 import { prisma } from '../db/prisma'
 import { getMonthKey } from '../shared/planConfig'
 
-type RenderMode = 'standard' | 'vertical'
+type RenderMode = 'horizontal' | 'vertical'
 
 const parseRenderMode = (value?: any): RenderMode => {
   const raw = String(value || '').trim().toLowerCase()
-  return raw === 'vertical' ? 'vertical' : 'standard'
+  if (raw === 'vertical') return 'vertical'
+  if (raw === 'horizontal' || raw === 'standard') return 'horizontal'
+  return 'horizontal'
 }
 
 const getUtcMonthBounds = (date: Date = new Date()) => {
