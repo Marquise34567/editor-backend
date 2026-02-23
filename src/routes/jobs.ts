@@ -300,14 +300,16 @@ type EditOptions = {
 
 const HOOK_MIN = 5
 const HOOK_MAX = 10
-const CUT_MIN = 3
+const CUT_MIN = 2
 const CUT_MAX = 5
 const PACE_MIN = 5
 const PACE_MAX = 10
 const CUT_GUARD_SEC = 0.35
-const CUT_LEN_PATTERN = [3.2, 4.4, 3.6, 4.8]
-const CUT_GAP_PATTERN = [1.0, 1.6, 1.2, 0.8]
-const MAX_CUT_RATIO = 0.6
+const CUT_LEN_PATTERN = [2.8, 3.8, 3.2, 4.2]
+const CUT_GAP_PATTERN = [0.9, 1.3, 1.0, 0.7]
+const MAX_CUT_RATIO = 0.68
+const AGGRESSIVE_MAX_CUT_RATIO = 0.74
+const AGGRESSIVE_CUT_GAP_MULTIPLIER = 0.78
 const ZOOM_HARD_MAX = 1.15
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
@@ -1023,50 +1025,69 @@ const buildFaceAbsenceFlags = (windows: EngagementWindow[], minDuration = 2) => 
   return output
 }
 
-const detectFillerWindows = (windows: EngagementWindow[], silences: TimeRange[]) => {
+const detectFillerWindows = (windows: EngagementWindow[], silences: TimeRange[], aggressiveMode = false) => {
   const isSilentAt = (time: number) => {
     const windowEnd = time + 1
     return silences.some((s) => time < s.end && windowEnd > s.start)
   }
   return windows.map((w) => {
     if (isSilentAt(w.time)) return false
-    const lowSpeech = w.speechIntensity < 0.25
-    const lowEnergy = w.audioEnergy < 0.25 && w.audioEnergy > 0.05
-    return lowSpeech && lowEnergy
+    const speechCeiling = aggressiveMode ? 0.35 : 0.31
+    const energyCeiling = aggressiveMode ? 0.34 : 0.3
+    const lowSpeech = w.speechIntensity < speechCeiling
+    const lowEnergy = w.audioEnergy < energyCeiling && w.audioEnergy > 0.03
+    const lowExcitement = w.vocalExcitement < (aggressiveMode ? 0.4 : 0.36)
+    const lowEmotion = w.emotionIntensity < (aggressiveMode ? 0.45 : 0.4)
+    const staticVisual = w.motionScore < 0.18 && w.sceneChangeRate < 0.18
+    return lowSpeech && lowEnergy && (lowExcitement || lowEmotion || staticVisual)
   })
 }
 
-const buildBoringFlags = (windows: EngagementWindow[], silences: TimeRange[]) => {
-  const faceAbsent = buildFaceAbsenceFlags(windows, 2)
-  const fillerFlags = detectFillerWindows(windows, silences)
+const buildBoringFlags = (windows: EngagementWindow[], silences: TimeRange[], aggressiveMode = false) => {
+  const faceAbsent = buildFaceAbsenceFlags(windows, aggressiveMode ? 1.5 : 2)
+  const fillerFlags = detectFillerWindows(windows, silences, aggressiveMode)
   const isSilentAt = (time: number) => {
     const windowEnd = time + 1
     return silences.some((s) => time < s.end && windowEnd > s.start)
   }
   return windows.map((w, idx) => {
-    const silent = isSilentAt(w.time) && w.audioEnergy < 0.15
-    const lowSpeech = w.speechIntensity < 0.25 && w.audioEnergy < 0.2
-    const lowMotion = w.motionScore < 0.2 && w.sceneChangeRate < 0.2
-    const staticVisual = w.motionScore < 0.1 && w.sceneChangeRate < 0.1
-    const strongWindow = w.score > 0.62 || (w.speechIntensity > 0.58 && w.vocalExcitement > 0.5)
+    const silent = isSilentAt(w.time) && w.audioEnergy < (aggressiveMode ? 0.18 : 0.16)
+    const lowSpeech = w.speechIntensity < (aggressiveMode ? 0.35 : 0.31) && w.audioEnergy < (aggressiveMode ? 0.28 : 0.24)
+    const lowMotion = w.motionScore < (aggressiveMode ? 0.3 : 0.26) && w.sceneChangeRate < (aggressiveMode ? 0.3 : 0.26)
+    const staticVisual = w.motionScore < (aggressiveMode ? 0.18 : 0.14) && w.sceneChangeRate < (aggressiveMode ? 0.18 : 0.14)
+    const lowExcitement = w.vocalExcitement < (aggressiveMode ? 0.4 : 0.36)
+    const lowEmotion = w.emotionIntensity < (aggressiveMode ? 0.45 : 0.4)
+    const excitementScore =
+      0.46 * w.score +
+      0.2 * w.speechIntensity +
+      0.14 * w.vocalExcitement +
+      0.1 * w.emotionIntensity +
+      0.1 * w.sceneChangeRate
+    const lowExcitementComposite = excitementScore < (aggressiveMode ? 0.42 : 0.38)
+    const strongWindow = w.score > (aggressiveMode ? 0.7 : 0.66) || (w.speechIntensity > 0.62 && w.vocalExcitement > 0.56)
     const retentionRisk = 1 - (0.55 * w.score + 0.18 * w.speechIntensity + 0.15 * w.vocalExcitement + 0.12 * w.emotionIntensity)
-    const lowRetention = retentionRisk > 0.64 && w.score < 0.35
-    const weakWindow = w.score < 0.3 && w.speechIntensity < 0.35 && w.vocalExcitement < 0.35
-    const emotionalMoment = w.emotionIntensity > 0.6 || w.vocalExcitement > 0.6 || w.emotionalSpike > 0
+    const lowRetention = retentionRisk > (aggressiveMode ? 0.58 : 0.61) && w.score < (aggressiveMode ? 0.43 : 0.4)
+    const weakWindow =
+      w.score < (aggressiveMode ? 0.4 : 0.36) &&
+      w.speechIntensity < (aggressiveMode ? 0.45 : 0.42) &&
+      w.vocalExcitement < (aggressiveMode ? 0.42 : 0.38)
+    const emotionalMoment = w.emotionIntensity > (aggressiveMode ? 0.74 : 0.68) || w.vocalExcitement > (aggressiveMode ? 0.74 : 0.68) || w.emotionalSpike > 0
     if (strongWindow) return false
     if (emotionalMoment) return false
     if (silent) return true
     if (fillerFlags[idx]) return true
-    if (lowRetention && (lowSpeech || lowMotion || faceAbsent[idx])) return true
-    if (weakWindow && (lowMotion || staticVisual)) return true
-    if (faceAbsent[idx] && (lowSpeech || lowMotion)) return true
-    if (lowSpeech && lowMotion) return true
-    if (staticVisual && w.audioEnergy < 0.2) return true
+    if (lowRetention && (lowSpeech || lowMotion || lowEmotion || faceAbsent[idx])) return true
+    if (weakWindow && (lowMotion || staticVisual || lowExcitement)) return true
+    if (faceAbsent[idx] && (lowSpeech || lowMotion || lowExcitementComposite)) return true
+    if (lowSpeech && (lowMotion || lowExcitement || lowEmotion)) return true
+    if (lowExcitementComposite && (lowMotion || lowSpeech || staticVisual)) return true
+    if (staticVisual && w.audioEnergy < (aggressiveMode ? 0.28 : 0.24)) return true
+    if (aggressiveMode && lowExcitementComposite && lowEmotion) return true
     return false
   })
 }
 
-const buildBoringCuts = (flags: boolean[]) => {
+const buildBoringCuts = (flags: boolean[], aggressiveMode = false) => {
   const ranges: TimeRange[] = []
   let runStart: number | null = null
   for (let i = 0; i <= flags.length; i += 1) {
@@ -1079,13 +1100,16 @@ const buildBoringCuts = (flags: boolean[]) => {
         if (runLen <= CUT_MAX) {
           ranges.push({ start: runStart, end: runEnd })
         } else {
-          const maxRemove = runLen * MAX_CUT_RATIO
+          const maxRemove = runLen * (aggressiveMode ? AGGRESSIVE_MAX_CUT_RATIO : MAX_CUT_RATIO)
           let removed = 0
-          let cursor = runStart + CUT_GUARD_SEC
-          const endLimit = runEnd - CUT_GUARD_SEC
+          const guard = aggressiveMode ? Math.max(0.2, CUT_GUARD_SEC - 0.1) : CUT_GUARD_SEC
+          let cursor = runStart + guard
+          const endLimit = runEnd - guard
+          const gapMultiplier = aggressiveMode ? AGGRESSIVE_CUT_GAP_MULTIPLIER : 1
           let patternIdx = 0
           while (cursor + CUT_MIN <= endLimit) {
             let cutLen = CUT_LEN_PATTERN[patternIdx % CUT_LEN_PATTERN.length]
+            if (aggressiveMode) cutLen += 0.35
             cutLen = Math.max(CUT_MIN, Math.min(CUT_MAX, cutLen))
             let actualLen = Math.min(cutLen, endLimit - cursor)
             if (actualLen < CUT_MIN) break
@@ -1095,7 +1119,7 @@ const buildBoringCuts = (flags: boolean[]) => {
             }
             ranges.push({ start: cursor, end: cursor + actualLen })
             removed += actualLen
-            cursor += actualLen + CUT_GAP_PATTERN[patternIdx % CUT_GAP_PATTERN.length]
+            cursor += actualLen + CUT_GAP_PATTERN[patternIdx % CUT_GAP_PATTERN.length] * gapMultiplier
             patternIdx += 1
           }
         }
@@ -1106,27 +1130,36 @@ const buildBoringCuts = (flags: boolean[]) => {
   return mergeRanges(ranges)
 }
 
-const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds: number) => {
-  if (!windows.length || durationSeconds < 45) return [] as TimeRange[]
+const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds: number, aggressiveMode = false) => {
+  const minDuration = aggressiveMode ? 35 : 40
+  if (!windows.length || durationSeconds < minDuration) return [] as TimeRange[]
+  const edgePadding = aggressiveMode ? 7 : 8
+  const cutHalfLength = aggressiveMode ? 2.6 : 2.3
   const candidates = windows
-    .filter((window) => window.time >= 8 && window.time <= Math.max(8, durationSeconds - 6))
+    .filter((window) => window.time >= edgePadding && window.time <= Math.max(edgePadding, durationSeconds - 6))
     .map((window) => ({
       start: Math.max(0, window.time - 1),
-      end: Math.min(durationSeconds, window.time + 2.2),
+      end: Math.min(durationSeconds, window.time + cutHalfLength),
       score:
-        0.64 * window.score +
-        0.18 * window.speechIntensity +
+        0.58 * window.score +
+        0.16 * window.speechIntensity +
         0.12 * window.vocalExcitement +
-        0.06 * window.emotionIntensity
+        0.08 * window.emotionIntensity +
+        0.06 * window.sceneChangeRate
     }))
     .sort((a, b) => a.score - b.score)
 
-  const desired = clamp(Math.floor(durationSeconds / 110) + 1, 1, 3)
+  const desired = clamp(
+    Math.floor(durationSeconds / (aggressiveMode ? 85 : 95)) + 1,
+    1,
+    aggressiveMode ? 4 : 3
+  )
   const selected: TimeRange[] = []
+  const spacingBuffer = aggressiveMode ? 4 : 4.5
   for (const candidate of candidates) {
     if (selected.length >= desired) break
     const overlaps = selected.some(
-      (existing) => candidate.start < existing.end + 5 && candidate.end > existing.start - 5
+      (existing) => candidate.start < existing.end + spacingBuffer && candidate.end > existing.start - spacingBuffer
     )
     if (overlaps) continue
     selected.push({ start: candidate.start, end: candidate.end })
@@ -1198,10 +1231,16 @@ const buildEditPlan = async (
   const [silences, energySamples, sceneChanges, faceSamples, textSamples] = await Promise.all(tasks)
   const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges, faceSamples, textSamples)
 
-  const boringFlags = options.removeBoring ? buildBoringFlags(windows, silences) : windows.map(() => false)
-  const detectedRemovedSegments = options.removeBoring ? buildBoringCuts(boringFlags) : []
+  const boringFlags = options.removeBoring
+    ? buildBoringFlags(windows, silences, options.aggressiveMode)
+    : windows.map(() => false)
+  const detectedRemovedSegments = options.removeBoring
+    ? buildBoringCuts(boringFlags, options.aggressiveMode)
+    : []
   const removedSegments = options.removeBoring
-    ? (detectedRemovedSegments.length ? detectedRemovedSegments : buildStrategicFallbackCuts(windows, durationSeconds))
+    ? (detectedRemovedSegments.length
+      ? detectedRemovedSegments
+      : buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode))
     : []
   const compressedSegments: TimeRange[] = []
 
