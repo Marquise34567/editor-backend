@@ -316,7 +316,9 @@ type EditOptions = {
 }
 
 const HOOK_MIN = 5
-const HOOK_MAX = 10
+const HOOK_MAX = 20
+const HOOK_RELOCATE_MIN_START = 6
+const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const CUT_MIN = 2
 const CUT_MAX = 5
 const PACE_MIN = 5
@@ -994,6 +996,9 @@ const pickBestHook = (
     .slice(0, 12)
     .forEach((win) => candidates.add(Math.max(0, win.time - 1)))
   ;[0, 1, 2].forEach((start) => candidates.add(start))
+  for (let start = 0; start <= Math.max(0, durationSeconds - HOOK_MIN); start += 2) {
+    candidates.add(start)
+  }
   windows
     .filter((window) => window.time <= STRATEGIST_HOOK_WINDOW_SEC)
     .sort((a, b) => b.score - a.score)
@@ -1003,9 +1008,7 @@ const pickBestHook = (
   const maxDuration = Math.min(HOOK_MAX, durationSeconds || HOOK_MAX)
   const minDuration = Math.min(HOOK_MIN, maxDuration)
 
-  let bestStart = 0
-  let bestDuration = Math.max(minDuration, maxDuration)
-  let bestScore = -Infinity
+  const evaluated: Array<{ start: number; duration: number; score: number }> = []
   const effectiveDuration = durationSeconds > 0 ? durationSeconds : HOOK_ANALYZE_MAX
   const urgencyWindow = Math.max(
     STRATEGIST_HOOK_WINDOW_SEC,
@@ -1030,7 +1033,8 @@ const pickBestHook = (
         start > STRATEGIST_LATE_HOOK_PENALTY_SEC
           ? Math.min(0.2, (start - STRATEGIST_LATE_HOOK_PENALTY_SEC) / 90)
           : 0
-      const longHookPenalty = duration >= 9 ? 0.03 : 0
+      const longHookPenalty = duration >= 14 ? Math.min(0.05, (duration - 13) * 0.01) : 0
+      const mediumHookBonus = duration >= 8 && duration <= 16 ? 0.02 : 0
       const score =
         baseScore +
         0.11 * avgExcitement +
@@ -1038,18 +1042,26 @@ const pickBestHook = (
         0.06 * avgSpeech +
         0.04 * avgFace +
         (hasSpike ? 0.08 : 0) +
+        mediumHookBonus +
         earlyBoost -
         latePenalty -
         longHookPenalty
-      if (score > bestScore) {
-        bestScore = score
-        bestStart = start
-        bestDuration = duration
-      }
+      evaluated.push({ start, duration, score })
     }
   }
-
-  return { start: bestStart, duration: bestDuration, score: clamp01(bestScore) }
+  if (!evaluated.length) {
+    return { start: 0, duration: minDuration, score: 0.5 }
+  }
+  evaluated.sort((a, b) => b.score - a.score || a.start - b.start)
+  const bestAny = evaluated[0]
+  const bestRelocationCandidate = evaluated.find(
+    (entry) =>
+      entry.start >= HOOK_RELOCATE_MIN_START &&
+      entry.score >= bestAny.score - HOOK_RELOCATE_SCORE_TOLERANCE
+  )
+  const selected =
+    bestAny.start < HOOK_RELOCATE_MIN_START && bestRelocationCandidate ? bestRelocationCandidate : bestAny
+  return { start: selected.start, duration: selected.duration, score: clamp01(selected.score) }
 }
 
 const subtractRange = (segments: Segment[], range: TimeRange) => {
@@ -1262,6 +1274,29 @@ const applyPacingPattern = (
   durationSeconds: number,
   aggressiveMode: boolean
 ) => {
+  const pickPacingSpeed = (start: number, end: number) => {
+    const engagement = averageWindowMetric(windows, start, end, (window) => window.score)
+    const speech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+    const excitement = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
+    const phase = durationSeconds > 0 ? start / durationSeconds : 0
+    let speed = 1
+    if (engagement < 0.28) {
+      speed = aggressiveMode ? 1.38 : 1.26
+    } else if (engagement < 0.4) {
+      speed = aggressiveMode ? 1.26 : 1.16
+    } else if (engagement < 0.52 && speech < 0.32) {
+      speed = aggressiveMode ? 1.16 : 1.08
+    }
+    if (excitement > 0.72) {
+      speed = Math.max(1, speed - 0.08)
+    }
+    // Preserve opening/closing cadence so the video doesn't feel rushed at key narrative points.
+    if (phase < 0.12 || phase > 0.9) {
+      speed = Math.min(speed, 1.08)
+    }
+    return Number(clamp(speed, 1, aggressiveMode ? 1.45 : 1.32).toFixed(3))
+  }
+
   const out: Segment[] = []
   let patternIdx = 0
   for (const seg of segments) {
@@ -1280,7 +1315,8 @@ const applyPacingPattern = (
       const jitter = patternIdx % 2 === 0 ? -0.25 : 0.25
       const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
       const nextEnd = Math.min(end, cursor + desired)
-      out.push({ ...seg, start: cursor, end: nextEnd })
+      const speed = pickPacingSpeed(cursor, nextEnd)
+      out.push({ ...seg, start: cursor, end: nextEnd, speed })
       cursor = nextEnd
       patternIdx += 1
     }
@@ -1289,7 +1325,8 @@ const applyPacingPattern = (
       if (remaining < minLen && out.length) {
         out[out.length - 1].end = end
       } else {
-        out.push({ ...seg, start: cursor, end })
+        const speed = pickPacingSpeed(cursor, end)
+        out.push({ ...seg, start: cursor, end, speed })
       }
     }
   }
@@ -1603,17 +1640,39 @@ const applyStoryStructure = (
   windows: EngagementWindow[],
   durationSeconds: number
 ) => {
-  if (segments.length <= 2) return segments
-  const tailStart = Math.max(0, durationSeconds * 0.6)
-  const tailCandidates = segments
-    .map((seg, idx) => ({ seg, idx, score: scoreSegment(seg, windows) }))
-    .filter((entry) => entry.seg.start >= tailStart)
-  if (!tailCandidates.length) return segments
-  const best = tailCandidates.sort((a, b) => b.score - a.score)[0]
-  if (best.idx === segments.length - 1) return segments
+  if (segments.length <= 3) return segments
+  const scored = segments.map((seg, idx) => ({ seg, idx, score: scoreSegment(seg, windows) }))
   const reordered = segments.slice()
-  reordered.splice(best.idx, 1)
-  reordered.push(best.seg)
+
+  // Lift a strong mid-video beat closer to the front to improve narrative momentum.
+  const middleStart = Math.max(0, durationSeconds * 0.2)
+  const middleEnd = Math.max(middleStart + 1, durationSeconds * 0.78)
+  const middleCandidates = scored
+    .filter((entry) => entry.seg.start >= middleStart && entry.seg.start <= middleEnd)
+    .sort((a, b) => b.score - a.score)
+  const middleHighlight = middleCandidates[0]
+  if (middleHighlight) {
+    const fromIdx = reordered.findIndex((seg) => seg === middleHighlight.seg)
+    if (fromIdx > 1) {
+      const [moved] = reordered.splice(fromIdx, 1)
+      reordered.splice(1, 0, moved)
+    }
+  }
+
+  // Keep a high-energy late beat as the closer.
+  const tailStart = Math.max(0, durationSeconds * 0.6)
+  const tailCandidates = scored
+    .filter((entry) => entry.seg.start >= tailStart)
+    .sort((a, b) => b.score - a.score)
+  const bestTail = tailCandidates[0]
+  if (bestTail) {
+    const tailIdx = reordered.findIndex((seg) => seg === bestTail.seg)
+    if (tailIdx >= 0 && tailIdx !== reordered.length - 1) {
+      const [moved] = reordered.splice(tailIdx, 1)
+      reordered.push(moved)
+    }
+  }
+
   return reordered
 }
 
@@ -1782,6 +1841,8 @@ const buildAudioFilters = () => {
   ]
 }
 
+const RETENTION_RENDER_THRESHOLD = 58
+
 const computeRetentionScore = (segments: Segment[], windows: EngagementWindow[], hookScore: number, captionsEnabled: boolean) => {
   const lengths = segments.map((seg) => seg.end - seg.start).filter((len) => len > 0)
   const avgLen = lengths.length ? lengths.reduce((sum, len) => sum + len, 0) / lengths.length : 0
@@ -1799,6 +1860,50 @@ const computeRetentionScore = (segments: Segment[], windows: EngagementWindow[],
   if (!captionsEnabled) notes.push('Enable auto subtitles for stronger retention.')
   if (hook < 0.6) notes.push('Hook strength is moderate; consider re-recording the opening.')
   return { score: Math.max(0, Math.min(100, score)), notes }
+}
+
+const boostSegmentsForRetention = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  aggressiveMode: boolean
+) => {
+  if (segments.length <= 1) return segments
+  const out = segments.map((seg) => ({ ...seg }))
+  const scored = out
+    .map((seg, idx) => {
+      const score = averageWindowMetric(windows, seg.start, seg.end, (window) => window.score)
+      const speech = averageWindowMetric(windows, seg.start, seg.end, (window) => window.speechIntensity)
+      const runtime = Math.max(0.1, (seg.end - seg.start) / (seg.speed && seg.speed > 0 ? seg.speed : 1))
+      return { idx, score, speech, runtime }
+    })
+    // keep intro hook mostly intact
+    .filter((entry) => entry.idx > 0 && entry.runtime >= 2)
+    .sort((a, b) => a.score - b.score || b.runtime - a.runtime)
+
+  const totalRuntime = out.reduce((sum, seg) => {
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    return sum + Math.max(0, (seg.end - seg.start) / speed)
+  }, 0)
+  const maxBoostedRuntime = Math.max(3, totalRuntime * 0.18)
+  let boostedRuntime = 0
+
+  for (const entry of scored) {
+    if (boostedRuntime >= maxBoostedRuntime) break
+    const seg = out[entry.idx]
+    const current = seg.speed && seg.speed > 0 ? seg.speed : 1
+    let target = current
+    if (entry.score < 0.28) {
+      target = aggressiveMode ? 1.42 : 1.3
+    } else if (entry.score < 0.42 && entry.speech < 0.35) {
+      target = aggressiveMode ? 1.28 : 1.16
+    }
+    target = Number(clamp(target, 1, aggressiveMode ? 1.5 : 1.35).toFixed(3))
+    if (target <= current + 0.02) continue
+    seg.speed = target
+    boostedRuntime += entry.runtime
+  }
+
+  return out
 }
 
 class PlanLimitError extends Error {
@@ -2152,7 +2257,7 @@ const processJob = async (
       const effectedSegments = editPlan && !options.onlyCuts
         ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options, hookRange)
         : filteredSegments
-      const finalSegments = editPlan && !options.onlyCuts ? applyZoomEasing(effectedSegments) : effectedSegments
+      let finalSegments = editPlan && !options.onlyCuts ? applyZoomEasing(effectedSegments) : effectedSegments
 
       // Enforce zoom duration cap: never exceed ZOOM_MAX_DURATION_RATIO of total duration.
       try {
@@ -2199,8 +2304,25 @@ const processJob = async (
       await updateJob(jobId, { status: 'retention', progress: 72 })
       if (editPlan) {
         const retention = computeRetentionScore(finalSegments, editPlan.engagementWindows, editPlan.hook.score, options.autoCaptions)
-        retentionScore = retention.score
-        optimizationNotes = [...optimizationNotes, ...retention.notes]
+        let bestRetention = retention
+        if (!options.onlyCuts && retention.score < RETENTION_RENDER_THRESHOLD) {
+          const boosted = boostSegmentsForRetention(finalSegments, editPlan.engagementWindows, options.aggressiveMode)
+          const boostedRetention = computeRetentionScore(
+            boosted,
+            editPlan.engagementWindows,
+            editPlan.hook.score,
+            options.autoCaptions
+          )
+          if (boostedRetention.score > retention.score) {
+            finalSegments = boosted
+            bestRetention = boostedRetention
+            optimizationNotes.push('Story/pacing optimization pass applied before render.')
+          } else {
+            optimizationNotes.push('Retention below target; best-effort pacing applied.')
+          }
+        }
+        retentionScore = bestRetention.score
+        optimizationNotes = [...optimizationNotes, ...bestRetention.notes]
       }
 
       await updateJob(jobId, { status: 'rendering', progress: 80 })
