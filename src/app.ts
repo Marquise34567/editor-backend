@@ -12,6 +12,7 @@ import meRoutes from './routes/me'
 import settingsRoutes from './routes/settings'
 import publicRoutes from './routes/public'
 import adminRoutes from './routes/admin'
+import debugRoutes from './routes/debug'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
@@ -100,6 +101,7 @@ app.post('/api/stripe/webhook', rateLimit({ windowMs: 60_000, max: 120 }), bodyP
 app.use(express.json({ limit: '10mb' }))
 
 app.use('/api/public', publicRoutes)
+app.use('/api/debug', debugRoutes)
 app.use('/api/billing', requireAuth, billingRoutes)
 app.use('/api', requireAuth, checkoutRoutes)
 app.use('/api/jobs', requireAuth, jobsRoutes)
