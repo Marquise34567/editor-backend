@@ -1553,8 +1553,13 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
-      const ffPreset = (options as any)?.fastMode ? 'superfast' : 'veryfast'
-      const ffCrf = (options as any)?.fastMode ? '28' : '23'
+      const ffPreset = (options as any)?.fastMode
+        ? 'superfast'
+        : (process.env.FFMPEG_PRESET || 'medium')
+      const defaultCrf = finalQuality === '4k' ? '18' : finalQuality === '1080p' ? '20' : '22'
+      const ffCrf = (options as any)?.fastMode
+        ? '28'
+        : (process.env.FFMPEG_CRF || defaultCrf)
       const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', ffPreset, '-crf', ffCrf, '-threads', '0', '-pix_fmt', 'yuv420p']
       if (withAudio) argsBase.push('-c:a', 'aac')
 
