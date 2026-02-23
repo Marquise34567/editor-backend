@@ -37,7 +37,8 @@ router.post('/complete', async (req: any, res) => {
   try {
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
-    const { jobId, key, uploadId, parts } = req.body
+    const { jobId, uploadId, parts } = req.body
+    const key = req.body?.key || req.body?.objectKey
     if (!jobId || !key) return res.status(400).json({ error: 'missing_params' })
     const job = await prisma.job.findUnique({ where: { id: jobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
@@ -97,8 +98,14 @@ router.post('/create', async (req: any, res) => {
   try {
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
-    const { jobId, filename, contentType, sizeBytes } = req.body
-    if (!filename || !sizeBytes) return res.status(400).json({ error: 'missing_params' })
+    const { jobId } = req.body
+    // Accept legacy field names used by older frontend bundles.
+    const filename = String(req.body?.filename ?? req.body?.fileName ?? '')
+    const contentType = String(req.body?.contentType ?? req.body?.mimeType ?? 'application/octet-stream')
+    const sizeBytes = Number(req.body?.sizeBytes ?? req.body?.fileSizeBytes ?? 0)
+    if (!filename || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+      return res.status(400).json({ error: 'missing_params' })
+    }
     const job = jobId ? await prisma.job.findUnique({ where: { id: jobId } }) : null
     if (jobId && (!job || job.userId !== userId)) return res.status(404).json({ error: 'not_found' })
 
@@ -109,10 +116,10 @@ router.post('/create', async (req: any, res) => {
     // Choose part size (start 15MB) and ensure parts <= 10000
     const MIN_PART_SIZE = 5 * 1024 * 1024
     let partSize = 15 * 1024 * 1024
-    let partsCount = Math.ceil(Number(sizeBytes) / partSize)
+    let partsCount = Math.ceil(sizeBytes / partSize)
     while (partsCount > 10000) {
       partSize = Math.max(partSize * 2, MIN_PART_SIZE)
-      partsCount = Math.ceil(Number(sizeBytes) / partSize)
+      partsCount = Math.ceil(sizeBytes / partSize)
     }
 
     // Initiate multipart upload
@@ -140,10 +147,49 @@ router.post('/create', async (req: any, res) => {
       }
     }
 
-    return res.json({ uploadId, key, partSize, presignedParts, completeUrl: '/api/uploads/complete', abortUrl: '/api/uploads/abort' })
+    return res.json({
+      uploadId,
+      key,
+      partSize,
+      presignedParts,
+      // Backward-compatible aliases for older frontend bundles.
+      objectKey: key,
+      partSizeBytes: partSize,
+      jobId: jobId || null,
+      completeUrl: '/api/uploads/complete',
+      abortUrl: '/api/uploads/abort'
+    })
   } catch (err: any) {
     console.error('uploads.create error', err)
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+// POST /api/uploads/sign-part - compatibility endpoint for legacy clients
+router.post('/sign-part', async (req: any, res) => {
+  try {
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = req.body?.jobId as string | undefined
+    const key = (req.body?.key || req.body?.objectKey) as string | undefined
+    const uploadId = req.body?.uploadId as string | undefined
+    const partNumber = Number(req.body?.partNumber)
+    if (!key || !uploadId || !Number.isFinite(partNumber) || partNumber < 1) {
+      return res.status(400).json({ error: 'missing_params' })
+    }
+    if (jobId) {
+      const job = await prisma.job.findUnique({ where: { id: jobId } })
+      if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
+    }
+    const url = await r2.getPresignedUploadPartUrl({
+      Key: key,
+      UploadId: uploadId,
+      PartNumber: partNumber
+    })
+    return res.json({ url })
+  } catch (err: any) {
+    console.error('uploads.sign-part error', err)
+    return res.status(500).json({ error: 'server_error' })
   }
 })
 
