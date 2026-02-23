@@ -1,84 +1,117 @@
 import express from 'express'
 import { prisma } from '../db/prisma'
 import { r2 } from '../lib/r2'
-import path from 'path'
 import crypto from 'crypto'
 import { enqueuePipeline, updateJob } from './jobs'
+import bodyParser from 'body-parser'
 
 const router = express.Router()
 
-const MAX_BYTES = 2 * 1024 * 1024 * 1024 // 2GB
-const PART_SIZE = 10 * 1024 * 1024 // 10MB
-
-router.post('/create', async (req: any, res) => {
+// POST /api/uploads/presign
+router.post('/presign', async (req: any, res) => {
   try {
-    const userId = req.user.id
-    const { fileName, fileSizeBytes, mimeType } = req.body
-    if (!fileName || !fileSizeBytes) return res.status(400).json({ error: 'missing_params' })
-    if (fileSizeBytes > MAX_BYTES) return res.status(400).json({ error: 'file_too_large', maxBytes: MAX_BYTES })
-    const id = crypto.randomUUID()
-    const safeName = path.basename(fileName)
-    const objectKey = `${userId}/${id}/${safeName}`
-
-    // create job record immediately
-    const job = await prisma.job.create({ data: { id, userId, status: 'uploading', inputPath: objectKey, progress: 0 } })
-
-    // create multipart upload on R2
-    const createRes: any = await r2.createMultipartUpload({ Key: objectKey, ContentType: mimeType })
-    const uploadId = createRes.UploadId
-    return res.json({ jobId: job.id, objectKey, uploadId, partSizeBytes: PART_SIZE, bucket: r2.bucket })
-  } catch (err) {
-    console.error('uploads.create error', err)
-    res.status(500).json({ error: 'server_error' })
-  }
-})
-
-router.post('/sign-part', async (req: any, res) => {
-  try {
-    const userId = req.user.id
-    const { jobId, objectKey, uploadId, partNumber } = req.body
-    if (!jobId || !objectKey || !uploadId || !partNumber) return res.status(400).json({ error: 'missing_params' })
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const { jobId, filename, contentType } = req.body
+    if (!jobId || !filename) return res.status(400).json({ error: 'missing_params' })
     const job = await prisma.job.findUnique({ where: { id: jobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
-    const url = await r2.getPresignedUploadPartUrl({ Key: objectKey, UploadId: uploadId, PartNumber: Number(partNumber), expiresIn: 60 * 15 })
-    res.json({ url })
-  } catch (err) {
-    console.error('uploads.sign-part error', err)
+
+    const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_')
+    const key = `uploads/${userId}/${jobId}/${Date.now()}-${safeName}`
+    try {
+      const uploadUrl = await r2.generateUploadUrl(key, contentType || 'application/octet-stream')
+      return res.json({ uploadUrl, key, bucket: r2.bucket })
+    } catch (e: any) {
+      console.error('presign failed', e?.message || e)
+      return res.status(500).json({ error: 'PRESIGN_FAILED', details: String(e?.message || e) })
+    }
+  } catch (err: any) {
+    console.error('uploads.presign error', err)
     res.status(500).json({ error: 'server_error' })
   }
 })
 
+// POST /api/uploads/complete
 router.post('/complete', async (req: any, res) => {
   try {
-    const userId = req.user.id
-    const { jobId, objectKey, uploadId, parts } = req.body
-    if (!jobId || !objectKey || !uploadId || !parts) return res.status(400).json({ error: 'missing_params' })
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const { jobId, key } = req.body
+    if (!jobId || !key) return res.status(400).json({ error: 'missing_params' })
     const job = await prisma.job.findUnique({ where: { id: jobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
-    // complete multipart
-    const completeRes = await r2.completeMultipartUpload({ Key: objectKey, UploadId: uploadId, Parts: parts })
-    // update job and queue pipeline
-    await updateJob(jobId, { status: 'queued', progress: 0, inputPath: objectKey })
-    enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
-    res.json({ ok: true, result: completeRes })
-  } catch (err) {
+
+    // Verify object exists
+    try {
+      const exists = await r2.objectExists(key)
+      if (!exists) return res.status(404).json({ error: 'R2_OBJECT_MISSING' })
+    } catch (e: any) {
+      console.error('headObject failed', e?.message || e)
+      return res.status(500).json({ error: 'R2_HEAD_FAILED', details: String(e?.message || e) })
+    }
+
+    // Construct public URL if possible
+    const account = process.env.R2_ACCOUNT_ID || ''
+    const bucket = process.env.R2_BUCKET || r2.bucket || ''
+    let publicUrl = ''
+    if (account && bucket) {
+      publicUrl = `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}`
+    } else if (process.env.R2_PUBLIC_BASE_URL) {
+      publicUrl = `${process.env.R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`
+    } else if (r2.endpoint) {
+      publicUrl = `${r2.endpoint.replace(/\/$/, '')}/${key}`
+    } else {
+      publicUrl = key
+    }
+
+    await updateJob(jobId, { inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    // trigger processing asynchronously
+    setImmediate(() => {
+      try {
+        enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
+      } catch (e) {
+        console.error('enqueuePipeline failed', e)
+      }
+    })
+    return res.json({ ok: true })
+  } catch (err: any) {
     console.error('uploads.complete error', err)
     res.status(500).json({ error: 'server_error' })
   }
 })
 
-router.post('/abort', async (req: any, res) => {
+// Optional proxy fallback: POST /api/uploads/proxy?jobId=...&key=...
+router.post('/proxy', bodyParser.raw({ type: '*/*', limit: '3gb' }), async (req: any, res) => {
   try {
-    const userId = req.user.id
-    const { jobId, objectKey, uploadId } = req.body
-    if (!jobId || !objectKey || !uploadId) return res.status(400).json({ error: 'missing_params' })
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = req.query.jobId as string | undefined
+    let key = (req.query.key as string) || undefined
+    if (!jobId) return res.status(400).json({ error: 'missing_jobId' })
     const job = await prisma.job.findUnique({ where: { id: jobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
-    await r2.abortMultipartUpload({ Key: objectKey, UploadId: uploadId })
-    await updateJob(jobId, { status: 'failed', error: 'upload_aborted' })
-    res.json({ ok: true })
-  } catch (err) {
-    console.error('uploads.abort error', err)
+    if (!key) {
+      key = `uploads/${userId}/${jobId}/${Date.now()}-upload`
+    }
+    const contentType = req.headers['content-type'] || 'application/octet-stream'
+    const body = req.body as Buffer
+    if (!body || body.length === 0) return res.status(400).json({ error: 'missing_body' })
+    try {
+      await r2.uploadBuffer({ Key: key, Body: Buffer.from(body), ContentType: String(contentType) })
+    } catch (e: any) {
+      console.error('proxy upload failed', e?.message || e)
+      return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(e?.message || e) })
+    }
+    // update job and enqueue
+    const account = process.env.R2_ACCOUNT_ID || ''
+    const bucket = process.env.R2_BUCKET || r2.bucket || ''
+    const publicUrl = account && bucket ? `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}` : `${r2.endpoint.replace(/\/$/, '')}/${key}`
+    await updateJob(jobId, { inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    setImmediate(() => enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 }))
+    return res.json({ ok: true, key })
+  } catch (err: any) {
+    console.error('uploads.proxy error', err)
     res.status(500).json({ error: 'server_error' })
   }
 })
