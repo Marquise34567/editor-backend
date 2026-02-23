@@ -15,6 +15,22 @@ import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subt
 
 const router = express.Router()
 
+const DEFAULT_SETTINGS = {
+  userId: null,
+  watermarkEnabled: true,
+  exportQuality: '720p',
+  autoCaptions: false,
+  autoHookMove: true,
+  removeBoring: true,
+  onlyCuts: false,
+  smartZoom: true,
+  emotionalBoost: true,
+  musicDuck: true,
+  aggressiveMode: false,
+  subtitleStyle: DEFAULT_SUBTITLE_PRESET,
+  autoZoomMax: 1.1
+}
+
 const coerceAutoZoomMax = (value: any, maxValue: number) => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return maxValue
@@ -36,13 +52,41 @@ router.get('/', async (req: any, res) => {
     }
 
     const userId = req.user?.id
-    if (!userId) return res.status(401).json({ error: 'unauthorized', message: 'Login required' })
+    // If not authenticated, return safe defaults (do not 500)
+    if (!userId) return res.status(200).json({ settings: DEFAULT_SETTINGS })
 
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
     const features = getPlanFeatures(tier)
     const subtitlesEnabled = features.subtitles.enabled
-    const settings = await prisma.userSettings.findUnique({ where: { userId } })
+    let settings = await prisma.userSettings.findUnique({ where: { userId } })
+
+    // If settings missing in DB, create with defaults suitable for this tier
+    if (!settings) {
+      const created = {
+        userId,
+        watermarkEnabled: features.watermark,
+        exportQuality: features.defaultExportQuality ?? '720p',
+        autoCaptions: subtitlesEnabled ? false : false,
+        autoHookMove: true,
+        removeBoring: true,
+        onlyCuts: false,
+        smartZoom: true,
+        emotionalBoost: features.advancedEffects ? true : false,
+        musicDuck: true,
+        aggressiveMode: features.advancedEffects ? false : false,
+        subtitleStyle: DEFAULT_SUBTITLE_PRESET,
+        autoZoomMax: features.autoZoomMax ?? 1.1
+      }
+      try {
+        settings = await prisma.userSettings.upsert({ where: { userId }, create: created as any, update: created as any })
+      } catch (e) {
+        // If DB write fails, fall back to defaults in-memory
+        console.warn('failed to create settings, falling back to defaults', e)
+        return res.status(200).json({ settings: { ...DEFAULT_SETTINGS, userId } })
+      }
+    }
+
     const normalizedQuality = clampQualityForTier(normalizeQuality(settings?.exportQuality), tier)
     const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
     const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
@@ -54,7 +98,6 @@ router.get('/', async (req: any, res) => {
       watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
       autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? false) : false,
-      autoDownload: settings?.autoDownload ?? false,
       autoHookMove: settings?.autoHookMove ?? true,
       removeBoring: settings?.removeBoring ?? true,
       onlyCuts: settings?.onlyCuts ?? false,
@@ -119,7 +162,6 @@ router.patch('/', async (req: any, res) => {
       watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, tier),
       autoCaptions: subtitlesEnabled ? (payload.autoCaptions ?? existing?.autoCaptions ?? false) : false,
-      autoDownload: Boolean(payload.autoDownload ?? existing?.autoDownload ?? false),
       autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
       removeBoring: payload.removeBoring ?? existing?.removeBoring ?? true,
       onlyCuts: payload.onlyCuts ?? existing?.onlyCuts ?? false,

@@ -1313,6 +1313,9 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       }
     }
 
+    // preserve any proxyPath that was uploaded earlier so the frontend can preview
+    const freshJob = await prisma.job.findUnique({ where: { id: jobId } })
+    const existingProxyPath = (freshJob?.analysis as any)?.proxyPath ?? null
     const analysis = {
       duration: duration ?? 0,
       size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
@@ -1322,7 +1325,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       hook_score: editPlan?.hook?.score ?? null,
       removed_segments: editPlan?.removedSegments ?? [],
       compressed_segments: editPlan?.compressedSegments ?? [],
-      editPlan
+      editPlan,
+      proxyPath: existingProxyPath
     }
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -1930,6 +1934,25 @@ router.post('/:id/download-url', async (req: any, res) => {
   }
 })
 
+// Return signed URL for proxy preview if available
+router.post('/:id/proxy-url', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const analysis = job.analysis as any
+    const proxyPath = analysis?.proxyPath
+    if (!proxyPath) return res.status(404).json({ error: 'proxy_not_available' })
+    await ensureBucket(OUTPUT_BUCKET, false)
+    const expires = 60 * 10
+    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(proxyPath, expires)
+    if (error) return res.status(500).json({ error: 'signed_url_failed' })
+    return res.json({ url: data.signedUrl })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
 const handleCompleteUpload = async (req: any, res: any) => {
   try {
     const id = req.params.id
@@ -1990,6 +2013,10 @@ router.post('/:id/process', async (req: any, res) => {
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
     const { options } = await getEditOptionsForUser(req.user.id)
+    // Allow client to request a fast-mode re-render (overrides user settings for this run)
+    if (req.body?.fastMode) {
+      ;(options as any).fastMode = true
+    }
     await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
   } catch (err: any) {

@@ -21,29 +21,17 @@ loadEnv()
 const app = express()
 app.set('trust proxy', 1)
 
-const frontendOrigin = process.env.FRONTEND_URL || ''
 const allowedOrigins = [
-  ...frontendOrigin.split(','),
-  'http://localhost:3000',
-  'http://localhost:5173',
   'https://www.autoeditor.app',
-  'https://autoeditor.app'
-].map((o) => o.trim()).filter(Boolean)
-const originSuffixes = (process.env.CORS_ORIGIN_SUFFIXES || '.vercel.app,.railway.app,.autoeditor.app,localhost').split(',')
-  .map((o) => o.trim())
-  .filter(Boolean)
+  'https://autoeditor.app',
+  'http://localhost:5173',
+  'http://localhost:3000'
+]
+
 app.use(cors({
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
     if (allowedOrigins.includes(origin)) return cb(null, true)
-    try {
-      const hostname = new URL(origin).hostname
-      if (originSuffixes.some((suffix) => hostname === suffix || hostname.endsWith(suffix))) {
-        return cb(null, true)
-      }
-    } catch (e) {
-      // ignore parse errors
-    }
     return cb(new Error('Not allowed by CORS'))
   },
   credentials: true,
@@ -52,25 +40,7 @@ app.use(cors({
 }))
 
 // Ensure OPTIONS preflight responses are handled quickly for all routes
-app.options('*', cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true)
-    if (allowedOrigins.includes(origin)) return cb(null, true)
-    try {
-      const hostname = new URL(origin).hostname
-      if (originSuffixes.some((suffix) => hostname === suffix || hostname.endsWith(suffix))) {
-        return cb(null, true)
-      }
-    } catch (e) {
-      // ignore parse errors
-    }
-    return cb(new Error('Not allowed by CORS'))
-  },
-  credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
-  optionsSuccessStatus: 204
-}))
+app.options('*', cors({ origin: allowedOrigins, credentials: true, optionsSuccessStatus: 204 }))
 
 app.use((req, res, next) => {
   const id = crypto.randomUUID().slice(0, 12)
