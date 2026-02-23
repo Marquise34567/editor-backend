@@ -14,8 +14,7 @@ const secretAccessKey = process.env.R2_SECRET_ACCESS_KEY || process.env.S3_SECRE
 const bucket = process.env.R2_BUCKET || process.env.S3_BUCKET || ''
 
 if (!endpoint || !accessKeyId || !secretAccessKey || !bucket) {
-  // warn but don't throw so devs can run parts that don't need R2
-  console.warn('R2 envs missing: S3_ENDPOINT,S3_ACCESS_KEY_ID,S3_SECRET_ACCESS_KEY,S3_BUCKET')
+  throw new Error('Missing R2 environment variables. Please set R2_ENDPOINT, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, and R2_BUCKET')
 }
 
 const client = new S3Client({

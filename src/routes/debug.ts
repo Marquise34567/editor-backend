@@ -1,5 +1,7 @@
 import express from 'express'
 import { supabaseAdmin } from '../supabaseClient'
+import { r2 } from '../lib/r2'
+import { ListObjectsV2Command } from '@aws-sdk/client-s3'
 
 const router = express.Router()
 
@@ -19,6 +21,23 @@ router.post('/validate-token', async (req: any, res) => {
   } catch (err: any) {
     console.error('debug.validate-token error', err?.stack || err)
     return res.status(500).json({ error: 'server_error', message: err?.message || String(err) })
+  }
+})
+
+// GET /api/debug/r2-health
+router.get('/r2-health', async (req: any, res) => {
+  try {
+    const bucket = process.env.R2_BUCKET || r2.bucket
+    if (!bucket) return res.status(500).json({ ok: false, error: 'R2_BUCKET_NOT_CONFIGURED' })
+    try {
+      await r2.client.send(new ListObjectsV2Command({ Bucket: bucket, MaxKeys: 1 }))
+      return res.json({ ok: true })
+    } catch (e: any) {
+      return res.status(500).json({ ok: false, error: String(e?.message || e) })
+    }
+  } catch (err: any) {
+    console.error('r2-health error', err)
+    res.status(500).json({ ok: false, error: String(err?.message || err) })
   }
 })
 

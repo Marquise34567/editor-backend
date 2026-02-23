@@ -1868,7 +1868,8 @@ router.post('/:id/complete-upload', async (req: any, res) => {
       publicUrl = key
     }
 
-    await updateJob(jobId, { inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    const bucketEnv = process.env.R2_BUCKET || r2.bucket || ''
+    await updateJob(jobId, { storageProvider: 'r2', inputKey: key, inputBucket: bucketEnv, inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
     // Enqueue pipeline to start processing
     enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
     res.json({ ok: true })
