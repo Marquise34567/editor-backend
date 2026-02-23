@@ -124,6 +124,11 @@ export const r2 = {
     const cmd = new PutObjectCommand({ Bucket: bucket, Key, Body, ContentType })
     return getClient().send(cmd)
   },
+  uploadFile: async ({ Key, filePath, ContentType }: { Key: string; filePath: string; ContentType?: string }) => {
+    const body = fs.createReadStream(filePath)
+    const cmd = new PutObjectCommand({ Bucket: bucket, Key, Body: body, ContentType })
+    return getClient().send(cmd)
+  },
   getPresignedGetUrl: async ({ Key, expiresIn = 600 }: { Key: string; expiresIn?: number }) => {
     const cmd = new GetObjectCommand({ Bucket: bucket, Key })
     return getSignedUrl(getClient(), cmd, { expiresIn })

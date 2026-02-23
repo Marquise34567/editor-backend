@@ -12,10 +12,11 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
-import { getRenderAttemptsForDay } from '../services/dailyRenderUsage'
+import { getRenderModeUsageForMonth } from '../services/renderModeUsage'
 import { getMonthKey, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
+import { isDevAccount } from '../lib/devAccounts'
 import {
   getPlanFeatures,
   getRequiredPlanForAdvancedEffects,
@@ -105,6 +106,22 @@ const uploadBufferToOutput = async ({ key, body, contentType }: { key: string; b
     return
   }
   await withRetries(`supabase_upload:${key}`, 3, async () => {
+    const { error } = await supabaseAdmin.storage
+      .from(OUTPUT_BUCKET)
+      .upload(key, body, { contentType: contentType || 'application/octet-stream', upsert: true })
+    if (error) throw error
+  })
+}
+
+const uploadFileToOutput = async ({ key, filePath, contentType }: { key: string; filePath: string; contentType?: string }) => {
+  if (r2.isConfigured) {
+    await withRetries(`r2_upload_file:${key}`, 3, async () => {
+      await r2.uploadFile({ Key: key, filePath, ContentType: contentType })
+    })
+    return
+  }
+  await withRetries(`supabase_upload_file:${key}`, 3, async () => {
+    const body = fs.readFileSync(filePath)
     const { error } = await supabaseAdmin.storage
       .from(OUTPUT_BUCKET)
       .upload(key, body, { contentType: contentType || 'application/octet-stream', upsert: true })
@@ -322,7 +339,7 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MAX_VERTICAL_CLIPS = 3
 const MIN_VERTICAL_CLIP_SECONDS = 8
-const FREE_DAILY_RENDER_LIMIT = 1
+const FREE_VERTICAL_MONTHLY_RENDER_LIMIT = 1
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -416,17 +433,87 @@ const buildRenderLimitPayload = (
   }
 }
 
-const buildDailyRenderLimitPayload = (usage?: { rendersCount?: number | null; dayKey?: string | null }) => {
-  const rendersUsed = typeof usage?.rendersCount === 'number' ? usage.rendersCount : FREE_DAILY_RENDER_LIMIT
+const buildVerticalRenderLimitPayload = (usage?: { rendersCount?: number | null; monthKey?: string | null }) => {
+  const rendersUsed = typeof usage?.rendersCount === 'number' ? usage.rendersCount : FREE_VERTICAL_MONTHLY_RENDER_LIMIT
   return {
-    error: 'DAILY_RENDER_LIMIT_REACHED',
-    code: 'DAILY_RENDER_LIMIT_REACHED',
-    message: 'Free plan includes 1 render per day. Upgrade to unlock more renders.',
-    rendersRemainingToday: Math.max(0, FREE_DAILY_RENDER_LIMIT - rendersUsed),
-    maxRendersPerDay: FREE_DAILY_RENDER_LIMIT,
-    rendersUsedToday: rendersUsed,
-    day: usage?.dayKey ?? null
+    error: 'VERTICAL_RENDER_LIMIT_REACHED',
+    code: 'VERTICAL_RENDER_LIMIT_REACHED',
+    message: 'Free plan includes 1 vertical render per month. Upgrade to unlock more vertical renders.',
+    rendersRemainingVertical: Math.max(0, FREE_VERTICAL_MONTHLY_RENDER_LIMIT - rendersUsed),
+    maxVerticalRendersPerMonth: FREE_VERTICAL_MONTHLY_RENDER_LIMIT,
+    verticalRendersUsed: rendersUsed,
+    month: usage?.monthKey ?? getMonthKey()
   }
+}
+
+type RenderLimitViolation = {
+  code: 'RENDER_LIMIT_REACHED' | 'VERTICAL_RENDER_LIMIT_REACHED'
+  payload: Record<string, any>
+  requiredPlan: PlanTier
+}
+
+type RenderLimitCheckArgs = {
+  userId: string
+  email?: string | null
+  tier: PlanTier
+  plan: { maxRendersPerMonth?: number | null }
+  renderMode: RenderMode
+  allowAtLimitForFree?: boolean
+}
+
+const getRenderLimitViolation = async ({
+  userId,
+  email,
+  tier,
+  plan,
+  renderMode,
+  allowAtLimitForFree = false
+}: RenderLimitCheckArgs): Promise<RenderLimitViolation | null> => {
+  if (isDevAccount(userId, email)) return null
+  const requiredPlan = getRequiredPlanForRenders(tier)
+
+  if (tier === 'free') {
+    if (renderMode === 'vertical') {
+      const verticalUsage = await getRenderModeUsageForMonth(userId, 'vertical')
+      const limitHit = allowAtLimitForFree
+        ? verticalUsage.rendersCount > FREE_VERTICAL_MONTHLY_RENDER_LIMIT
+        : verticalUsage.rendersCount >= FREE_VERTICAL_MONTHLY_RENDER_LIMIT
+      if (limitHit) {
+        return {
+          code: 'VERTICAL_RENDER_LIMIT_REACHED',
+          payload: buildVerticalRenderLimitPayload(verticalUsage),
+          requiredPlan
+        }
+      }
+      return null
+    }
+
+    const standardLimit = typeof plan.maxRendersPerMonth === 'number' ? plan.maxRendersPerMonth : 10
+    const standardUsage = await getRenderModeUsageForMonth(userId, 'standard')
+    const limitHit = allowAtLimitForFree
+      ? standardUsage.rendersCount > standardLimit
+      : standardUsage.rendersCount >= standardLimit
+    if (limitHit) {
+      return {
+        code: 'RENDER_LIMIT_REACHED',
+        payload: buildRenderLimitPayload({ maxRendersPerMonth: standardLimit }, standardUsage),
+        requiredPlan
+      }
+    }
+    return null
+  }
+
+  const monthKey = getMonthKey()
+  const renderUsage = await getRenderUsageForMonth(userId, monthKey)
+  const maxRenders = plan.maxRendersPerMonth
+  if (maxRenders !== null && maxRenders !== undefined && (renderUsage?.rendersCount ?? 0) >= maxRenders) {
+    return {
+      code: 'RENDER_LIMIT_REACHED',
+      payload: buildRenderLimitPayload(plan, renderUsage),
+      requiredPlan
+    }
+  }
+  return null
 }
 
 const runFfmpegCapture = async (args: string[]) => {
@@ -1738,26 +1825,29 @@ const getRequestedQuality = (value?: string | null, fallback?: string | null): E
 
 const ensureUsageWithinLimits = async (
   userId: string,
+  userEmail: string | undefined,
   durationMinutes: number,
   tier: PlanTier,
-  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null }
+  plan: { maxRendersPerMonth: number | null; maxMinutesPerMonth: number | null },
+  renderMode: RenderMode
 ) => {
   const monthKey = getMonthKey()
-  if (tier !== 'free') {
-    const renderUsage = await getRenderUsageForMonth(userId, monthKey)
-    const maxRenders = plan.maxRendersPerMonth
-    if (maxRenders !== null && maxRenders !== undefined) {
-      if ((renderUsage?.rendersCount ?? 0) >= maxRenders) {
-        const requiredPlan = getRequiredPlanForRenders(tier)
-        throw new PlanLimitError(
-          'Monthly render limit reached. Upgrade to continue.',
-          'renders',
-          requiredPlan,
-          undefined,
-          'RENDER_LIMIT_REACHED'
-        )
-      }
-    }
+  const renderViolation = await getRenderLimitViolation({
+    userId,
+    email: userEmail,
+    tier,
+    plan,
+    renderMode,
+    allowAtLimitForFree: true
+  })
+  if (renderViolation) {
+    throw new PlanLimitError(
+      renderViolation.payload?.message || 'Monthly render limit reached. Upgrade to continue.',
+      'renders',
+      renderViolation.requiredPlan,
+      undefined,
+      renderViolation.code
+    )
   }
   const usage = await getUsageForMonth(userId, monthKey)
   if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
@@ -2023,7 +2113,7 @@ const processJob = async (
     const durationMinutes = toMinutes(durationSeconds)
     await updateJob(jobId, { inputDurationSeconds: Math.round(durationSeconds) })
 
-    await ensureUsageWithinLimits(user.id, durationMinutes, tier, plan)
+    await ensureUsageWithinLimits(user.id, user.email, durationMinutes, tier, plan, renderConfig.mode)
 
     let processed = false
     let retentionScore: number | null = null
@@ -2317,18 +2407,16 @@ const processJob = async (
       for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
         const clipPath = renderedClipPaths[idx]
         const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
-        const body = fs.readFileSync(clipPath)
-        await uploadBufferToOutput({ key, body, contentType: 'video/mp4' })
+        await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
         outputPaths.push(key)
       }
     } else {
-      const outBuf = fs.readFileSync(tmpOut)
       const outPath = `${job.userId}/${jobId}/output.mp4`
       const localOutPath = path.join(localOutDir, 'output.mp4')
       fs.copyFileSync(tmpOut, localOutPath)
       console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
       try {
-        await uploadBufferToOutput({ key: outPath, body: outBuf, contentType: 'video/mp4' })
+        await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
       } catch (e) {
         await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
         throw new Error('upload_failed')
@@ -2377,6 +2465,10 @@ const processJob = async (
 
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
   try {
+    const existing = await prisma.job.findUnique({ where: { id: jobId } })
+    if (!existing) return
+    const status = String(existing.status || '').toLowerCase()
+    if (status === 'completed' || status === 'failed') return
     if (!hasFfmpeg()) {
       await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
       throw new Error('ffmpeg_missing')
@@ -2396,6 +2488,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
 
 type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string; priorityLevel: number }
 const pipelineQueue: QueueItem[] = []
+const queuedPipelineJobIds = new Set<string>()
+const runningPipelineJobIds = new Set<string>()
 let activePipelines = 0
 const MAX_PIPELINES = (() => {
   const envVal = Number(process.env.JOB_CONCURRENCY || 0)
@@ -2406,14 +2500,51 @@ const MAX_PIPELINES = (() => {
   if (cpus >= 4) return Math.max(2, Math.min(4, cpus - 1))
   return cpus
 })()
+const QUEUE_RECOVERY_INTERVAL_MS = (() => {
+  const envVal = Number(process.env.JOB_QUEUE_RECOVERY_INTERVAL_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 5000) return envVal
+  return 30_000
+})()
+const STALE_PIPELINE_MS = (() => {
+  const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 60_000) return envVal
+  return 90 * 60_000
+})()
+const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
+const STALE_RECOVERABLE_STATUSES = new Set([
+  'analyzing',
+  'hooking',
+  'cutting',
+  'pacing',
+  'story',
+  'subtitling',
+  'audio',
+  'retention',
+  'rendering'
+])
+let queueRecoveryRunning = false
+let queueRecoveryLoopStarted = false
+
+const toTimeMs = (value: unknown) => {
+  if (!value) return 0
+  if (value instanceof Date) return value.getTime()
+  const parsed = new Date(String(value)).getTime()
+  return Number.isFinite(parsed) ? parsed : 0
+}
 
 const processQueue = () => {
   while (activePipelines < MAX_PIPELINES && pipelineQueue.length > 0) {
     const next = pipelineQueue.shift()
     if (!next) return
+    queuedPipelineJobIds.delete(next.jobId)
+    if (runningPipelineJobIds.has(next.jobId)) {
+      continue
+    }
+    runningPipelineJobIds.add(next.jobId)
     activePipelines += 1
     void runPipeline(next.jobId, next.user, next.requestedQuality, next.requestId)
       .finally(() => {
+        runningPipelineJobIds.delete(next.jobId)
         activePipelines = Math.max(0, activePipelines - 1)
         processQueue()
       })
@@ -2421,14 +2552,85 @@ const processQueue = () => {
 }
 
 export const enqueuePipeline = (item: QueueItem) => {
+  if (!item?.jobId || !item?.user?.id) return
+  if (queuedPipelineJobIds.has(item.jobId) || runningPipelineJobIds.has(item.jobId)) return
   const index = pipelineQueue.findIndex((queued) => queued.priorityLevel > item.priorityLevel)
   if (index === -1) {
     pipelineQueue.push(item)
   } else {
     pipelineQueue.splice(index, 0, item)
   }
+  queuedPipelineJobIds.add(item.jobId)
   processQueue()
 }
+
+const recoverQueuedJobs = async () => {
+  if (queueRecoveryRunning) return
+  queueRecoveryRunning = true
+  try {
+    const candidates = await prisma.job.findMany({
+      where: {
+        status: {
+          in: [...STARTABLE_QUEUE_STATUSES, ...STALE_RECOVERABLE_STATUSES] as any
+        }
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 200
+    })
+    const jobs = Array.isArray(candidates) ? candidates : []
+    const nowMs = Date.now()
+    for (const job of jobs) {
+      const jobId = String(job?.id || '')
+      const userId = String(job?.userId || '')
+      if (!jobId || !userId) continue
+
+      const status = String(job?.status || '').toLowerCase()
+      const startable = STARTABLE_QUEUE_STATUSES.has(status)
+      const staleRecoverable =
+        STALE_RECOVERABLE_STATUSES.has(status) &&
+        nowMs - toTimeMs(job?.updatedAt) >= STALE_PIPELINE_MS
+
+      if (!startable && !staleRecoverable) continue
+
+      if (staleRecoverable) {
+        const boundedProgress = Math.max(1, Math.min(90, Number(job?.progress || 1)))
+        try {
+          await updateJob(jobId, { status: 'queued', progress: boundedProgress, error: null })
+          console.warn(`[queue] recovered stale job ${jobId} from ${status}`)
+        } catch (err) {
+          console.error('[queue] stale recovery update failed', { jobId, status, err })
+          continue
+        }
+      }
+
+      const requestedQuality = typeof job?.requestedQuality === 'string'
+        ? normalizeQuality(job.requestedQuality)
+        : undefined
+      enqueuePipeline({
+        jobId,
+        user: { id: userId },
+        requestedQuality,
+        priorityLevel: Number(job?.priorityLevel ?? 2) || 2
+      })
+    }
+  } catch (err) {
+    console.error('[queue] recovery sweep failed', err)
+  } finally {
+    queueRecoveryRunning = false
+  }
+}
+
+const startQueueRecoveryLoop = () => {
+  if (queueRecoveryLoopStarted) return
+  queueRecoveryLoopStarted = true
+  setTimeout(() => void recoverQueuedJobs(), 2000)
+  const timer = setInterval(() => void recoverQueuedJobs(), QUEUE_RECOVERY_INTERVAL_MS)
+  if (typeof (timer as any).unref === 'function') {
+    ;(timer as any).unref()
+  }
+}
+
+startQueueRecoveryLoop()
 
 const handleCreateJob = async (req: any, res: any) => {
   try {
@@ -2452,19 +2654,15 @@ const handleCreateJob = async (req: any, res: any) => {
 
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
-    if (tier === 'free') {
-      const dailyUsage = await getRenderAttemptsForDay(userId)
-      if ((dailyUsage?.rendersCount ?? 0) >= FREE_DAILY_RENDER_LIMIT) {
-        return res.status(403).json(buildDailyRenderLimitPayload(dailyUsage))
-      }
-    } else {
-      const monthKey = getMonthKey()
-      const renderUsage = await getRenderUsageForMonth(userId, monthKey)
-      if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
-        if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-          return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
-        }
-      }
+    const renderLimitViolation = await getRenderLimitViolation({
+      userId,
+      email: req.user?.email,
+      tier,
+      plan,
+      renderMode: renderConfig.mode
+    })
+    if (renderLimitViolation) {
+      return res.status(403).json(renderLimitViolation.payload)
     }
     const subtitleRequest = req.body?.subtitles
     if (subtitleRequest?.enabled) {
@@ -2741,14 +2939,17 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
     const { plan, tier } = await getUserPlan(req.user.id)
-    if (tier !== 'free') {
-      const monthKey = getMonthKey()
-      const renderUsage = await getRenderUsageForMonth(req.user.id, monthKey)
-      if (plan.maxRendersPerMonth !== null && plan.maxRendersPerMonth !== undefined) {
-        if ((renderUsage?.rendersCount ?? 0) >= plan.maxRendersPerMonth) {
-          return res.status(403).json(buildRenderLimitPayload(plan, renderUsage))
-        }
-      }
+    const renderMode = parseRenderConfigFromAnalysis(job.analysis as any).mode
+    const renderLimitViolation = await getRenderLimitViolation({
+      userId: req.user.id,
+      email: req.user?.email,
+      tier,
+      plan,
+      renderMode,
+      allowAtLimitForFree: true
+    })
+    if (renderLimitViolation) {
+      return res.status(403).json(renderLimitViolation.payload)
     }
 
     await updateJob(id, { inputPath, status: 'analyzing', progress: 10, requestedQuality: requestedQuality || job.requestedQuality })

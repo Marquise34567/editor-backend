@@ -2,20 +2,16 @@ import express from 'express'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth } from '../services/usage'
-import { getRenderAttemptsForDay } from '../services/dailyRenderUsage'
+import { getRenderModeUsageForMonth } from '../services/renderModeUsage'
 import { getMonthKey } from '../shared/planConfig'
 import { getPlanFeatures } from '../lib/planFeatures'
 import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
+import { isDevAccount } from '../lib/devAccounts'
 
 const router = express.Router()
-const DEV_ACCOUNT_EMAILS = (process.env.DEV_ACCOUNT_EMAILS || process.env.DEV_ACCOUNT_EMAIL || '')
-  .split(',')
-  .map((value) => value.trim().toLowerCase())
-  .filter(Boolean)
-const DEV_ACCOUNT_USER_IDS = (process.env.DEV_ACCOUNT_USER_IDS || '')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean)
+
+const FREE_VERTICAL_MONTHLY_RENDER_LIMIT = 1
+
 router.get('/', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
@@ -23,12 +19,11 @@ router.get('/', async (req: any, res) => {
   const { subscription, tier, plan } = await getUserPlan(id)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
-  const dailyUsage = tier === 'free' ? await getRenderAttemptsForDay(id) : null
-  const email = String(user.email || '').toLowerCase()
-  const isDev = Boolean(
-    (email && DEV_ACCOUNT_EMAILS.includes(email)) ||
-      (DEV_ACCOUNT_USER_IDS.length && DEV_ACCOUNT_USER_IDS.includes(user.id))
-  )
+  const standardModeUsage = await getRenderModeUsageForMonth(id, 'standard')
+  const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
+  const isDev = isDevAccount(user.id, user.email)
+  const rendersUsed = tier === 'free' ? standardModeUsage.rendersCount : (usage?.rendersUsed ?? 0)
+
   res.json({
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     subscription: subscription
@@ -42,19 +37,23 @@ router.get('/', async (req: any, res) => {
     flags: { dev: isDev },
     usage: {
       month,
-      rendersUsed: usage?.rendersUsed ?? 0,
+      rendersUsed,
       minutesUsed: usage?.minutesUsed ?? 0
     },
-    usageDaily: dailyUsage
-      ? {
-          day: dailyUsage.dayKey,
-          rendersUsed: dailyUsage.rendersCount,
-          rendersLimit: 1
-        }
-      : null,
+    usageByMode: {
+      month,
+      standardRendersUsed: standardModeUsage.rendersCount,
+      verticalRendersUsed: verticalModeUsage.rendersCount
+    },
+    usageDaily: null,
     limits: {
-      maxRendersPerMonth: tier === 'free' ? null : plan.maxRendersPerMonth,
-      maxRendersPerDay: tier === 'free' ? 1 : null,
+      maxRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
+      maxRendersPerDay: null,
+      maxVerticalRendersPerMonth: isDev
+        ? null
+        : tier === 'free'
+          ? FREE_VERTICAL_MONTHLY_RENDER_LIMIT
+          : plan.maxRendersPerMonth,
       maxMinutesPerMonth: plan.maxMinutesPerMonth,
       exportQuality: plan.exportQuality,
       watermark: plan.watermark,
