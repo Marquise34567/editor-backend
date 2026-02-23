@@ -262,8 +262,8 @@ const HOOK_MIN = 5
 const HOOK_MAX = 10
 const CUT_MIN = 3
 const CUT_MAX = 5
-const PACE_MIN = 3
-const PACE_MAX = 6
+const PACE_MIN = 5
+const PACE_MAX = 10
 const CUT_GUARD_SEC = 0.35
 const CUT_LEN_PATTERN = [3.2, 4.4, 3.6, 4.8]
 const CUT_GAP_PATTERN = [1.0, 1.6, 1.2, 0.8]
@@ -433,6 +433,145 @@ const averageWindowMetric = (
   const relevant = windows.filter((window) => window.time >= start && window.time < end)
   if (!relevant.length) return 0
   return relevant.reduce((sum, window) => sum + metric(window), 0) / relevant.length
+}
+
+const pickRetentionSplitPoint = (
+  start: number,
+  end: number,
+  minLen: number,
+  maxLen: number,
+  windows: EngagementWindow[]
+) => {
+  const searchStart = start + minLen
+  const searchEnd = Math.min(start + maxLen, end - minLen)
+  if (searchEnd <= searchStart) return Math.min(end, start + maxLen)
+  const ideal = Math.min(searchEnd, Math.max(searchStart, start + (minLen + maxLen) / 2))
+  let best = ideal
+  let bestScore = Number.POSITIVE_INFINITY
+  for (let split = searchStart; split <= searchEnd; split += 0.5) {
+    const before = averageWindowMetric(
+      windows,
+      Math.max(start, split - 2),
+      split,
+      (window) => 0.72 * window.score + 0.18 * window.speechIntensity + 0.1 * window.vocalExcitement
+    )
+    const valley = averageWindowMetric(
+      windows,
+      Math.max(start, split - 1),
+      Math.min(end, split + 1),
+      (window) => window.score
+    )
+    const after = averageWindowMetric(
+      windows,
+      split,
+      Math.min(end, split + 2),
+      (window) => 0.7 * window.score + 0.2 * window.vocalExcitement + 0.1 * window.speechIntensity
+    )
+    const momentumBoost = Math.max(0, after - before) * 0.35
+    const distancePenalty = Math.abs(split - ideal) * 0.02
+    const score = valley + distancePenalty - momentumBoost
+    if (score < bestScore) {
+      bestScore = score
+      best = split
+    }
+  }
+  return Number(best.toFixed(2))
+}
+
+const enforceSegmentLengths = (
+  segments: Segment[],
+  minLen: number,
+  maxLen: number,
+  windows: EngagementWindow[]
+) => {
+  const normalized: Segment[] = []
+  for (const seg of segments) {
+    let cursor = seg.start
+    const end = seg.end
+    while (end - cursor > maxLen + 0.05) {
+      const split = pickRetentionSplitPoint(cursor, end, minLen, maxLen, windows)
+      const safeSplit = Number.isFinite(split) ? split : cursor + maxLen
+      if (safeSplit <= cursor + 0.25 || safeSplit >= end - 0.25) break
+      normalized.push({ ...seg, start: cursor, end: safeSplit })
+      cursor = safeSplit
+    }
+    if (end - cursor > 0.2) {
+      normalized.push({ ...seg, start: cursor, end })
+    }
+  }
+
+  const merged: Segment[] = []
+  for (const seg of normalized) {
+    const len = seg.end - seg.start
+    if (len >= minLen || merged.length === 0) {
+      merged.push({ ...seg })
+      continue
+    }
+    const prev = merged[merged.length - 1]
+    const prevLen = prev.end - prev.start
+    if (prevLen + len <= maxLen + 0.25) {
+      prev.end = seg.end
+      continue
+    }
+    const needed = Math.min(minLen - len, Math.max(0, prevLen - minLen))
+    if (needed > 0.1) {
+      prev.end -= needed
+      merged.push({ ...seg, start: seg.start - needed, end: seg.end })
+    } else {
+      merged.push({ ...seg })
+    }
+  }
+
+  return merged.filter((seg) => seg.end - seg.start > 0.25)
+}
+
+const refineSegmentsForRetention = (
+  segments: Segment[],
+  windows: EngagementWindow[],
+  minLen: number,
+  maxLen: number
+) => {
+  const refined = segments
+    .map((segment) => {
+      let start = segment.start
+      let end = segment.end
+      for (let pass = 0; pass < 5; pass += 1) {
+        const duration = end - start
+        if (duration <= minLen + 0.2) break
+        const segmentScore = averageWindowMetric(
+          windows,
+          start,
+          end,
+          (window) => 0.7 * window.score + 0.2 * window.speechIntensity + 0.1 * window.vocalExcitement
+        )
+        const headScore = averageWindowMetric(
+          windows,
+          start,
+          Math.min(end, start + 1.5),
+          (window) => 0.7 * window.score + 0.3 * window.speechIntensity
+        )
+        const tailScore = averageWindowMetric(
+          windows,
+          Math.max(start, end - 1.5),
+          end,
+          (window) => 0.7 * window.score + 0.3 * window.speechIntensity
+        )
+        let trimmed = false
+        if (headScore < segmentScore * 0.76 && end - (start + 1) >= minLen) {
+          start += 1
+          trimmed = true
+        }
+        if (tailScore < segmentScore * 0.76 && (end - 1) - start >= minLen) {
+          end -= 1
+          trimmed = true
+        }
+        if (!trimmed) break
+      }
+      return { ...segment, start, end }
+    })
+    .filter((segment) => segment.end - segment.start > 0.25)
+
+  return enforceSegmentLengths(refined, minLen, maxLen, windows)
 }
 
 const buildEngagementWindows = (
@@ -787,10 +926,15 @@ const buildBoringFlags = (windows: EngagementWindow[], silences: TimeRange[]) =>
     const lowSpeech = w.speechIntensity < 0.25 && w.audioEnergy < 0.2
     const lowMotion = w.motionScore < 0.2 && w.sceneChangeRate < 0.2
     const staticVisual = w.motionScore < 0.1 && w.sceneChangeRate < 0.1
+    const retentionRisk = 1 - (0.55 * w.score + 0.18 * w.speechIntensity + 0.15 * w.vocalExcitement + 0.12 * w.emotionIntensity)
+    const lowRetention = retentionRisk > 0.64 && w.score < 0.35
+    const weakWindow = w.score < 0.3 && w.speechIntensity < 0.35 && w.vocalExcitement < 0.35
     const emotionalMoment = w.emotionIntensity > 0.6 || w.vocalExcitement > 0.6 || w.emotionalSpike > 0
     if (emotionalMoment) return false
     if (silent) return true
     if (fillerFlags[idx]) return true
+    if (lowRetention && (lowSpeech || lowMotion || faceAbsent[idx])) return true
+    if (weakWindow && (lowMotion || staticVisual)) return true
     if (faceAbsent[idx] && (lowSpeech || lowMotion)) return true
     if (lowSpeech && lowMotion) return true
     if (staticVisual && w.audioEnergy < 0.2) return true
@@ -856,12 +1000,12 @@ const applyPacingPattern = (
       const engagement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.score)
       const excitement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.vocalExcitement)
       const phase = durationSeconds > 0 ? cursor / durationSeconds : 0
-      let target = phase < 0.2 ? 3.0 : phase > 0.82 ? 3.4 : 4.25
-      if (engagement < 0.28) target -= 0.7
-      else if (engagement > 0.72) target += 0.35
-      if (excitement > 0.7) target -= 0.25
-      if (aggressiveMode) target -= 0.45
-      const jitter = patternIdx % 2 === 0 ? -0.18 : 0.18
+      let target = phase < 0.2 ? 5.8 : phase > 0.82 ? 5.6 : 6.8
+      if (engagement < 0.28) target -= 1.1
+      else if (engagement > 0.72) target += 1.0
+      if (excitement > 0.7) target -= 0.55
+      if (aggressiveMode) target -= 0.65
+      const jitter = patternIdx % 2 === 0 ? -0.25 : 0.25
       const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
       const nextEnd = Math.min(end, cursor + desired)
       out.push({ ...seg, start: cursor, end: nextEnd })
@@ -909,12 +1053,15 @@ const buildEditPlan = async (
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
   const keepSegments = removedSegments.length ? subtractRanges(baseSegments, removedSegments) : baseSegments
 
-  const minLen = options.onlyCuts ? PACE_MIN : options.aggressiveMode ? 2.2 : 2.7
-  const maxLen = options.onlyCuts ? PACE_MAX : options.aggressiveMode ? 4.8 : 5.6
+  const minLen = PACE_MIN
+  const maxLen = PACE_MAX
   const pacingInput = keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }]
-  const normalizedKeep = options.onlyCuts
+  const pacedSegments = options.onlyCuts
     ? pacingInput
     : applyPacingPattern(pacingInput, minLen, maxLen, windows, durationSeconds, options.aggressiveMode)
+  const normalizedKeep = options.onlyCuts
+    ? enforceSegmentLengths(pacedSegments, minLen, maxLen, windows)
+    : refineSegmentsForRetention(pacedSegments, windows, minLen, maxLen)
 
   if (onStage) await onStage('hooking')
   const hook = pickBestHook(durationSeconds, normalizedKeep, windows)
@@ -923,7 +1070,7 @@ const buildEditPlan = async (
   if (onStage) await onStage('pacing')
   const shouldMoveHook = options.autoHookMove && !options.onlyCuts
   const withoutHook = shouldMoveHook ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
-  const finalSegments = withoutHook.map((seg) => ({ ...seg }))
+  const finalSegments = enforceSegmentLengths(withoutHook.map((seg) => ({ ...seg })), minLen, maxLen, windows)
 
   return {
     hook,
