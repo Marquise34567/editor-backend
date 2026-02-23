@@ -276,6 +276,8 @@ const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const HOOK_ANALYZE_MAX = 600
 const SCENE_THRESHOLD = 0.45
+const STRATEGIST_HOOK_WINDOW_SEC = 35
+const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -420,6 +422,19 @@ const normalizeEnergy = (rmsDb: number) => {
   return (clamped + 60) / 60
 }
 
+const clamp01 = (value: number) => Math.max(0, Math.min(1, value))
+
+const averageWindowMetric = (
+  windows: EngagementWindow[],
+  start: number,
+  end: number,
+  metric: (window: EngagementWindow) => number
+) => {
+  const relevant = windows.filter((window) => window.time >= start && window.time < end)
+  if (!relevant.length) return 0
+  return relevant.reduce((sum, window) => sum + metric(window), 0) / relevant.length
+}
+
 const buildEngagementWindows = (
   durationSeconds: number,
   energySamples: { time: number; rms: number }[],
@@ -475,7 +490,7 @@ const buildEngagementWindows = (
     const emotionalSpike = audioEnergy > meanEnergy + std * 1.5 ? 1 : 0
     const vocalExcitement = Math.min(1, Math.max(0, (audioEnergy - meanEnergy) / (std + 0.05)))
     const emotionIntensity = Math.min(1, 0.6 * speechIntensity + 0.25 * vocalExcitement + 0.15 * emotionalSpike)
-    const score =
+    const baseScore =
       0.2 * audioEnergy +
       0.2 * speechIntensity +
       0.15 * motionScore +
@@ -483,6 +498,14 @@ const buildEngagementWindows = (
       0.15 * emotionIntensity +
       0.08 * textDensity +
       0.07 * vocalExcitement
+    const hookPotential =
+      0.32 * vocalExcitement +
+      0.24 * emotionIntensity +
+      0.2 * sceneChangeRate +
+      0.14 * speechIntensity +
+      0.1 * textDensity
+    const introBias = i < 20 ? 0.06 : i < 40 ? 0.03 : 0
+    const score = clamp01(baseScore * 0.82 + hookPotential * 0.18 + introBias)
     windows.push({
       time: i,
       audioEnergy,
@@ -603,9 +626,8 @@ const isRangeCoveredBySegments = (start: number, end: number, segments: Segment[
 
 const scoreWindow = (start: number, duration: number, windows: EngagementWindow[]) => {
   const end = start + duration
-  const relevant = windows.filter((w) => w.time >= start && w.time < end)
-  if (!relevant.length) return -Infinity
-  const avg = relevant.reduce((sum, w) => sum + w.score, 0) / relevant.length
+  const avg = averageWindowMetric(windows, start, end, (window) => window.score)
+  if (!Number.isFinite(avg) || avg <= 0) return -Infinity
   return avg
 }
 
@@ -619,9 +641,14 @@ const pickBestHook = (
   windows
     .slice()
     .sort((a, b) => b.score - a.score)
-    .slice(0, 8)
-    .forEach((win) => candidates.add(win.time))
-  candidates.add(0)
+    .slice(0, 12)
+    .forEach((win) => candidates.add(Math.max(0, win.time - 1)))
+  ;[0, 1, 2].forEach((start) => candidates.add(start))
+  windows
+    .filter((window) => window.time <= STRATEGIST_HOOK_WINDOW_SEC)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6)
+    .forEach((window) => candidates.add(window.time))
 
   const maxDuration = Math.min(HOOK_MAX, durationSeconds || HOOK_MAX)
   const minDuration = Math.min(HOOK_MIN, maxDuration)
@@ -629,13 +656,41 @@ const pickBestHook = (
   let bestStart = 0
   let bestDuration = Math.max(minDuration, maxDuration)
   let bestScore = -Infinity
+  const effectiveDuration = durationSeconds > 0 ? durationSeconds : HOOK_ANALYZE_MAX
+  const urgencyWindow = Math.max(
+    STRATEGIST_HOOK_WINDOW_SEC,
+    Math.max(STRATEGIST_HOOK_WINDOW_SEC, effectiveDuration * 0.35)
+  )
 
   for (const start of candidates) {
     for (let duration = maxDuration; duration >= minDuration; duration -= 1) {
       const end = start + duration
       if (end > durationSeconds) continue
       if (!isRangeCoveredBySegments(start, end, segments)) continue
-      const score = scoreWindow(start, duration, windows)
+      const baseScore = scoreWindow(start, duration, windows)
+      if (!Number.isFinite(baseScore)) continue
+      const avgSpeech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+      const avgEmotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
+      const avgExcitement = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
+      const avgFace = averageWindowMetric(windows, start, end, (window) => window.facePresence)
+      const hasSpike = averageWindowMetric(windows, start, end, (window) => window.emotionalSpike) > 0.05
+      const urgency = clamp01(1 - start / urgencyWindow)
+      const earlyBoost = 0.16 * urgency
+      const latePenalty =
+        start > STRATEGIST_LATE_HOOK_PENALTY_SEC
+          ? Math.min(0.2, (start - STRATEGIST_LATE_HOOK_PENALTY_SEC) / 90)
+          : 0
+      const longHookPenalty = duration >= 9 ? 0.03 : 0
+      const score =
+        baseScore +
+        0.11 * avgExcitement +
+        0.09 * avgEmotion +
+        0.06 * avgSpeech +
+        0.04 * avgFace +
+        (hasSpike ? 0.08 : 0) +
+        earlyBoost -
+        latePenalty -
+        longHookPenalty
       if (score > bestScore) {
         bestScore = score
         bestStart = start
@@ -644,7 +699,7 @@ const pickBestHook = (
     }
   }
 
-  return { start: bestStart, duration: bestDuration, score: bestScore }
+  return { start: bestStart, duration: bestDuration, score: clamp01(bestScore) }
 }
 
 const subtractRange = (segments: Segment[], range: TimeRange) => {
@@ -783,15 +838,30 @@ const buildBoringCuts = (flags: boolean[]) => {
   return mergeRanges(ranges)
 }
 
-const applyPacingPattern = (segments: Segment[], minLen: number, maxLen: number) => {
+const applyPacingPattern = (
+  segments: Segment[],
+  minLen: number,
+  maxLen: number,
+  windows: EngagementWindow[],
+  durationSeconds: number,
+  aggressiveMode: boolean
+) => {
   const out: Segment[] = []
   let patternIdx = 0
   for (const seg of segments) {
     let cursor = seg.start
     const end = seg.end
     while (end - cursor > maxLen) {
-      const target = CUT_LEN_PATTERN[patternIdx % CUT_LEN_PATTERN.length]
-      const jitter = (patternIdx % 2 === 0 ? -0.2 : 0.2)
+      const previewEnd = Math.min(end, cursor + 4)
+      const engagement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.score)
+      const excitement = averageWindowMetric(windows, cursor, previewEnd, (window) => window.vocalExcitement)
+      const phase = durationSeconds > 0 ? cursor / durationSeconds : 0
+      let target = phase < 0.2 ? 3.0 : phase > 0.82 ? 3.4 : 4.25
+      if (engagement < 0.28) target -= 0.7
+      else if (engagement > 0.72) target += 0.35
+      if (excitement > 0.7) target -= 0.25
+      if (aggressiveMode) target -= 0.45
+      const jitter = patternIdx % 2 === 0 ? -0.18 : 0.18
       const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
       const nextEnd = Math.min(end, cursor + desired)
       out.push({ ...seg, start: cursor, end: nextEnd })
@@ -839,10 +909,12 @@ const buildEditPlan = async (
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
   const keepSegments = removedSegments.length ? subtractRanges(baseSegments, removedSegments) : baseSegments
 
-  const minLen = PACE_MIN
-  const maxLen = PACE_MAX
+  const minLen = options.onlyCuts ? PACE_MIN : options.aggressiveMode ? 2.2 : 2.7
+  const maxLen = options.onlyCuts ? PACE_MAX : options.aggressiveMode ? 4.8 : 5.6
   const pacingInput = keepSegments.length ? keepSegments : [{ start: 0, end: durationSeconds, speed: 1 }]
-  const normalizedKeep = options.onlyCuts ? pacingInput : applyPacingPattern(pacingInput, minLen, maxLen)
+  const normalizedKeep = options.onlyCuts
+    ? pacingInput
+    : applyPacingPattern(pacingInput, minLen, maxLen, windows, durationSeconds, options.aggressiveMode)
 
   if (onStage) await onStage('hooking')
   const hook = pickBestHook(durationSeconds, normalizedKeep, windows)
