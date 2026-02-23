@@ -2591,6 +2591,11 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
     if (!existing) return
     const status = String(existing.status || '').toLowerCase()
     if (status === 'completed' || status === 'failed') return
+    const progress = Number(existing.progress ?? 0)
+    if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
+      console.log(`[${requestId || 'noid'}] skip pipeline ${jobId} (upload not completed yet)`)
+      return
+    }
     if (!hasFfmpeg()) {
       await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
       throw new Error('ffmpeg_missing')
@@ -2707,12 +2712,16 @@ const recoverQueuedJobs = async () => {
       if (!jobId || !userId) continue
 
       const status = String(job?.status || '').toLowerCase()
+      const progress = Number(job?.progress ?? 0)
+      const inputPath = typeof job?.inputPath === 'string' ? job.inputPath.trim() : ''
+      const uploadReady = Number.isFinite(progress) && progress >= 1 && inputPath.length > 0
       const startable = STARTABLE_QUEUE_STATUSES.has(status)
       const staleRecoverable =
         STALE_RECOVERABLE_STATUSES.has(status) &&
         nowMs - toTimeMs(job?.updatedAt) >= STALE_PIPELINE_MS
 
       if (!startable && !staleRecoverable) continue
+      if (startable && !uploadReady) continue
 
       if (staleRecoverable) {
         const boundedProgress = Math.max(1, Math.min(90, Number(job?.progress || 1)))
