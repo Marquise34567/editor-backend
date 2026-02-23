@@ -22,15 +22,59 @@ export const ensureStripeCustomer = async (userId: string, email?: string | null
 
 export type BillingInterval = 'monthly' | 'annual'
 
-const getPriceIdForTier = (tier: PlanTier, interval: BillingInterval, useTrial: boolean) => {
-  const { priceIds } = getStripeConfig()
-  if (tier === 'founder') return priceIds.founder || ''
-  if (useTrial && tier === 'starter' && priceIds.trial) return priceIds.trial
+const getBucketPriceId = (
+  tier: PlanTier,
+  interval: BillingInterval,
+  priceIds: ReturnType<typeof getStripeConfig>['priceIds']
+) => {
   const bucket = interval === 'annual' ? priceIds.annual : priceIds.monthly
   if (tier === 'starter') return bucket.starter || ''
   if (tier === 'creator') return bucket.creator || ''
   if (tier === 'studio') return bucket.studio || ''
   return ''
+}
+
+const getPriceIdForTier = (tier: PlanTier, interval: BillingInterval, useTrial: boolean) => {
+  const { priceIds } = getStripeConfig()
+  if (tier === 'founder') return priceIds.founder || ''
+  if (useTrial && tier === 'starter' && priceIds.trial) return priceIds.trial
+  return getBucketPriceId(tier, interval, priceIds)
+}
+
+const stripeIntervalToBillingInterval = (value?: string | null): BillingInterval | null => {
+  const raw = String(value || '').toLowerCase()
+  if (raw === 'month') return 'monthly'
+  if (raw === 'year') return 'annual'
+  return null
+}
+
+const readStripePriceInterval = async (priceId: string): Promise<BillingInterval | null> => {
+  if (!priceId || !isStripeEnabled() || !stripe) return null
+  try {
+    const price = await stripe.prices.retrieve(priceId)
+    return stripeIntervalToBillingInterval(price?.recurring?.interval)
+  } catch {
+    return null
+  }
+}
+
+const resolveCheckoutPriceId = async (tier: PlanTier, interval: BillingInterval, useTrial: boolean) => {
+  const primary = getPriceIdForTier(tier, interval, useTrial)
+  if (!primary) return ''
+  if (tier === 'founder' || useTrial || !isStripeEnabled()) return primary
+  const primaryInterval = await readStripePriceInterval(primary)
+  if (!primaryInterval || primaryInterval === interval) return primary
+
+  const { priceIds } = getStripeConfig()
+  const alternateInterval: BillingInterval = interval === 'monthly' ? 'annual' : 'monthly'
+  const alternate = getBucketPriceId(tier, alternateInterval, priceIds)
+  if (!alternate || alternate === primary) return primary
+  const alternateResolvedInterval = await readStripePriceInterval(alternate)
+  if (alternateResolvedInterval === interval) {
+    console.warn(`Stripe price IDs appear swapped for tier "${tier}" (${interval}); using alternate ID.`)
+    return alternate
+  }
+  return primary
 }
 
 export const createCheckoutUrlForUser = async (
@@ -40,7 +84,7 @@ export const createCheckoutUrlForUser = async (
   interval: BillingInterval = 'monthly',
   useTrial = false
 ) => {
-  const priceId = getPriceIdForTier(tier, interval, useTrial)
+  const priceId = await resolveCheckoutPriceId(tier, interval, useTrial)
   if (!priceId) return null
   const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
   const customerId = await ensureStripeCustomer(userId, email)
