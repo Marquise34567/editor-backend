@@ -1258,6 +1258,19 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
   const tmpIn = path.join(os.tmpdir(), `${jobId}-analysis`)
   try {
+    // Verify the object exists in R2 before attempting to download
+    try {
+      const exists = await r2.objectExists(job.inputPath)
+      if (!exists) {
+        await updateJob(jobId, { status: 'failed', error: 'Input file missing in R2' })
+        throw new Error('Input file missing in R2')
+      }
+    } catch (e) {
+      console.error('r2 head check failed', e)
+      await updateJob(jobId, { status: 'failed', error: 'Input file missing in R2' })
+      throw new Error('Input file missing in R2')
+    }
+
     await r2.getObjectToFile({ Key: job.inputPath, destPath: tmpIn })
   } catch (e) {
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
@@ -1792,13 +1805,12 @@ const handleCreateJob = async (req: any, res: any) => {
     })
 
     try {
-      const expires = 60 * 15
-      const result: any = await (supabaseAdmin.storage.from(INPUT_BUCKET) as any).createSignedUploadUrl(inputPath, expires)
-      const uploadUrl = result?.data?.signedUploadUrl ?? result?.data?.signedUrl ?? null
-      return res.json({ job, uploadUrl, inputPath, bucket: INPUT_BUCKET })
+      // Generate an R2 presigned PUT URL for direct upload
+      const uploadUrl = await r2.generateUploadUrl(inputPath, 'video/mp4')
+      return res.json({ job, uploadUrl, inputPath, bucket: r2.bucket })
     } catch (e) {
-      console.warn('createSignedUploadUrl not available or failed, returning job only', e)
-      return res.json({ job, uploadUrl: null, inputPath, bucket: INPUT_BUCKET })
+      console.warn('generateUploadUrl failed, returning job only', e)
+      return res.json({ job, uploadUrl: null, inputPath, bucket: r2.bucket })
     }
   } catch (err: any) {
     console.error('create job error', err?.stack || err)
@@ -1810,6 +1822,61 @@ const handleCreateJob = async (req: any, res: any) => {
 // Create job and return upload URL or null
 router.post('/', handleCreateJob)
 router.post('/create', handleCreateJob)
+
+// Generate a presigned upload URL for direct-to-R2 PUT upload
+router.post('/:id/upload-url', async (req: any, res) => {
+  try {
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = req.params.id
+    const { contentType } = req.body
+    if (!jobId) return res.status(400).json({ error: 'missing_job_id' })
+    const job = await prisma.job.findUnique({ where: { id: jobId } })
+    if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
+    const timestamp = Date.now()
+    const key = `uploads/${userId}/${jobId}/${timestamp}.mp4`
+    const uploadUrl = await r2.generateUploadUrl(key, contentType || 'video/mp4')
+    return res.json({ uploadUrl, key })
+  } catch (err) {
+    console.error('upload-url error', err)
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+// Complete upload: called by frontend after successful PUT to R2
+router.post('/:id/complete-upload', async (req: any, res) => {
+  try {
+    const userId = req.user?.id
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = req.params.id
+    const { key } = req.body
+    if (!jobId || !key) return res.status(400).json({ error: 'missing_params' })
+    const job = await prisma.job.findUnique({ where: { id: jobId } })
+    if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
+
+    // Construct public URL for R2 object
+    const account = process.env.R2_ACCOUNT_ID || ''
+    const bucket = process.env.R2_BUCKET || r2.bucket || ''
+    let publicUrl = ''
+    if (account && bucket) {
+      publicUrl = `https://${bucket}.${account}.r2.cloudflarestorage.com/${key}`
+    } else if (process.env.R2_PUBLIC_BASE_URL) {
+      publicUrl = `${process.env.R2_PUBLIC_BASE_URL.replace(/\/$/, '')}/${key}`
+    } else if (r2.endpoint) {
+      publicUrl = `${r2.endpoint.replace(/\/$/, '')}/${key}`
+    } else {
+      publicUrl = key
+    }
+
+    await updateJob(jobId, { inputPath: key, inputUrl: publicUrl, status: 'queued', progress: 1 })
+    // Enqueue pipeline to start processing
+    enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
+    res.json({ ok: true })
+  } catch (err) {
+    console.error('complete-upload error', err)
+    res.status(500).json({ error: 'server_error' })
+  }
+})
 
 // List jobs
 router.get('/', async (req: any, res) => {
