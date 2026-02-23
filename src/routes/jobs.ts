@@ -1510,28 +1510,211 @@ const processJob = async (
     let processed = false
     let retentionScore: number | null = null
     let optimizationNotes: string[] = []
-    await updateJob(jobId, { status: 'rendering', progress: 80 })
-    const hasAudio = hasAudioStream(tmpIn)
-    const minimalArgs = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-vf', 'scale=720:-2', '-preset', 'fast', '-crf', '23', '-movflags', '+faststart', '-c:v', 'libx264', '-pix_fmt', 'yuv420p']
-    if (hasAudio) minimalArgs.push('-c:a', 'aac')
-    minimalArgs.push(tmpOut)
-    console.log(`[${requestId || 'noid'}] ffmpeg minimal proof`, {
-      command: formatFfmpegCommand(minimalArgs)
-    })
-    try {
-      await runFfmpeg(minimalArgs)
-      processed = true
-      optimizationNotes.push('Minimal proof edit pipeline executed: ffmpeg -i input.mp4 -vf scale=720:-2 -preset fast -crf 23 output.mp4')
-    } catch (err: any) {
-      const failedReason = formatFfmpegFailure(err)
-      await updateJob(jobId, { status: 'failed', error: failedReason })
-      console.error(`[${requestId || 'noid'}] ffmpeg minimal proof failed`, {
-        command: formatFfmpegCommand(minimalArgs),
-        exitCode: err?.exitCode,
-        stderr: err?.stderr,
-        stdout: err?.stdout
-      })
-      throw err
+    if (hasFfmpeg()) {
+      const target = getTargetDimensions(finalQuality)
+
+      const storedPlan = (job.analysis as any)?.editPlan as EditPlan | undefined
+      const editPlan = storedPlan?.segments ? storedPlan : (durationSeconds ? await buildEditPlan(tmpIn, durationSeconds, options) : null)
+
+      await updateJob(jobId, { status: 'story', progress: 55 })
+
+      const hookRange: TimeRange | null = editPlan
+        ? { start: editPlan.hook.start, end: editPlan.hook.start + editPlan.hook.duration }
+        : null
+      const hookSegment: Segment | null = hookRange ? { ...hookRange, speed: 1 } : null
+      const baseSegments: Segment[] = editPlan
+        ? editPlan.segments
+        : [{ start: 0, end: durationSeconds || 0, speed: 1 }]
+      const storySegments = editPlan && !options.onlyCuts
+        ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
+        : baseSegments
+      const orderedSegments = editPlan && options.autoHookMove && !options.onlyCuts && hookSegment
+        ? [hookSegment, ...storySegments]
+        : storySegments
+      const filteredSegments = orderedSegments.filter((seg) => seg.end - seg.start > 0.25)
+      const effectedSegments = editPlan && !options.onlyCuts
+        ? applySegmentEffects(filteredSegments, editPlan.engagementWindows, options, hookRange)
+        : filteredSegments
+      const finalSegments = editPlan && !options.onlyCuts ? applyZoomEasing(effectedSegments) : effectedSegments
+
+      // Enforce zoom duration cap: never exceed ZOOM_MAX_DURATION_RATIO of total duration.
+      try {
+        const totalDuration = durationSeconds || 0
+        const zoomSegments = finalSegments.filter((s) => (s.zoom ?? 0) > 0)
+        const zoomDuration = zoomSegments.reduce((sum, s) => sum + Math.max(0, s.end - s.start), 0)
+        const maxZoomAllowed = Math.max(0, ZOOM_MAX_DURATION_RATIO * totalDuration)
+        if (zoomDuration > maxZoomAllowed && zoomSegments.length) {
+          // Sort by emphasize/score (segments with emphasize should keep zoom first), otherwise by length
+          const prioritized = finalSegments
+            .map((s) => ({ seg: s, score: (s as any).emphasize ? 2 : 0, len: s.end - s.start }))
+            .sort((a, b) => b.score - a.score || b.len - a.len)
+          let running = 0
+          for (const entry of prioritized) {
+            const s = entry.seg
+            const segLen = Math.max(0, s.end - s.start)
+            if ((s.zoom ?? 0) > 0) {
+              if (running + segLen <= maxZoomAllowed) {
+                running += segLen
+                continue
+              }
+              // remove zoom from lower priority segments until under cap
+              s.zoom = 0
+            }
+          }
+        }
+      } catch (e) {
+        // non-fatal
+        console.warn('zoom-cap enforcement failed', e)
+      }
+
+      if (options.autoCaptions) {
+        await updateJob(jobId, { status: 'subtitling', progress: 62 })
+        subtitlePath = await generateSubtitles(tmpIn, workDir)
+        if (!subtitlePath) optimizationNotes.push('Auto subtitles skipped: no caption engine available.')
+      }
+
+      await updateJob(jobId, { status: 'audio', progress: 68 })
+
+      const hasAudio = hasAudioStream(tmpIn)
+      const withAudio = true
+      const audioFilters = withAudio ? buildAudioFilters() : []
+
+      await updateJob(jobId, { status: 'retention', progress: 72 })
+      if (editPlan) {
+        const retention = computeRetentionScore(finalSegments, editPlan.engagementWindows, editPlan.hook.score, options.autoCaptions)
+        retentionScore = retention.score
+        optimizationNotes = [...optimizationNotes, ...retention.notes]
+      }
+
+      await updateJob(jobId, { status: 'rendering', progress: 80 })
+
+      const hasSegments = finalSegments.length >= 1
+      const ffPreset = (options as any)?.fastMode
+        ? 'superfast'
+        : (process.env.FFMPEG_PRESET || 'medium')
+      const defaultCrf = finalQuality === '4k' ? '18' : finalQuality === '1080p' ? '20' : '22'
+      const ffCrf = (options as any)?.fastMode
+        ? '28'
+        : (process.env.FFMPEG_CRF || defaultCrf)
+      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', ffPreset, '-crf', ffCrf, '-threads', '0', '-pix_fmt', 'yuv420p']
+      if (withAudio) argsBase.push('-c:a', 'aac')
+
+      const watermarkFont = getSystemFontFile()
+      const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
+
+      // Prefer an image watermark if available (uses favicon from frontend/public),
+      // otherwise fall back to a subtle text watermark. The image will be overlaid
+      // at bottom-right with a small inset.
+      const defaultWatermarkImage = path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
+      const watermarkImagePath = process.env.WATERMARK_IMAGE_PATH || defaultWatermarkImage
+      const watermarkImageExists = watermarkEnabled && fs.existsSync(watermarkImagePath)
+      const watermarkFilter = watermarkImageExists
+        ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
+        : watermarkEnabled
+        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
+        : ''
+      const subtitleFilter = subtitlePath ? `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'` : ''
+
+      const probe = probeVideoStream(tmpIn)
+      if (probe && finalSegments.length) {
+        finalSegments.forEach((seg, idx) => {
+          console.log(
+            `[${requestId || 'noid'}] segment ${idx} ${seg.start}-${seg.end} width=${probe.width} height=${probe.height} sar=${probe.sampleAspectRatio} fps=${probe.frameRate}`
+          )
+        })
+      } else if (!probe) {
+        console.warn(`[${requestId || 'noid'}] segment preflight ffprobe unavailable`)
+      }
+
+      const logFfmpegFailure = (label: string, args: string[], err: any) => {
+        const stderr = typeof err?.stderr === 'string' ? err.stderr : ''
+        console.error(`[${requestId || 'noid'}] ffmpeg ${label} failed`, {
+          cmd: formatFfmpegCommand(args),
+          stderr
+        })
+      }
+
+      const summarizeFfmpegError = (err: any) => {
+        const stderr = typeof err?.stderr === 'string' ? err.stderr.trim() : ''
+        const message = err?.message ? String(err.message) : 'ffmpeg_failed'
+        if (!stderr) return message
+        const trimmed = stderr.split(/\r?\n/).filter(Boolean).slice(-2).join(' | ')
+        const combined = `${message}: ${trimmed}`
+        return combined.length > 200 ? combined.slice(0, 200) : combined
+      }
+
+      try {
+        if (hasSegments) {
+          const concatFilter = buildConcatFilter(finalSegments, {
+            withAudio,
+            hasAudioStream: hasAudio,
+            targetWidth: target.width,
+            targetHeight: target.height
+          })
+          const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          // If using an image watermark we must add the watermark file as a second input
+          // so ffmpeg can reference it as input index 1 in the overlay filter.
+          const argsWithWatermark = [...argsBase]
+          if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
+          const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
+
+          const runWithChain = async (videoChain: string) => {
+            const filterParts: string[] = [concatFilter]
+            if (videoChain) {
+              filterParts.push(`[outv]${videoChain}[vout]`)
+            }
+            if (withAudio && audioFilters.length > 0) {
+              filterParts.push(`[outa]${audioFilters.join(',')}[aout]`)
+            }
+            const filter = filterParts.join(';')
+            const videoMap = videoChain ? '[vout]' : '[outv]'
+            const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
+            const args = [...argsWithWatermark, '-filter_complex', filter, '-map', videoMap]
+            if (audioMap) args.push('-map', audioMap)
+            const fullArgs = [...args, tmpOut]
+            try {
+              await runFfmpeg(fullArgs)
+            } catch (err) {
+              logFfmpegFailure('concat', fullArgs, err)
+              throw err
+            }
+          }
+
+          let lastErr: any = null
+          let ran = false
+          for (const chain of videoChains) {
+            try {
+              await runWithChain(chain)
+              ran = true
+              if (chain !== fullVideoChain) {
+                const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
+                optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
+              }
+              break
+            } catch (err) {
+              lastErr = err
+            }
+          }
+          if (!ran) throw lastErr || new Error('ffmpeg_failed')
+        } else {
+          const fallbackArgs = [
+            ...argsBase,
+            '-vf',
+            `scale=${target.width}:${target.height}:force_original_aspect_ratio=decrease,pad=${target.width}:${target.height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p`,
+            tmpOut
+          ]
+          try {
+            await runFfmpeg(fallbackArgs)
+          } catch (err) {
+            logFfmpegFailure('single', fallbackArgs, err)
+            throw err
+          }
+        }
+        processed = true
+      } catch (err) {
+        processed = false
+        throw err
+      }
     }
 
     if (!processed) {
