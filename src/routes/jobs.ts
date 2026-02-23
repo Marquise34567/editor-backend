@@ -83,6 +83,8 @@ const runFfmpeg = (args: string[]) => {
   })
 }
 
+// helper: run ffmpeg and capture stderr output (already exists as runFfmpegCapture)
+
 const formatFfmpegCommand = (args: string[]) => {
   const quoted = args.map((arg) => {
     if (arg === '') return '""'
@@ -761,11 +763,19 @@ const buildEditPlan = async (
   onStage?: (stage: 'cutting' | 'hooking' | 'pacing') => void | Promise<void>
 ) => {
   if (onStage) await onStage('cutting')
-  const silences = await detectSilences(filePath, durationSeconds).catch(() => [])
-  const energySamples = await detectAudioEnergy(filePath, durationSeconds).catch(() => [])
-  const sceneChanges = await detectSceneChanges(filePath, durationSeconds).catch(() => [])
-  const faceSamples = await detectFacePresence(filePath, durationSeconds).catch(() => [])
-  const textSamples = await detectTextDensity(filePath, durationSeconds).catch(() => [])
+  // Run independent analysis tasks in parallel to save wall-clock time.
+  const tasks: Array<Promise<any>> = []
+  tasks.push(detectSilences(filePath, durationSeconds).catch(() => []))
+  tasks.push(detectAudioEnergy(filePath, durationSeconds).catch(() => []))
+  tasks.push(detectSceneChanges(filePath, durationSeconds).catch(() => []))
+  // Face detection is optional if smartZoom is disabled (saves time)
+  if (options.smartZoom !== false) {
+    tasks.push(detectFacePresence(filePath, durationSeconds).catch(() => []))
+  } else {
+    tasks.push(Promise.resolve([]))
+  }
+  tasks.push(detectTextDensity(filePath, durationSeconds).catch(() => []))
+  const [silences, energySamples, sceneChanges, faceSamples, textSamples] = await Promise.all(tasks)
   const windows = buildEngagementWindows(durationSeconds, energySamples, sceneChanges, faceSamples, textSamples)
 
   const boringFlags = options.removeBoring ? buildBoringFlags(windows, silences) : windows.map(() => false)
@@ -1108,6 +1118,14 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
   })
 }
 
+const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
+  const width = opts?.width ?? 960
+  const height = opts?.height ?? 540
+  const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'copy', outPath]
+  await runFfmpeg(args)
+}
+
 const buildAudioFilters = () => {
   return [
     'highpass=f=80',
@@ -1252,10 +1270,31 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
     await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: Math.round(duration) })
 
+    // Generate a low-res proxy and analyze the proxy to save CPU/time.
+    const tmpProxy = path.join(os.tmpdir(), `${jobId}-proxy.mp4`)
+    try {
+      await generateProxy(tmpIn, tmpProxy)
+      // upload proxy for client preview
+      const proxyBucketPath = `${job.userId}/${jobId}/proxy.mp4`
+      try {
+        const proxyBuf = fs.readFileSync(tmpProxy)
+        await supabaseAdmin.storage.from(OUTPUT_BUCKET).upload(proxyBucketPath, proxyBuf, { contentType: 'video/mp4', upsert: true })
+        // persist proxy path so frontend can request preview quickly
+        await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
+      } catch (e) {
+        // non-fatal: continue analysis even if upload fails
+        console.warn('proxy upload failed', e)
+      }
+    } catch (e) {
+      console.warn('proxy generation failed, falling back to original for analysis', e)
+    }
+
     let editPlan: EditPlan | null = null
     if (duration) {
       try {
-        editPlan = await buildEditPlan(tmpIn, duration, options, async (stage) => {
+        // Prefer analyzing the proxy if it exists
+        const analyzePath = fs.existsSync(tmpProxy) ? tmpProxy : tmpIn
+        editPlan = await buildEditPlan(analyzePath, duration, options, async (stage) => {
           if (stage === 'cutting') {
             await updateJob(jobId, { status: 'cutting', progress: 25 })
           } else if (stage === 'hooking') {
@@ -1459,7 +1498,9 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
-      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', '-pix_fmt', 'yuv420p']
+      const ffPreset = (options as any)?.fastMode ? 'superfast' : 'veryfast'
+      const ffCrf = (options as any)?.fastMode ? '28' : '23'
+      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', ffPreset, '-crf', ffCrf, '-threads', '0', '-pix_fmt', 'yuv420p']
       if (withAudio) argsBase.push('-c:a', 'aac')
 
       const watermarkFont = getSystemFontFile()
@@ -1632,7 +1673,15 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
 type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string; priorityLevel: number }
 const pipelineQueue: QueueItem[] = []
 let activePipelines = 0
-const MAX_PIPELINES = Number(process.env.JOB_CONCURRENCY || 1)
+const MAX_PIPELINES = (() => {
+  const envVal = Number(process.env.JOB_CONCURRENCY || 0)
+  if (envVal && Number.isFinite(envVal) && envVal > 0) return envVal
+  const cpus = os.cpus() ? os.cpus().length : 1
+  if (cpus <= 1) return 1
+  if (cpus === 2) return 2
+  if (cpus >= 4) return Math.max(2, Math.min(4, cpus - 1))
+  return cpus
+})()
 
 const processQueue = () => {
   while (activePipelines < MAX_PIPELINES && pipelineQueue.length > 0) {
@@ -1764,9 +1813,19 @@ router.get('/:id', async (req: any, res) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const mapStatus = (s: string) => {
+      if (!s) return 'FAILED'
+      if (s === 'queued') return 'QUEUED'
+      if (s === 'rendering') return 'RENDERING'
+      if (s === 'completed') return 'READY'
+      if (s === 'failed') return 'FAILED'
+      // any intermediate states are processing
+      return 'PROCESSING'
+    }
+
     const jobPayload: any = {
       ...job,
-      status: job.status === 'completed' ? 'ready' : job.status,
+      status: mapStatus(job.status),
       watermark: job.watermarkApplied,
       steps: [
         { key: 'queued', label: 'Queued' },
@@ -1793,7 +1852,31 @@ router.get('/:id', async (req: any, res) => {
         // ignore signed URL failures; client can fallback to output-url endpoint
       }
     }
+    if (job.outputPath) {
+      try {
+        jobPayload.fileName = path.basename(job.outputPath)
+      } catch (e) {
+        // ignore
+      }
+    }
     res.json({ job: jobPayload })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+// Return a short-lived signed URL for downloads (only when ready)
+router.post('/:id/download-url', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id || !job.outputPath) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+    await ensureBucket(OUTPUT_BUCKET, false)
+    const expires = 60 * 10
+    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(job.outputPath, expires)
+    if (error) return res.status(500).json({ error: 'signed_url_failed' })
+    return res.json({ url: data.signedUrl })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }

@@ -4,6 +4,7 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { ensureFounderAvailable, FounderSoldOutError } from '../services/founder'
 import { PLAN_TIERS, type PlanTier } from '../shared/planConfig'
+import { isPaidTier, getPlanFeatures } from '../shared/planConfig'
 
 const router = express.Router()
 
@@ -89,6 +90,29 @@ const handleStatus = async (req: any, res: any) => {
 
 // Billing status
 router.get('/status', handleStatus)
+
+// Entitlements: server source-of-truth for feature flags
+router.get('/entitlements', async (req: any, res) => {
+  try {
+    const user = req.user
+    if (!user) return res.status(401).json({ error: 'Unauthorized' })
+    const { tier, plan } = await getUserPlan(user.id)
+    const planKey = tier
+    const isPaid = isPaidTier(tier)
+    const features = getPlanFeatures(plan)
+    const entitlements = {
+      autoDownloadAllowed: isPaid,
+      canExport4k: features.resolution === '4K',
+      watermark: features.watermark,
+      priorityQueue: features.queuePriority === 'priority',
+      rendersPerMonth: features.rendersPerMonth
+    }
+    res.json({ planKey, isPaid, entitlements })
+  } catch (err) {
+    console.error('entitlements', err)
+    res.status(500).json({ error: 'server_error' })
+  }
+})
 
 // Backwards-compatible aliases
 router.post('/create-checkout-session', async (req, res) => {

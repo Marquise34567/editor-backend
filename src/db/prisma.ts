@@ -16,6 +16,7 @@ class StubDB {
   settings = new Map<string, any>()
   exports = new Map<string, any>()
   founderInventoryStore = new Map<string, any>()
+  adminAudits = new Map<string, any>()
 
   async $queryRaw() { return 1 }
 
@@ -51,6 +52,22 @@ class StubDB {
         }
       }
       return { count }
+    }
+  }
+
+  adminAudit = {
+    create: async ({ data }: any) => {
+      const id = data.id || `audit-${Math.random().toString(36).slice(2,9)}`
+      const rec = { id, ...data, createdAt: data?.createdAt || new Date() }
+      this.adminAudits.set(id, rec)
+      return rec
+    },
+    findMany: async ({ where }: any) => {
+      return Array.from(this.adminAudits.values()).filter((a:any) => {
+        if (!where) return true
+        if (where.targetEmail) return a.targetEmail === where.targetEmail
+        return true
+      })
     }
   }
 

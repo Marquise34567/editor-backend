@@ -10,6 +10,7 @@ import webhookRoutes from './webhooks/stripe'
 import meRoutes from './routes/me'
 import settingsRoutes from './routes/settings'
 import publicRoutes from './routes/public'
+import adminRoutes from './routes/admin'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
@@ -80,6 +81,7 @@ app.use('/api', requireAuth, checkoutRoutes)
 app.use('/api/jobs', requireAuth, jobsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
+app.use('/api/admin', adminRoutes)
 
 app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
   const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'

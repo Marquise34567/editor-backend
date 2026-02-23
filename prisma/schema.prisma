@@ -175,3 +175,15 @@ model LessonProgress {
   user       User     @relation(fields: [userId], references: [id])
   @@index([userId])
 }
+
+model AdminAudit {
+  id         String   @id @default(uuid())
+  actor      String?
+  action     String
+  targetEmail String
+  planKey    String?
+  reason     String?
+  createdAt  DateTime @default(now())
+
+  @@map("admin_audit")
+}
