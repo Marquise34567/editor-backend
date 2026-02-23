@@ -186,8 +186,11 @@ export const qualityToHeight = (quality: ExportQuality) => {
 }
 
 export type PlanFeatures = {
+  tier?: PlanTier
   resolution: '720p' | '1080p' | '4K'
+  maxResolution?: ExportQuality
   watermark: boolean
+  maxRendersPerMonth?: number
   subtitleAccess: 'all' | 'limited' | 'none'
   subtitles: {
     enabled: boolean
@@ -195,8 +198,10 @@ export type PlanFeatures = {
   }
   autoZoomMax: number
   queuePriority: 'priority' | 'standard'
+  priorityQueue?: boolean
   rendersPerMonth: number
   lifetime: boolean
+  advancedEffects?: boolean
   includesFutureFeatures: boolean
 }
 

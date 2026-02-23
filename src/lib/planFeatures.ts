@@ -1,25 +1,6 @@
-import { PLAN_CONFIG, QUALITY_ORDER, type ExportQuality, type PlanTier } from '../shared/planConfig'
+import { PLAN_CONFIG, QUALITY_ORDER, type ExportQuality, type PlanTier, type PlanFeatures } from '../shared/planConfig'
 import { normalizeSubtitlePreset, type SubtitlePresetId } from '../shared/subtitlePresets'
 
-export type PlanFeatures = {
-  tier: PlanTier
-  resolution: '720p' | '1080p' | '4K'
-  maxResolution: ExportQuality
-  rendersPerMonth: number
-  maxRendersPerMonth: number
-  watermark: boolean
-  queuePriority: 'priority' | 'standard'
-  priorityQueue: boolean
-  subtitleAccess: 'all' | 'limited' | 'none'
-  subtitles: {
-    enabled: boolean
-    allowedPresets: SubtitlePresetId[] | 'ALL'
-  }
-  autoZoomMax: number
-  advancedEffects: boolean
-  lifetime: boolean
-  includesFutureFeatures: boolean
-}
 
 export const getPlanFeatures = (tier: PlanTier): PlanFeatures => {
   const plan = PLAN_CONFIG[tier] ?? PLAN_CONFIG.free

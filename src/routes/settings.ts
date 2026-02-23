@@ -66,7 +66,7 @@ router.get('/', async (req: any, res) => {
       const created = {
         userId,
         watermarkEnabled: features.watermark,
-        exportQuality: features.defaultExportQuality ?? '720p',
+        exportQuality: features.maxResolution ?? '720p',
         autoCaptions: subtitlesEnabled ? false : false,
         autoHookMove: true,
         removeBoring: true,
