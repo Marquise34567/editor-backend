@@ -27,16 +27,43 @@ if (!fs.existsSync(localOutputsDir)) {
   fs.mkdirSync(localOutputsDir, { recursive: true })
 }
 
+const parseOriginList = (value?: string | null) =>
+  String(value || '')
+    .split(',')
+    .map((item) => item.trim().replace(/\/+$/, ''))
+    .filter(Boolean)
+
+const envOrigins = parseOriginList(process.env.CORS_ALLOWED_ORIGINS)
+  .concat(parseOriginList(process.env.FRONTEND_URL))
+  .concat(parseOriginList(process.env.APP_URL))
+
 const allowedOrigins = [
   'https://www.autoeditor.app',
   'https://autoeditor.app',
+  'https://autoeddd.vercel.app',
   'http://localhost:5173',
   'http://127.0.0.1:5173',
   'http://localhost:3000',
   'http://127.0.0.1:3000',
   'http://localhost:8080',
-  'http://127.0.0.1:8080'
+  'http://127.0.0.1:8080',
+  ...envOrigins
 ]
+
+const vercelSuffixes = parseOriginList(process.env.CORS_VERCEL_SUFFIXES).concat([
+  '-quises-projects-89577714.vercel.app'
+])
+
+const isAllowedVercelOrigin = (origin: string) => {
+  try {
+    const url = new URL(origin)
+    if (url.protocol !== 'https:') return false
+    const host = url.hostname.toLowerCase()
+    return vercelSuffixes.some((suffix) => host.endsWith(String(suffix).toLowerCase()))
+  } catch {
+    return false
+  }
+}
 
 // Central origin check used by CORS middleware (handles null/undefined origin safely)
 const originCallback = (origin: any, cb: any) => {
@@ -44,6 +71,7 @@ const originCallback = (origin: any, cb: any) => {
     // Allow requests with no origin (server-to-server, curl, etc.)
     if (!origin) return cb(null, true)
     if (allowedOrigins.includes(origin)) return cb(null, true)
+    if (isAllowedVercelOrigin(origin)) return cb(null, true)
     // Build a CORS-specific error so downstream error middleware can respond safely
     const err: any = new Error('Not allowed by CORS')
     err.type = 'cors'
