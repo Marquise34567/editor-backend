@@ -20,6 +20,7 @@ export async function requireAuth(req: Request, res: Response, next: NextFunctio
     next()
   } catch (err) {
     console.error('Auth middleware error', err)
-    res.status(500).json({ error: 'Server error' })
+    // Return 401 to indicate auth failure rather than a generic 500.
+    return res.status(401).json({ error: 'auth_error', message: String(err) })
   }
 }

@@ -38,11 +38,16 @@ const bucketChecks: Record<string, Promise<void> | null> = {}
 const ensureBucket = async (name: string, isPublic: boolean) => {
   if (bucketChecks[name]) return bucketChecks[name]
   bucketChecks[name] = (async () => {
-    const existing = await supabaseAdmin.storage.getBucket(name)
-    if (existing.data) return
-    if (existing.error) {
-      const created = await supabaseAdmin.storage.createBucket(name, { public: isPublic })
-      if (created.error) throw created.error
+    try {
+      const existing = await supabaseAdmin.storage.getBucket(name)
+      if (existing?.data) return
+      if (existing?.error) {
+        const created = await supabaseAdmin.storage.createBucket(name, { public: isPublic })
+        if (created.error) throw created.error
+      }
+    } catch (e) {
+      console.warn(`ensureBucket failed for ${name}:`, e)
+      // don't block job creation if storage is temporarily unavailable
     }
   })()
   return bucketChecks[name]
@@ -1882,6 +1887,29 @@ router.post('/:id/download-url', async (req: any, res) => {
     const expires = 60 * 10
     try {
       const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+
+      // schedule auto-delete 1 minute after user requests download
+      try {
+        const keyToDelete = job.outputPath
+        if (keyToDelete) {
+          setTimeout(async () => {
+            try {
+              await r2.deleteObject({ Key: keyToDelete })
+              try {
+                await updateJob(id, { outputPath: null })
+              } catch (e) {
+                // ignore DB update failures
+              }
+              console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
+            } catch (err) {
+              console.error('auto-delete failed', err)
+            }
+          }, 60_000)
+        }
+      } catch (e) {
+        // scheduling failure shouldn't block download
+      }
+
       return res.json({ url })
     } catch (err) {
       return res.status(500).json({ error: 'signed_url_failed' })
@@ -1982,6 +2010,29 @@ router.get('/:id/output-url', async (req: any, res) => {
     const expires = 60 * 10
     try {
       const url = await r2.getPresignedGetUrl({ Key: job.outputPath, expiresIn: expires })
+
+      // schedule auto-delete 1 minute after user requests download
+      try {
+        const keyToDelete = job.outputPath
+        if (keyToDelete) {
+          setTimeout(async () => {
+            try {
+              await r2.deleteObject({ Key: keyToDelete })
+              try {
+                await updateJob(id, { outputPath: null })
+              } catch (e) {
+                // ignore DB update failures
+              }
+              console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
+            } catch (err) {
+              console.error('auto-delete failed', err)
+            }
+          }, 60_000)
+        }
+      } catch (e) {
+        // scheduling failure shouldn't block download
+      }
+
       res.json({ url })
     } catch (err) {
       res.status(500).json({ error: 'signed_url_failed' })
