@@ -24,6 +24,46 @@ const r2NotConfigured = (res: any) => {
   return res.status(503).json({ error: 'R2_NOT_CONFIGURED', missing: r2.missingEnvVars || [] })
 }
 
+const parseJobIdFromPath = (value: unknown, userId: string) => {
+  if (!value) return null
+  const raw = String(value).trim()
+  if (!raw) return null
+  const clean = raw.replace(/^\/+|\/+$/g, '')
+  const parts = clean.split('/')
+  // uploads/{userId}/{jobId}/...
+  if (parts.length >= 4 && parts[0] === 'uploads' && parts[1] === userId) return parts[2]
+  // {userId}/{jobId}/...
+  if (parts.length >= 3 && parts[0] === userId) return parts[1]
+  return null
+}
+
+const resolveJobIdForCreate = async (userId: string, req: any) => {
+  const explicitJobId = typeof req.body?.jobId === 'string' ? req.body.jobId.trim() : ''
+  if (explicitJobId) return explicitJobId
+
+  const fromInputPath = parseJobIdFromPath(req.body?.inputPath, userId)
+  if (fromInputPath) return fromInputPath
+
+  // Legacy frontend payloads may omit jobId; attach upload to the latest non-terminal job for this user.
+  const list = await prisma.job.findMany({
+    where: { userId },
+    orderBy: { createdAt: 'desc' },
+    take: 20
+  })
+  const sorted = (Array.isArray(list) ? list : [])
+    .slice()
+    .sort((a: any, b: any) => {
+      const at = new Date(a?.createdAt || 0).getTime()
+      const bt = new Date(b?.createdAt || 0).getTime()
+      return bt - at
+    })
+  const open = sorted.find((job: any) => {
+    const status = String(job?.status || '').toLowerCase()
+    return status !== 'completed' && status !== 'failed'
+  })
+  return open?.id || null
+}
+
 // POST /api/uploads/presign
 router.post('/presign', async (req: any, res) => {
   try {
@@ -56,10 +96,14 @@ router.post('/complete', async (req: any, res) => {
     if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
-    const { jobId, uploadId, parts } = req.body
+    const { uploadId, parts } = req.body
     const key = req.body?.key || req.body?.objectKey
-    if (!jobId || !key) return res.status(400).json({ error: 'missing_params' })
-    const job = await prisma.job.findUnique({ where: { id: jobId } })
+    const resolvedJobId =
+      (typeof req.body?.jobId === 'string' ? req.body.jobId.trim() : '') ||
+      parseJobIdFromPath(req.body?.inputPath, userId) ||
+      parseJobIdFromPath(key, userId)
+    if (!resolvedJobId || !key) return res.status(400).json({ error: 'missing_params' })
+    const job = await prisma.job.findUnique({ where: { id: resolvedJobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
 
     // If multipart completion requested, call CompleteMultipartUpload
@@ -81,16 +125,16 @@ router.post('/complete', async (req: any, res) => {
       }
     }
 
-    await updateJob(jobId, { inputPath: key, status: 'queued', progress: 1 })
+    await updateJob(resolvedJobId, { inputPath: key, status: 'queued', progress: 1 })
     // trigger processing asynchronously
     setImmediate(() => {
       try {
-        enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
+        enqueuePipeline({ jobId: resolvedJobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
       } catch (e) {
         console.error('enqueuePipeline failed', e)
       }
     })
-    return res.json({ ok: true })
+    return res.json({ ok: true, jobId: resolvedJobId })
   } catch (err: any) {
     console.error('uploads.complete error', err)
     res.status(500).json({ error: 'server_error' })
@@ -103,7 +147,8 @@ router.post('/create', async (req: any, res) => {
     if (!r2.isConfigured) return r2NotConfigured(res)
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized' })
-    const { jobId } = req.body
+    const resolvedJobId = await resolveJobIdForCreate(userId, req)
+    if (!resolvedJobId) return res.status(400).json({ error: 'missing_jobId' })
     // Accept legacy field names used by older frontend bundles.
     const filename = String(req.body?.filename ?? req.body?.fileName ?? '')
     const contentType = String(req.body?.contentType ?? req.body?.mimeType ?? 'application/octet-stream')
@@ -111,11 +156,11 @@ router.post('/create', async (req: any, res) => {
     if (!filename || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
       return res.status(400).json({ error: 'missing_params' })
     }
-    const job = jobId ? await prisma.job.findUnique({ where: { id: jobId } }) : null
-    if (jobId && (!job || job.userId !== userId)) return res.status(404).json({ error: 'not_found' })
+    const job = await prisma.job.findUnique({ where: { id: resolvedJobId } })
+    if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })
 
     const safeName = String(filename).replace(/[^a-zA-Z0-9._-]/g, '_')
-    const idSegment = jobId || crypto.randomUUID()
+    const idSegment = resolvedJobId || crypto.randomUUID()
     const key = `uploads/${userId}/${idSegment}/${Date.now()}-${safeName}`
 
     // Choose part size (start 15MB) and ensure parts <= 10000
@@ -160,7 +205,7 @@ router.post('/create', async (req: any, res) => {
       // Backward-compatible aliases for older frontend bundles.
       objectKey: key,
       partSizeBytes: partSize,
-      jobId: jobId || null,
+      jobId: resolvedJobId,
       completeUrl: '/api/uploads/complete',
       abortUrl: '/api/uploads/abort'
     })
