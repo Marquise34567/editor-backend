@@ -25,6 +25,7 @@ const frontendOrigin = process.env.FRONTEND_URL || ''
 const allowedOrigins = [
   ...frontendOrigin.split(','),
   'http://localhost:3000',
+  'http://localhost:5173',
   'https://www.autoeditor.app',
   'https://autoeditor.app'
 ].map((o) => o.trim()).filter(Boolean)
