@@ -13,7 +13,7 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
-import { PLAN_CONFIG, getMonthKey, type PlanTier } from '../shared/planConfig'
+import { PLAN_CONFIG, getMonthKey, isPaidTier, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { isDevAccount } from '../lib/devAccounts'
@@ -378,7 +378,15 @@ const getTargetDimensions = (quality?: ExportQuality | null) => {
 }
 
 type TimeRange = { start: number; end: number }
-type Segment = { start: number; end: number; speed?: number; zoom?: number; brightness?: number; emphasize?: boolean }
+type Segment = {
+  start: number
+  end: number
+  speed?: number
+  zoom?: number
+  brightness?: number
+  emphasize?: boolean
+  audioGain?: number
+}
 type WebcamCrop = { x: number; y: number; width: number; height: number }
 type HorizontalFitMode = 'cover' | 'contain'
 type HorizontalModeOutput = 'quality' | 'source' | { width: number; height: number }
@@ -408,8 +416,12 @@ type EngagementWindow = {
   speechIntensity: number
   motionScore: number
   facePresence: number
+  faceIntensity?: number
   textDensity: number
+  textConfidence?: number
   sceneChangeRate: number
+  actionSpike?: number
+  visualImpact?: number
   emotionalSpike: number
   vocalExcitement: number
   emotionIntensity: number
@@ -508,6 +520,8 @@ type RetentionAttemptRecord = {
   patternInterruptCount: number
   patternInterruptDensity: number
   boredomRemovalRatio: number
+  predictedRetention?: number
+  variantScore?: number
 }
 type HookSelectionDecision = {
   candidate: HookCandidate
@@ -528,10 +542,37 @@ type HookCalibrationProfile = {
   sampleSize: number
   averageOutcome: number
   earlyDropRate: number
+  platformFeedbackShare: number
   dominantStyle: ContentStyle | null
   weights: HookCalibrationWeights
+  strategyBias: Partial<Record<RetentionRetryStrategy, number>>
   reasons: string[]
   updatedAt: string
+}
+type CreatorFeedbackCategory = 'bad_hook' | 'too_fast' | 'too_generic' | 'great_edit'
+type RetentionFeedbackPayload = {
+  watchPercent: number | null
+  hookHoldPercent: number | null
+  completionPercent: number | null
+  rewatchRate: number | null
+  first30Retention: number | null
+  avgViewDurationSeconds: number | null
+  clickThroughRate: number | null
+  sharesPerView: number | null
+  likesPerView: number | null
+  commentsPerView: number | null
+  manualScore: number | null
+  source: string | null
+  sourceType: 'platform' | 'internal'
+  notes: string | null
+  submittedAt: string
+}
+type CreatorFeedbackPayload = {
+  category: CreatorFeedbackCategory
+  source: string | null
+  notes: string | null
+  manualScore: number | null
+  submittedAt: string
 }
 type EditPlan = {
   hook: HookCandidate
@@ -651,6 +692,44 @@ const DEFAULT_HOOK_FACEOFF_WEIGHTS: HookCalibrationWeights = {
   energy: 0.16,
   curiosity: 0.1,
   emotionalSpike: 0.1
+}
+const RETENTION_VARIANT_STRATEGIES: RetentionRetryStrategy[] = ['BASELINE', 'HOOK_FIRST', 'EMOTION_FIRST', 'PACING_FIRST']
+const CREATOR_FEEDBACK_CATEGORIES: CreatorFeedbackCategory[] = ['bad_hook', 'too_fast', 'too_generic', 'great_edit']
+const CREATOR_FEEDBACK_SIGNAL_MAP: Record<CreatorFeedbackCategory, {
+  manualScore: number
+  watchPercent: number
+  hookHoldPercent: number
+  completionPercent: number
+  rewatchRate: number
+}> = {
+  bad_hook: {
+    manualScore: 42,
+    watchPercent: 0.44,
+    hookHoldPercent: 0.34,
+    completionPercent: 0.28,
+    rewatchRate: 0.04
+  },
+  too_fast: {
+    manualScore: 56,
+    watchPercent: 0.52,
+    hookHoldPercent: 0.51,
+    completionPercent: 0.43,
+    rewatchRate: 0.06
+  },
+  too_generic: {
+    manualScore: 53,
+    watchPercent: 0.5,
+    hookHoldPercent: 0.46,
+    completionPercent: 0.4,
+    rewatchRate: 0.05
+  },
+  great_edit: {
+    manualScore: 92,
+    watchPercent: 0.82,
+    hookHoldPercent: 0.86,
+    completionPercent: 0.72,
+    rewatchRate: 0.18
+  }
 }
 const MAX_QUALITY_GATE_RETRIES = 3
 const QUALITY_GATE_THRESHOLDS: QualityGateThresholds = {
@@ -1389,7 +1468,25 @@ const normalizeScore100 = (value: any) => {
   return Number(clamp(score, 0, 100).toFixed(2))
 }
 
-const parseRetentionFeedbackPayload = (payload: any) => {
+const normalizeDurationSeconds = (value: any) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric) || numeric < 0) return null
+  return Number(clamp(numeric, 0, 60 * 60 * 8).toFixed(3))
+}
+
+const resolveFeedbackSource = (raw: any) => {
+  const source = typeof raw === 'string' && raw.trim()
+    ? raw.trim().toLowerCase().slice(0, 64)
+    : ''
+  if (!source) return { source: null as string | null, isPlatform: false }
+  const platform = /(youtube|tiktok|instagram|reels|shorts|analytics|platform|meta)/.test(source)
+  return {
+    source,
+    isPlatform: platform
+  }
+}
+
+const parseRetentionFeedbackPayload = (payload: any): RetentionFeedbackPayload | null => {
   if (!payload || typeof payload !== 'object') return null
   const watchPercent = normalizePercentMetric(
     payload.watchPercent ?? payload.watch_percent ?? payload.avgWatchPercent ?? payload.averageWatchPercent
@@ -1403,12 +1500,35 @@ const parseRetentionFeedbackPayload = (payload: any) => {
   const rewatchRate = normalizePercentMetric(
     payload.rewatchRate ?? payload.rewatch_rate ?? payload.loopRate
   )
+  const first30Retention = normalizePercentMetric(
+    payload.first30Retention ?? payload.first30_retention ?? payload.firstThirtyRetention
+  )
+  const avgViewDurationSeconds = normalizeDurationSeconds(
+    payload.avgViewDurationSec ?? payload.avg_view_duration_seconds ?? payload.averageViewDurationSec
+  )
+  const clickThroughRate = normalizePercentMetric(
+    payload.clickThroughRate ?? payload.click_through_rate ?? payload.ctr
+  )
+  const sharesPerView = normalizePercentMetric(
+    payload.sharesPerView ?? payload.shares_per_view
+  )
+  const likesPerView = normalizePercentMetric(
+    payload.likesPerView ?? payload.likes_per_view
+  )
+  const commentsPerView = normalizePercentMetric(
+    payload.commentsPerView ?? payload.comments_per_view
+  )
   const manualScore = normalizeScore100(
     payload.manualScore ?? payload.manual_score ?? payload.creatorScore ?? payload.editorScore
   )
-  const source = typeof payload.source === 'string' && payload.source.trim()
-    ? payload.source.trim().slice(0, 48)
-    : null
+  const sourceMeta = resolveFeedbackSource(
+    payload.source ?? payload.sourceType ?? payload.source_type
+  )
+  const source = sourceMeta.source
+  const sourceTypeRaw = typeof payload.sourceType === 'string' ? payload.sourceType.toLowerCase() : ''
+  const sourceType = sourceTypeRaw === 'platform' || sourceMeta.isPlatform
+    ? 'platform'
+    : 'internal'
   const notes = typeof payload.notes === 'string' && payload.notes.trim()
     ? payload.notes.trim().slice(0, 400)
     : null
@@ -1417,6 +1537,12 @@ const parseRetentionFeedbackPayload = (payload: any) => {
     hookHoldPercent !== null ||
     completionPercent !== null ||
     rewatchRate !== null ||
+    first30Retention !== null ||
+    avgViewDurationSeconds !== null ||
+    clickThroughRate !== null ||
+    sharesPerView !== null ||
+    likesPerView !== null ||
+    commentsPerView !== null ||
     manualScore !== null
   if (!hasSignal) return null
   return {
@@ -1424,10 +1550,61 @@ const parseRetentionFeedbackPayload = (payload: any) => {
     hookHoldPercent,
     completionPercent,
     rewatchRate,
+    first30Retention,
+    avgViewDurationSeconds,
+    clickThroughRate,
+    sharesPerView,
+    likesPerView,
+    commentsPerView,
     manualScore,
     source,
+    sourceType,
     notes,
     submittedAt: toIsoNow()
+  }
+}
+
+const parseCreatorFeedbackPayload = (payload: any): CreatorFeedbackPayload | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const categoryRaw = String(payload.category || payload.feedback || '').trim().toLowerCase()
+  if (!CREATOR_FEEDBACK_CATEGORIES.includes(categoryRaw as CreatorFeedbackCategory)) {
+    return null
+  }
+  const sourceMeta = resolveFeedbackSource(payload.source ?? 'creator_feedback')
+  const notes = typeof payload.notes === 'string' && payload.notes.trim()
+    ? payload.notes.trim().slice(0, 400)
+    : null
+  const manualScore = normalizeScore100(payload.manualScore ?? payload.manual_score)
+  return {
+    category: categoryRaw as CreatorFeedbackCategory,
+    source: sourceMeta.source || 'creator_feedback',
+    notes,
+    manualScore,
+    submittedAt: toIsoNow()
+  }
+}
+
+const buildRetentionFeedbackFromCreatorPayload = (
+  payload: CreatorFeedbackPayload
+): RetentionFeedbackPayload => {
+  const mapped = CREATOR_FEEDBACK_SIGNAL_MAP[payload.category]
+  const manualScore = payload.manualScore ?? mapped.manualScore
+  return {
+    watchPercent: mapped.watchPercent,
+    hookHoldPercent: mapped.hookHoldPercent,
+    completionPercent: mapped.completionPercent,
+    rewatchRate: mapped.rewatchRate,
+    first30Retention: null,
+    avgViewDurationSeconds: null,
+    clickThroughRate: null,
+    sharesPerView: null,
+    likesPerView: null,
+    commentsPerView: null,
+    manualScore,
+    source: payload.source || `creator_feedback:${payload.category}`,
+    sourceType: 'internal',
+    notes: payload.notes,
+    submittedAt: payload.submittedAt
   }
 }
 
@@ -1439,8 +1616,43 @@ const getRetentionFeedbackFromAnalysis = (analysis: any) => {
     hookHoldPercent: normalizePercentMetric(feedback.hookHoldPercent ?? feedback.hook_hold_percent ?? feedback.first8sRetention),
     completionPercent: normalizePercentMetric(feedback.completionPercent ?? feedback.completion_percent),
     rewatchRate: normalizePercentMetric(feedback.rewatchRate ?? feedback.rewatch_rate),
-    manualScore: normalizeScore100(feedback.manualScore ?? feedback.manual_score)
+    manualScore: normalizeScore100(feedback.manualScore ?? feedback.manual_score),
+    first30Retention: normalizePercentMetric(feedback.first30Retention ?? feedback.first30_retention),
+    avgViewDurationSeconds: normalizeDurationSeconds(feedback.avgViewDurationSec ?? feedback.avg_view_duration_seconds),
+    clickThroughRate: normalizePercentMetric(feedback.clickThroughRate ?? feedback.click_through_rate ?? feedback.ctr),
+    sharesPerView: normalizePercentMetric(feedback.sharesPerView ?? feedback.shares_per_view),
+    likesPerView: normalizePercentMetric(feedback.likesPerView ?? feedback.likes_per_view),
+    commentsPerView: normalizePercentMetric(feedback.commentsPerView ?? feedback.comments_per_view),
+    sourceType: String(feedback.sourceType || '').toLowerCase() === 'platform' ? 'platform' : 'internal'
   }
+}
+
+const persistRetentionFeedbackForJob = async ({
+  job,
+  feedback,
+  analysisPatch
+}: {
+  job: any
+  feedback: RetentionFeedbackPayload
+  analysisPatch?: Record<string, any>
+}) => {
+  const existingAnalysis = (job.analysis as any) || {}
+  const feedbackHistoryRaw = Array.isArray(existingAnalysis?.retention_feedback_history)
+    ? existingAnalysis.retention_feedback_history
+    : []
+  const feedbackHistory = [
+    ...feedbackHistoryRaw.slice(-39),
+    feedback
+  ]
+  const nextAnalysis = {
+    ...existingAnalysis,
+    ...(analysisPatch || {}),
+    retention_feedback: feedback,
+    retention_feedback_history: feedbackHistory,
+    retention_feedback_updated_at: toIsoNow()
+  }
+  await updateJob(job.id, { analysis: nextAnalysis })
+  return nextAnalysis
 }
 
 const normalizeHookCalibrationWeights = (weights: HookCalibrationWeights): HookCalibrationWeights => {
@@ -1467,11 +1679,98 @@ const buildDefaultHookCalibrationProfile = (reason: string, sampleSize = 0): Hoo
   sampleSize,
   averageOutcome: 0,
   earlyDropRate: 0,
+  platformFeedbackShare: 0,
   dominantStyle: null,
   weights: { ...DEFAULT_HOOK_FACEOFF_WEIGHTS },
+  strategyBias: {},
   reasons: [reason],
   updatedAt: toIsoNow()
 })
+
+const computeFeedbackOutcomeSignal = (entry: {
+  analysis?: any
+  retentionScore?: number | null
+}) => {
+  const analysis = entry.analysis || {}
+  const feedback = getRetentionFeedbackFromAnalysis(analysis)
+  const modelRetentionRaw = Number(
+    analysis?.retention_score ??
+    analysis?.retentionScore ??
+    entry.retentionScore ??
+    0
+  )
+  const modelRetention = Number.isFinite(modelRetentionRaw) && modelRetentionRaw > 0
+    ? clamp01(modelRetentionRaw / 100)
+    : null
+  const watch = feedback?.watchPercent ?? null
+  const hookHold = feedback?.hookHoldPercent ?? null
+  const completion = feedback?.completionPercent ?? null
+  const manualScore = feedback?.manualScore !== null && feedback?.manualScore !== undefined
+    ? clamp01((feedback?.manualScore ?? 0) / 100)
+    : null
+  const rewatch = feedback?.rewatchRate ?? null
+  const first30Retention = feedback?.first30Retention ?? null
+  const clickThroughRate = feedback?.clickThroughRate ?? null
+  const sharesPerView = feedback?.sharesPerView ?? null
+  const likesPerView = feedback?.likesPerView ?? null
+  const commentsPerView = feedback?.commentsPerView ?? null
+  const platformBoost = [
+    clickThroughRate,
+    sharesPerView,
+    likesPerView,
+    commentsPerView
+  ].filter((value): value is number => value !== null && Number.isFinite(value))
+
+  const weightedSignals = [
+    { value: watch, weight: 0.28 },
+    { value: hookHold, weight: 0.21 },
+    { value: completion, weight: 0.12 },
+    { value: first30Retention, weight: 0.14 },
+    { value: manualScore, weight: 0.08 },
+    { value: rewatch, weight: 0.05 },
+    { value: modelRetention, weight: 0.08 },
+    { value: platformBoost.length ? clamp01(platformBoost.reduce((sum, value) => sum + Number(value), 0) / platformBoost.length) : null, weight: 0.04 }
+  ].filter((signal) => signal.value !== null && Number.isFinite(signal.value))
+  if (!weightedSignals.length) {
+    return {
+      outcome: null as number | null,
+      hookHoldProxy: null as number | null,
+      isPlatform: false
+    }
+  }
+  const signalWeight = weightedSignals.reduce((sum, signal) => sum + signal.weight, 0)
+  if (signalWeight <= 0) {
+    return {
+      outcome: null as number | null,
+      hookHoldProxy: null as number | null,
+      isPlatform: false
+    }
+  }
+  const outcome = clamp01(
+    weightedSignals.reduce((sum, signal) => sum + (signal.value as number) * signal.weight, 0) / signalWeight
+  )
+  const hookHoldProxy = hookHold ?? watch ?? first30Retention ?? completion ?? outcome
+  return {
+    outcome: Number(outcome.toFixed(4)),
+    hookHoldProxy: Number(clamp01(hookHoldProxy).toFixed(4)),
+    isPlatform: feedback?.sourceType === 'platform'
+  }
+}
+
+const computeStrategyBiasFromHistory = (
+  strategyOutcomes: Partial<Record<RetentionRetryStrategy, { total: number; count: number }>>,
+  averageOutcome: number
+) => {
+  const bias: Partial<Record<RetentionRetryStrategy, number>> = {}
+  for (const strategy of RETENTION_VARIANT_STRATEGIES) {
+    const stats = strategyOutcomes[strategy]
+    if (!stats || stats.count < 2) continue
+    const strategyMean = stats.total / stats.count
+    const delta = clamp((strategyMean - averageOutcome) * 100, -12, 12)
+    bias[strategy] = Number(delta.toFixed(2))
+  }
+  return bias
+}
 
 const computeHookCalibrationProfileFromHistory = (
   entries: Array<{ analysis?: any; retentionScore?: number | null }>
@@ -1483,6 +1782,8 @@ const computeHookCalibrationProfileFromHistory = (
   let earlyDropCount = 0
   let lowEmotionCount = 0
   let lowPacingCount = 0
+  let platformFeedbackCount = 0
+  const strategyOutcomes: Partial<Record<RetentionRetryStrategy, { total: number; count: number }>> = {}
   const styleCounts: Record<ContentStyle, number> = {
     reaction: 0,
     vlog: 0,
@@ -1493,48 +1794,28 @@ const computeHookCalibrationProfileFromHistory = (
 
   for (const entry of entries) {
     const analysis = entry.analysis || {}
-    const feedback = getRetentionFeedbackFromAnalysis(analysis)
-    const modelRetentionRaw = Number(
-      analysis?.retention_score ??
-      analysis?.retentionScore ??
-      entry.retentionScore ??
-      0
-    )
-    const modelRetention = Number.isFinite(modelRetentionRaw) && modelRetentionRaw > 0
-      ? clamp01(modelRetentionRaw / 100)
-      : null
-    const watch = feedback?.watchPercent ?? null
-    const hookHold = feedback?.hookHoldPercent ?? null
-    const completion = feedback?.completionPercent ?? null
-    const manualScore = feedback?.manualScore !== null && feedback?.manualScore !== undefined
-      ? clamp01((feedback?.manualScore ?? 0) / 100)
-      : null
-    const rewatch = feedback?.rewatchRate ?? null
-
-    const weightedSignals = [
-      { value: watch, weight: 0.38 },
-      { value: hookHold, weight: 0.34 },
-      { value: completion, weight: 0.12 },
-      { value: manualScore, weight: 0.08 },
-      { value: rewatch, weight: 0.03 },
-      { value: modelRetention, weight: 0.05 }
-    ].filter((signal) => signal.value !== null && Number.isFinite(signal.value))
-    if (!weightedSignals.length) continue
-
-    const signalWeight = weightedSignals.reduce((sum, signal) => sum + signal.weight, 0)
-    if (signalWeight <= 0) continue
-    const outcome = clamp01(
-      weightedSignals.reduce((sum, signal) => sum + (signal.value as number) * signal.weight, 0) / signalWeight
-    )
+    const signal = computeFeedbackOutcomeSignal(entry)
+    if (signal.outcome === null) continue
+    const outcome = signal.outcome
     sampleSize += 1
     totalOutcome += outcome
+    if (signal.isPlatform) platformFeedbackCount += 1
 
-    const hookHoldProxy = hookHold ?? watch ?? completion ?? outcome
+    const hookHoldProxy = signal.hookHoldProxy ?? outcome
     if (hookHoldProxy < 0.55) earlyDropCount += 1
     const emotionalPull = Number(analysis?.retention_judge?.emotional_pull)
     if (Number.isFinite(emotionalPull) && emotionalPull < QUALITY_GATE_THRESHOLDS.emotional_pull) lowEmotionCount += 1
     const pacingScore = Number(analysis?.retention_judge?.pacing_score)
     if (Number.isFinite(pacingScore) && pacingScore < QUALITY_GATE_THRESHOLDS.pacing_score) lowPacingCount += 1
+    const strategyRaw = String(analysis?.selected_strategy || '').toUpperCase()
+    if (RETENTION_VARIANT_STRATEGIES.includes(strategyRaw as RetentionRetryStrategy)) {
+      const strategy = strategyRaw as RetentionRetryStrategy
+      const prev = strategyOutcomes[strategy] || { total: 0, count: 0 }
+      strategyOutcomes[strategy] = {
+        total: prev.total + outcome,
+        count: prev.count + 1
+      }
+    }
     const style = analysis?.style_profile?.style
     if (style && Object.prototype.hasOwnProperty.call(styleCounts, style)) {
       styleCounts[style as ContentStyle] += 1
@@ -1552,6 +1833,7 @@ const computeHookCalibrationProfileFromHistory = (
   const earlyDropRate = earlyDropCount / sampleSize
   const lowEmotionRate = lowEmotionCount / sampleSize
   const lowPacingRate = lowPacingCount / sampleSize
+  const platformFeedbackShare = platformFeedbackCount / sampleSize
   const reasons: string[] = []
   let weights: HookCalibrationWeights = { ...DEFAULT_HOOK_FACEOFF_WEIGHTS }
 
@@ -1628,8 +1910,10 @@ const computeHookCalibrationProfileFromHistory = (
     sampleSize,
     averageOutcome: Number(averageOutcome.toFixed(4)),
     earlyDropRate: Number(earlyDropRate.toFixed(4)),
+    platformFeedbackShare: Number(platformFeedbackShare.toFixed(4)),
     dominantStyle,
     weights: normalizeHookCalibrationWeights(weights),
+    strategyBias: computeStrategyBiasFromHistory(strategyOutcomes, averageOutcome),
     reasons,
     updatedAt: toIsoNow()
   }
@@ -1657,6 +1941,49 @@ const loadHookCalibrationProfile = async (userId: string) => {
     console.warn('hook calibration load failed', error)
     return buildDefaultHookCalibrationProfile('Failed to load calibration data; using baseline weights.', 0)
   }
+}
+
+const predictVariantRetention = ({
+  strategy,
+  judge,
+  hook,
+  hookCalibration,
+  styleProfile
+}: {
+  strategy: RetentionRetryStrategy
+  judge: RetentionJudgeReport
+  hook: HookCandidate
+  hookCalibration?: HookCalibrationProfile | null
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  const calibration = hookCalibration && hookCalibration.enabled ? hookCalibration : null
+  const base = (
+    0.38 * judge.retention_score +
+    0.24 * judge.hook_strength +
+    0.18 * judge.emotional_pull +
+    0.12 * judge.pacing_score +
+    0.08 * judge.clarity_score
+  )
+  const strategyBias = calibration?.strategyBias?.[strategy] ?? 0
+  const confidenceScale = calibration
+    ? clamp(0.84 + calibration.sampleSize / Math.max(1, HOOK_CALIBRATION_LOOKBACK_JOBS * 2), 0.84, 1.18)
+    : 1
+  let styleBias = 0
+  if (styleProfile?.style === 'tutorial' && strategy === 'HOOK_FIRST') styleBias -= 2.5
+  if ((styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') && strategy === 'EMOTION_FIRST') styleBias += 2.2
+  if (styleProfile?.style === 'vlog' && strategy === 'PACING_FIRST') styleBias += 1.2
+  if (styleProfile?.style === 'story' && strategy === 'BASELINE') styleBias += 1
+
+  const hookConfidence = clamp01(0.64 * hook.score + 0.36 * hook.auditScore)
+  const projected = clamp(
+    base * confidenceScale +
+    strategyBias +
+    styleBias +
+    (hookConfidence - 0.5) * 12,
+    0,
+    100
+  )
+  return Number(projected.toFixed(2))
 }
 
 const buildRenderLimitPayload = (
@@ -2444,8 +2771,8 @@ const buildEngagementWindows = (
   durationSeconds: number,
   energySamples: { time: number; rms: number }[],
   sceneChanges: number[],
-  faceSamples: { time: number; presence: number }[] = [],
-  textSamples: { time: number; density: number }[] = [],
+  faceSamples: { time: number; presence: number; intensity?: number; faceCount?: number }[] = [],
+  textSamples: { time: number; density: number; confidence?: number }[] = [],
   emotionSamples: { time: number; intensity: number }[] = []
 ): EngagementWindow[] => {
   const totalSeconds = Math.max(0, Math.floor(durationSeconds))
@@ -2470,19 +2797,25 @@ const buildEngagementWindows = (
   }
 
   const faceBySecond = new Array(totalSeconds).fill(0)
+  const faceIntensityBySecond = new Array(totalSeconds).fill(0)
   for (const sample of faceSamples) {
     if (sample.time < 0 || sample.time >= totalSeconds) continue
     const idx = Math.floor(sample.time)
     const value = Number.isFinite(sample.presence) ? Math.max(0, Math.min(1, sample.presence)) : 0
     faceBySecond[idx] = Math.max(faceBySecond[idx], value)
+    const intensity = Number.isFinite(sample.intensity) ? clamp01(sample.intensity ?? 0) : value
+    faceIntensityBySecond[idx] = Math.max(faceIntensityBySecond[idx], intensity)
   }
 
   const textBySecond = new Array(totalSeconds).fill(0)
+  const textConfidenceBySecond = new Array(totalSeconds).fill(0)
   for (const sample of textSamples) {
     if (sample.time < 0 || sample.time >= totalSeconds) continue
     const idx = Math.floor(sample.time)
     const value = Number.isFinite(sample.density) ? Math.max(0, Math.min(1, sample.density)) : 0
     textBySecond[idx] = Math.max(textBySecond[idx], value)
+    const confidence = Number.isFinite(sample.confidence) ? clamp01(sample.confidence ?? 0) : (value > 0 ? 0.6 : 0)
+    textConfidenceBySecond[idx] = Math.max(textConfidenceBySecond[idx], confidence)
   }
 
   const emotionBySecond = new Array(totalSeconds).fill(0)
@@ -2498,30 +2831,52 @@ const buildEngagementWindows = (
     const audioEnergy = energyBySecond[i]
     const speechIntensity = Math.min(1, Math.abs(audioEnergy - meanEnergy) / (std || 0.15))
     const sceneChangeRate = Math.min(1, sceneChangesBySecond[i])
-    const motionScore = sceneChangeRate
+    const prevScene = i > 0 ? Math.min(1, sceneChangesBySecond[i - 1]) : sceneChangeRate
+    const motionDelta = Math.abs(sceneChangeRate - prevScene)
+    const audioDelta = i > 0 ? Math.abs(audioEnergy - energyBySecond[i - 1]) : 0
+    const actionSpike = clamp01(
+      0.5 * sceneChangeRate +
+      0.28 * motionDelta +
+      0.22 * clamp01(audioDelta * 2)
+    )
+    const motionScore = clamp01(0.64 * sceneChangeRate + 0.36 * actionSpike)
     const facePresence = faceBySecond[i] || 0
+    const faceIntensity = Math.max(facePresence, faceIntensityBySecond[i] || 0)
     const textDensity = textBySecond[i] || 0
+    const textConfidence = textConfidenceBySecond[i] || 0
     const emotionalSpike = audioEnergy > meanEnergy + std * 1.5 ? 1 : 0
     const vocalExcitement = Math.min(1, Math.max(0, (audioEnergy - meanEnergy) / (std + 0.05)))
     const modelEmotion = emotionBySecond[i] || 0
+    const visualImpact = clamp01(
+      0.36 * motionScore +
+      0.26 * faceIntensity +
+      0.2 * textDensity +
+      0.18 * actionSpike
+    )
     const emotionIntensity = Math.min(
       1,
-      0.45 * speechIntensity + 0.2 * vocalExcitement + 0.15 * emotionalSpike + 0.2 * modelEmotion
+      0.38 * speechIntensity +
+      0.18 * vocalExcitement +
+      0.14 * emotionalSpike +
+      0.18 * modelEmotion +
+      0.12 * faceIntensity
     )
     const baseScore =
       0.2 * audioEnergy +
       0.2 * speechIntensity +
-      0.15 * motionScore +
-      0.15 * facePresence +
+      0.14 * motionScore +
+      0.12 * facePresence +
       0.15 * emotionIntensity +
-      0.08 * textDensity +
-      0.07 * vocalExcitement
+      0.09 * textDensity +
+      0.06 * vocalExcitement +
+      0.04 * visualImpact
     const hookPotential =
-      0.32 * vocalExcitement +
-      0.24 * emotionIntensity +
-      0.2 * sceneChangeRate +
-      0.14 * speechIntensity +
-      0.1 * textDensity
+      0.25 * vocalExcitement +
+      0.22 * emotionIntensity +
+      0.18 * actionSpike +
+      0.14 * sceneChangeRate +
+      0.12 * speechIntensity +
+      0.09 * textDensity
     const introBias = i < 20 ? 0.06 : i < 40 ? 0.03 : 0
     const score = clamp01(baseScore * 0.82 + hookPotential * 0.18 + introBias)
     windows.push({
@@ -2530,8 +2885,12 @@ const buildEngagementWindows = (
       speechIntensity,
       motionScore,
       facePresence,
+      faceIntensity,
       textDensity,
+      textConfidence,
       sceneChangeRate,
+      actionSpike,
+      visualImpact,
       emotionalSpike,
       vocalExcitement,
       emotionIntensity,
@@ -2672,14 +3031,16 @@ const enrichWindowsWithCognitiveScores = ({
       0.14 * transcript.fillerDensity
     )
     const hookScore = clamp01(
-      0.16 * audioVariance +
-      0.14 * window.speechIntensity +
-      0.13 * window.emotionIntensity +
-      0.12 * window.motionScore +
-      0.11 * window.textDensity +
-      0.12 * transcript.keywordIntensity +
-      0.12 * transcript.curiosityTrigger +
-      0.1 * window.facePresence
+      0.14 * audioVariance +
+      0.13 * window.speechIntensity +
+      0.12 * window.emotionIntensity +
+      0.1 * window.motionScore +
+      0.08 * window.textDensity +
+      0.11 * transcript.keywordIntensity +
+      0.11 * transcript.curiosityTrigger +
+      0.09 * window.facePresence +
+      0.06 * (window.faceIntensity ?? window.facePresence) +
+      0.06 * (window.actionSpike ?? 0)
     )
     return {
       ...window,
@@ -2785,16 +3146,18 @@ const runHookAudit = ({
     transcriptSignals.curiosityTrigger * 0.45
   )
   const emotionalSignal = clamp01(
-    averageWindowMetric(windows, start, end, (window) => window.emotionIntensity) * 0.5 +
-    averageWindowMetric(windows, start, end, (window) => window.vocalExcitement) * 0.25 +
-    averageWindowMetric(windows, start, end, (window) => window.speechIntensity) * 0.15 +
-    averageWindowMetric(windows, start, end, (window) => window.motionScore) * 0.1
+    averageWindowMetric(windows, start, end, (window) => window.emotionIntensity) * 0.42 +
+    averageWindowMetric(windows, start, end, (window) => window.vocalExcitement) * 0.22 +
+    averageWindowMetric(windows, start, end, (window) => window.speechIntensity) * 0.12 +
+    averageWindowMetric(windows, start, end, (window) => window.motionScore) * 0.12 +
+    averageWindowMetric(windows, start, end, (window) => window.actionSpike ?? 0) * 0.12
   )
   const nonVerbalClarity = clamp01(
-    0.44 * emotionalSignal +
-    0.22 * averageWindowMetric(windows, start, end, (window) => window.motionScore) +
-    0.2 * averageWindowMetric(windows, start, end, (window) => window.speechIntensity) +
-    0.14 * averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
+    0.34 * emotionalSignal +
+    0.2 * averageWindowMetric(windows, start, end, (window) => window.motionScore) +
+    0.18 * averageWindowMetric(windows, start, end, (window) => window.speechIntensity) +
+    0.14 * averageWindowMetric(windows, start, end, (window) => window.vocalExcitement) +
+    0.14 * averageWindowMetric(windows, start, end, (window) => window.visualImpact ?? 0)
   )
   const hasTranscriptSupport = words.length >= 3
   const understandableByTranscript = words.length >= 5 && contextPenalty <= 0.34
@@ -3380,8 +3743,8 @@ const hasFaceDetectFilter = () => {
 }
 
 const detectFacePresence = async (filePath: string, durationSeconds: number) => {
-  if (!hasFfmpeg()) return [] as { time: number; presence: number }[]
-  if (!hasFaceDetectFilter()) return [] as { time: number; presence: number }[]
+  if (!hasFfmpeg()) return [] as { time: number; presence: number; intensity?: number; faceCount?: number }[]
+  if (!hasFaceDetectFilter()) return [] as { time: number; presence: number; intensity?: number; faceCount?: number }[]
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
   const args = [
     '-hide_banner',
@@ -3394,7 +3757,7 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
   ]
   const output = await runFfmpegCapture(args).catch(() => '')
   const lines = output.split(/\r?\n/)
-  const sampleMap = new Map<number, number>()
+  const sampleMap = new Map<number, { count: number; maxArea: number }>()
   for (const line of lines) {
     if (!line.includes('lavfi.facedetect')) continue
     const timeMatch = line.match(/pts_time:([0-9.]+)/)
@@ -3402,9 +3765,30 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
     const time = Number.parseFloat(timeMatch[1])
     if (!Number.isFinite(time)) continue
     const bucket = Math.floor(time)
-    sampleMap.set(bucket, 1)
+    const width = Number.parseFloat((line.match(/lavfi\.facedetect\.w=([0-9.]+)/)?.[1] || '0'))
+    const height = Number.parseFloat((line.match(/lavfi\.facedetect\.h=([0-9.]+)/)?.[1] || '0'))
+    const area = Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
+      ? width * height
+      : 0
+    const prev = sampleMap.get(bucket) || { count: 0, maxArea: 0 }
+    sampleMap.set(bucket, {
+      count: prev.count + 1,
+      maxArea: Math.max(prev.maxArea, area)
+    })
   }
-  return Array.from(sampleMap.entries()).map(([time, presence]) => ({ time, presence }))
+  return Array.from(sampleMap.entries()).map(([time, stats]) => {
+    const presence = clamp01(stats.count >= 2 ? 1 : 0.6)
+    const intensity = clamp01(
+      0.62 * presence +
+      0.38 * clamp01(stats.maxArea / 110000)
+    )
+    return {
+      time,
+      presence: Number(presence.toFixed(4)),
+      intensity: Number(intensity.toFixed(4)),
+      faceCount: stats.count
+    }
+  })
 }
 
 const detectEmotionModelSignals = async (filePath: string, durationSeconds: number) => {
@@ -3440,11 +3824,116 @@ const detectEmotionModelSignals = async (filePath: string, durationSeconds: numb
   })
 }
 
+let cachedTesseractBin: string | null | undefined
+const resolveTesseractBinary = () => {
+  if (cachedTesseractBin !== undefined) return cachedTesseractBin
+  const explicit = process.env.TEXT_DENSITY_TESSERACT_BIN
+  if (explicit && explicit.trim()) {
+    cachedTesseractBin = explicit.trim()
+    return cachedTesseractBin
+  }
+  const candidates = process.platform === 'win32'
+    ? ['tesseract', 'C:\\Program Files\\Tesseract-OCR\\tesseract.exe']
+    : ['tesseract']
+  for (const candidate of candidates) {
+    try {
+      const result = spawnSync(candidate, ['--version'], { stdio: 'ignore' })
+      if (result.status === 0) {
+        cachedTesseractBin = candidate
+        return cachedTesseractBin
+      }
+    } catch {
+      // continue
+    }
+  }
+  cachedTesseractBin = null
+  return cachedTesseractBin
+}
+
+const detectTextDensityWithTesseract = async (filePath: string, durationSeconds: number) => {
+  const tesseractBin = resolveTesseractBinary()
+  if (!tesseractBin) return [] as { time: number; density: number; confidence?: number }[]
+  const analyzeSeconds = Math.min(300, Math.max(20, durationSeconds || 120))
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'text-density-'))
+  const framePattern = path.join(tmpDir, 'td-%05d.jpg')
+  const frameArgs = [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-i',
+    filePath,
+    '-t',
+    String(analyzeSeconds),
+    '-vf',
+    'fps=1,scale=540:-1:flags=lanczos',
+    '-q:v',
+    '8',
+    framePattern
+  ]
+  try {
+    await runFfmpeg(frameArgs)
+  } catch {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    } catch {
+      // ignore
+    }
+    return [] as { time: number; density: number; confidence?: number }[]
+  }
+  try {
+    const frames = fs.readdirSync(tmpDir)
+      .filter((name) => name.toLowerCase().endsWith('.jpg'))
+      .sort()
+      .slice(0, 300)
+    const samples: Array<{ time: number; density: number; confidence?: number }> = []
+    for (let index = 0; index < frames.length; index += 1) {
+      const framePath = path.join(tmpDir, frames[index])
+      let textOut = ''
+      try {
+        const result = spawnSync(
+          tesseractBin,
+          [framePath, 'stdout', '--psm', '6', '-l', 'eng'],
+          { encoding: 'utf8', timeout: 1800 }
+        )
+        if (result.status === 0) textOut = String(result.stdout || '')
+      } catch {
+        textOut = ''
+      }
+      const cleaned = textOut.replace(/\s+/g, ' ').trim()
+      const charCount = cleaned.length
+      const density = clamp01(charCount / 90)
+      const uppercaseRatio = cleaned.length
+        ? clamp01((cleaned.match(/[A-Z]/g)?.length || 0) / cleaned.length)
+        : 0
+      const confidence = Number(clamp01(0.56 + uppercaseRatio * 0.22 + (charCount > 16 ? 0.12 : 0)).toFixed(4))
+      samples.push({
+        time: index,
+        density: Number(density.toFixed(4)),
+        confidence
+      })
+    }
+    return samples
+  } catch {
+    return [] as { time: number; density: number; confidence?: number }[]
+  } finally {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    } catch {
+      // ignore
+    }
+  }
+}
+
 const detectTextDensity = async (filePath: string, durationSeconds: number) => {
   const modelBin = process.env.TEXT_DENSITY_MODEL_BIN || process.env.TEXT_DENSITY_BIN
-  if (!modelBin) return [] as { time: number; density: number }[]
+  if (!modelBin) {
+    if (String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+      return detectTextDensityWithTesseract(filePath, durationSeconds)
+    }
+    return [] as { time: number; density: number; confidence?: number }[]
+  }
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
-  return new Promise<{ time: number; density: number }[]>((resolve) => {
+  return new Promise<{ time: number; density: number; confidence?: number }[]>((resolve) => {
     let stdout = ''
     const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.stdout.on('data', (chunk) => {
@@ -3463,16 +3952,26 @@ const detectTextDensity = async (filePath: string, durationSeconds: number) => {
         const output = list
           .map((entry: any) => ({
             time: Number(entry?.time ?? entry?.second ?? entry?.t),
-            density: Number(entry?.density ?? entry?.textDensity ?? entry?.value)
+            density: Number(entry?.density ?? entry?.textDensity ?? entry?.value),
+            confidence: Number(entry?.confidence ?? entry?.score ?? entry?.textConfidence)
           }))
           .filter((entry: any) => Number.isFinite(entry.time) && Number.isFinite(entry.density))
           .map((entry: any) => ({
             time: entry.time,
-            density: clamp01(entry.density)
+            density: clamp01(entry.density),
+            confidence: Number.isFinite(entry.confidence) ? clamp01(entry.confidence) : undefined
           }))
+        if (!output.length && String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+          void detectTextDensityWithTesseract(filePath, durationSeconds).then(resolve).catch(() => resolve([]))
+          return
+        }
         resolve(output)
       } catch {
-        resolve([])
+        if (String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+          void detectTextDensityWithTesseract(filePath, durationSeconds).then(resolve).catch(() => resolve([]))
+          return
+        }
+        resolve([] as { time: number; density: number; confidence?: number }[])
       }
     })
   })
@@ -4729,7 +5228,8 @@ const mergeSegmentsToLimitCount = (segments: Segment[], maxSegments: number) => 
       end: right.end,
       speed: 1,
       zoom: 0,
-      brightness: 0
+      brightness: 0,
+      audioGain: Number(clamp(((left.audioGain ?? 1) + (right.audioGain ?? 1)) / 2, 0.8, 1.24).toFixed(3))
     })
   }
   return merged
@@ -4751,6 +5251,7 @@ const prepareSegmentsForRender = (segments: Segment[], durationSeconds: number) 
       prev.speed = 1
       prev.zoom = 0
       prev.brightness = 0
+      prev.audioGain = Number(clamp(((prev.audioGain ?? 1) + (next.audioGain ?? 1)) / 2, 0.8, 1.24).toFixed(3))
       continue
     }
     compacted.push({ ...next })
@@ -4832,6 +5333,8 @@ const buildConcatFilter = (
 
     if (opts.withAudio) {
       const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
+      const gain = Number.isFinite(seg.audioGain) ? clamp(Number(seg.audioGain), 0.8, 1.24) : 1
+      const aGain = Math.abs(gain - 1) >= 0.01 ? `volume=${toFilterNumber(gain)}` : ''
       const aNormalize = 'aformat=sample_rates=48000:channel_layouts=stereo'
       const fadeLen = roundForFilter(0.04)
       const afadeIn = `afade=t=in:st=0:d=${toFilterNumber(fadeLen)}`
@@ -4839,10 +5342,10 @@ const buildConcatFilter = (
       if (opts.hasAudioStream) {
         const guard = roundForFilter(0.04)
         const aTrim = `atrim=start=${toFilterNumber(Math.max(0, seg.start - guard))}:end=${toFilterNumber(seg.end + guard)}`
-        const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize].filter(Boolean).join(',')
+        const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, aGain, afadeIn, afadeOut, aNormalize].filter(Boolean).join(',')
         parts.push(`[0:a]${chain}[a${idx}]`)
       } else {
-        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${toFilterNumber(segDuration)}`, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize]
+        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${toFilterNumber(segDuration)}`, 'asetpts=PTS-STARTPTS', aSpeed, aGain, afadeIn, afadeOut, aNormalize]
           .filter(Boolean)
           .join(',')
         parts.push(`${chain}[a${idx}]`)
@@ -5265,13 +5768,65 @@ const renderVerticalClip = async ({
   await runFfmpeg(args)
 }
 
-const buildAudioFilters = () => {
+const applyAudioPolishToSegments = ({
+  segments,
+  windows,
+  styleProfile,
+  aggressionLevel,
+  musicDuck
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  styleProfile?: ContentStyleProfile | null
+  aggressionLevel: RetentionAggressionLevel
+  musicDuck: boolean
+}) => {
+  return segments.map((segment) => {
+    const energy = averageWindowMetric(windows, segment.start, segment.end, (window) => window.audioEnergy)
+    const speech = averageWindowMetric(windows, segment.start, segment.end, (window) => window.speechIntensity)
+    const emotion = averageWindowMetric(windows, segment.start, segment.end, (window) => window.emotionIntensity)
+    const vocal = averageWindowMetric(windows, segment.start, segment.end, (window) => window.vocalExcitement)
+    const hasLowEnergy = energy < 0.38 && speech < 0.52
+    const hasPeakEnergy = energy > 0.8 || emotion > 0.78 || vocal > 0.76
+    let gain = 1
+    if (segment.emphasize) gain += 0.02
+    if (hasLowEnergy) gain += aggressionLevel === 'viral' ? 0.08 : aggressionLevel === 'high' ? 0.06 : 0.04
+    if (hasPeakEnergy) gain -= 0.04
+    if (styleProfile?.style === 'tutorial') gain += 0.03
+    if ((styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') && hasPeakEnergy) gain -= 0.03
+    if (musicDuck && !segment.emphasize && hasLowEnergy) gain -= 0.02
+    const audioGain = Number(clamp(gain, 0.8, 1.24).toFixed(3))
+    if (Math.abs(audioGain - 1) < 0.005) return { ...segment, audioGain: 1 }
+    return {
+      ...segment,
+      audioGain
+    }
+  })
+}
+
+const buildAudioFilters = ({
+  aggressionLevel,
+  styleProfile
+}: {
+  aggressionLevel: RetentionAggressionLevel
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  const targetLoudness = aggressionLevel === 'viral'
+    ? -13.4
+    : aggressionLevel === 'high'
+      ? -13.8
+      : aggressionLevel === 'low'
+        ? -14.6
+        : -14
+  const compressionRatio = styleProfile?.style === 'tutorial' ? 2.8 : 3.2
+  const attackMs = styleProfile?.style === 'tutorial' ? 18 : 12
+  const releaseMs = styleProfile?.style === 'tutorial' ? 240 : 170
   return [
-    'highpass=f=80',
+    'highpass=f=78',
     'lowpass=f=16000',
-    'afftdn',
-    'acompressor=threshold=-15dB:ratio=3:attack=20:release=250',
-    'loudnorm=I=-14:TP=-1.5:LRA=11'
+    'afftdn=nf=-22',
+    `acompressor=threshold=-17dB:ratio=${toFilterNumber(compressionRatio)}:attack=${toFilterNumber(attackMs)}:release=${toFilterNumber(releaseMs)}:makeup=2`,
+    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.5:LRA=10`
   ]
 }
 
@@ -6438,15 +6993,29 @@ const processJob = async (
       }
 
       let finalSegments: Segment[] = []
-      const attemptStrategies: RetentionRetryStrategy[] = ['BASELINE', 'HOOK_FIRST', 'EMOTION_FIRST', 'PACING_FIRST']
+      const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, MAX_QUALITY_GATE_RETRIES + 1))
+      const attemptEvaluations: Array<{
+        strategy: RetentionRetryStrategy
+        hookCandidate: HookCandidate
+        segments: Segment[]
+        judge: RetentionJudgeReport
+        retention: ReturnType<typeof computeRetentionScore>
+        predictedRetention: number
+        variantScore: number
+        patternInterruptCount: number
+        patternInterruptDensity: number
+      }> = []
       for (let attemptIndex = 0; attemptIndex < attemptStrategies.length; attemptIndex += 1) {
         const strategy = attemptStrategies[attemptIndex]
-        const hookCandidate =
+        const hookCandidate = (
           strategy === 'HOOK_FIRST'
             ? (orderedHookCandidates[1] || orderedHookCandidates[0] || initialHook)
             : strategy === 'EMOTION_FIRST'
               ? (orderedHookCandidates[2] || orderedHookCandidates[0] || initialHook)
-              : initialHook
+              : strategy === 'PACING_FIRST'
+                ? (orderedHookCandidates[3] || orderedHookCandidates[0] || initialHook)
+                : initialHook
+        )
         const attempt = buildAttemptSegments(strategy, hookCandidate)
         const retention = computeRetentionScore(
           attempt.segments,
@@ -6474,6 +7043,18 @@ const processJob = async (
           segments: attempt.segments,
           thresholds: qualityGateThresholds
         })
+        const predictedRetention = predictVariantRetention({
+          strategy,
+          judge,
+          hook: hookCandidate,
+          hookCalibration: hookCalibrationForAnalysis,
+          styleProfile: styleProfileForAnalysis
+        })
+        const variantScore = Number((
+          0.8 * predictedRetention +
+          0.2 * judge.retention_score +
+          (judge.passed ? 3.5 : 0)
+        ).toFixed(2))
         retentionAttempts.push({
           attempt: attemptIndex + 1,
           strategy,
@@ -6481,17 +7062,41 @@ const processJob = async (
           hook: hookCandidate,
           patternInterruptCount: attempt.patternInterruptCount,
           patternInterruptDensity: attempt.patternInterruptDensity,
-          boredomRemovalRatio: retention.details.boredomRemovalRatio
+          boredomRemovalRatio: retention.details.boredomRemovalRatio,
+          predictedRetention,
+          variantScore
         })
-        if (judge.passed || attemptIndex >= MAX_QUALITY_GATE_RETRIES) {
-          finalSegments = attempt.segments
-          selectedHook = hookCandidate
-          selectedJudge = judge
-          retentionScore = judge.retention_score
-          selectedPatternInterruptCount = attempt.patternInterruptCount
-          selectedPatternInterruptDensity = attempt.patternInterruptDensity
-          selectedBoredomRemovalRatio = retention.details.boredomRemovalRatio
-          selectedStrategy = strategy
+        attemptEvaluations.push({
+          strategy,
+          hookCandidate,
+          segments: attempt.segments,
+          judge,
+          retention,
+          predictedRetention,
+          variantScore,
+          patternInterruptCount: attempt.patternInterruptCount,
+          patternInterruptDensity: attempt.patternInterruptDensity
+        })
+      }
+      if (attemptEvaluations.length) {
+        const passedAttempts = attemptEvaluations.filter((attempt) => attempt.judge.passed)
+        const candidatePool = passedAttempts.length ? passedAttempts : attemptEvaluations
+        const winner = candidatePool
+          .slice()
+          .sort((a, b) => (
+            b.variantScore - a.variantScore ||
+            b.predictedRetention - a.predictedRetention ||
+            b.judge.retention_score - a.judge.retention_score
+          ))[0]
+        if (winner) {
+          finalSegments = winner.segments
+          selectedHook = winner.hookCandidate
+          selectedJudge = winner.judge
+          retentionScore = winner.judge.retention_score
+          selectedPatternInterruptCount = winner.patternInterruptCount
+          selectedPatternInterruptDensity = winner.patternInterruptDensity
+          selectedBoredomRemovalRatio = winner.retention.details.boredomRemovalRatio
+          selectedStrategy = winner.strategy
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -6499,10 +7104,9 @@ const processJob = async (
           }))
           optimizationNotes = [
             ...optimizationNotes,
-            ...retention.notes,
-            ...judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
+            ...winner.retention.notes,
+            ...winner.judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
           ]
-          break
         }
       }
 
@@ -6705,7 +7309,18 @@ const processJob = async (
 
       const hasAudio = hasAudioStream(tmpIn)
       const withAudio = true
-      const audioFilters = withAudio ? buildAudioFilters() : []
+      if (withAudio && finalSegments.length) {
+        finalSegments = applyAudioPolishToSegments({
+          segments: finalSegments,
+          windows: editPlan?.engagementWindows ?? [],
+          styleProfile: styleProfileForAnalysis,
+          aggressionLevel,
+          musicDuck: options.musicDuck
+        })
+      }
+      const audioFilters = withAudio
+        ? buildAudioFilters({ aggressionLevel, styleProfile: styleProfileForAnalysis })
+        : []
       await updateJob(jobId, { status: 'retention', progress: 72 })
 
       const plannedSegmentCount = finalSegments.length
@@ -6863,11 +7478,14 @@ const processJob = async (
             if (withAudio) {
               const segDuration = Math.max(0.01, roundForFilter((seg.end - seg.start) / speed))
               const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
+              const gain = Number.isFinite(seg.audioGain) ? clamp(Number(seg.audioGain), 0.8, 1.24) : 1
+              const aGain = Math.abs(gain - 1) >= 0.01 ? `volume=${toFilterNumber(gain)}` : ''
               if (hasAudio) {
                 const aChain = [
                   `[0:a]atrim=start=${toFilterNumber(Math.max(0, seg.start - 0.02))}:end=${toFilterNumber(seg.end + 0.02)}`,
                   'asetpts=PTS-STARTPTS',
                   aSpeed,
+                  aGain,
                   'aformat=sample_rates=48000:channel_layouts=stereo[aout]'
                 ].filter(Boolean).join(',')
                 filterParts.push(aChain)
@@ -6877,6 +7495,7 @@ const processJob = async (
                   `atrim=duration=${toFilterNumber(segDuration)}`,
                   'asetpts=PTS-STARTPTS',
                   aSpeed,
+                  aGain,
                   'aformat=sample_rates=48000:channel_layouts=stereo[aout]'
                 ].filter(Boolean).join(',')
                 filterParts.push(aChain)
@@ -8056,25 +8675,90 @@ router.post('/:id/retention-feedback', async (req: any, res) => {
       return res.status(400).json({ error: 'invalid_feedback_payload' })
     }
 
-    const existingAnalysis = (job.analysis as any) || {}
-    const feedbackHistoryRaw = Array.isArray(existingAnalysis?.retention_feedback_history)
-      ? existingAnalysis.retention_feedback_history
-      : []
-    const feedbackHistory = [
-      ...feedbackHistoryRaw.slice(-19),
-      feedback
-    ]
-    const nextAnalysis = {
-      ...existingAnalysis,
-      retention_feedback: feedback,
-      retention_feedback_history: feedbackHistory,
-      retention_feedback_updated_at: toIsoNow()
-    }
-    await updateJob(id, { analysis: nextAnalysis })
+    await persistRetentionFeedbackForJob({ job, feedback })
 
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
     return res.json({
       ok: true,
+      feedback,
+      hookCalibration
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/platform-feedback', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+
+    const feedback = parseRetentionFeedbackPayload({
+      ...(req.body || {}),
+      sourceType: 'platform',
+      source: req.body?.source || 'platform_analytics'
+    })
+    if (!feedback) {
+      return res.status(400).json({ error: 'invalid_feedback_payload' })
+    }
+
+    await persistRetentionFeedbackForJob({ job, feedback })
+    const hookCalibration = await loadHookCalibrationProfile(job.userId)
+    return res.json({
+      ok: true,
+      feedback,
+      hookCalibration
+    })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/creator-feedback', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+
+    const { tier } = await getUserPlan(req.user.id)
+    if (!isPaidTier(tier)) {
+      return res.status(403).json({
+        error: 'PAID_ONLY_FEATURE',
+        message: 'Creator correction feedback is available on paid plans.',
+        requiredPlan: 'starter'
+      })
+    }
+
+    const creatorFeedback = parseCreatorFeedbackPayload(req.body || {})
+    if (!creatorFeedback) {
+      return res.status(400).json({ error: 'invalid_creator_feedback_payload' })
+    }
+    const feedback = buildRetentionFeedbackFromCreatorPayload(creatorFeedback)
+    const existingAnalysis = (job.analysis as any) || {}
+    const creatorHistoryRaw = Array.isArray(existingAnalysis?.creator_feedback_history)
+      ? existingAnalysis.creator_feedback_history
+      : []
+    const creatorHistory = [
+      ...creatorHistoryRaw.slice(-29),
+      creatorFeedback
+    ]
+    await persistRetentionFeedbackForJob({
+      job,
+      feedback,
+      analysisPatch: {
+        creator_feedback: creatorFeedback,
+        creator_feedback_history: creatorHistory,
+        creator_feedback_updated_at: toIsoNow()
+      }
+    })
+
+    const hookCalibration = await loadHookCalibrationProfile(job.userId)
+    return res.json({
+      ok: true,
+      creatorFeedback,
       feedback,
       hookCalibration
     })
@@ -8194,6 +8878,8 @@ export const __retentionTestUtils = {
   resolveQualityGateThresholds,
   computeContentSignalStrength,
   parseRetentionFeedbackPayload,
+  parseCreatorFeedbackPayload,
+  buildRetentionFeedbackFromCreatorPayload,
   computeHookCalibrationProfileFromHistory,
   normalizeHookCalibrationWeights,
   inferContentStyleProfile,
@@ -8204,6 +8890,7 @@ export const __retentionTestUtils = {
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
+  predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
 }

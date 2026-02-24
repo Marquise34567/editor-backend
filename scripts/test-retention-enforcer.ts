@@ -7,6 +7,8 @@ const {
   resolveQualityGateThresholds,
   computeContentSignalStrength,
   parseRetentionFeedbackPayload,
+  parseCreatorFeedbackPayload,
+  buildRetentionFeedbackFromCreatorPayload,
   computeHookCalibrationProfileFromHistory,
   normalizeHookCalibrationWeights,
   inferContentStyleProfile,
@@ -16,6 +18,7 @@ const {
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
+  predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
 } = __retentionTestUtils
@@ -180,7 +183,19 @@ const run = () => {
   assert.strictEqual(parsedFeedback?.hookHoldPercent, 0.51, 'hook hold should keep normalized values')
   assert.strictEqual(parsedFeedback?.manualScore, 85, 'manual score 0-10 should normalize to 0-100')
 
-  // 1f) Hook calibration should adapt weights when historical feedback shows weak opening retention.
+  // 1f) Creator feedback payload should map to structured retention signals.
+  const parsedCreatorFeedback = parseCreatorFeedbackPayload({
+    category: 'bad_hook',
+    notes: 'opening did not grab attention',
+    source: 'frontend_creator'
+  })
+  assert.ok(parsedCreatorFeedback, 'creator feedback payload should parse')
+  assert.strictEqual(parsedCreatorFeedback?.category, 'bad_hook', 'creator feedback category should persist')
+  const creatorRetentionFeedback = buildRetentionFeedbackFromCreatorPayload(parsedCreatorFeedback as any)
+  assert.ok(Number(creatorRetentionFeedback.manualScore) <= 50, 'bad_hook feedback should lower manual score proxy')
+  assert.strictEqual(creatorRetentionFeedback.sourceType, 'internal', 'creator feedback should stay internal source type')
+
+  // 1g) Hook calibration should adapt weights when historical feedback shows weak opening retention.
   const calibration = computeHookCalibrationProfileFromHistory([
     {
       analysis: {
@@ -222,6 +237,94 @@ const run = () => {
   const normalizedWeights = normalizeHookCalibrationWeights(calibration.weights)
   const weightSum = normalizedWeights.candidateScore + normalizedWeights.auditScore + normalizedWeights.energy + normalizedWeights.curiosity + normalizedWeights.emotionalSpike
   assert.ok(Math.abs(weightSum - 1) < 0.01, 'calibration weights should stay normalized')
+
+  // 1h) Variant predictor should reward stronger style-aligned strategies.
+  const predictorJudge = {
+    retention_score: 84,
+    hook_strength: 86,
+    pacing_score: 79,
+    clarity_score: 77,
+    emotional_pull: 83,
+    why_keep_watching: ['strong opening'],
+    what_is_generic: [],
+    required_fixes: {
+      stronger_hook: false,
+      raise_emotion: false,
+      improve_pacing: false,
+      increase_interrupts: false
+    },
+    applied_thresholds: {
+      hook_strength: 80,
+      emotional_pull: 70,
+      pacing_score: 70,
+      retention_score: 75
+    },
+    gate_mode: 'strict' as const,
+    passed: true
+  }
+  const projectedBaseline = predictVariantRetention({
+    strategy: 'BASELINE',
+    judge: predictorJudge,
+    hook: { ...pickA.selected, score: 0.82, auditScore: 0.86, auditPassed: true, reason: 'strong', text: 'hook' },
+    hookCalibration: {
+      enabled: true,
+      sampleSize: 12,
+      averageOutcome: 0.71,
+      earlyDropRate: 0.26,
+      platformFeedbackShare: 0.2,
+      dominantStyle: 'reaction',
+      weights: {
+        candidateScore: 0.34,
+        auditScore: 0.24,
+        energy: 0.2,
+        curiosity: 0.12,
+        emotionalSpike: 0.1
+      },
+      strategyBias: { EMOTION_FIRST: 4.5, BASELINE: 0.8 },
+      reasons: ['test'],
+      updatedAt: new Date().toISOString()
+    },
+    styleProfile: {
+      style: 'reaction',
+      confidence: 0.78,
+      rationale: ['test'],
+      tempoBias: -0.4,
+      interruptBias: 0.24,
+      hookBias: 0.1
+    }
+  })
+  const projectedEmotion = predictVariantRetention({
+    strategy: 'EMOTION_FIRST',
+    judge: predictorJudge,
+    hook: { ...pickA.selected, score: 0.82, auditScore: 0.86, auditPassed: true, reason: 'strong', text: 'hook' },
+    hookCalibration: {
+      enabled: true,
+      sampleSize: 12,
+      averageOutcome: 0.71,
+      earlyDropRate: 0.26,
+      platformFeedbackShare: 0.2,
+      dominantStyle: 'reaction',
+      weights: {
+        candidateScore: 0.34,
+        auditScore: 0.24,
+        energy: 0.2,
+        curiosity: 0.12,
+        emotionalSpike: 0.1
+      },
+      strategyBias: { EMOTION_FIRST: 4.5, BASELINE: 0.8 },
+      reasons: ['test'],
+      updatedAt: new Date().toISOString()
+    },
+    styleProfile: {
+      style: 'reaction',
+      confidence: 0.78,
+      rationale: ['test'],
+      tempoBias: -0.4,
+      interruptBias: 0.24,
+      hookBias: 0.1
+    }
+  })
+  assert.ok(projectedEmotion > projectedBaseline, 'variant predictor should favor better strategy/style fit')
 
   // 2) Quality gate thresholds
   const strongSegments = [
