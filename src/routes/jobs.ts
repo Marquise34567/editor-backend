@@ -442,6 +442,8 @@ type EngagementWindow = {
   score: number
 }
 type RetentionAggressionLevel = 'low' | 'medium' | 'high' | 'viral'
+type RetentionStrategyProfile = 'safe' | 'balanced' | 'viral'
+type RetentionContentFormat = 'youtube_long' | 'tiktok_short' | 'podcast_clip'
 type PipelineStepStatus = 'pending' | 'running' | 'completed' | 'failed'
 type RetentionPipelineStep =
   | 'TRANSCRIBE'
@@ -506,6 +508,8 @@ type RetentionJudgeReport = {
   pacing_score: number
   clarity_score: number
   emotional_pull: number
+  content_format?: RetentionContentFormat
+  strategy_profile?: RetentionStrategyProfile
   why_keep_watching: string[]
   what_is_generic: string[]
   required_fixes: {
@@ -616,6 +620,7 @@ type EditOptions = {
   subtitleStyle?: string | null
   autoZoomMax: number
   retentionAggressionLevel: RetentionAggressionLevel
+  retentionStrategyProfile: RetentionStrategyProfile
   preferredHookCandidate?: HookCandidate | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
@@ -792,6 +797,86 @@ const LEVEL_QUALITY_THRESHOLD_OFFSET: Record<RetentionAggressionLevel, number> =
   high: 4,
   viral: 8
 }
+const STRATEGY_TO_AGGRESSION: Record<RetentionStrategyProfile, RetentionAggressionLevel> = {
+  safe: 'low',
+  balanced: 'medium',
+  viral: 'viral'
+}
+const AGGRESSION_TO_STRATEGY: Record<RetentionAggressionLevel, RetentionStrategyProfile> = {
+  low: 'safe',
+  medium: 'balanced',
+  high: 'balanced',
+  viral: 'viral'
+}
+const FORMAT_SCORE_WEIGHTS: Record<RetentionContentFormat, {
+  hook: number
+  consistency: number
+  pacing: number
+  boredomRemoval: number
+  emotionalSpikeDensity: number
+  interruptDensity: number
+  subtitle: number
+  audio: number
+  targetSegmentSeconds: number
+  interruptIntervalSeconds: number
+}> = {
+  youtube_long: {
+    hook: 0.22,
+    consistency: 0.18,
+    pacing: 0.16,
+    boredomRemoval: 0.16,
+    emotionalSpikeDensity: 0.12,
+    interruptDensity: 0.08,
+    subtitle: 0.04,
+    audio: 0.04,
+    targetSegmentSeconds: 4.2,
+    interruptIntervalSeconds: 6
+  },
+  tiktok_short: {
+    hook: 0.3,
+    consistency: 0.12,
+    pacing: 0.2,
+    boredomRemoval: 0.1,
+    emotionalSpikeDensity: 0.13,
+    interruptDensity: 0.1,
+    subtitle: 0.03,
+    audio: 0.02,
+    targetSegmentSeconds: 2.8,
+    interruptIntervalSeconds: 4
+  },
+  podcast_clip: {
+    hook: 0.2,
+    consistency: 0.2,
+    pacing: 0.12,
+    boredomRemoval: 0.15,
+    emotionalSpikeDensity: 0.14,
+    interruptDensity: 0.06,
+    subtitle: 0.06,
+    audio: 0.07,
+    targetSegmentSeconds: 4.8,
+    interruptIntervalSeconds: 7
+  }
+}
+const FORMAT_QUALITY_GATE_OFFSET: Record<RetentionContentFormat, Partial<QualityGateThresholds>> = {
+  youtube_long: {
+    hook_strength: 0,
+    emotional_pull: 0,
+    pacing_score: 0,
+    retention_score: 0
+  },
+  tiktok_short: {
+    hook_strength: 3,
+    emotional_pull: 2,
+    pacing_score: 4,
+    retention_score: 2
+  },
+  podcast_clip: {
+    hook_strength: -2,
+    emotional_pull: 0,
+    pacing_score: -3,
+    retention_score: -2
+  }
+}
 const RETENTION_PIPELINE_STEPS: RetentionPipelineStep[] = [
   'TRANSCRIBE',
   'FRAME_ANALYSIS',
@@ -946,7 +1031,8 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   musicDuck: true,
   subtitleStyle: DEFAULT_SUBTITLE_PRESET,
   autoZoomMax: 1.1,
-  retentionAggressionLevel: 'medium'
+  retentionAggressionLevel: 'medium',
+  retentionStrategyProfile: 'balanced'
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
@@ -964,11 +1050,28 @@ const truncateErrorText = (value: unknown, max = 360) => {
 
 const parseRetentionAggressionLevel = (value?: any): RetentionAggressionLevel => {
   const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'safe') return 'low'
+  if (raw === 'balanced') return 'medium'
   if (raw === 'low') return 'low'
   if (raw === 'high') return 'high'
   if (raw === 'viral' || raw === 'max') return 'viral'
   return 'medium'
 }
+
+const parseRetentionStrategyProfile = (value?: any): RetentionStrategyProfile => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'safe') return 'safe'
+  if (raw === 'viral' || raw === 'max') return 'viral'
+  if (raw === 'balanced' || raw === 'default' || raw === 'normal') return 'balanced'
+  // Backward-compatible mapping from aggression labels.
+  if (raw === 'low') return 'safe'
+  if (raw === 'high' || raw === 'medium') return 'balanced'
+  return 'balanced'
+}
+
+const strategyFromAggressionLevel = (level: RetentionAggressionLevel): RetentionStrategyProfile => (
+  AGGRESSION_TO_STRATEGY[level] || 'balanced'
+)
 
 const isAggressiveRetentionLevel = (level: RetentionAggressionLevel) => level === 'high' || level === 'viral'
 
@@ -1195,39 +1298,126 @@ const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): Re
   }
 }
 
-const getRetentionAggressionFromPayload = (payload?: any) => {
-  if (!payload || typeof payload !== 'object') return DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
-  return parseRetentionAggressionLevel(
+const getRetentionStrategyFromPayload = (payload?: any) => {
+  if (!payload || typeof payload !== 'object') return DEFAULT_EDIT_OPTIONS.retentionStrategyProfile
+  const explicitStrategy = (payload as any).retentionStrategyProfile ?? (payload as any).retentionStrategy
+  if (explicitStrategy !== undefined && explicitStrategy !== null && String(explicitStrategy).trim().length > 0) {
+    return parseRetentionStrategyProfile(explicitStrategy)
+  }
+  const legacyAggressionValue =
     (payload as any).retentionLevel ??
     (payload as any).retentionAggressionLevel ??
     (payload as any).aggressionLevel
-  )
+  if (legacyAggressionValue !== undefined && legacyAggressionValue !== null && String(legacyAggressionValue).trim().length > 0) {
+    return parseRetentionStrategyProfile(legacyAggressionValue)
+  }
+  return DEFAULT_EDIT_OPTIONS.retentionStrategyProfile
+}
+
+const getRetentionAggressionFromPayload = (payload?: any) => {
+  if (!payload || typeof payload !== 'object') return DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
+  const explicitAggression =
+    (payload as any).retentionLevel ??
+    (payload as any).retentionAggressionLevel ??
+    (payload as any).aggressionLevel
+  if (explicitAggression !== undefined && explicitAggression !== null && String(explicitAggression).trim().length > 0) {
+    return parseRetentionAggressionLevel(explicitAggression)
+  }
+  const strategy = getRetentionStrategyFromPayload(payload)
+  return STRATEGY_TO_AGGRESSION[strategy] || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
 }
 
 const getRetentionAggressionFromJob = (job?: any) => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
-  return parseRetentionAggressionLevel(
+  const explicitAggression =
     settings?.retentionLevel ??
     settings?.retentionAggressionLevel ??
     analysis?.retentionLevel ??
-    analysis?.retentionAggressionLevel ??
-    DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
+    analysis?.retentionAggressionLevel
+  if (explicitAggression !== undefined && explicitAggression !== null && String(explicitAggression).trim().length > 0) {
+    return parseRetentionAggressionLevel(explicitAggression)
+  }
+  const strategy = parseRetentionStrategyProfile(
+    settings?.retentionStrategyProfile ??
+    settings?.retentionStrategy ??
+    analysis?.retentionStrategyProfile ??
+    analysis?.retentionStrategy
   )
+  return STRATEGY_TO_AGGRESSION[strategy] || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
+}
+
+const getRetentionStrategyFromJob = (job?: any): RetentionStrategyProfile => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const strategyRaw =
+    settings?.retentionStrategyProfile ??
+    settings?.retentionStrategy ??
+    analysis?.retentionStrategyProfile ??
+    analysis?.retentionStrategy
+  if (strategyRaw !== undefined && strategyRaw !== null && String(strategyRaw).trim().length > 0) {
+    return parseRetentionStrategyProfile(strategyRaw)
+  }
+  return strategyFromAggressionLevel(getRetentionAggressionFromJob(job))
+}
+
+const buildRetentionTuningFromPayload = ({
+  payload,
+  fallbackAggression,
+  fallbackStrategy
+}: {
+  payload?: any
+  fallbackAggression: RetentionAggressionLevel
+  fallbackStrategy: RetentionStrategyProfile
+}) => {
+  const hasAggressionOverride = Boolean(
+    payload &&
+    (
+      payload?.retentionLevel !== undefined ||
+      payload?.retentionAggressionLevel !== undefined ||
+      payload?.aggressionLevel !== undefined
+    )
+  )
+  const hasStrategyOverride = Boolean(
+    payload &&
+    (
+      payload?.retentionStrategyProfile !== undefined ||
+      payload?.retentionStrategy !== undefined
+    )
+  )
+  const strategy = hasStrategyOverride
+    ? getRetentionStrategyFromPayload(payload)
+    : fallbackStrategy
+  const aggression = hasAggressionOverride
+    ? getRetentionAggressionFromPayload(payload)
+    : (hasStrategyOverride
+      ? (STRATEGY_TO_AGGRESSION[strategy] || fallbackAggression)
+      : fallbackAggression)
+  return { aggression, strategy, hasAggressionOverride, hasStrategyOverride }
 }
 
 const buildPersistedRenderSettings = (
   renderConfig: RenderConfig,
-  opts?: { retentionAggressionLevel?: RetentionAggressionLevel | null }
+  opts?: {
+    retentionAggressionLevel?: RetentionAggressionLevel | null
+    retentionStrategyProfile?: RetentionStrategyProfile | null
+  }
 ) => {
-  const retentionLevel = parseRetentionAggressionLevel(opts?.retentionAggressionLevel || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel)
+  const retentionLevel = parseRetentionAggressionLevel(
+    opts?.retentionAggressionLevel || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
+  )
+  const retentionStrategy = parseRetentionStrategyProfile(
+    opts?.retentionStrategyProfile || strategyFromAggressionLevel(retentionLevel)
+  )
   return {
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
     verticalClipCount: renderConfig.mode === 'vertical' ? renderConfig.verticalClipCount : 1,
     verticalMode: renderConfig.mode === 'vertical' ? renderConfig.verticalMode : null,
     retentionAggressionLevel: retentionLevel,
-    retentionLevel
+    retentionLevel,
+    retentionStrategyProfile: retentionStrategy,
+    retentionStrategy: retentionStrategy
   }
 }
 
@@ -2564,35 +2754,41 @@ const normalizeQualityGateThresholds = (thresholds?: Partial<QualityGateThreshol
 const resolveQualityGateThresholds = ({
   aggressionLevel,
   hasTranscript,
-  signalStrength
+  signalStrength,
+  contentFormat = 'youtube_long',
+  feedbackOffset = 0
 }: {
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
+  contentFormat?: RetentionContentFormat
+  feedbackOffset?: number
 }): QualityGateThresholds => {
   const levelOffset = LEVEL_QUALITY_THRESHOLD_OFFSET[aggressionLevel]
   const transcriptOffset = hasTranscript ? 0 : -8
   const lowSignalPenalty = signalStrength < 0.42 ? -7 : signalStrength < 0.52 ? -4 : 0
   const highSignalBoost = signalStrength > 0.74 ? 2 : 0
+  const formatOffset = FORMAT_QUALITY_GATE_OFFSET[contentFormat] || FORMAT_QUALITY_GATE_OFFSET.youtube_long
+  const telemetryOffset = Math.round(clamp(Number(feedbackOffset || 0), -4, 4))
   const baseOffset = levelOffset + transcriptOffset + lowSignalPenalty + highSignalBoost
   return normalizeQualityGateThresholds({
     hook_strength: clamp(
-      QUALITY_GATE_THRESHOLDS.hook_strength + baseOffset,
+      QUALITY_GATE_THRESHOLDS.hook_strength + baseOffset + Number(formatOffset.hook_strength || 0) + telemetryOffset,
       QUALITY_GATE_THRESHOLD_FLOORS.hook_strength,
       96
     ),
     emotional_pull: clamp(
-      QUALITY_GATE_THRESHOLDS.emotional_pull + baseOffset,
+      QUALITY_GATE_THRESHOLDS.emotional_pull + baseOffset + Number(formatOffset.emotional_pull || 0) + Math.round(telemetryOffset * 0.8),
       QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull,
       94
     ),
     pacing_score: clamp(
-      QUALITY_GATE_THRESHOLDS.pacing_score + Math.round(baseOffset * 0.6),
+      QUALITY_GATE_THRESHOLDS.pacing_score + Math.round(baseOffset * 0.6) + Number(formatOffset.pacing_score || 0) + Math.round(telemetryOffset * 0.6),
       QUALITY_GATE_THRESHOLD_FLOORS.pacing_score,
       94
     ),
     retention_score: clamp(
-      QUALITY_GATE_THRESHOLDS.retention_score + Math.round(baseOffset * 0.85),
+      QUALITY_GATE_THRESHOLDS.retention_score + Math.round(baseOffset * 0.85) + Number(formatOffset.retention_score || 0) + telemetryOffset,
       QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
       95
     )
@@ -4635,7 +4831,9 @@ const buildRetentionMetadataSummary = ({
   boredomRemovedRatio,
   qualityGateOverride,
   optimizationNotes,
-  hookSelectionSource
+  hookSelectionSource,
+  contentFormat,
+  strategyProfile
 }: {
   durationSeconds: number
   segments: Segment[]
@@ -4652,6 +4850,8 @@ const buildRetentionMetadataSummary = ({
   qualityGateOverride?: { applied: boolean; reason: string } | null
   optimizationNotes?: string[]
   hookSelectionSource?: 'auto' | 'user_selected' | 'fallback'
+  contentFormat?: RetentionContentFormat | null
+  strategyProfile?: RetentionStrategyProfile | null
 }) => {
   const segmentStats = buildSegmentStatsSummary(segments)
   const hookRangeEnd = hook ? hook.start + hook.duration : null
@@ -4745,6 +4945,8 @@ const buildRetentionMetadataSummary = ({
     retention: {
       score: retentionScore ?? judge?.retention_score ?? null,
       strategy: strategy ?? null,
+      strategyProfile: strategyProfile ?? judge?.strategy_profile ?? null,
+      contentFormat: contentFormat ?? judge?.content_format ?? null,
       hookSelectionSource: hookSelectionSource ?? 'auto',
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
@@ -6594,6 +6796,75 @@ const buildAudioFilters = ({
 
 const RETENTION_RENDER_THRESHOLD = 58
 
+const inferRetentionContentFormat = ({
+  runtimeSeconds,
+  windows,
+  renderMode,
+  nicheProfile
+}: {
+  runtimeSeconds: number
+  windows: EngagementWindow[]
+  renderMode?: RenderMode
+  nicheProfile?: VideoNicheProfile | null
+}): RetentionContentFormat => {
+  const runtime = Math.max(1, Number(runtimeSeconds || 0))
+  if (renderMode === 'vertical' || runtime <= 80) return 'tiktok_short'
+  const speechAvg = windows.length
+    ? windows.reduce((sum, window) => sum + window.speechIntensity, 0) / windows.length
+    : 0
+  const sceneAvg = windows.length
+    ? windows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / windows.length
+    : 0
+  if (
+    runtime >= 140 &&
+    speechAvg >= 0.55 &&
+    sceneAvg <= 0.28 &&
+    (nicheProfile?.niche === 'talking_head' || nicheProfile?.niche === 'education')
+  ) {
+    return 'podcast_clip'
+  }
+  return 'youtube_long'
+}
+
+const computeFeedbackQualityGateOffset = (analysisRaw: any) => {
+  const analysis = analysisRaw && typeof analysisRaw === 'object' ? analysisRaw : {}
+  const history = Array.isArray(analysis.retention_feedback_history)
+    ? analysis.retention_feedback_history.slice(-12)
+    : []
+  if (!history.length) return 0
+  const composites: number[] = []
+  for (const item of history) {
+    if (!item || typeof item !== 'object') continue
+    const metrics = [
+      { value: normalizePercentMetric((item as any).watchPercent ?? (item as any).watch_percent), weight: 0.28 },
+      { value: normalizePercentMetric((item as any).hookHoldPercent ?? (item as any).hook_hold_percent), weight: 0.22 },
+      { value: normalizePercentMetric((item as any).completionPercent ?? (item as any).completion_percent), weight: 0.22 },
+      { value: normalizePercentMetric((item as any).rewatchRate ?? (item as any).rewatch_rate), weight: 0.08 },
+      {
+        value: (() => {
+          const score = normalizeScore100((item as any).manualScore ?? (item as any).manual_score)
+          return score === null ? null : Number(clamp01(score / 100).toFixed(4))
+        })(),
+        weight: 0.2
+      }
+    ].filter((entry) => entry.value !== null && Number.isFinite(Number(entry.value)))
+    const totalWeight = metrics.reduce((sum, entry) => sum + entry.weight, 0)
+    if (totalWeight <= 0) continue
+    const composite = metrics.reduce((sum, entry) => sum + Number(entry.value) * entry.weight, 0) / totalWeight
+    if (Number.isFinite(composite)) {
+      composites.push(clamp01(composite))
+    }
+  }
+  if (!composites.length) return 0
+  const mean = composites.reduce((sum, value) => sum + value, 0) / composites.length
+  if (mean < 0.42) return 3
+  if (mean < 0.5) return 2
+  if (mean < 0.58) return 1
+  if (mean > 0.8) return -2
+  if (mean > 0.72) return -1
+  return 0
+}
+
 const computeRetentionScore = (
   segments: Segment[],
   windows: EngagementWindow[],
@@ -6602,14 +6873,24 @@ const computeRetentionScore = (
   extras?: {
     removedRanges?: TimeRange[]
     patternInterruptCount?: number
+    contentFormat?: RetentionContentFormat
   }
 ) => {
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
-  const interruptTargetInterval = runtimeSeconds <= 90 ? 4 : 6
+  const contentFormat = extras?.contentFormat || inferRetentionContentFormat({
+    runtimeSeconds,
+    windows,
+    renderMode: 'horizontal',
+    nicheProfile: null
+  })
+  const formatWeights = FORMAT_SCORE_WEIGHTS[contentFormat]
+  const interruptTargetInterval = formatWeights.interruptIntervalSeconds
   const interruptTargetCount = Math.max(1, Math.ceil(runtimeSeconds / interruptTargetInterval))
   const lengths = segments.map((seg) => seg.end - seg.start).filter((len) => len > 0)
   const avgLen = lengths.length ? lengths.reduce((sum, len) => sum + len, 0) / lengths.length : 0
-  const pacingScore = avgLen > 0 ? Math.max(0, 1 - Math.abs(avgLen - 3.8) / 5.8) : 0.5
+  const pacingScore = avgLen > 0
+    ? Math.max(0, 1 - Math.abs(avgLen - formatWeights.targetSegmentSeconds) / Math.max(3.8, formatWeights.targetSegmentSeconds + 2.2))
+    : 0.5
   const energies = windows.map((w) => w.audioEnergy)
   const mean = energies.length ? energies.reduce((sum, v) => sum + v, 0) / energies.length : 0
   const variance = energies.length ? energies.reduce((sum, v) => sum + (v - mean) ** 2, 0) / energies.length : 0
@@ -6626,17 +6907,19 @@ const computeRetentionScore = (
   const subtitleScore = captionsEnabled ? 1 : 0.6
   const audioScore = 0.82
   const score = Math.round(100 * (
-    0.24 * hook +
-    0.16 * consistency +
-    0.18 * pacingScore +
-    0.14 * boredomRemovalRatio +
-    0.12 * emotionalSpikeDensity +
-    0.1 * interruptDensity +
-    0.06 * subtitleScore +
-    0.1 * audioScore
+    formatWeights.hook * hook +
+    formatWeights.consistency * consistency +
+    formatWeights.pacing * pacingScore +
+    formatWeights.boredomRemoval * boredomRemovalRatio +
+    formatWeights.emotionalSpikeDensity * emotionalSpikeDensity +
+    formatWeights.interruptDensity * interruptDensity +
+    formatWeights.subtitle * subtitleScore +
+    formatWeights.audio * audioScore
   ))
   const notes: string[] = []
-  if (avgLen > 6) notes.push('Pacing is slower than short-form optimal; consider aggressive mode.')
+  if (avgLen > formatWeights.targetSegmentSeconds + 2.2) {
+    notes.push(`Pacing is slower than ${contentFormat.replace('_', ' ')} target; tighten mid-sections.`)
+  }
   if (!captionsEnabled) notes.push('Enable auto subtitles for stronger retention.')
   if (hook < 0.6) notes.push('Hook strength is moderate; consider re-recording the opening.')
   if (boredomRemovalRatio < 0.06) notes.push('Boredom removal ratio is low; increase retention aggression level.')
@@ -6651,7 +6934,9 @@ const computeRetentionScore = (
       boredomRemovalRatio,
       interruptDensity,
       interruptDensityRaw: Number(interruptDensityRaw.toFixed(4)),
-      runtimeSeconds: Number(runtimeSeconds.toFixed(3))
+      runtimeSeconds: Number(runtimeSeconds.toFixed(3)),
+      contentFormat,
+      pacingTargetSeconds: Number(formatWeights.targetSegmentSeconds.toFixed(2))
     }
   }
 }
@@ -6665,7 +6950,9 @@ const buildRetentionJudgeReport = ({
   patternInterruptCount,
   removedRanges,
   segments,
-  thresholds
+  thresholds,
+  contentFormat,
+  strategyProfile
 }: {
   retentionScore: ReturnType<typeof computeRetentionScore>
   hook: HookCandidate
@@ -6676,12 +6963,22 @@ const buildRetentionJudgeReport = ({
   removedRanges: TimeRange[]
   segments: Segment[]
   thresholds?: QualityGateThresholds
+  contentFormat?: RetentionContentFormat
+  strategyProfile?: RetentionStrategyProfile
 }): RetentionJudgeReport => {
   const appliedThresholds = normalizeQualityGateThresholds(thresholds)
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
-  const interruptIntervalTarget = runtimeSeconds <= 90 ? 4 : 6
+  const resolvedContentFormat = contentFormat || (retentionScore?.details?.contentFormat as RetentionContentFormat) || 'youtube_long'
+  const formatWeights = FORMAT_SCORE_WEIGHTS[resolvedContentFormat]
+  const interruptIntervalTarget = Number(formatWeights?.interruptIntervalSeconds || (runtimeSeconds <= 90 ? 4 : 6))
   const interruptTargetCount = Math.max(1, Math.ceil(runtimeSeconds / interruptIntervalTarget))
   const interruptCoverage = clamp01(patternInterruptCount / interruptTargetCount)
+  const interruptCoverageTarget =
+    resolvedContentFormat === 'podcast_clip'
+      ? 0.72
+      : resolvedContentFormat === 'youtube_long'
+        ? 0.86
+        : 0.92
   const emotionalPull = Math.round(100 * clamp01(
     0.45 * averageWindowMetric(windows, 0, Math.max(1, windows.length), (window) => window.emotionIntensity) +
     0.22 * averageWindowMetric(windows, 0, Math.max(1, windows.length), (window) => window.vocalExcitement) +
@@ -6708,7 +7005,9 @@ const buildRetentionJudgeReport = ({
   if (whyKeepWatching.length === 0) whyKeepWatching.push('Retention signals are mixed; stronger setup/payoff needed.')
 
   const whatIsGeneric: string[] = []
-  if (interruptCoverage < 0.95) whatIsGeneric.push('Interrupt density is below retention target for this runtime.')
+  if (interruptCoverage < interruptCoverageTarget) {
+    whatIsGeneric.push(`Interrupt density is below ${resolvedContentFormat.replace('_', ' ')} target for this runtime.`)
+  }
   if (retentionScore.details.boredomRemovalRatio < 0.07) whatIsGeneric.push('Too much low-arousal material remains.')
   if (!hook.auditPassed) whatIsGeneric.push('Hook is not fully understandable without prior context.')
   if (whatIsGeneric.length === 0) whatIsGeneric.push('Generic signals are low for this attempt.')
@@ -6719,13 +7018,15 @@ const buildRetentionJudgeReport = ({
     pacing_score: pacing,
     clarity_score: clarity,
     emotional_pull: emotionalPull,
+    content_format: resolvedContentFormat,
+    strategy_profile: strategyProfile || 'balanced',
     why_keep_watching: whyKeepWatching.slice(0, 3),
     what_is_generic: whatIsGeneric.slice(0, 3),
     required_fixes: {
       stronger_hook: hookStrength < appliedThresholds.hook_strength,
       raise_emotion: emotionalPull < appliedThresholds.emotional_pull,
       improve_pacing: pacing < appliedThresholds.pacing_score,
-      increase_interrupts: interruptCoverage < 0.95
+      increase_interrupts: interruptCoverage < interruptCoverageTarget
     },
     applied_thresholds: appliedThresholds,
     gate_mode:
@@ -6873,7 +7174,10 @@ const ensureUsageWithinLimits = async (
 
 const getEditOptionsForUser = async (
   userId: string,
-  overrides?: { retentionAggressionLevel?: RetentionAggressionLevel | null }
+  overrides?: {
+    retentionAggressionLevel?: RetentionAggressionLevel | null
+    retentionStrategyProfile?: RetentionStrategyProfile | null
+  }
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
   const { tier, plan } = await getUserPlan(userId)
@@ -6885,12 +7189,21 @@ const getEditOptionsForUser = async (
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
   const onlyCuts = settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
+  const requestedStrategy = parseRetentionStrategyProfile(
+    overrides?.retentionStrategyProfile ??
+    strategyFromAggressionLevel(
+      parseRetentionAggressionLevel(
+        overrides?.retentionAggressionLevel ??
+        (settings?.aggressiveMode ? 'high' : DEFAULT_EDIT_OPTIONS.retentionAggressionLevel)
+      )
+    )
+  )
   const requestedAggression = parseRetentionAggressionLevel(
-    overrides?.retentionAggressionLevel ??
-    (settings?.aggressiveMode ? 'high' : DEFAULT_EDIT_OPTIONS.retentionAggressionLevel)
+    overrides?.retentionAggressionLevel ?? STRATEGY_TO_AGGRESSION[requestedStrategy]
   )
   const allowedAggression: RetentionAggressionLevel =
     features.advancedEffects ? requestedAggression : (requestedAggression === 'low' ? 'low' : 'medium')
+  const allowedStrategy = strategyFromAggressionLevel(allowedAggression)
   const aggressiveMode = onlyCuts ? false : isAggressiveRetentionLevel(allowedAggression)
   return {
     options: {
@@ -6904,7 +7217,8 @@ const getEditOptionsForUser = async (
       musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
       subtitleStyle,
       autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
-      retentionAggressionLevel: allowedAggression
+      retentionAggressionLevel: allowedAggression,
+      retentionStrategyProfile: allowedStrategy
     } as EditOptions,
     plan,
     tier
@@ -6974,12 +7288,13 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       console.warn('proxy generation failed, falling back to original for analysis', e)
     }
 
+    const strategyProfile = parseRetentionStrategyProfile(
+      options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
+    )
     const aggressionLevel = parseRetentionAggressionLevel(
-      (job.analysis as any)?.retentionLevel ??
-      (job.analysis as any)?.retentionAggressionLevel ??
-      (job as any)?.renderSettings?.retentionLevel ??
-      (job as any)?.renderSettings?.retentionAggressionLevel ??
-      options.retentionAggressionLevel
+      options.retentionAggressionLevel ??
+      STRATEGY_TO_AGGRESSION[strategyProfile] ??
+      getRetentionAggressionFromJob(job)
     )
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
 
@@ -7160,6 +7475,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const existingAnalysis = (freshJob?.analysis as any) || (job.analysis as any) || {}
     const existingProxyPath = existingAnalysis?.proxyPath ?? null
     const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis, (freshJob as any)?.renderSettings ?? (job as any)?.renderSettings)
+    const analyzeContentFormat = inferRetentionContentFormat({
+      runtimeSeconds: duration,
+      windows: editPlan?.engagementWindows ?? [],
+      renderMode: renderConfig.mode,
+      nicheProfile: editPlan?.nicheProfile ?? null
+    })
     const analyzeMetadataSummary = buildRetentionMetadataSummary({
       durationSeconds: duration,
       segments: editPlan?.segments ?? [],
@@ -7168,7 +7489,9 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       nicheProfile: editPlan?.nicheProfile ?? null,
       patternInterruptCount: editPlan?.patternInterruptCount ?? 0,
       patternInterruptDensity: editPlan?.patternInterruptDensity ?? 0,
-      boredomRemovedRatio: editPlan?.boredomRemovedRatio ?? 0
+      boredomRemovedRatio: editPlan?.boredomRemovedRatio ?? 0,
+      contentFormat: analyzeContentFormat,
+      strategyProfile
     })
     const analysis = buildPersistedRenderAnalysis({
       existing: {
@@ -7195,6 +7518,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         boredom_removed_ratio: editPlan?.boredomRemovedRatio ?? 0,
         retentionAggressionLevel: aggressionLevel,
         retentionLevel: aggressionLevel,
+        retentionStrategyProfile: strategyProfile,
+        retentionStrategy: strategyProfile,
+        retentionContentFormat: analyzeContentFormat,
+        retention_content_format: analyzeContentFormat,
         style_profile: editPlan?.styleProfile ?? null,
         niche_profile: editPlan?.nicheProfile ?? null,
         beat_anchors: editPlan?.beatAnchors ?? [],
@@ -7221,7 +7548,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       status: editPlan ? 'pacing' : 'analyzing',
       progress: editPlan ? 50 : 30,
       inputDurationSeconds: duration ? Math.round(duration) : null,
-      renderSettings: buildPersistedRenderSettings(renderConfig, { retentionAggressionLevel: aggressionLevel }),
+      renderSettings: buildPersistedRenderSettings(renderConfig, {
+        retentionAggressionLevel: aggressionLevel,
+        retentionStrategyProfile: strategyProfile
+      }),
       analysis: analysis
     })
     console.log(`[${requestId || 'noid'}] analyze complete ${jobId}`)
@@ -7265,9 +7595,15 @@ const processJob = async (
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
   }
   const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
-  const aggressionLevel = parseRetentionAggressionLevel(
-    getRetentionAggressionFromJob(job) || options.retentionAggressionLevel
+  const strategyProfile = parseRetentionStrategyProfile(
+    options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
   )
+  const aggressionLevel = parseRetentionAggressionLevel(
+    options.retentionAggressionLevel ??
+    STRATEGY_TO_AGGRESSION[strategyProfile] ??
+    getRetentionAggressionFromJob(job)
+  )
+  const feedbackQualityGateOffset = computeFeedbackQualityGateOffset(job.analysis as any)
   const hookCalibration = await loadHookCalibrationProfile(job.userId)
   const rawSubtitleStyle = options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
@@ -7449,10 +7785,22 @@ const processJob = async (
         windows: verticalWindows,
         hookCandidates: verticalHookCandidates
       })
+      const verticalContentFormat = inferRetentionContentFormat({
+        runtimeSeconds: durationSeconds,
+        windows: verticalWindows,
+        renderMode: finalRenderConfig.mode,
+        nicheProfile: null
+      })
       const nextAnalysis = buildPersistedRenderAnalysis({
         existing: {
           ...((job.analysis as any) || {}),
           metadata_version: 2,
+          retentionAggressionLevel: aggressionLevel,
+          retentionLevel: aggressionLevel,
+          retentionStrategyProfile: strategyProfile,
+          retentionStrategy: strategyProfile,
+          retentionContentFormat: verticalContentFormat,
+          retention_content_format: verticalContentFormat,
           vertical_clip_ranges: clipRanges.map((range, index) => ({
             clip: index + 1,
             start: Number(range.start.toFixed(3)),
@@ -7492,7 +7840,10 @@ const processJob = async (
         watermarkApplied: false,
         retentionScore: null,
         optimizationNotes: null,
-        renderSettings: buildPersistedRenderSettings(finalRenderConfig, { retentionAggressionLevel: aggressionLevel }),
+        renderSettings: buildPersistedRenderSettings(finalRenderConfig, {
+          retentionAggressionLevel: aggressionLevel,
+          retentionStrategyProfile: strategyProfile
+        }),
         analysis: nextAnalysis
       })
 
@@ -7522,6 +7873,12 @@ const processJob = async (
     let finalSegmentsForAnalysis: Segment[] = []
     let styleProfileForAnalysis: ContentStyleProfile | null = ((job.analysis as any)?.style_profile as ContentStyleProfile) || null
     let nicheProfileForAnalysis: VideoNicheProfile | null = ((job.analysis as any)?.niche_profile as VideoNicheProfile) || null
+    let selectedContentFormat: RetentionContentFormat = inferRetentionContentFormat({
+      runtimeSeconds: durationSeconds,
+      windows: [],
+      renderMode: renderConfig.mode,
+      nicheProfile: nicheProfileForAnalysis
+    })
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
@@ -7584,10 +7941,18 @@ const processJob = async (
         )
       )
       contentSignalStrength = computeContentSignalStrength(editPlan?.engagementWindows ?? [])
+      selectedContentFormat = inferRetentionContentFormat({
+        runtimeSeconds: durationSeconds,
+        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+        renderMode: renderConfig.mode,
+        nicheProfile: nicheProfileForAnalysis
+      })
       const qualityGateThresholds = resolveQualityGateThresholds({
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
-        signalStrength: contentSignalStrength
+        signalStrength: contentSignalStrength,
+        contentFormat: selectedContentFormat,
+        feedbackOffset: feedbackQualityGateOffset
       })
       qualityGateOverride = null
       const latestJobHookSnapshot = await prisma.job.findUnique({
@@ -7873,7 +8238,8 @@ const processJob = async (
           options.autoCaptions,
           {
             removedRanges: editPlan?.removedSegments ?? [],
-            patternInterruptCount: attempt.patternInterruptCount
+            patternInterruptCount: attempt.patternInterruptCount,
+            contentFormat: selectedContentFormat
           }
         )
         const clarityPenalty = hookCandidate.auditPassed
@@ -7890,7 +8256,9 @@ const processJob = async (
           patternInterruptCount: attempt.patternInterruptCount,
           removedRanges: editPlan?.removedSegments ?? [],
           segments: attempt.segments,
-          thresholds: qualityGateThresholds
+          thresholds: qualityGateThresholds,
+          contentFormat: selectedContentFormat,
+          strategyProfile
         })
         const predictedRetention = predictVariantRetention({
           strategy,
@@ -7969,7 +8337,9 @@ const processJob = async (
             attempts: retentionAttempts,
             thresholds: qualityGateThresholds,
             hasTranscriptSignals,
-            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            strategyProfile
           }
         })
         await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
@@ -7980,7 +8350,9 @@ const processJob = async (
             attempts: retentionAttempts,
             thresholds: qualityGateThresholds,
             hasTranscriptSignals,
-            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            strategyProfile
           }
         })
         await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
@@ -7988,7 +8360,9 @@ const processJob = async (
           attempts: retentionAttempts,
           thresholds: qualityGateThresholds,
           hasTranscriptSignals,
-          contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          contentFormat: selectedContentFormat,
+          strategyProfile
         })
       }
       if (!selectedJudge.passed) {
@@ -8008,7 +8382,8 @@ const processJob = async (
             options.autoCaptions,
             {
               removedRanges: editPlan?.removedSegments ?? [],
-              patternInterruptCount: rescueAttempt.patternInterruptCount
+              patternInterruptCount: rescueAttempt.patternInterruptCount,
+              contentFormat: selectedContentFormat
             }
           )
           const rescueThresholds = normalizeQualityGateThresholds({
@@ -8047,7 +8422,9 @@ const processJob = async (
             patternInterruptCount: rescueAttempt.patternInterruptCount,
             removedRanges: editPlan?.removedSegments ?? [],
             segments: rescueAttempt.segments,
-            thresholds: rescueThresholds
+            thresholds: rescueThresholds,
+            contentFormat: selectedContentFormat,
+            strategyProfile
           })
           retentionAttempts.push({
             attempt: retentionAttempts.length + 1,
@@ -8101,6 +8478,8 @@ const processJob = async (
           thresholds: qualityGateThresholds,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          contentFormat: selectedContentFormat,
+          strategyProfile,
           qualityGateOverride
         }
       })
@@ -8114,6 +8493,8 @@ const processJob = async (
           thresholds: qualityGateThresholds,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          contentFormat: selectedContentFormat,
+          strategyProfile,
           qualityGateOverride
         }
       })
@@ -8610,7 +8991,9 @@ const processJob = async (
       boredomRemovedRatio: selectedBoredomRemovalRatio,
       qualityGateOverride,
       optimizationNotes,
-      hookSelectionSource: selectedHookSelectionSource
+      hookSelectionSource: selectedHookSelectionSource,
+      contentFormat: selectedContentFormat,
+      strategyProfile
     })
 
     const nextAnalysis = buildPersistedRenderAnalysis({
@@ -8660,7 +9043,11 @@ const processJob = async (
         content_signal_strength: Number(contentSignalStrength.toFixed(4)),
         has_transcript_signals: hasTranscriptSignals,
         retentionAggressionLevel: aggressionLevel,
-        retentionLevel: aggressionLevel
+        retentionLevel: aggressionLevel,
+        retentionStrategyProfile: strategyProfile,
+        retentionStrategy: strategyProfile,
+        retentionContentFormat: selectedContentFormat,
+        retention_content_format: selectedContentFormat
       },
       renderConfig,
       outputPaths
@@ -8680,7 +9067,10 @@ const processJob = async (
       watermarkApplied: watermarkEnabled,
       retentionScore,
       optimizationNotes: optimizationNotes.length ? optimizationNotes : null,
-      renderSettings: buildPersistedRenderSettings(renderConfig, { retentionAggressionLevel: aggressionLevel }),
+      renderSettings: buildPersistedRenderSettings(renderConfig, {
+        retentionAggressionLevel: aggressionLevel,
+        retentionStrategyProfile: strategyProfile
+      }),
       analysis: nextAnalysis
     })
 
@@ -8713,7 +9103,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         throw new Error('ffmpeg_missing')
       }
       const { options } = await getEditOptionsForUser(user.id, {
-        retentionAggressionLevel: getRetentionAggressionFromJob(existing)
+        retentionAggressionLevel: getRetentionAggressionFromJob(existing),
+        retentionStrategyProfile: getRetentionStrategyFromJob(existing)
       })
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       await analyzeJob(jobId, options, requestId)
@@ -9050,7 +9441,13 @@ const handleCreateJob = async (req: any, res: any) => {
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
     const renderConfig = parseRenderConfigFromRequest(req.body)
-    const retentionAggressionLevel = getRetentionAggressionFromPayload(req.body)
+    const retentionTuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
+      fallbackStrategy: DEFAULT_EDIT_OPTIONS.retentionStrategyProfile
+    })
+    const retentionAggressionLevel = retentionTuning.aggression
+    const retentionStrategyProfile = retentionTuning.strategy
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -9114,11 +9511,16 @@ const handleCreateJob = async (req: any, res: any) => {
         progress: 0,
         requestedQuality: desiredQuality,
         priorityLevel: plan.priority ? 1 : 2,
-        renderSettings: buildPersistedRenderSettings(renderConfig, { retentionAggressionLevel }),
+        renderSettings: buildPersistedRenderSettings(renderConfig, {
+          retentionAggressionLevel,
+          retentionStrategyProfile
+        }),
         analysis: buildPersistedRenderAnalysis({
           existing: {
             retentionAggressionLevel,
             retentionLevel: retentionAggressionLevel,
+            retentionStrategyProfile,
+            retentionStrategy: retentionStrategyProfile,
             pipelineSteps: normalizePipelineStepMap({})
           },
           renderConfig,
@@ -9413,22 +9815,26 @@ const handleCompleteUpload = async (req: any, res: any) => {
     }
     const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
-    const hasAggressionOverride =
-      req.body?.retentionLevel !== undefined ||
-      req.body?.retentionAggressionLevel !== undefined ||
-      req.body?.aggressionLevel !== undefined
-    const requestedAggressionLevel = hasAggressionOverride
-      ? getRetentionAggressionFromPayload(req.body)
-      : getRetentionAggressionFromJob(job)
+    const tuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: getRetentionAggressionFromJob(job),
+      fallbackStrategy: getRetentionStrategyFromJob(job)
+    })
+    const requestedAggressionLevel = tuning.aggression
+    const requestedStrategyProfile = tuning.strategy
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
-      retentionLevel: requestedAggressionLevel
+      retentionLevel: requestedAggressionLevel,
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionStrategy: requestedStrategyProfile
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
       retentionAggressionLevel: requestedAggressionLevel,
-      retentionLevel: requestedAggressionLevel
+      retentionLevel: requestedAggressionLevel,
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionStrategy: requestedStrategyProfile
     }
 
     const { plan, tier } = await getUserPlan(req.user.id)
@@ -9477,14 +9883,18 @@ router.post('/:id/analyze', async (req: any, res) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
-    const { options } = await getEditOptionsForUser(req.user.id, {
-      retentionAggressionLevel: getRetentionAggressionFromJob(job)
+    const tuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: getRetentionAggressionFromJob(job),
+      fallbackStrategy: getRetentionStrategyFromJob(job)
     })
-    if (req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel) {
-      const overrideLevel = parseRetentionAggressionLevel(req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel)
-      options.retentionAggressionLevel = overrideLevel
-      options.aggressiveMode = isAggressiveRetentionLevel(overrideLevel)
-    }
+    const { options } = await getEditOptionsForUser(req.user.id, {
+      retentionAggressionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy
+    })
+    options.retentionAggressionLevel = tuning.aggression
+    options.retentionStrategyProfile = tuning.strategy
+    options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
   } catch (err) {
@@ -9508,8 +9918,14 @@ router.post('/:id/process', async (req: any, res) => {
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
+    const tuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: getRetentionAggressionFromJob(job),
+      fallbackStrategy: getRetentionStrategyFromJob(job)
+    })
     const { options } = await getEditOptionsForUser(req.user.id, {
-      retentionAggressionLevel: getRetentionAggressionFromJob(job)
+      retentionAggressionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy
     })
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -9528,11 +9944,9 @@ router.post('/:id/process', async (req: any, res) => {
     if (preferredHookCandidate) {
       options.preferredHookCandidate = preferredHookCandidate
     }
-    if (req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel) {
-      const overrideLevel = parseRetentionAggressionLevel(req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel)
-      options.retentionAggressionLevel = overrideLevel
-      options.aggressiveMode = isAggressiveRetentionLevel(overrideLevel)
-    }
+    options.retentionAggressionLevel = tuning.aggression
+    options.retentionStrategyProfile = tuning.strategy
+    options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     // Allow client to request a fast-mode re-render (overrides user settings for this run)
     if (req.body?.fastMode) {
       ;(options as any).fastMode = true
@@ -9676,13 +10090,13 @@ router.post('/:id/reprocess', async (req: any, res) => {
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
-    const hasAggressionOverride =
-      req.body?.retentionLevel !== undefined ||
-      req.body?.retentionAggressionLevel !== undefined ||
-      req.body?.aggressionLevel !== undefined
-    const requestedAggressionLevel = hasAggressionOverride
-      ? getRetentionAggressionFromPayload(req.body)
-      : getRetentionAggressionFromJob(job)
+    const tuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: getRetentionAggressionFromJob(job),
+      fallbackStrategy: getRetentionStrategyFromJob(job)
+    })
+    const requestedAggressionLevel = tuning.aggression
+    const requestedStrategyProfile = tuning.strategy
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -9702,12 +10116,16 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
-      retentionLevel: requestedAggressionLevel
+      retentionLevel: requestedAggressionLevel,
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionStrategy: requestedStrategyProfile
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionStrategy: requestedStrategyProfile,
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }
