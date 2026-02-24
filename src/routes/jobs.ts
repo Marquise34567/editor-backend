@@ -6178,6 +6178,38 @@ const matchPreferredHookCandidate = ({
   return matched || null
 }
 
+const getHookCandidatesFromAnalysis = (analysisRaw: any): HookCandidate[] => {
+  const analysis = analysisRaw && typeof analysisRaw === 'object' ? analysisRaw : {}
+  const pipelineSteps = analysis.pipelineSteps && typeof analysis.pipelineSteps === 'object'
+    ? analysis.pipelineSteps
+    : {}
+  const rawCandidates = [
+    ...(Array.isArray(analysis.hook_variants) ? analysis.hook_variants : []),
+    ...(Array.isArray(analysis.hook_candidates) ? analysis.hook_candidates : []),
+    ...(Array.isArray(analysis?.editPlan?.hookVariants) ? analysis.editPlan.hookVariants : []),
+    ...(Array.isArray(analysis?.editPlan?.hookCandidates) ? analysis.editPlan.hookCandidates : []),
+    ...(Array.isArray((pipelineSteps as any)?.HOOK_SCORING?.meta?.topCandidates)
+      ? (pipelineSteps as any).HOOK_SCORING.meta.topCandidates
+      : []),
+    ...(Array.isArray((pipelineSteps as any)?.BEST_MOMENT_SCORING?.meta?.topCandidates)
+      ? (pipelineSteps as any).BEST_MOMENT_SCORING.meta.topCandidates
+      : []),
+    ...((pipelineSteps as any)?.HOOK_SELECT_AND_AUDIT?.meta?.selectedHook
+      ? [(pipelineSteps as any).HOOK_SELECT_AND_AUDIT.meta.selectedHook]
+      : [])
+  ]
+  const normalized = normalizeStoredHookCandidates(rawCandidates)
+  const seen = new Set<string>()
+  const deduped: HookCandidate[] = []
+  for (const candidate of normalized) {
+    const key = `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(candidate)
+  }
+  return deduped
+}
+
 const buildVerticalClipRanges = (
   durationSeconds: number,
   requestedCount: number,
@@ -7493,9 +7525,7 @@ const processJob = async (
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
-    let hookVariantsForAnalysis: HookCandidate[] = Array.isArray((job.analysis as any)?.hook_variants)
-      ? ((job.analysis as any).hook_variants as HookCandidate[])
-      : []
+    let hookVariantsForAnalysis: HookCandidate[] = getHookCandidatesFromAnalysis(job.analysis as any)
     let hookCalibrationForAnalysis: HookCalibrationProfile | null = ((job.analysis as any)?.hook_calibration as HookCalibrationProfile) || hookCalibration
     let audioProfileForAnalysis: AudioStreamProfile | null = null
     let audioFiltersForAnalysis: string[] = []
@@ -7560,14 +7590,26 @@ const processJob = async (
         signalStrength: contentSignalStrength
       })
       qualityGateOverride = null
+      const latestJobHookSnapshot = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { analysis: true }
+      })
+      const latestAnalysisForHook = (
+        (latestJobHookSnapshot?.analysis as any) ||
+        (job.analysis as any) ||
+        {}
+      ) as Record<string, any>
       const preferredHookCandidateRaw =
         options.preferredHookCandidate ||
-        parsePreferredHookCandidateFromPayload((job.analysis as any)?.preferred_hook)
+        parsePreferredHookCandidateFromPayload(latestAnalysisForHook.preferred_hook)
+      const hookCandidatesFromStoredAnalysis = getHookCandidatesFromAnalysis(latestAnalysisForHook)
       const hookCandidates = (
         editPlan?.hookCandidates?.length
           ? editPlan.hookCandidates
-          : (editPlan?.hook ? [editPlan.hook] : [])
-      ).filter(Boolean)
+          : hookCandidatesFromStoredAnalysis.length
+            ? hookCandidatesFromStoredAnalysis
+            : (editPlan?.hook ? [editPlan.hook] : [])
+      ).filter((candidate): candidate is HookCandidate => Boolean(candidate))
       const hookDecision = selectRenderableHookCandidate({
         candidates: hookCandidates,
         aggressionLevel,
@@ -9475,12 +9517,7 @@ router.post('/:id/process', async (req: any, res) => {
     const preferredHookPayload = parsePreferredHookCandidateFromPayload(
       req.body?.preferredHook ?? req.body?.selectedHook
     )
-    const availableHookCandidates = normalizeStoredHookCandidates(
-      (job.analysis as any)?.hook_variants ||
-      (job.analysis as any)?.hook_candidates ||
-      (job.analysis as any)?.editPlan?.hookVariants ||
-      (job.analysis as any)?.editPlan?.hookCandidates
-    )
+    const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
     const preferredHookCandidate = matchPreferredHookCandidate({
       preferred: preferredHookPayload,
       candidates: availableHookCandidates
@@ -9536,6 +9573,97 @@ router.post('/:id/process', async (req: any, res) => {
   }
 })
 
+router.post('/:id/preferred-hook', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+
+    const status = String(job.status || '').toLowerCase()
+    const mutableHookStatuses = new Set([
+      'queued',
+      'uploading',
+      'analyzing',
+      'hooking',
+      'cutting',
+      'pacing'
+    ])
+    if (!mutableHookStatuses.has(status)) {
+      return res.status(409).json({
+        error: 'hook_stage_complete',
+        message: 'Hook selection can only be changed before subtitle/render stages.'
+      })
+    }
+
+    const preferredHookPayload = parsePreferredHookCandidateFromPayload(
+      req.body?.preferredHook ?? req.body?.selectedHook
+    )
+    if (!preferredHookPayload) {
+      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    }
+
+    const analysis = ((job.analysis as any) || {}) as Record<string, any>
+    const availableHookCandidates = getHookCandidatesFromAnalysis(analysis)
+    if (!availableHookCandidates.length) {
+      return res.status(409).json({
+        error: 'hook_candidates_not_ready',
+        message: 'Hook options are still being generated.'
+      })
+    }
+
+    const preferredHookCandidate = matchPreferredHookCandidate({
+      preferred: preferredHookPayload,
+      candidates: availableHookCandidates
+    })
+    if (!preferredHookCandidate) {
+      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    }
+
+    const nowIso = toIsoNow()
+    const existingSteps = normalizePipelineStepMap(analysis.pipelineSteps)
+    const hookStepMeta =
+      existingSteps.HOOK_SELECT_AND_AUDIT?.meta &&
+      typeof existingSteps.HOOK_SELECT_AND_AUDIT.meta === 'object'
+        ? existingSteps.HOOK_SELECT_AND_AUDIT.meta
+        : {}
+    existingSteps.HOOK_SELECT_AND_AUDIT = {
+      ...existingSteps.HOOK_SELECT_AND_AUDIT,
+      meta: {
+        ...hookStepMeta,
+        selectedHook: preferredHookCandidate,
+        hookSelectionSource: 'user_selected',
+        preferredHookUpdatedAt: nowIso
+      }
+    }
+
+    const nextAnalysis = {
+      ...analysis,
+      preferred_hook: preferredHookCandidate,
+      preferred_hook_updated_at: nowIso,
+      hook_start_time: preferredHookCandidate.start,
+      hook_end_time: Number((preferredHookCandidate.start + preferredHookCandidate.duration).toFixed(3)),
+      hook_text: preferredHookCandidate.text || analysis.hook_text || null,
+      hook_reason: preferredHookCandidate.reason || analysis.hook_reason || null,
+      hook_selection_source: 'user_selected',
+      pipelineSteps: existingSteps,
+      pipelineUpdatedAt: nowIso
+    }
+
+    await updateJob(id, { analysis: nextAnalysis })
+    return res.json({
+      ok: true,
+      preferredHook: {
+        start: preferredHookCandidate.start,
+        duration: preferredHookCandidate.duration
+      },
+      appliedAt: nowIso
+    })
+  } catch (err) {
+    console.error('preferred-hook update error', err)
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
 router.post('/:id/reprocess', async (req: any, res) => {
   try {
     const id = req.params.id
@@ -9562,12 +9690,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const preferredHookPayload = parsePreferredHookCandidateFromPayload(
       req.body?.preferredHook ?? req.body?.selectedHook
     )
-    const availableHookCandidates = normalizeStoredHookCandidates(
-      (job.analysis as any)?.hook_variants ||
-      (job.analysis as any)?.hook_candidates ||
-      (job.analysis as any)?.editPlan?.hookVariants ||
-      (job.analysis as any)?.editPlan?.hookCandidates
-    )
+    const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
     const preferredHookCandidate = matchPreferredHookCandidate({
       preferred: preferredHookPayload,
       candidates: availableHookCandidates
