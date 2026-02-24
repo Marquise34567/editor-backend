@@ -3553,6 +3553,70 @@ const STALE_RECOVERABLE_STATUSES = new Set([
 ])
 let queueRecoveryRunning = false
 let queueRecoveryLoopStarted = false
+const DEFAULT_QUEUE_SLOT_SECONDS = (() => {
+  const envVal = Number(process.env.JOB_QUEUE_SLOT_SECONDS || 0)
+  if (Number.isFinite(envVal) && envVal >= 20) return Math.round(envVal)
+  return 210
+})()
+const RECENT_DURATION_SAMPLE_LIMIT = (() => {
+  const envVal = Number(process.env.JOB_QUEUE_DURATION_SAMPLE_LIMIT || 0)
+  if (Number.isFinite(envVal) && envVal >= 5) return Math.min(120, Math.round(envVal))
+  return 25
+})()
+const recentPipelineDurationsSeconds: number[] = []
+
+type QueueEtaInfo = {
+  queuePosition: number
+  queueEtaSeconds: number
+  queueDepth: number
+  queueSlotSeconds: number
+}
+
+const recordPipelineDurationSeconds = (seconds: number) => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return
+  const bounded = Math.round(clamp(seconds, 15, 10_800))
+  recentPipelineDurationsSeconds.push(bounded)
+  if (recentPipelineDurationsSeconds.length > RECENT_DURATION_SAMPLE_LIMIT) {
+    recentPipelineDurationsSeconds.splice(0, recentPipelineDurationsSeconds.length - RECENT_DURATION_SAMPLE_LIMIT)
+  }
+}
+
+const getQueueSlotEstimateSeconds = () => {
+  if (!recentPipelineDurationsSeconds.length) return DEFAULT_QUEUE_SLOT_SECONDS
+  const total = recentPipelineDurationsSeconds.reduce((sum, value) => sum + value, 0)
+  const average = total / recentPipelineDurationsSeconds.length
+  return Math.round(clamp(average, 20, 10_800))
+}
+
+const buildQueueEtaSnapshot = () => {
+  const queueDepth = runningPipelineJobIds.size + pipelineQueue.length
+  const queueSlotSeconds = getQueueSlotEstimateSeconds()
+  const availableNow = Math.max(0, MAX_PIPELINES - activePipelines)
+  const byJobId = new Map<string, QueueEtaInfo>()
+
+  for (const runningJobId of runningPipelineJobIds) {
+    byJobId.set(runningJobId, {
+      queuePosition: 0,
+      queueEtaSeconds: 0,
+      queueDepth,
+      queueSlotSeconds
+    })
+  }
+
+  for (let index = 0; index < pipelineQueue.length; index += 1) {
+    const item = pipelineQueue[index]
+    const waitSlots = index < availableNow ? 0 : index - availableNow + 1
+    const waitWaves = waitSlots > 0 ? Math.ceil(waitSlots / Math.max(1, MAX_PIPELINES)) : 0
+    byJobId.set(item.jobId, {
+      queuePosition: index + 1,
+      queueEtaSeconds: waitWaves * queueSlotSeconds,
+      queueDepth,
+      queueSlotSeconds
+    })
+  }
+
+  return { byJobId, queueDepth, queueSlotSeconds }
+}
 
 const toTimeMs = (value: unknown) => {
   if (!value) return 0
@@ -3571,8 +3635,11 @@ const processQueue = () => {
     }
     runningPipelineJobIds.add(next.jobId)
     activePipelines += 1
+    const startedAtMs = Date.now()
     void runPipeline(next.jobId, next.user, next.requestedQuality, next.requestId)
       .finally(() => {
+        const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAtMs) / 1000))
+        recordPipelineDurationSeconds(elapsedSeconds)
         runningPipelineJobIds.delete(next.jobId)
         activePipelines = Math.max(0, activePipelines - 1)
         processQueue()
@@ -3794,16 +3861,26 @@ router.get('/', async (req: any, res) => {
   try {
     const userId = req.user.id
     const jobs = await prisma.job.findMany({ where: { userId }, orderBy: { createdAt: 'desc' } })
-    const payload = jobs.map((job) => ({
-      id: job.id,
-      status: job.status === 'completed' ? 'ready' : job.status,
-      createdAt: job.createdAt,
-      requestedQuality: job.requestedQuality,
-      watermark: job.watermarkApplied,
-      inputPath: job.inputPath,
-      progress: job.progress,
-      renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
-    }))
+    const queueSnapshot = buildQueueEtaSnapshot()
+    const payload = jobs.map((job) => {
+      const normalizedStatus = job.status === 'completed' ? 'ready' : job.status
+      const queueEta =
+        normalizedStatus === 'queued' || normalizedStatus === 'uploading'
+          ? queueSnapshot.byJobId.get(job.id)
+          : null
+      return {
+        id: job.id,
+        status: normalizedStatus,
+        createdAt: job.createdAt,
+        requestedQuality: job.requestedQuality,
+        watermark: job.watermarkApplied,
+        inputPath: job.inputPath,
+        progress: job.progress,
+        queuePosition: queueEta?.queuePosition ?? null,
+        queueEtaSeconds: queueEta?.queueEtaSeconds ?? null,
+        renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
+      }
+    })
     res.json({ jobs: payload })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -3826,6 +3903,11 @@ router.get('/:id', async (req: any, res) => {
       return 'PROCESSING'
     }
     const normalizedStatus = job.status === 'completed' ? 'ready' : job.status
+    const queueSnapshot = buildQueueEtaSnapshot()
+    const queueEta =
+      normalizedStatus === 'queued' || normalizedStatus === 'uploading'
+        ? queueSnapshot.byJobId.get(job.id)
+        : null
 
     const jobPayload: any = {
       ...job,
@@ -3834,6 +3916,8 @@ router.get('/:id', async (req: any, res) => {
       // Legacy coarse-grained status for older clients.
       legacyStatus: mapStatus(job.status),
       watermark: job.watermarkApplied,
+      queuePosition: queueEta?.queuePosition ?? null,
+      queueEtaSeconds: queueEta?.queueEtaSeconds ?? null,
       renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode,
       steps: [
         { key: 'queued', label: 'Queued' },
