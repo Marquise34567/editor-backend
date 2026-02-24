@@ -31,7 +31,7 @@ const router = express.Router()
 
 const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
 const OUTPUT_BUCKET = process.env.SUPABASE_BUCKET_OUTPUT || process.env.SUPABASE_BUCKET_OUTPUTS || 'outputs'
-const FFMPEG_LOG_LIMIT = 120000
+const FFMPEG_LOG_LIMIT = 10_000_000
 
 type FfmpegRunResult = {
   exitCode: number | null
@@ -357,12 +357,16 @@ const STITCH_FADE_SEC = 0.08
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const SILENCE_KEEP_PADDING_SEC = 0.2
-const HOOK_ANALYZE_MAX = 600
+const HOOK_ANALYZE_MAX = 1800
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MAX_VERTICAL_CLIPS = 3
 const MIN_VERTICAL_CLIP_SECONDS = 8
+const LONG_FORM_RESCUE_MIN_DURATION = 120
+const LONG_FORM_MIN_EDIT_RATIO = 0.035
+const LONG_FORM_MIN_EDIT_SECONDS = 20
+const LONG_FORM_MAX_EDIT_SECONDS = 140
 const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
 const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
@@ -1497,7 +1501,7 @@ const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds
   const minDuration = aggressiveMode ? 35 : 40
   if (!windows.length || durationSeconds < minDuration) return [] as TimeRange[]
   const edgePadding = aggressiveMode ? 7 : 8
-  const cutHalfLength = aggressiveMode ? 2.6 : 2.3
+  const cutHalfLength = aggressiveMode ? 2.8 : 2.5
   const candidates = windows
     .filter((window) => window.time >= edgePadding && window.time <= Math.max(edgePadding, durationSeconds - 6))
     .map((window) => ({
@@ -1515,10 +1519,13 @@ const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds
   const desired = clamp(
     Math.floor(durationSeconds / (aggressiveMode ? 85 : 95)) + 1,
     1,
-    aggressiveMode ? 4 : 3
+    aggressiveMode ? 9 : 7
   )
   const selected: TimeRange[] = []
-  const spacingBuffer = aggressiveMode ? 4 : 4.5
+  const spacingBuffer = Math.max(
+    aggressiveMode ? 5.5 : 7,
+    durationSeconds / Math.max(10, desired * 2.5)
+  )
   for (const candidate of candidates) {
     if (selected.length >= desired) break
     const overlaps = selected.some(
@@ -1528,6 +1535,98 @@ const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds
     selected.push({ start: candidate.start, end: candidate.end })
   }
   return mergeRanges(selected)
+}
+
+const getRangesDurationSeconds = (ranges: TimeRange[]) => {
+  return ranges.reduce((sum, range) => sum + Math.max(0, range.end - range.start), 0)
+}
+
+const getMinimumRemovedSeconds = (durationSeconds: number, aggressiveMode = false) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RESCUE_MIN_DURATION) return 0
+  const ratio = aggressiveMode ? LONG_FORM_MIN_EDIT_RATIO + 0.01 : LONG_FORM_MIN_EDIT_RATIO
+  const target = durationSeconds * ratio
+  return clamp(target, LONG_FORM_MIN_EDIT_SECONDS, aggressiveMode ? LONG_FORM_MAX_EDIT_SECONDS + 30 : LONG_FORM_MAX_EDIT_SECONDS)
+}
+
+const buildLongFormRescueCuts = (
+  windows: EngagementWindow[],
+  durationSeconds: number,
+  missingSeconds: number,
+  aggressiveMode = false,
+  existingCuts: TimeRange[] = []
+) => {
+  if (!windows.length || durationSeconds < LONG_FORM_RESCUE_MIN_DURATION || missingSeconds <= 0) {
+    return [] as TimeRange[]
+  }
+  const edgePadding = aggressiveMode ? 6 : 8
+  const cutLength = aggressiveMode ? 3.5 : 3.1
+  const minSpacing = aggressiveMode ? 8.5 : 10.5
+  const existing = mergeRanges(existingCuts)
+  const candidates = windows
+    .filter((window) => window.time >= edgePadding && window.time <= Math.max(edgePadding, durationSeconds - edgePadding))
+    .map((window) => {
+      const center = window.time + 0.5
+      const start = clamp(center - cutLength / 2, edgePadding, Math.max(edgePadding, durationSeconds - edgePadding - cutLength))
+      const end = Math.min(durationSeconds - edgePadding, start + cutLength)
+      const engagementCost =
+        0.58 * window.score +
+        0.16 * window.speechIntensity +
+        0.12 * window.vocalExcitement +
+        0.08 * window.emotionIntensity +
+        0.06 * window.sceneChangeRate
+      return {
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        score: engagementCost
+      }
+    })
+    .filter((entry) => entry.end - entry.start >= (aggressiveMode ? 1.9 : 2.2))
+    .sort((a, b) => a.score - b.score)
+
+  const targetCuts = clamp(
+    Math.ceil(missingSeconds / Math.max(1.8, cutLength - 0.2)),
+    1,
+    Math.max(4, Math.floor(durationSeconds / (aggressiveMode ? 20 : 24)))
+  )
+
+  const selected: TimeRange[] = []
+  for (const candidate of candidates) {
+    if (selected.length >= targetCuts) break
+    const overlapsExisting = existing.some(
+      (range) => candidate.start < range.end + 0.35 && candidate.end > range.start - 0.35
+    )
+    if (overlapsExisting) continue
+    const tooClose = selected.some(
+      (range) => candidate.start < range.end + minSpacing && candidate.end > range.start - minSpacing
+    )
+    if (tooClose) continue
+    selected.push({ start: candidate.start, end: candidate.end })
+  }
+
+  return mergeRanges(selected)
+}
+
+const buildConservativeFallbackSegments = (durationSeconds: number, aggressiveMode = false) => {
+  const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
+  if (total <= 0.25) {
+    return [{ start: 0, end: total, speed: 1 } as Segment]
+  }
+  const base: Segment[] = [{ start: 0, end: Number(total.toFixed(3)), speed: 1 }]
+  if (total < LONG_FORM_RESCUE_MIN_DURATION) return base
+
+  const cutLength = aggressiveMode ? 2.9 : 2.4
+  const spacing = aggressiveMode ? 42 : 55
+  const startOffset = aggressiveMode ? 12 : 14
+  const edgePadding = aggressiveMode ? 6 : 8
+  const cuts: TimeRange[] = []
+  for (let cursor = startOffset; cursor + cutLength < total - edgePadding; cursor += spacing) {
+    const start = Number(cursor.toFixed(3))
+    const end = Number(Math.min(total - edgePadding, cursor + cutLength).toFixed(3))
+    if (end - start > 0.3) cuts.push({ start, end })
+  }
+  if (!cuts.length) return base
+  const fallback = subtractRanges(base, cuts)
+  return fallback.length ? fallback : base
 }
 
 const buildRangesFromFlags = (flags: boolean[], minDurationSeconds = 1) => {
@@ -1923,13 +2022,34 @@ const buildEditPlan = async (
   const fallbackRemovedSegments = options.removeBoring && !detectedRemovedSegments.length
     ? buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode)
     : []
-  const candidateRemovedSegments = mergeRanges([
+  let candidateRemovedSegments = mergeRanges([
     ...(detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments),
     ...silenceTrimCuts
   ])
-  const removedSegments = options.removeBoring
+  let removedSegments = options.removeBoring
     ? applyContinuityGuardsToCuts(candidateRemovedSegments, windows, options.aggressiveMode)
     : []
+  if (options.removeBoring) {
+    const minimumRemovedSeconds = getMinimumRemovedSeconds(durationSeconds, options.aggressiveMode)
+    const removedSeconds = getRangesDurationSeconds(removedSegments)
+    if (minimumRemovedSeconds > 0 && removedSeconds < minimumRemovedSeconds) {
+      const rescueCuts = buildLongFormRescueCuts(
+        windows,
+        durationSeconds,
+        minimumRemovedSeconds - removedSeconds,
+        options.aggressiveMode,
+        removedSegments.length ? removedSegments : candidateRemovedSegments
+      )
+      if (rescueCuts.length) {
+        candidateRemovedSegments = mergeRanges([...candidateRemovedSegments, ...rescueCuts])
+        const guarded = applyContinuityGuardsToCuts(candidateRemovedSegments, windows, true)
+        const guardedRemovedSeconds = getRangesDurationSeconds(guarded)
+        removedSegments = guardedRemovedSeconds >= removedSeconds + 0.5
+          ? guarded
+          : candidateRemovedSegments
+      }
+    }
+  }
   const compressedSegments: TimeRange[] = []
 
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
@@ -3066,7 +3186,7 @@ const processJob = async (
       const hookSegment: Segment | null = hookRange ? { ...hookRange, speed: 1 } : null
       const baseSegments: Segment[] = editPlan
         ? editPlan.segments
-        : [{ start: 0, end: durationSeconds || 0, speed: 1 }]
+        : buildConservativeFallbackSegments(durationSeconds || 0, options.aggressiveMode)
       const storySegments = editPlan && !options.onlyCuts
         ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
         : baseSegments
