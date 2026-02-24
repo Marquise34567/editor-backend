@@ -3,6 +3,7 @@ import fs from 'fs'
 import os from 'os'
 import path from 'path'
 import crypto from 'crypto'
+import { AsyncLocalStorage } from 'async_hooks'
 import { spawn, spawnSync } from 'child_process'
 import { prisma } from '../db/prisma'
 import { supabaseAdmin } from '../supabaseClient'
@@ -162,11 +163,83 @@ const hasFfprobe = () => {
   }
 }
 
+const pipelineJobContext = new AsyncLocalStorage<{ jobId: string }>()
+const canceledPipelineJobIds = new Set<string>()
+const ffmpegProcessesByJobId = new Map<string, Set<ReturnType<typeof spawn>>>()
+
+class JobCanceledError extends Error {
+  jobId?: string
+  constructor(jobId?: string) {
+    super('job_canceled')
+    this.name = 'JobCanceledError'
+    this.jobId = jobId
+  }
+}
+
+const getPipelineJobId = () => pipelineJobContext.getStore()?.jobId
+
+const isPipelineCanceled = (jobId?: string | null) => {
+  if (!jobId) return false
+  return canceledPipelineJobIds.has(jobId)
+}
+
+const markPipelineCanceled = (jobId: string) => {
+  if (!jobId) return
+  canceledPipelineJobIds.add(jobId)
+}
+
+const clearPipelineCanceled = (jobId: string) => {
+  if (!jobId) return
+  canceledPipelineJobIds.delete(jobId)
+}
+
+const killJobFfmpegProcesses = (jobId: string) => {
+  const processes = ffmpegProcessesByJobId.get(jobId)
+  if (!processes || processes.size === 0) return 0
+  let killed = 0
+  for (const proc of Array.from(processes)) {
+    if (!proc || proc.killed) continue
+    try {
+      proc.kill('SIGKILL')
+      killed += 1
+    } catch (e) {
+      // ignore
+    }
+  }
+  return killed
+}
+
 const runFfmpegProcess = (args: string[]) => {
   return new Promise<FfmpegRunResult>((resolve, reject) => {
     const proc = spawn(FFMPEG_PATH, args, { stdio: 'pipe' })
+    const jobId = getPipelineJobId()
+    if (jobId) {
+      let set = ffmpegProcessesByJobId.get(jobId)
+      if (!set) {
+        set = new Set()
+        ffmpegProcessesByJobId.set(jobId, set)
+      }
+      set.add(proc)
+      if (isPipelineCanceled(jobId)) {
+        try {
+          proc.kill('SIGKILL')
+        } catch (e) {
+          // ignore
+        }
+      }
+    }
     let stdout = ''
     let stderr = ''
+    let finished = false
+    const cleanup = () => {
+      if (finished) return
+      finished = true
+      if (!jobId) return
+      const set = ffmpegProcessesByJobId.get(jobId)
+      if (!set) return
+      set.delete(proc)
+      if (set.size === 0) ffmpegProcessesByJobId.delete(jobId)
+    }
     proc.stdout.on('data', (data) => {
       if (stdout.length >= FFMPEG_LOG_LIMIT) return
       stdout += data.toString()
@@ -175,14 +248,30 @@ const runFfmpegProcess = (args: string[]) => {
       if (stderr.length >= FFMPEG_LOG_LIMIT) return
       stderr += data.toString()
     })
-    proc.on('error', (err) => reject(err))
-    proc.on('close', (exitCode) => resolve({ exitCode, stdout, stderr }))
+    proc.on('error', (err) => {
+      cleanup()
+      reject(err)
+    })
+    proc.on('close', (exitCode) => {
+      cleanup()
+      resolve({ exitCode, stdout, stderr })
+    })
   })
 }
 
 const runFfmpeg = async (args: string[]) => {
+  const jobId = getPipelineJobId()
+  if (isPipelineCanceled(jobId)) {
+    throw new JobCanceledError(jobId || undefined)
+  }
   const result = await runFfmpegProcess(args)
-  if (result.exitCode === 0) return result
+  if (result.exitCode === 0) {
+    if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId || undefined)
+    return result
+  }
+  if (isPipelineCanceled(jobId)) {
+    throw new JobCanceledError(jobId || undefined)
+  }
   const err: any = new Error(`ffmpeg_failed_${result.exitCode}`)
   err.exitCode = result.exitCode
   err.stdout = result.stdout
@@ -3185,6 +3274,10 @@ const processJob = async (
   console.log(`[${requestId || 'noid'}] process start ${jobId}`)
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job) throw new Error('not_found')
+  const throwIfCanceled = () => {
+    if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+  }
+  throwIfCanceled()
   if (!hasFfmpeg()) {
     await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
     throw new Error('ffmpeg_missing')
@@ -3248,6 +3341,7 @@ const processJob = async (
     await updateJob(jobId, { status: 'failed', error: 'download_failed' })
     throw new Error('download_failed')
   }
+  throwIfCanceled()
   if (!fs.existsSync(tmpIn)) {
     await updateJob(jobId, { status: 'failed', error: 'input_file_missing_after_download' })
     throw new Error('input_file_missing_after_download')
@@ -3847,6 +3941,7 @@ const processJob = async (
       throw new Error('output_file_empty_after_render')
     }
 
+    throwIfCanceled()
     await updateJob(jobId, { progress: 95 })
 
     const outputPaths: string[] = []
@@ -3863,6 +3958,7 @@ const processJob = async (
       throw new Error('upload_failed')
     }
     outputPaths.push(outPath)
+    throwIfCanceled()
 
     if (!outputPaths.length) {
       await updateJob(jobId, { status: 'failed', error: 'output_upload_missing' })
@@ -3875,6 +3971,7 @@ const processJob = async (
       outputPaths
     })
 
+    throwIfCanceled()
     await updateJob(jobId, {
       status: 'completed',
       progress: 100,
@@ -3899,31 +3996,47 @@ const processJob = async (
 }
 
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
-  try {
-    const existing = await prisma.job.findUnique({ where: { id: jobId } })
-    if (!existing) return
-    const status = String(existing.status || '').toLowerCase()
-    if (status === 'completed' || status === 'failed') return
-    const progress = Number(existing.progress ?? 0)
-    if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
-      console.log(`[${requestId || 'noid'}] skip pipeline ${jobId} (upload not completed yet)`)
-      return
+  await pipelineJobContext.run({ jobId }, async () => {
+    try {
+      const existing = await prisma.job.findUnique({ where: { id: jobId } })
+      if (!existing) return
+      const status = String(existing.status || '').toLowerCase()
+      if (status === 'completed' || status === 'failed') return
+      if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+      const progress = Number(existing.progress ?? 0)
+      if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
+        console.log(`[${requestId || 'noid'}] skip pipeline ${jobId} (upload not completed yet)`)
+        return
+      }
+      if (!hasFfmpeg()) {
+        await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
+        throw new Error('ffmpeg_missing')
+      }
+      const { options } = await getEditOptionsForUser(user.id)
+      if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+      await analyzeJob(jobId, options, requestId)
+      if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+      await processJob(jobId, user, requestedQuality, options, requestId)
+    } catch (err: any) {
+      if (err instanceof PlanLimitError) {
+        await updateJob(jobId, { status: 'failed', error: err.code })
+        return
+      }
+      if (err instanceof JobCanceledError || isPipelineCanceled(jobId)) {
+        try {
+          await updateJob(jobId, { status: 'failed', error: 'queue_canceled_by_user' })
+        } catch (e) {
+          // ignore cancellation update races
+        }
+        return
+      }
+      console.error(`[${requestId || 'noid'}] pipeline error`, err)
+      await updateJob(jobId, { status: 'failed', error: formatFfmpegFailure(err) })
+    } finally {
+      killJobFfmpegProcesses(jobId)
+      clearPipelineCanceled(jobId)
     }
-    if (!hasFfmpeg()) {
-      await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
-      throw new Error('ffmpeg_missing')
-    }
-    const { options } = await getEditOptionsForUser(user.id)
-    await analyzeJob(jobId, options, requestId)
-    await processJob(jobId, user, requestedQuality, options, requestId)
-  } catch (err: any) {
-    if (err instanceof PlanLimitError) {
-      await updateJob(jobId, { status: 'failed', error: err.code })
-      return
-    }
-    console.error(`[${requestId || 'noid'}] pipeline error`, err)
-    await updateJob(jobId, { status: 'failed', error: formatFfmpegFailure(err) })
-  }
+  })
 }
 
 type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string; priorityLevel: number }
@@ -3952,6 +4065,19 @@ const STALE_PIPELINE_MS = (() => {
 })()
 const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
 const STALE_RECOVERABLE_STATUSES = new Set([
+  'analyzing',
+  'hooking',
+  'cutting',
+  'pacing',
+  'story',
+  'subtitling',
+  'audio',
+  'retention',
+  'rendering'
+])
+const CANCELABLE_PIPELINE_STATUSES = new Set([
+  'queued',
+  'uploading',
   'analyzing',
   'hooking',
   'cutting',
@@ -4279,32 +4405,40 @@ router.post('/:id/upload-url', async (req: any, res) => {
   }
 })
 
-router.post('/:id/cancel-queue', async (req: any, res) => {
+const handleCancelJob = async (req: any, res: any) => {
   try {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
 
     const status = String(job.status || '').toLowerCase()
-    if (!STARTABLE_QUEUE_STATUSES.has(status)) {
-      return res.status(409).json({ error: 'cannot_cancel', message: 'Job is no longer in queue.' })
+    if (status === 'completed' || status === 'failed') {
+      return res.status(409).json({ error: 'cannot_cancel', message: 'Job is already finished.' })
     }
-    if (runningPipelineJobIds.has(id)) {
-      return res.status(409).json({ error: 'already_running', message: 'Job already started processing.' })
+    if (!CANCELABLE_PIPELINE_STATUSES.has(status)) {
+      return res.status(409).json({ error: 'cannot_cancel', message: 'Job cannot be canceled in its current state.' })
     }
 
+    markPipelineCanceled(id)
     removeJobFromQueue(id)
+    processQueue()
+    const killedCount = killJobFfmpegProcesses(id)
+    const isRunning = runningPipelineJobIds.has(id)
     const progress = Math.max(0, Math.min(100, Number(job.progress || 0)))
     await updateJob(id, {
       status: 'failed',
       progress,
       error: 'queue_canceled_by_user'
     })
-    return res.json({ ok: true, id, status: 'failed' })
+    if (!isRunning) clearPipelineCanceled(id)
+    return res.json({ ok: true, id, status: 'failed', running: isRunning, killedCount })
   } catch (err) {
     return res.status(500).json({ error: 'server_error' })
   }
-})
+}
+
+router.post('/:id/cancel', handleCancelJob)
+router.post('/:id/cancel-queue', handleCancelJob)
 
 // List jobs
 router.get('/', async (req: any, res) => {
