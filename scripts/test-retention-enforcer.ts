@@ -4,6 +4,9 @@ import { __retentionTestUtils } from '../src/routes/jobs'
 const {
   pickTopHookCandidates,
   buildRetentionJudgeReport,
+  resolveQualityGateThresholds,
+  computeContentSignalStrength,
+  selectRenderableHookCandidate,
   executeQualityGateRetriesForTest,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
@@ -132,6 +135,42 @@ const run = () => {
     segments: [{ start: 0, end: 12, speed: 1 }]
   })
   assert.ok(!weakJudge.passed, 'weak attempt should fail quality gate')
+
+  // 2b) Non-transcript videos should still find a renderable hook candidate.
+  const nonVerbalWindows = new Array(28).fill(null).map((_, idx) =>
+    makeWindow(idx, {
+      score: idx >= 9 && idx <= 17 ? 0.86 : 0.28,
+      hookScore: idx >= 9 && idx <= 17 ? 0.9 : 0.24,
+      emotionIntensity: idx >= 9 && idx <= 17 ? 0.82 : 0.28,
+      vocalExcitement: idx >= 9 && idx <= 17 ? 0.76 : 0.24,
+      speechIntensity: idx >= 9 && idx <= 17 ? 0.7 : 0.34,
+      motionScore: idx >= 9 && idx <= 17 ? 0.8 : 0.2
+    })
+  )
+  const nonVerbalPick = pickTopHookCandidates({
+    durationSeconds: 28,
+    segments: [{ start: 0, end: 28 }],
+    windows: nonVerbalWindows,
+    transcriptCues: []
+  })
+  const nonVerbalSignalStrength = computeContentSignalStrength(nonVerbalWindows)
+  const nonVerbalDecision = selectRenderableHookCandidate({
+    candidates: nonVerbalPick.topCandidates.length ? nonVerbalPick.topCandidates : [nonVerbalPick.selected],
+    aggressionLevel: 'medium',
+    hasTranscript: false,
+    signalStrength: nonVerbalSignalStrength
+  })
+  assert.ok(nonVerbalDecision, 'non-transcript content should still produce a renderable hook decision')
+  assert.ok(Boolean(nonVerbalDecision?.candidate), 'hook decision must include a hook candidate')
+
+  // 2c) Adaptive thresholds should relax in no-transcript/low-signal mode.
+  const adaptiveThresholds = resolveQualityGateThresholds({
+    aggressionLevel: 'medium',
+    hasTranscript: false,
+    signalStrength: 0.41
+  })
+  assert.ok(adaptiveThresholds.hook_strength < 80, 'adaptive thresholds should reduce hook requirement when transcript is missing')
+  assert.ok(adaptiveThresholds.retention_score < 75, 'adaptive thresholds should reduce retention requirement on low-signal footage')
 
   // 3) Retry loop max attempts (baseline + up to 3 retries)
   const attemptsAllFail = executeQualityGateRetriesForTest([false, false, false, false, false], 3)

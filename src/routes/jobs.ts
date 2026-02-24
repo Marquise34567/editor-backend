@@ -475,6 +475,12 @@ type HookCandidate = {
   reason: string
   synthetic?: boolean
 }
+type QualityGateThresholds = {
+  hook_strength: number
+  emotional_pull: number
+  pacing_score: number
+  retention_score: number
+}
 type RetentionRetryStrategy = 'BASELINE' | 'HOOK_FIRST' | 'EMOTION_FIRST' | 'PACING_FIRST'
 type RetentionJudgeReport = {
   retention_score: number
@@ -490,6 +496,8 @@ type RetentionJudgeReport = {
     improve_pacing: boolean
     increase_interrupts: boolean
   }
+  applied_thresholds: QualityGateThresholds
+  gate_mode: 'strict' | 'adaptive'
   passed: boolean
 }
 type RetentionAttemptRecord = {
@@ -500,6 +508,13 @@ type RetentionAttemptRecord = {
   patternInterruptCount: number
   patternInterruptDensity: number
   boredomRemovalRatio: number
+}
+type HookSelectionDecision = {
+  candidate: HookCandidate
+  confidence: number
+  threshold: number
+  usedFallback: boolean
+  reason: string | null
 }
 type EditPlan = {
   hook: HookCandidate
@@ -596,11 +611,35 @@ const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
 const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.4
 const HOOK_SELECTION_MAX_CANDIDATES = 5
 const MAX_QUALITY_GATE_RETRIES = 3
-const QUALITY_GATE_THRESHOLDS = {
+const QUALITY_GATE_THRESHOLDS: QualityGateThresholds = {
   hook_strength: 80,
   emotional_pull: 70,
   pacing_score: 70,
   retention_score: 75
+}
+const QUALITY_GATE_THRESHOLD_FLOORS: QualityGateThresholds = {
+  hook_strength: 64,
+  emotional_pull: 55,
+  pacing_score: 62,
+  retention_score: 58
+}
+const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
+  low: 0.62,
+  medium: 0.68,
+  high: 0.74,
+  viral: 0.8
+}
+const LEVEL_HOOK_THRESHOLD_FLOOR: Record<RetentionAggressionLevel, number> = {
+  low: 0.46,
+  medium: 0.5,
+  high: 0.56,
+  viral: 0.62
+}
+const LEVEL_QUALITY_THRESHOLD_OFFSET: Record<RetentionAggressionLevel, number> = {
+  low: -6,
+  medium: 0,
+  high: 4,
+  viral: 8
 }
 const RETENTION_PIPELINE_STEPS: RetentionPipelineStep[] = [
   'TRANSCRIBE',
@@ -1399,6 +1438,188 @@ const normalizeEnergy = (rmsDb: number) => {
 
 const clamp01 = (value: number) => Math.max(0, Math.min(1, value))
 
+const getHookCandidateConfidence = (hook: Pick<HookCandidate, 'score' | 'auditScore'>) => {
+  return clamp01(0.7 * (hook.score ?? 0) + 0.3 * (hook.auditScore ?? 0))
+}
+
+const computeContentSignalStrength = (windows: EngagementWindow[]) => {
+  if (!windows.length) return 0.42
+  const totals = windows.reduce((acc, window) => ({
+    speech: acc.speech + window.speechIntensity,
+    motion: acc.motion + window.motionScore,
+    emotion: acc.emotion + window.emotionIntensity,
+    vocal: acc.vocal + window.vocalExcitement,
+    variance: acc.variance + (window.audioVariance ?? 0),
+    spikes: acc.spikes + (window.emotionalSpike > 0 || window.emotionIntensity > 0.66 ? 1 : 0)
+  }), { speech: 0, motion: 0, emotion: 0, vocal: 0, variance: 0, spikes: 0 })
+  const total = Math.max(1, windows.length)
+  const base = clamp01(
+    0.26 * (totals.emotion / total) +
+    0.22 * (totals.vocal / total) +
+    0.2 * (totals.speech / total) +
+    0.17 * (totals.motion / total) +
+    0.15 * (totals.variance / total)
+  )
+  const spikeDensity = totals.spikes / total
+  return Number(clamp01(base * 0.88 + spikeDensity * 0.12).toFixed(4))
+}
+
+const resolveHookScoreThreshold = ({
+  aggressionLevel,
+  hasTranscript,
+  signalStrength
+}: {
+  aggressionLevel: RetentionAggressionLevel
+  hasTranscript: boolean
+  signalStrength: number
+}) => {
+  let threshold = LEVEL_HOOK_THRESHOLD_BASE[aggressionLevel]
+  if (!hasTranscript) threshold -= 0.11
+  if (signalStrength < 0.42) threshold -= 0.08
+  else if (signalStrength < 0.52) threshold -= 0.05
+  else if (signalStrength > 0.76) threshold += 0.02
+  const floor = LEVEL_HOOK_THRESHOLD_FLOOR[aggressionLevel]
+  return Number(clamp(threshold, floor, 0.9).toFixed(3))
+}
+
+const normalizeQualityGateThresholds = (thresholds?: Partial<QualityGateThresholds> | null): QualityGateThresholds => {
+  return {
+    hook_strength: Math.round(clamp(Number(thresholds?.hook_strength ?? QUALITY_GATE_THRESHOLDS.hook_strength), 45, 98)),
+    emotional_pull: Math.round(clamp(Number(thresholds?.emotional_pull ?? QUALITY_GATE_THRESHOLDS.emotional_pull), 40, 96)),
+    pacing_score: Math.round(clamp(Number(thresholds?.pacing_score ?? QUALITY_GATE_THRESHOLDS.pacing_score), 45, 96)),
+    retention_score: Math.round(clamp(Number(thresholds?.retention_score ?? QUALITY_GATE_THRESHOLDS.retention_score), 45, 98))
+  }
+}
+
+const resolveQualityGateThresholds = ({
+  aggressionLevel,
+  hasTranscript,
+  signalStrength
+}: {
+  aggressionLevel: RetentionAggressionLevel
+  hasTranscript: boolean
+  signalStrength: number
+}): QualityGateThresholds => {
+  const levelOffset = LEVEL_QUALITY_THRESHOLD_OFFSET[aggressionLevel]
+  const transcriptOffset = hasTranscript ? 0 : -8
+  const lowSignalPenalty = signalStrength < 0.42 ? -7 : signalStrength < 0.52 ? -4 : 0
+  const highSignalBoost = signalStrength > 0.74 ? 2 : 0
+  const baseOffset = levelOffset + transcriptOffset + lowSignalPenalty + highSignalBoost
+  return normalizeQualityGateThresholds({
+    hook_strength: clamp(
+      QUALITY_GATE_THRESHOLDS.hook_strength + baseOffset,
+      QUALITY_GATE_THRESHOLD_FLOORS.hook_strength,
+      96
+    ),
+    emotional_pull: clamp(
+      QUALITY_GATE_THRESHOLDS.emotional_pull + baseOffset,
+      QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull,
+      94
+    ),
+    pacing_score: clamp(
+      QUALITY_GATE_THRESHOLDS.pacing_score + Math.round(baseOffset * 0.6),
+      QUALITY_GATE_THRESHOLD_FLOORS.pacing_score,
+      94
+    ),
+    retention_score: clamp(
+      QUALITY_GATE_THRESHOLDS.retention_score + Math.round(baseOffset * 0.85),
+      QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+      95
+    )
+  })
+}
+
+const maybeAllowQualityGateOverride = ({
+  judge,
+  thresholds,
+  hasTranscript,
+  signalStrength
+}: {
+  judge: RetentionJudgeReport
+  thresholds: QualityGateThresholds
+  hasTranscript: boolean
+  signalStrength: number
+}) => {
+  if (hasTranscript && signalStrength >= 0.5) return null
+  const hookBuffer = hasTranscript ? 8 : 14
+  const emotionBuffer = hasTranscript ? 10 : 16
+  const pacingBuffer = 8
+  const retentionBuffer = 10
+  const hookOk = judge.hook_strength >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.hook_strength, thresholds.hook_strength - hookBuffer)
+  const emotionOk = judge.emotional_pull >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull, thresholds.emotional_pull - emotionBuffer)
+  const pacingOk = judge.pacing_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.pacing_score, thresholds.pacing_score - pacingBuffer)
+  const retentionOk = judge.retention_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.retention_score, thresholds.retention_score - retentionBuffer)
+  if (hookOk && emotionOk && pacingOk && retentionOk && judge.retention_score >= RETENTION_RENDER_THRESHOLD) {
+    if (!hasTranscript) {
+      return 'Quality gate override: transcript unavailable, accepted strongest non-verbal retention cut.'
+    }
+    if (signalStrength < 0.45) {
+      return 'Quality gate override: low-signal vlog/reaction profile passed adaptive floor after retries.'
+    }
+  }
+  return null
+}
+
+const selectRenderableHookCandidate = ({
+  candidates,
+  aggressionLevel,
+  hasTranscript,
+  signalStrength
+}: {
+  candidates: HookCandidate[]
+  aggressionLevel: RetentionAggressionLevel
+  hasTranscript: boolean
+  signalStrength: number
+}): HookSelectionDecision | null => {
+  const deduped = candidates.filter((candidate, index) => (
+    candidate &&
+    Number.isFinite(candidate.start) &&
+    Number.isFinite(candidate.duration) &&
+    candidate.duration >= HOOK_MIN &&
+    candidate.duration <= HOOK_MAX &&
+    candidates.findIndex((entry) => (
+      Math.abs((entry?.start ?? -9999) - candidate.start) < 0.01 &&
+      Math.abs((entry?.duration ?? -9999) - candidate.duration) < 0.01
+    )) === index
+  ))
+  if (!deduped.length) return null
+  const ranked = deduped
+    .map((candidate) => ({ candidate, confidence: getHookCandidateConfidence(candidate) }))
+    .sort((a, b) => b.confidence - a.confidence || b.candidate.score - a.candidate.score)
+  const threshold = resolveHookScoreThreshold({ aggressionLevel, hasTranscript, signalStrength })
+  const strict = ranked.find((entry) => entry.candidate.auditPassed && entry.confidence >= threshold)
+  if (strict) {
+    return {
+      candidate: strict.candidate,
+      confidence: strict.confidence,
+      threshold,
+      usedFallback: false,
+      reason: null
+    }
+  }
+  const relaxedThreshold = clamp(
+    threshold - (hasTranscript ? 0.08 : 0.16) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.4,
+    threshold
+  )
+  const relaxed = ranked.find((entry) => (
+    entry.confidence >= relaxedThreshold &&
+    (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
+  ))
+  if (relaxed) {
+    return {
+      candidate: relaxed.candidate,
+      confidence: relaxed.confidence,
+      threshold,
+      usedFallback: true,
+      reason: hasTranscript
+        ? 'Hook fallback selected after strict audit miss, using strongest near-threshold candidate.'
+        : 'Hook fallback selected from strongest non-verbal peak due missing transcript context.'
+    }
+  }
+  return null
+}
+
 const averageWindowMetric = (
   windows: EngagementWindow[],
   start: number,
@@ -1901,22 +2122,50 @@ const runHookAudit = ({
     averageWindowMetric(windows, start, end, (window) => window.speechIntensity) * 0.15 +
     averageWindowMetric(windows, start, end, (window) => window.motionScore) * 0.1
   )
-  const understandable = words.length >= 5 && contextPenalty <= 0.32
-  const curiosity = curiositySignal >= 0.3 || transcriptSignals.keywordIntensity >= 0.36 || /\?/.test(text)
-  const payoff = emotionalSignal >= 0.5 || /\b(changed|reveal|result|mistake|warning|proof|won|lost)\b/.test(text)
-  const auditScore = clamp01(
-    0.34 * (understandable ? 1 : 0) +
-    0.28 * (curiosity ? 1 : 0) +
-    0.28 * (payoff ? 1 : 0) +
-    0.1 * (1 - contextPenalty)
+  const nonVerbalClarity = clamp01(
+    0.44 * emotionalSignal +
+    0.22 * averageWindowMetric(windows, start, end, (window) => window.motionScore) +
+    0.2 * averageWindowMetric(windows, start, end, (window) => window.speechIntensity) +
+    0.14 * averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
   )
+  const hasTranscriptSupport = words.length >= 3
+  const understandableByTranscript = words.length >= 5 && contextPenalty <= 0.34
+  const understandableBySignal = nonVerbalClarity >= 0.52 && contextPenalty <= 0.55
+  const understandable = hasTranscriptSupport
+    ? (understandableByTranscript || (words.length >= 3 && understandableBySignal))
+    : understandableBySignal
+  const curiosity = (
+    curiositySignal >= 0.3 ||
+    transcriptSignals.keywordIntensity >= 0.36 ||
+    /\?/.test(text) ||
+    (!hasTranscriptSupport && emotionalSignal >= 0.58)
+  )
+  const payoff = (
+    emotionalSignal >= 0.5 ||
+    /\b(changed|reveal|result|mistake|warning|proof|won|lost)\b/.test(text) ||
+    (!hasTranscriptSupport && nonVerbalClarity >= 0.64)
+  )
+  const auditScore = hasTranscriptSupport
+    ? clamp01(
+        0.34 * (understandable ? 1 : 0) +
+        0.28 * (curiosity ? 1 : 0) +
+        0.28 * (payoff ? 1 : 0) +
+        0.1 * (1 - contextPenalty)
+      )
+    : clamp01(
+        0.32 * (understandable ? 1 : 0) +
+        0.3 * (curiosity ? 1 : 0) +
+        0.28 * (payoff ? 1 : 0) +
+        0.1 * (1 - contextPenalty)
+      )
+  const passThreshold = hasTranscriptSupport ? 0.72 : 0.58
   const reasons: string[] = []
-  if (!understandable) reasons.push('Not understandable in isolation')
-  if (!curiosity) reasons.push('Does not trigger curiosity strongly enough')
-  if (!payoff) reasons.push('Payoff signal is weak')
-  if (contextPenalty > 0.32) reasons.push('Requires too much prior context')
+  if (!understandable) reasons.push(hasTranscriptSupport ? 'Not understandable in isolation' : 'Non-verbal hook beat is too context-dependent')
+  if (!curiosity) reasons.push(hasTranscriptSupport ? 'Does not trigger curiosity strongly enough' : 'Visual/audio peak does not trigger enough curiosity')
+  if (!payoff) reasons.push(hasTranscriptSupport ? 'Payoff signal is weak' : 'Peak moment does not imply a clear payoff')
+  if (contextPenalty > (hasTranscriptSupport ? 0.34 : 0.55)) reasons.push('Requires too much prior context')
   return {
-    passed: understandable && curiosity && payoff && auditScore >= 0.72,
+    passed: understandable && curiosity && payoff && auditScore >= passThreshold,
     auditScore: Number(auditScore.toFixed(4)),
     understandable,
     curiosity,
@@ -4219,7 +4468,8 @@ const buildRetentionJudgeReport = ({
   captionsEnabled,
   patternInterruptCount,
   removedRanges,
-  segments
+  segments,
+  thresholds
 }: {
   retentionScore: ReturnType<typeof computeRetentionScore>
   hook: HookCandidate
@@ -4229,7 +4479,9 @@ const buildRetentionJudgeReport = ({
   patternInterruptCount: number
   removedRanges: TimeRange[]
   segments: Segment[]
+  thresholds?: QualityGateThresholds
 }): RetentionJudgeReport => {
+  const appliedThresholds = normalizeQualityGateThresholds(thresholds)
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
   const interruptIntervalTarget = runtimeSeconds <= 90 ? 4 : 6
   const interruptTargetCount = Math.max(1, Math.ceil(runtimeSeconds / interruptIntervalTarget))
@@ -4274,16 +4526,24 @@ const buildRetentionJudgeReport = ({
     why_keep_watching: whyKeepWatching.slice(0, 3),
     what_is_generic: whatIsGeneric.slice(0, 3),
     required_fixes: {
-      stronger_hook: hookStrength < QUALITY_GATE_THRESHOLDS.hook_strength,
-      raise_emotion: emotionalPull < QUALITY_GATE_THRESHOLDS.emotional_pull,
-      improve_pacing: pacing < QUALITY_GATE_THRESHOLDS.pacing_score,
+      stronger_hook: hookStrength < appliedThresholds.hook_strength,
+      raise_emotion: emotionalPull < appliedThresholds.emotional_pull,
+      improve_pacing: pacing < appliedThresholds.pacing_score,
       increase_interrupts: interruptCoverage < 0.95
     },
+    applied_thresholds: appliedThresholds,
+    gate_mode:
+      appliedThresholds.hook_strength === QUALITY_GATE_THRESHOLDS.hook_strength &&
+      appliedThresholds.emotional_pull === QUALITY_GATE_THRESHOLDS.emotional_pull &&
+      appliedThresholds.pacing_score === QUALITY_GATE_THRESHOLDS.pacing_score &&
+      appliedThresholds.retention_score === QUALITY_GATE_THRESHOLDS.retention_score
+        ? 'strict'
+        : 'adaptive',
     passed:
-      hookStrength >= QUALITY_GATE_THRESHOLDS.hook_strength &&
-      emotionalPull >= QUALITY_GATE_THRESHOLDS.emotional_pull &&
-      pacing >= QUALITY_GATE_THRESHOLDS.pacing_score &&
-      retention >= QUALITY_GATE_THRESHOLDS.retention_score
+      hookStrength >= appliedThresholds.hook_strength &&
+      emotionalPull >= appliedThresholds.emotional_pull &&
+      pacing >= appliedThresholds.pacing_score &&
+      retention >= appliedThresholds.retention_score
   }
 }
 
@@ -4616,13 +4876,6 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
               },
               { transcriptCues, aggressionLevel }
             )
-            if (!plan.hook.auditPassed) {
-              const reason = plan.hookFailureReason || plan.hook.reason || 'Hook audit failed'
-              throw new HookGateError(reason, {
-                hook: plan.hook,
-                topCandidates: plan.hookCandidates ?? []
-              })
-            }
             return plan
           },
           summarize: (plan) => ({
@@ -4991,6 +5244,9 @@ const processJob = async (
     let selectedBoredomRemovalRatio = 0
     let selectedStrategy: RetentionRetryStrategy = 'BASELINE'
     let selectedStoryReorderMap: Array<{ sourceStart: number; sourceEnd: number; orderedIndex: number }> = []
+    let hasTranscriptSignals = false
+    let contentSignalStrength = 0.42
+    let qualityGateOverride: { applied: boolean; reason: string } | null = null
     if (hasFfmpeg()) {
       const qualityTarget = getTargetDimensions(finalQuality)
       const sourceProbe = probeVideoStream(tmpIn)
@@ -5022,45 +5278,70 @@ const processJob = async (
       const storySegments = editPlan && !options.onlyCuts
         ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
         : baseSegments
-      const hookCandidates = editPlan?.hookCandidates?.length
-        ? editPlan.hookCandidates
-        : (editPlan?.hook ? [editPlan.hook] : [])
-      const initialHook = hookCandidates[0] || editPlan?.hook || null
-      if (!initialHook) {
+      hasTranscriptSignals = Boolean(
+        editPlan?.transcriptSignals?.hasTranscript ||
+        (
+          (editPlan?.hook?.text || '')
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean)
+            .length >= 4
+        )
+      )
+      contentSignalStrength = computeContentSignalStrength(editPlan?.engagementWindows ?? [])
+      const qualityGateThresholds = resolveQualityGateThresholds({
+        aggressionLevel,
+        hasTranscript: hasTranscriptSignals,
+        signalStrength: contentSignalStrength
+      })
+      qualityGateOverride = null
+      const hookCandidates = (
+        editPlan?.hookCandidates?.length
+          ? editPlan.hookCandidates
+          : (editPlan?.hook ? [editPlan.hook] : [])
+      ).filter(Boolean)
+      const hookDecision = selectRenderableHookCandidate({
+        candidates: hookCandidates,
+        aggressionLevel,
+        hasTranscript: hasTranscriptSignals,
+        signalStrength: contentSignalStrength
+      })
+      if (!hookDecision) {
         await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
           status: 'failed',
           completedAt: toIsoNow(),
-          lastError: 'Hook candidate unavailable for render'
+          lastError: 'Hook candidate unavailable for render',
+          meta: {
+            hasTranscriptSignals,
+            contentSignalStrength
+          }
         })
         await updateJob(jobId, { status: 'failed', error: 'FAILED_HOOK: Hook candidate unavailable for render' })
         throw new HookGateError('Hook candidate unavailable for render')
       }
-      const hookScoreThresholdByLevel: Record<RetentionAggressionLevel, number> = {
-        low: 0.62,
-        medium: 0.68,
-        high: 0.74,
-        viral: 0.8
-      }
-      const baseHookConfidence = clamp01(0.7 * initialHook.score + 0.3 * initialHook.auditScore)
-      if (!initialHook.auditPassed || baseHookConfidence < hookScoreThresholdByLevel[aggressionLevel]) {
-        const reason = initialHook.reason || 'Best moment hook did not pass quality audit'
-        await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: reason,
-          meta: {
-            hook: initialHook,
-            threshold: hookScoreThresholdByLevel[aggressionLevel]
-          }
-        })
-        await updateJob(jobId, { status: 'failed', error: `FAILED_HOOK: ${reason}` })
-        throw new HookGateError(
-          reason,
-          {
-            hook: initialHook,
-            threshold: hookScoreThresholdByLevel[aggressionLevel]
-          }
-        )
+      const initialHook = hookDecision.candidate
+      const orderedHookCandidates = [
+        initialHook,
+        ...hookCandidates.filter((candidate) => (
+          Math.abs(candidate.start - initialHook.start) > 0.01 ||
+          Math.abs(candidate.duration - initialHook.duration) > 0.01
+        ))
+      ]
+      await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
+        status: 'completed',
+        completedAt: toIsoNow(),
+        meta: {
+          selectedHook: initialHook,
+          confidence: Number(hookDecision.confidence.toFixed(4)),
+          threshold: hookDecision.threshold,
+          usedFallback: hookDecision.usedFallback,
+          reason: hookDecision.reason,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+        }
+      })
+      if (hookDecision.usedFallback && hookDecision.reason) {
+        optimizationNotes.push(hookDecision.reason)
       }
 
       const reorderForEmotion = (segments: Segment[]) => {
@@ -5173,9 +5454,9 @@ const processJob = async (
         const strategy = attemptStrategies[attemptIndex]
         const hookCandidate =
           strategy === 'HOOK_FIRST'
-            ? (hookCandidates[1] || hookCandidates[0] || initialHook)
+            ? (orderedHookCandidates[1] || orderedHookCandidates[0] || initialHook)
             : strategy === 'EMOTION_FIRST'
-              ? (hookCandidates[2] || hookCandidates[0] || initialHook)
+              ? (orderedHookCandidates[2] || orderedHookCandidates[0] || initialHook)
               : initialHook
         const attempt = buildAttemptSegments(strategy, hookCandidate)
         const retention = computeRetentionScore(
@@ -5188,7 +5469,11 @@ const processJob = async (
             patternInterruptCount: attempt.patternInterruptCount
           }
         )
-        const clarityPenalty = hookCandidate.auditPassed ? 0.08 : 0.34
+        const clarityPenalty = hookCandidate.auditPassed
+          ? 0.08
+          : hasTranscriptSignals
+            ? 0.3
+            : 0.2
         const judge = buildRetentionJudgeReport({
           retentionScore: retention,
           hook: hookCandidate,
@@ -5197,7 +5482,8 @@ const processJob = async (
           captionsEnabled: options.autoCaptions,
           patternInterruptCount: attempt.patternInterruptCount,
           removedRanges: editPlan?.removedSegments ?? [],
-          segments: attempt.segments
+          segments: attempt.segments,
+          thresholds: qualityGateThresholds
         })
         retentionAttempts.push({
           attempt: attemptIndex + 1,
@@ -5237,38 +5523,77 @@ const processJob = async (
           status: 'failed',
           completedAt: toIsoNow(),
           lastError: reason,
-          meta: { attempts: retentionAttempts }
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+          }
         })
         await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
           status: 'failed',
           completedAt: toIsoNow(),
           lastError: reason,
-          meta: { attempts: retentionAttempts }
-        })
-        await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
-        throw new QualityGateError(reason, {
-          attempts: retentionAttempts
-        })
-      }
-      if (!selectedJudge.passed) {
-        const reason = selectedJudge.what_is_generic.join('; ') || 'Video is still generic after retries'
-        await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: reason,
-          meta: { attempts: retentionAttempts, judge: selectedJudge }
-        })
-        await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: reason,
-          meta: { attempts: retentionAttempts, judge: selectedJudge }
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+          }
         })
         await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
         throw new QualityGateError(reason, {
           attempts: retentionAttempts,
-          judge: selectedJudge
+          thresholds: qualityGateThresholds,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4))
         })
+      }
+      if (!selectedJudge.passed) {
+        const overrideReason = maybeAllowQualityGateOverride({
+          judge: selectedJudge,
+          thresholds: qualityGateThresholds,
+          hasTranscript: hasTranscriptSignals,
+          signalStrength: contentSignalStrength
+        })
+        if (overrideReason) {
+          qualityGateOverride = { applied: true, reason: overrideReason }
+          optimizationNotes.push(overrideReason)
+        } else {
+          const reason = selectedJudge.what_is_generic.join('; ') || 'Video is still generic after retries'
+          await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+            status: 'failed',
+            completedAt: toIsoNow(),
+            lastError: reason,
+            meta: {
+              attempts: retentionAttempts,
+              judge: selectedJudge,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+            }
+          })
+          await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+            status: 'failed',
+            completedAt: toIsoNow(),
+            lastError: reason,
+            meta: {
+              attempts: retentionAttempts,
+              judge: selectedJudge,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+            }
+          })
+          await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
+          throw new QualityGateError(reason, {
+            attempts: retentionAttempts,
+            judge: selectedJudge,
+            thresholds: qualityGateThresholds,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+          })
+        }
       }
 
       await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
@@ -5278,7 +5603,11 @@ const processJob = async (
           attemptCount: retentionAttempts.length,
           selectedStrategy,
           selectedJudge,
-          attempts: retentionAttempts
+          attempts: retentionAttempts,
+          thresholds: qualityGateThresholds,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          qualityGateOverride
         }
       })
       await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
@@ -5287,7 +5616,11 @@ const processJob = async (
         meta: {
           score: retentionScore,
           judge: selectedJudge,
-          attempts: retentionAttempts
+          attempts: retentionAttempts,
+          thresholds: qualityGateThresholds,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          qualityGateOverride
         }
       })
 
@@ -5749,10 +6082,14 @@ const processJob = async (
         selected_strategy: selectedStrategy,
         retention_attempts: retentionAttempts,
         retention_judge: selectedJudge,
+        quality_gate_thresholds: selectedJudge?.applied_thresholds ?? null,
+        quality_gate_override: qualityGateOverride,
         pattern_interrupt_count: selectedPatternInterruptCount || (job.analysis as any)?.pattern_interrupt_count || 0,
         pattern_interrupt_density: selectedPatternInterruptDensity || (job.analysis as any)?.pattern_interrupt_density || 0,
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
         story_reorder_map: selectedStoryReorderMap,
+        content_signal_strength: Number(contentSignalStrength.toFixed(4)),
+        has_transcript_signals: hasTranscriptSignals,
         retentionAggressionLevel: aggressionLevel,
         retentionLevel: aggressionLevel
       },
@@ -6689,6 +7026,9 @@ export const __retentionTestUtils = {
   pickTopHookCandidates,
   computeRetentionScore,
   buildRetentionJudgeReport,
+  resolveQualityGateThresholds,
+  computeContentSignalStrength,
+  selectRenderableHookCandidate,
   executeQualityGateRetriesForTest,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
