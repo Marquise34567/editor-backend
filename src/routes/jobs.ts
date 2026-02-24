@@ -378,6 +378,8 @@ const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
 const LONG_FORM_MIN_EDIT_SECONDS = 20
 const LONG_FORM_MAX_EDIT_SECONDS = 140
+const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
+const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
 const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
 const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
@@ -1643,6 +1645,97 @@ const buildConservativeFallbackSegments = (durationSeconds: number, aggressiveMo
   if (!cuts.length) return base
   const fallback = subtractRanges(base, cuts)
   return fallback.length ? fallback : base
+}
+
+const computeEditedRuntimeSeconds = (segments: Segment[]) => {
+  return segments.reduce((sum, seg) => {
+    const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+    return sum + Math.max(0, (seg.end - seg.start) / speed)
+  }, 0)
+}
+
+const computeKeptTimelineSeconds = (segments: Segment[]) => {
+  return segments.reduce((sum, seg) => sum + Math.max(0, seg.end - seg.start), 0)
+}
+
+const computeEditImpactRatio = (segments: Segment[], durationSeconds: number) => {
+  const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
+  if (total <= 0) return 0
+  const kept = clamp(computeKeptTimelineSeconds(segments), 0, total)
+  const runtime = clamp(computeEditedRuntimeSeconds(segments), 0, total)
+  const cutImpact = (total - kept) / total
+  const paceImpact = Math.max(0, (kept - runtime) / total)
+  return Math.max(0, cutImpact + paceImpact)
+}
+
+const buildGuaranteedFallbackSegments = (durationSeconds: number, options: EditOptions) => {
+  const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
+  if (total <= 0.25) return [{ start: 0, end: total, speed: 1 } as Segment]
+
+  const normalizedTotal = roundForFilter(total)
+  const introLen = clamp(normalizedTotal * 0.06, 4, 10)
+  const outroLen = clamp(normalizedTotal * 0.04, 3, 8)
+  const workingEnd = Math.max(introLen + MIN_RENDER_SEGMENT_SECONDS, normalizedTotal - outroLen)
+  const keepBase = options.aggressiveMode ? 6.2 : 7.4
+  const cutGap = options.aggressiveMode ? 2.2 : 1.6
+  const speedPattern = options.onlyCuts ? [1] : [1.18, 1.24, 1.12, 1.2]
+  const segments: Segment[] = [
+    { start: 0, end: roundForFilter(introLen), speed: 1 }
+  ]
+
+  let cursor = roundForFilter(introLen + cutGap * 0.6)
+  let index = 0
+  while (cursor < workingEnd - MIN_RENDER_SEGMENT_SECONDS) {
+    const keepLen = keepBase + (index % 3 === 0 ? 0.85 : index % 3 === 1 ? -0.55 : 0.3)
+    const end = Math.min(workingEnd, cursor + keepLen)
+    const duration = end - cursor
+    if (duration < MIN_RENDER_SEGMENT_SECONDS) break
+    const speed = speedPattern[index % speedPattern.length]
+    segments.push({
+      start: roundForFilter(cursor),
+      end: roundForFilter(end),
+      speed: Number(clamp(speed, 1, 1.36).toFixed(3))
+    })
+    cursor = roundForFilter(end + cutGap)
+    index += 1
+  }
+
+  const outroStart = Math.max(0, roundForFilter(normalizedTotal - outroLen))
+  if (!segments.some((segment) => segment.end >= outroStart - MIN_RENDER_SEGMENT_SECONDS)) {
+    segments.push({ start: outroStart, end: normalizedTotal, speed: 1 })
+  } else {
+    const tail = segments[segments.length - 1]
+    tail.end = normalizedTotal
+    tail.speed = options.onlyCuts ? 1 : tail.speed
+  }
+
+  return segments
+}
+
+const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: EditOptions): EditPlan => {
+  const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
+  const segments = buildGuaranteedFallbackSegments(total, options)
+  const baseRange = [{ start: 0, end: total, speed: 1 }]
+  const keepRanges = segments.map((segment) => ({ start: segment.start, end: segment.end, speed: 1 }))
+  const removedSegments = total > 0 ? subtractRanges(baseRange, keepRanges) : []
+  const compressedSegments = segments
+    .filter((segment) => (segment.speed ?? 1) > 1.01)
+    .map((segment) => ({ start: segment.start, end: segment.end }))
+  const hookDuration = total > 0
+    ? clamp(Math.min(HOOK_MAX, Math.max(HOOK_MIN, total * 0.12)), Math.min(HOOK_MIN, total), total)
+    : 0
+  return {
+    hook: {
+      start: 0,
+      duration: roundForFilter(hookDuration),
+      score: 0.45
+    },
+    segments,
+    silences: [],
+    removedSegments,
+    compressedSegments,
+    engagementWindows: []
+  }
 }
 
 const buildRangesFromFlags = (flags: boolean[], minDurationSeconds = 1) => {
@@ -3007,7 +3100,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
           }
         })
       } catch (e) {
-        editPlan = null
+        console.warn(`[${requestId || 'noid'}] buildEditPlan failed during analyze, using deterministic fallback`, e)
+        editPlan = buildDeterministicFallbackEditPlan(duration, options)
       }
     }
 
@@ -3259,9 +3353,9 @@ const processJob = async (
         try {
           editPlan = await buildEditPlan(tmpIn, durationSeconds, options)
         } catch (err) {
-          console.warn(`[${requestId || 'noid'}] edit-plan generation failed, falling back to conservative render`, err)
-          editPlan = null
-          optimizationNotes.push('AI edit plan fallback: conservative render mode used.')
+          console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process, using deterministic fallback`, err)
+          editPlan = buildDeterministicFallbackEditPlan(durationSeconds, options)
+          optimizationNotes.push('AI edit plan fallback: deterministic rescue plan used.')
         }
       }
 
@@ -3273,7 +3367,7 @@ const processJob = async (
       const hookSegment: Segment | null = hookRange ? { ...hookRange, speed: 1 } : null
       const baseSegments: Segment[] = editPlan
         ? editPlan.segments
-        : buildConservativeFallbackSegments(durationSeconds || 0, options.aggressiveMode)
+        : buildGuaranteedFallbackSegments(durationSeconds || 0, options)
       const storySegments = editPlan && !options.onlyCuts
         ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
         : baseSegments
@@ -3358,6 +3452,23 @@ const processJob = async (
         optimizationNotes.push(
           `Render stabilization adjusted segments (${plannedSegmentCount} -> ${finalSegments.length}) for long-form reliability.`
         )
+      }
+      const impactBeforeRescue = computeEditImpactRatio(finalSegments, durationSeconds)
+      const minImpact = durationSeconds >= LONG_FORM_RESCUE_MIN_DURATION
+        ? MIN_EDIT_IMPACT_RATIO_LONG
+        : MIN_EDIT_IMPACT_RATIO_SHORT
+      if (impactBeforeRescue < minImpact) {
+        const rescuedSegments = prepareSegmentsForRender(
+          buildGuaranteedFallbackSegments(durationSeconds, options),
+          durationSeconds
+        )
+        if (rescuedSegments.length) {
+          finalSegments = rescuedSegments
+          const impactAfterRescue = computeEditImpactRatio(finalSegments, durationSeconds)
+          optimizationNotes.push(
+            `Edit impact rescue applied (${(impactBeforeRescue * 100).toFixed(1)}% -> ${(impactAfterRescue * 100).toFixed(1)}%).`
+          )
+        }
       }
       if (!finalSegments.length) {
         await updateJob(jobId, { status: 'failed', error: 'no_renderable_segments' })
