@@ -2428,6 +2428,30 @@ const buildConcatFilter = (
   const parts: string[] = []
   const scalePad = buildFrameFitFilter(opts.fit, opts.targetWidth, opts.targetHeight)
   const durations: number[] = []
+  const nonZoomIndexes = segments
+    .map((segment, idx) => ({
+      idx,
+      zoom: segment.zoom && segment.zoom > 0 ? segment.zoom : 0
+    }))
+    .filter((entry) => entry.zoom <= 0)
+    .map((entry) => entry.idx)
+  const nonZoomSourceLabels = new Map<number, string>()
+
+  // Share one pre-fitted stream across non-zoom segments to keep large concat
+  // graphs from spawning a scale filter per segment.
+  if (nonZoomIndexes.length === 1) {
+    const idx = nonZoomIndexes[0]
+    const label = `vbase${idx}`
+    parts.push(`[0:v]${scalePad}[${label}]`)
+    nonZoomSourceLabels.set(idx, label)
+  } else if (nonZoomIndexes.length > 1) {
+    const labels = nonZoomIndexes.map((idx) => {
+      const label = `vbase${idx}`
+      nonZoomSourceLabels.set(idx, label)
+      return `[${label}]`
+    }).join('')
+    parts.push(`[0:v]${scalePad},split=${nonZoomIndexes.length}${labels}`)
+  }
 
   segments.forEach((seg, idx) => {
     const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
@@ -2439,7 +2463,12 @@ const buildConcatFilter = (
     const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : ',setpts=PTS-STARTPTS'
     const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
     const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
-    parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
+    const nonZoomLabel = nonZoomSourceLabels.get(idx)
+    if (nonZoomLabel) {
+      parts.push(`[${nonZoomLabel}]${vTrim}${vSpeed}${vBright}[v${idx}]`)
+    } else {
+      parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
+    }
 
     if (opts.withAudio) {
       const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
@@ -2633,7 +2662,7 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
 const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
   const width = opts?.width ?? 960
   const height = opts?.height ?? 540
-  const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease:eval=frame,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+  const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
   const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'copy', outPath]
   await runFfmpeg(args)
 }
@@ -2657,14 +2686,14 @@ const buildVerticalClipRanges = (durationSeconds: number, requestedCount: number
 const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
   if (fit === 'cover') {
     return [
-      `scale=${width}:${height}:force_original_aspect_ratio=increase:eval=frame`,
+      `scale=${width}:${height}:force_original_aspect_ratio=increase`,
       `crop=${width}:${height}`,
       'setsar=1',
       'format=yuv420p'
     ].join(',')
   }
   return [
-    `scale=${width}:${height}:force_original_aspect_ratio=decrease:eval=frame`,
+    `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
     'setsar=1',
     'format=yuv420p'
