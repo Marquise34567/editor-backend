@@ -17,7 +17,8 @@
     "add:stripe": "ts-node scripts/add-stripe.ts",
     "setup": "ts-node scripts/setup.ts",
     "verify": "ts-node scripts/verify.ts",
-    "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts"
+    "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts",
+    "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",
