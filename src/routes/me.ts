@@ -10,11 +10,18 @@ import { isDevAccount } from '../lib/devAccounts'
 
 const router = express.Router()
 
+const resolveEffectiveSubscriptionStatus = (rawStatus?: string | null, trialActive?: boolean) => {
+  if (trialActive) return 'trial'
+  if (rawStatus === 'trialing') return 'free'
+  return rawStatus || 'free'
+}
+
 router.get('/', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
   const user = await getOrCreateUser(id, req.user?.email)
   const { subscription, tier, plan, trial } = await getUserPlan(id)
+  const effectiveStatus = resolveEffectiveSubscriptionStatus(subscription?.status, trial?.active)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
   const horizontalModeUsage = await getRenderModeUsageForMonth(id, 'horizontal')
@@ -27,8 +34,8 @@ router.get('/', async (req: any, res) => {
     subscription: subscription
       ? {
           tier,
-          status: subscription.status,
-          currentPeriodEnd: subscription.currentPeriodEnd,
+          status: effectiveStatus,
+          currentPeriodEnd: trial?.active ? trial.endsAt : subscription.currentPeriodEnd,
           cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
           trial
         }
@@ -68,9 +75,10 @@ router.get('/plan', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
   const { subscription, tier, trial } = await getUserPlan(id)
+  const effectiveStatus = resolveEffectiveSubscriptionStatus(subscription?.status, trial?.active)
   res.json({
     tier,
-    status: subscription?.status ?? (trial?.active ? 'trial' : 'free'),
+    status: effectiveStatus,
     currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
     stripeCustomerId: subscription?.stripeCustomerId ?? null,
     stripeSubscriptionId: subscription?.stripeSubscriptionId ?? null,
@@ -83,10 +91,11 @@ router.get('/subscription', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
   const { subscription, tier, trial } = await getUserPlan(id)
+  const effectiveStatus = resolveEffectiveSubscriptionStatus(subscription?.status, trial?.active)
   const features = getPlanFeatures(tier)
   res.json({
     plan: tier,
-    status: subscription?.status ?? (trial?.active ? 'trial' : 'free'),
+    status: effectiveStatus,
     currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
     features,
     subtitlePresets: SUBTITLE_PRESET_REGISTRY,

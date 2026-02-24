@@ -1,7 +1,7 @@
 import express from 'express'
 import { createCheckoutUrlForUser, createPortalUrlForUser, type BillingInterval } from '../services/billing'
 import { getOrCreateUser } from '../services/users'
-import { getUserPlan } from '../services/plans'
+import { activateManualFreeTrial, getSubscriptionForUser, getUserPlan } from '../services/plans'
 import { ensureFounderAvailable, FounderSoldOutError } from '../services/founder'
 import { PLAN_TIERS, type PlanTier } from '../shared/planConfig'
 import { isPaidTier, getPlanFeatures } from '../shared/planConfig'
@@ -27,6 +27,12 @@ const parseBool = (value: any) => {
   return raw === 'true' || raw === '1' || raw === 'yes'
 }
 
+const resolveEffectiveStatus = (rawStatus?: string | null, trialActive?: boolean) => {
+  if (trialActive) return 'trial'
+  if (rawStatus === 'trialing') return 'free'
+  return rawStatus || 'free'
+}
+
 const handleCheckout = async (req: any, res: any) => {
   try {
     const user = req.user
@@ -37,6 +43,30 @@ const handleCheckout = async (req: any, res: any) => {
     const interval = parseInterval(req.body?.interval || req.body?.billingInterval)
     const wantTrial = parseBool(req.body?.trial)
     const useTrial = tier === 'starter' && wantTrial
+    if (useTrial) {
+      const existingSubscription = await getSubscriptionForUser(user.id)
+      if (existingSubscription?.status === 'active') {
+        return res.status(409).json({
+          error: 'already_subscribed',
+          message: 'Active subscription already has unlocked features. Manage billing to change plans.'
+        })
+      }
+      const activated = await activateManualFreeTrial(user.id)
+      const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'http://localhost:3000'
+      const trialStatus = activated.alreadyActive ? 'active' : 'started'
+      const trialUrl = `${baseUrl}/editor?trial=${trialStatus}`
+      return res.json({
+        url: trialUrl,
+        trial: {
+          tier: activated.tier,
+          active: activated.trial.active,
+          startedAt: activated.trial.startedAt,
+          endsAt: activated.trial.endsAt,
+          daysRemaining: activated.trial.daysRemaining,
+          alreadyActive: activated.alreadyActive
+        }
+      })
+    }
     if (tier === 'founder') {
       await ensureFounderAvailable()
     }
@@ -76,11 +106,11 @@ const handleStatus = async (req: any, res: any) => {
   try {
     const user = req.user
     if (!user) return res.status(401).json({ error: 'Unauthorized' })
-    const { subscription, tier } = await getUserPlan(user.id)
+    const { subscription, tier, trial } = await getUserPlan(user.id)
     res.json({
       tier,
-      status: subscription?.status ?? 'free',
-      current_period_end: subscription?.currentPeriodEnd ?? null
+      status: resolveEffectiveStatus(subscription?.status, trial?.active),
+      current_period_end: trial?.active ? trial.endsAt : subscription?.currentPeriodEnd ?? null
     })
   } catch (err) {
     console.error('billing me', err)
