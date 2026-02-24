@@ -4029,6 +4029,18 @@ const buildQueueEtaSnapshot = () => {
   return { byJobId, queueDepth, queueSlotSeconds }
 }
 
+const removeJobFromQueue = (jobId: string) => {
+  if (!jobId) return false
+  let removed = false
+  for (let index = pipelineQueue.length - 1; index >= 0; index -= 1) {
+    if (pipelineQueue[index]?.jobId !== jobId) continue
+    pipelineQueue.splice(index, 1)
+    removed = true
+  }
+  queuedPipelineJobIds.delete(jobId)
+  return removed
+}
+
 const toTimeMs = (value: unknown) => {
   if (!value) return 0
   if (value instanceof Date) return value.getTime()
@@ -4267,6 +4279,33 @@ router.post('/:id/upload-url', async (req: any, res) => {
   }
 })
 
+router.post('/:id/cancel-queue', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+
+    const status = String(job.status || '').toLowerCase()
+    if (!STARTABLE_QUEUE_STATUSES.has(status)) {
+      return res.status(409).json({ error: 'cannot_cancel', message: 'Job is no longer in queue.' })
+    }
+    if (runningPipelineJobIds.has(id)) {
+      return res.status(409).json({ error: 'already_running', message: 'Job already started processing.' })
+    }
+
+    removeJobFromQueue(id)
+    const progress = Math.max(0, Math.min(100, Number(job.progress || 0)))
+    await updateJob(id, {
+      status: 'failed',
+      progress,
+      error: 'queue_canceled_by_user'
+    })
+    return res.json({ ok: true, id, status: 'failed' })
+  } catch (err) {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
 // List jobs
 router.get('/', async (req: any, res) => {
   try {
@@ -4455,6 +4494,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const status = String(job.status || '').toLowerCase()
+    if (!STARTABLE_QUEUE_STATUSES.has(status)) {
+      return res.status(409).json({ error: 'job_not_startable' })
+    }
     const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
 
