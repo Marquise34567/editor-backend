@@ -534,6 +534,9 @@ type EditPlan = {
     cueCount: number
     hasTranscript: boolean
   }
+  styleProfile?: ContentStyleProfile
+  beatAnchors?: number[]
+  hookVariants?: HookCandidate[]
 }
 type EditOptions = {
   autoHookMove: boolean
@@ -547,6 +550,15 @@ type EditOptions = {
   subtitleStyle?: string | null
   autoZoomMax: number
   retentionAggressionLevel: RetentionAggressionLevel
+}
+type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
+type ContentStyleProfile = {
+  style: ContentStyle
+  confidence: number
+  rationale: string[]
+  tempoBias: number
+  interruptBias: number
+  hookBias: number
 }
 type PacingNiche = 'high_energy' | 'education' | 'talking_head' | 'story'
 type PacingProfile = {
@@ -705,6 +717,48 @@ const FILLER_WORDS = [
   'literally',
   'kind of',
   'sort of'
+]
+const REACTION_STYLE_KEYWORDS = [
+  'reaction',
+  'reacting',
+  'no way',
+  'oh my god',
+  'omg',
+  'wtf',
+  'you guys',
+  'chat',
+  'live stream'
+]
+const VLOG_STYLE_KEYWORDS = [
+  'vlog',
+  'day in the life',
+  'today',
+  'this morning',
+  'come with me',
+  'we went',
+  'my day'
+]
+const TUTORIAL_STYLE_KEYWORDS = [
+  'how to',
+  'step',
+  'tutorial',
+  'guide',
+  'tip',
+  'lesson',
+  'first',
+  'next',
+  'finally'
+]
+const GAMING_STYLE_KEYWORDS = [
+  'game',
+  'gaming',
+  'match',
+  'ranked',
+  'clutch',
+  'boss',
+  'level',
+  'fps',
+  'controller'
 ]
 const RETENTION_AGGRESSION_PRESET: Record<RetentionAggressionLevel, {
   cutMultiplier: number
@@ -1219,6 +1273,78 @@ const getOutputPathsForJob = (job: any) => {
   return [] as string[]
 }
 
+const resolveLocalOutputPathForJob = (job: any, clipIndex = 0) => {
+  const localOutDir = path.join(process.cwd(), 'outputs', job.userId, job.id)
+  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+  if (renderConfig.mode === 'vertical') {
+    return path.join(localOutDir, `vertical-clip-${clipIndex + 1}.mp4`)
+  }
+  return path.join(localOutDir, 'output.mp4')
+}
+
+const getLocalOutputFileInfo = (job: any, clipIndex = 0) => {
+  const filePath = resolveLocalOutputPathForJob(job, clipIndex)
+  if (!fs.existsSync(filePath)) return null
+  try {
+    const stats = fs.statSync(filePath)
+    if (!stats.isFile() || stats.size <= 0) return null
+    return { filePath, size: stats.size }
+  } catch {
+    return null
+  }
+}
+
+const buildAbsoluteApiUrl = (req: any, pathname: string) => {
+  const forwardedProtoRaw = req.headers?.['x-forwarded-proto']
+  const forwardedProto = Array.isArray(forwardedProtoRaw)
+    ? String(forwardedProtoRaw[0] || '')
+    : String(forwardedProtoRaw || '')
+  const protocol = forwardedProto
+    ? forwardedProto.split(',')[0].trim()
+    : (req.protocol || 'http')
+  const host = req.get?.('host') || req.headers?.host
+  if (!host) return pathname
+  return `${protocol}://${host}${pathname}`
+}
+
+const buildLocalOutputFallbackUrl = (req: any, jobId: string, clipIndex: number) => {
+  const clip = Math.max(1, clipIndex + 1)
+  const query = clip > 1 ? `?clip=${clip}` : ''
+  return buildAbsoluteApiUrl(req, `/api/jobs/${jobId}/local-output${query}`)
+}
+
+const resolveOutputUrlWithLocalFallback = async ({
+  req,
+  job,
+  outputPath,
+  clipIndex,
+  expiresIn = 60 * 10
+}: {
+  req: any
+  job: any
+  outputPath: string
+  clipIndex: number
+  expiresIn?: number
+}) => {
+  try {
+    await ensureBucket(OUTPUT_BUCKET, false)
+    const signed = await getSignedOutputUrl({ key: outputPath, expiresIn })
+    return {
+      url: signed,
+      source: 'remote' as const
+    }
+  } catch (error) {
+    const local = getLocalOutputFileInfo(job, clipIndex)
+    if (local) {
+      return {
+        url: buildLocalOutputFallbackUrl(req, job.id, clipIndex),
+        source: 'local' as const
+      }
+    }
+    throw error
+  }
+}
+
 const buildRenderLimitPayload = (
   plan: { maxRendersPerMonth?: number | null },
   usage?: { rendersCount?: number | null }
@@ -1467,6 +1593,221 @@ const computeContentSignalStrength = (windows: EngagementWindow[]) => {
   )
   const spikeDensity = totals.spikes / total
   return Number(clamp01(base * 0.88 + spikeDensity * 0.12).toFixed(4))
+}
+
+const countPhraseHits = (text: string, phrases: string[]) => {
+  if (!text) return 0
+  const normalized = text.toLowerCase()
+  return phrases.reduce((sum, phrase) => (
+    sum + (normalized.includes(phrase.toLowerCase()) ? 1 : 0)
+  ), 0)
+}
+
+const inferContentStyleProfile = ({
+  windows,
+  transcriptCues,
+  durationSeconds
+}: {
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+}): ContentStyleProfile => {
+  const transcriptText = transcriptCues.map((cue) => cue.text).join(' ').toLowerCase()
+  const reactionHits = countPhraseHits(transcriptText, REACTION_STYLE_KEYWORDS)
+  const vlogHits = countPhraseHits(transcriptText, VLOG_STYLE_KEYWORDS)
+  const tutorialHits = countPhraseHits(transcriptText, TUTORIAL_STYLE_KEYWORDS)
+  const gamingHits = countPhraseHits(transcriptText, GAMING_STYLE_KEYWORDS)
+  const totalWindows = Math.max(1, windows.length)
+  const avgSpeech = windows.reduce((sum, window) => sum + window.speechIntensity, 0) / totalWindows
+  const avgScene = windows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / totalWindows
+  const avgEmotion = windows.reduce((sum, window) => sum + window.emotionIntensity, 0) / totalWindows
+  const spikeRatio = windows.filter((window) => window.emotionalSpike > 0 || window.emotionIntensity > 0.72).length / totalWindows
+  const longFormBias = durationSeconds > 120 ? 0.08 : 0
+
+  const scores: Record<ContentStyle, number> = {
+    reaction: clamp01(0.34 * clamp01(reactionHits / 3) + 0.24 * avgEmotion + 0.18 * spikeRatio + 0.12 * avgScene + 0.12 * computeContentSignalStrength(windows)),
+    vlog: clamp01(0.34 * clamp01(vlogHits / 3) + 0.24 * avgSpeech + 0.18 * (1 - avgScene) + 0.14 * longFormBias + 0.1 * avgEmotion),
+    tutorial: clamp01(0.42 * clamp01(tutorialHits / 4) + 0.28 * avgSpeech + 0.18 * (1 - spikeRatio) + 0.12 * (1 - avgScene)),
+    gaming: clamp01(0.36 * clamp01(gamingHits / 3) + 0.24 * avgScene + 0.2 * spikeRatio + 0.2 * avgEmotion),
+    story: clamp01(0.26 + 0.22 * avgEmotion + 0.2 * avgSpeech + 0.16 * clamp01(1 - Math.abs(avgScene - 0.34)) + 0.16 * clamp01(1 - Math.abs(spikeRatio - 0.18)))
+  }
+  const ranked = (Object.keys(scores) as ContentStyle[])
+    .map((style) => ({ style, score: scores[style] }))
+    .sort((a, b) => b.score - a.score)
+  const selected = ranked[0]
+  const runnerUp = ranked[1]
+  const confidence = Number(clamp01(0.58 + (selected.score - (runnerUp?.score ?? 0)) * 0.9).toFixed(4))
+  const rationale: string[] = []
+  if (selected.style === 'reaction') rationale.push('Emotion spikes and reaction-style language dominate.')
+  if (selected.style === 'vlog') rationale.push('Conversational flow and day-style narration indicate vlog pacing.')
+  if (selected.style === 'tutorial') rationale.push('Instructional language favors clarity-first pacing.')
+  if (selected.style === 'gaming') rationale.push('High scene churn and action terms indicate gaming cadence.')
+  if (selected.style === 'story') rationale.push('Balanced narrative signals favor story pacing.')
+  if (!rationale.length) rationale.push('Default story profile selected from mixed signals.')
+
+  const biasByStyle: Record<ContentStyle, Pick<ContentStyleProfile, 'tempoBias' | 'interruptBias' | 'hookBias'>> = {
+    reaction: { tempoBias: -0.58, interruptBias: 0.28, hookBias: 0.1 },
+    vlog: { tempoBias: -0.2, interruptBias: 0.08, hookBias: 0.04 },
+    tutorial: { tempoBias: 0.35, interruptBias: -0.12, hookBias: -0.04 },
+    gaming: { tempoBias: -0.52, interruptBias: 0.24, hookBias: 0.08 },
+    story: { tempoBias: -0.06, interruptBias: 0.04, hookBias: 0.02 }
+  }
+  return {
+    style: selected.style,
+    confidence,
+    rationale,
+    ...biasByStyle[selected.style]
+  }
+}
+
+const getStyleAdjustedAggressionLevel = (
+  baseLevel: RetentionAggressionLevel,
+  styleProfile?: ContentStyleProfile | null
+): RetentionAggressionLevel => {
+  if (!styleProfile) return baseLevel
+  const confidence = clamp01(styleProfile.confidence)
+  const ranking: RetentionAggressionLevel[] = ['low', 'medium', 'high', 'viral']
+  let index = ranking.indexOf(baseLevel)
+  if (index < 0) index = 1
+  if ((styleProfile.style === 'reaction' || styleProfile.style === 'gaming') && confidence >= 0.6) {
+    index = Math.min(ranking.length - 1, index + 1)
+  } else if (styleProfile.style === 'tutorial' && confidence >= 0.58) {
+    index = Math.max(0, index - 1)
+  }
+  return ranking[index]
+}
+
+const applyStyleToPacingProfile = (
+  profile: PacingProfile,
+  styleProfile?: ContentStyleProfile | null,
+  aggressiveMode = false
+) => {
+  if (!styleProfile) return profile
+  const weight = clamp01(styleProfile.confidence)
+  const tempoShift = styleProfile.tempoBias * (0.65 + 0.35 * weight)
+  const interruptShift = styleProfile.interruptBias * (0.7 + 0.3 * weight)
+  const adjustedMin = clamp(profile.minLen + tempoShift, 3.2, 9)
+  const adjustedMax = clamp(profile.maxLen + tempoShift * 1.25, adjustedMin + 0.8, 11.5)
+  const adjustedJitter = clamp(profile.jitter + interruptShift * 0.16, 0.12, 0.52)
+  const adjustedSpeedCap = clamp(
+    profile.speedCap + (aggressiveMode ? 0.03 : 0) - tempoShift * 0.06 + interruptShift * 0.05,
+    1.18,
+    1.58
+  )
+  return {
+    ...profile,
+    minLen: Number(adjustedMin.toFixed(2)),
+    maxLen: Number(adjustedMax.toFixed(2)),
+    earlyTarget: Number(clamp(profile.earlyTarget + tempoShift, adjustedMin, adjustedMax).toFixed(2)),
+    middleTarget: Number(clamp(profile.middleTarget + tempoShift, adjustedMin, adjustedMax).toFixed(2)),
+    lateTarget: Number(clamp(profile.lateTarget + tempoShift, adjustedMin, adjustedMax).toFixed(2)),
+    jitter: Number(adjustedJitter.toFixed(3)),
+    speedCap: Number(adjustedSpeedCap.toFixed(3))
+  }
+}
+
+const detectRhythmAnchors = ({
+  windows,
+  durationSeconds,
+  styleProfile
+}: {
+  windows: EngagementWindow[]
+  durationSeconds: number
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  if (!windows.length) return [] as number[]
+  const pulse = windows.map((window) => (
+    0.42 * window.audioEnergy +
+    0.28 * (window.audioVariance ?? 0) +
+    0.18 * window.vocalExcitement +
+    0.12 * window.sceneChangeRate
+  ))
+  const meanPulse = pulse.reduce((sum, value) => sum + value, 0) / pulse.length
+  const variance = pulse.reduce((sum, value) => sum + (value - meanPulse) ** 2, 0) / pulse.length
+  const std = Math.sqrt(Math.max(0, variance))
+  const threshold = meanPulse + std * 0.14
+  const spacing = styleProfile?.style === 'tutorial' ? 0.9 : styleProfile?.style === 'vlog' ? 0.75 : 0.58
+  const anchors: number[] = []
+  for (let index = 1; index < windows.length - 1; index += 1) {
+    const prev = pulse[index - 1]
+    const curr = pulse[index]
+    const next = pulse[index + 1]
+    if (curr < prev || curr < next || curr < threshold) continue
+    const candidate = Number(clamp(windows[index].time + 0.5, 0, Math.max(0, durationSeconds)).toFixed(3))
+    if (!anchors.length || Math.abs(candidate - anchors[anchors.length - 1]) >= spacing) {
+      anchors.push(candidate)
+    }
+  }
+  if (!anchors.length) {
+    anchors.push(Number(clamp(durationSeconds * 0.2, 0, durationSeconds).toFixed(3)))
+    anchors.push(Number(clamp(durationSeconds * 0.5, 0, durationSeconds).toFixed(3)))
+    anchors.push(Number(clamp(durationSeconds * 0.8, 0, durationSeconds).toFixed(3)))
+  }
+  return anchors
+}
+
+const alignSegmentsToRhythm = ({
+  segments,
+  durationSeconds,
+  anchors,
+  styleProfile
+}: {
+  segments: Segment[]
+  durationSeconds: number
+  anchors: number[]
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  if (segments.length <= 1 || !anchors.length) return segments.map((segment) => ({ ...segment }))
+  const tolerance = styleProfile?.style === 'tutorial' ? 0.14 : styleProfile?.style === 'vlog' ? 0.18 : 0.24
+  const minSegmentDuration = styleProfile?.style === 'tutorial' ? 0.3 : 0.24
+  const sortedAnchors = anchors.slice().sort((a, b) => a - b)
+  const boundaries = segments.map((segment) => segment.start)
+  boundaries.push(segments[segments.length - 1].end)
+
+  for (let index = 1; index < boundaries.length - 1; index += 1) {
+    const boundary = boundaries[index]
+    let nearest = boundary
+    let nearestDistance = Number.POSITIVE_INFINITY
+    for (const anchor of sortedAnchors) {
+      const distance = Math.abs(anchor - boundary)
+      if (distance < nearestDistance) {
+        nearest = anchor
+        nearestDistance = distance
+      }
+    }
+    if (nearestDistance <= tolerance) {
+      boundaries[index] = nearest
+    }
+  }
+  boundaries[0] = clamp(boundaries[0], 0, Math.max(0, durationSeconds))
+  boundaries[boundaries.length - 1] = clamp(boundaries[boundaries.length - 1], 0, Math.max(0, durationSeconds))
+  for (let index = 1; index < boundaries.length; index += 1) {
+    if (boundaries[index] < boundaries[index - 1] + minSegmentDuration) {
+      boundaries[index] = boundaries[index - 1] + minSegmentDuration
+    }
+  }
+  for (let index = boundaries.length - 2; index >= 0; index -= 1) {
+    if (boundaries[index] > boundaries[index + 1] - minSegmentDuration) {
+      boundaries[index] = boundaries[index + 1] - minSegmentDuration
+    }
+  }
+  const rebuilt: Segment[] = []
+  for (let index = 0; index < segments.length; index += 1) {
+    const start = Number(clamp(boundaries[index], 0, durationSeconds).toFixed(3))
+    const end = Number(clamp(boundaries[index + 1], start + 0.05, durationSeconds).toFixed(3))
+    if (end - start < minSegmentDuration * 0.6) {
+      if (rebuilt.length) {
+        rebuilt[rebuilt.length - 1].end = end
+      }
+      continue
+    }
+    rebuilt.push({
+      ...segments[index],
+      start,
+      end
+    })
+  }
+  return rebuilt.length ? rebuilt : segments.map((segment) => ({ ...segment }))
 }
 
 const resolveHookScoreThreshold = ({
@@ -3691,7 +4032,17 @@ const buildEditPlan = async (
     silences,
     transcriptCues
   })
-  const pacingProfile = inferPacingProfile(windows, durationSeconds, options.aggressiveMode)
+  const styleProfile = inferContentStyleProfile({
+    windows,
+    transcriptCues,
+    durationSeconds
+  })
+  const styleAdjustedAggressionLevel = getStyleAdjustedAggressionLevel(aggressionLevel, styleProfile)
+  const pacingProfile = applyStyleToPacingProfile(
+    inferPacingProfile(windows, durationSeconds, options.aggressiveMode),
+    styleProfile,
+    options.aggressiveMode
+  )
   const silenceTrimCuts = options.removeBoring
     ? buildSilenceTrimCuts(silences, durationSeconds, options.aggressiveMode)
     : []
@@ -3758,7 +4109,16 @@ const buildEditPlan = async (
     windows,
     transcriptCues
   })
-  const hook = topHookCandidates.selected
+  const hookVariants = [
+    topHookCandidates.selected,
+    ...topHookCandidates.topCandidates
+  ].filter((candidate, index, list) => (
+    list.findIndex((entry) => (
+      Math.abs(entry.start - candidate.start) < 0.01 &&
+      Math.abs(entry.duration - candidate.duration) < 0.01
+    )) === index
+  ))
+  const hook = hookVariants[0] || topHookCandidates.selected
   const hookRange: TimeRange = {
     start: hook.start,
     end: Number((hook.start + hook.duration).toFixed(3))
@@ -3777,23 +4137,34 @@ const buildEditPlan = async (
   const boredomApplied = applyBoredomModelToSegments({
     segments: speechBalancedSegments,
     windows,
-    aggressionLevel,
+    aggressionLevel: styleAdjustedAggressionLevel,
     hookRange
   })
   const interruptInjected = injectPatternInterrupts({
     segments: boredomApplied.segments,
     durationSeconds,
-    aggressionLevel
+    aggressionLevel: styleAdjustedAggressionLevel
   })
   const endingSpikeSegments = enforceEndingSpike({
     segments: interruptInjected.segments,
     windows,
     durationSeconds
   })
+  const beatAnchors = detectRhythmAnchors({
+    windows,
+    durationSeconds,
+    styleProfile
+  })
+  const rhythmAlignedSegments = alignSegmentsToRhythm({
+    segments: endingSpikeSegments,
+    durationSeconds,
+    anchors: beatAnchors,
+    styleProfile
+  })
 
   return {
     hook,
-    segments: endingSpikeSegments,
+    segments: rhythmAlignedSegments,
     silences,
     removedSegments: mergeRanges([...removedSegments, ...boredomApplied.removedRanges]),
     compressedSegments,
@@ -3803,12 +4174,12 @@ const buildEditPlan = async (
         hookScore: clamp01((window.hookScore ?? window.score) * aggressionPreset.hookRelocateBias),
         boredomScore: window.boredomScore ?? 0
       })),
-    hookCandidates: topHookCandidates.topCandidates,
+    hookCandidates: hookVariants,
     boredomRanges: boredomApplied.removedRanges,
     patternInterruptCount: interruptInjected.count,
     patternInterruptDensity: interruptInjected.density,
     boredomRemovedRatio: Number(clamp01(getRangesDurationSeconds(boredomApplied.removedRanges) / Math.max(0.1, durationSeconds)).toFixed(4)),
-    storyReorderMap: endingSpikeSegments.map((segment, orderedIndex) => ({
+    storyReorderMap: rhythmAlignedSegments.map((segment, orderedIndex) => ({
       sourceStart: Number(segment.start.toFixed(3)),
       sourceEnd: Number(segment.end.toFixed(3)),
       orderedIndex
@@ -3817,7 +4188,10 @@ const buildEditPlan = async (
     transcriptSignals: {
       cueCount: transcriptCues.length,
       hasTranscript: transcriptCues.length > 0
-    }
+    },
+    styleProfile,
+    beatAnchors,
+    hookVariants
   }
 }
 
@@ -4184,24 +4558,28 @@ const scoreSegment = (segment: Segment, windows: EngagementWindow[]) => {
 const applyStoryStructure = (
   segments: Segment[],
   windows: EngagementWindow[],
-  durationSeconds: number
+  durationSeconds: number,
+  styleProfile?: ContentStyleProfile | null
 ) => {
   if (segments.length <= 3) return segments
   const scored = segments.map((seg, idx) => ({ seg, idx, score: scoreSegment(seg, windows) }))
   const reordered = segments.slice()
+  const style = styleProfile?.style || 'story'
+  const tutorialMode = style === 'tutorial'
+  const highEnergyMode = style === 'reaction' || style === 'gaming'
 
   // Lift a strong mid-video beat closer to the front to improve narrative momentum.
-  const middleStart = Math.max(0, durationSeconds * 0.2)
-  const middleEnd = Math.max(middleStart + 1, durationSeconds * 0.78)
+  const middleStart = Math.max(0, durationSeconds * (tutorialMode ? 0.24 : 0.2))
+  const middleEnd = Math.max(middleStart + 1, durationSeconds * (tutorialMode ? 0.72 : 0.78))
   const middleCandidates = scored
     .filter((entry) => entry.seg.start >= middleStart && entry.seg.start <= middleEnd)
     .sort((a, b) => b.score - a.score)
   const middleHighlight = middleCandidates[0]
   if (middleHighlight) {
     const fromIdx = reordered.findIndex((seg) => seg === middleHighlight.seg)
-    if (fromIdx > 1) {
+    if (fromIdx > (tutorialMode ? 2 : 1)) {
       const [moved] = reordered.splice(fromIdx, 1)
-      reordered.splice(1, 0, moved)
+      reordered.splice(tutorialMode ? 2 : 1, 0, moved)
     }
   }
 
@@ -4216,6 +4594,21 @@ const applyStoryStructure = (
     if (tailIdx >= 0 && tailIdx !== reordered.length - 1) {
       const [moved] = reordered.splice(tailIdx, 1)
       reordered.push(moved)
+    }
+  }
+
+  if (highEnergyMode) {
+    const frontBoost = scored
+      .filter((entry) => entry.seg.start <= Math.max(8, durationSeconds * 0.4))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 2)
+      .map((entry) => entry.seg)
+    for (const seg of frontBoost) {
+      const idx = reordered.findIndex((item) => item === seg)
+      if (idx > 2) {
+        const [moved] = reordered.splice(idx, 1)
+        reordered.splice(2, 0, moved)
+      }
     }
   }
 
@@ -5099,10 +5492,13 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         removed_segments: editPlan?.removedSegments ?? [],
         compressed_segments: editPlan?.compressedSegments ?? [],
         hook_candidates: editPlan?.hookCandidates ?? [],
+        hook_variants: editPlan?.hookVariants ?? editPlan?.hookCandidates ?? [],
         boredom_ranges: editPlan?.boredomRanges ?? [],
         boredom_removed_ratio: editPlan?.boredomRemovedRatio ?? 0,
         retentionAggressionLevel: aggressionLevel,
         retentionLevel: aggressionLevel,
+        style_profile: editPlan?.styleProfile ?? null,
+        beat_anchors: editPlan?.beatAnchors ?? [],
         transcript_signals: editPlan?.transcriptSignals ?? {
           cueCount: transcriptCues.length,
           hasTranscript: transcriptCues.length > 0
@@ -5237,6 +5633,8 @@ const processJob = async (
     inputBytes: inStats.size
   })
   let subtitlePath: string | null = null
+  let outputUploadFallbackUsed = false
+  const failedOutputUploads: string[] = []
   try {
     const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
     const durationSeconds = storedDuration ?? getDurationSeconds(tmpIn) ?? 0
@@ -5304,7 +5702,16 @@ const processJob = async (
       for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
         const clipPath = renderedClipPaths[idx]
         const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
-        await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
+        try {
+          await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
+        } catch (error) {
+          outputUploadFallbackUsed = true
+          failedOutputUploads.push(key)
+          console.warn(`[${requestId || 'noid'}] vertical output upload failed, serving local fallback`, {
+            key,
+            error: (error as any)?.message || error
+          })
+        }
         outputPaths.push(key)
       }
 
@@ -5318,7 +5725,17 @@ const processJob = async (
         verticalMode: resolvedVerticalMode
       }
       const nextAnalysis = buildPersistedRenderAnalysis({
-        existing: (job.analysis as any) || {},
+        existing: {
+          ...((job.analysis as any) || {}),
+          output_upload_fallback: outputUploadFallbackUsed
+            ? {
+                used: true,
+                failedOutputs: failedOutputUploads,
+                mode: 'local',
+                updatedAt: toIsoNow()
+              }
+            : ((job.analysis as any)?.output_upload_fallback ?? null)
+        },
         renderConfig: finalRenderConfig,
         outputPaths
       })
@@ -5367,6 +5784,13 @@ const processJob = async (
     let hasTranscriptSignals = false
     let contentSignalStrength = 0.42
     let qualityGateOverride: { applied: boolean; reason: string } | null = null
+    let styleProfileForAnalysis: ContentStyleProfile | null = ((job.analysis as any)?.style_profile as ContentStyleProfile) || null
+    let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
+      ? ((job.analysis as any).beat_anchors as number[])
+      : []
+    let hookVariantsForAnalysis: HookCandidate[] = Array.isArray((job.analysis as any)?.hook_variants)
+      ? ((job.analysis as any).hook_variants as HookCandidate[])
+      : []
     if (hasFfmpeg()) {
       const qualityTarget = getTargetDimensions(finalQuality)
       const sourceProbe = probeVideoStream(tmpIn)
@@ -5389,6 +5813,13 @@ const processJob = async (
           optimizationNotes.push('AI edit plan fallback: deterministic rescue plan used.')
         }
       }
+      if (editPlan?.styleProfile) styleProfileForAnalysis = editPlan.styleProfile
+      if (Array.isArray(editPlan?.beatAnchors)) beatAnchorsForAnalysis = editPlan.beatAnchors
+      if (Array.isArray(editPlan?.hookVariants) && editPlan.hookVariants.length) {
+        hookVariantsForAnalysis = editPlan.hookVariants
+      } else if (Array.isArray(editPlan?.hookCandidates) && editPlan.hookCandidates.length) {
+        hookVariantsForAnalysis = editPlan.hookCandidates
+      }
 
       await updateJob(jobId, { status: 'story', progress: 55 })
 
@@ -5396,7 +5827,7 @@ const processJob = async (
         ? editPlan.segments
         : buildGuaranteedFallbackSegments(durationSeconds || 0, options)
       const storySegments = editPlan && !options.onlyCuts
-        ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds)
+        ? applyStoryStructure(baseSegments, editPlan.engagementWindows, durationSeconds, editPlan.styleProfile)
         : baseSegments
       hasTranscriptSignals = Boolean(
         editPlan?.transcriptSignals?.hasTranscript ||
@@ -5610,10 +6041,14 @@ const processJob = async (
             : strategy === 'PACING_FIRST'
               ? (aggressionLevel === 'low' ? 'medium' : 'high')
               : aggressionLevel
+        const styleAdjustedInterruptAggression = getStyleAdjustedAggressionLevel(
+          interruptAggression,
+          editPlan?.styleProfile
+        )
         const interruptInjected = injectPatternInterrupts({
           segments: effected,
           durationSeconds,
-          aggressionLevel: interruptAggression
+          aggressionLevel: styleAdjustedInterruptAggression
         })
         const withZoom = editPlan && !options.onlyCuts
           ? applyZoomEasing(interruptInjected.segments)
@@ -6288,9 +6723,13 @@ const processJob = async (
     console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
     try {
       await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
-    } catch (e) {
-      await updateJob(jobId, { status: 'failed', error: 'upload_failed' })
-      throw new Error('upload_failed')
+    } catch (error) {
+      outputUploadFallbackUsed = true
+      failedOutputUploads.push(outPath)
+      console.warn(`[${requestId || 'noid'}] output upload failed, serving local fallback`, {
+        key: outPath,
+        error: (error as any)?.message || error
+      })
     }
     outputPaths.push(outPath)
     throwIfCanceled()
@@ -6319,6 +6758,17 @@ const processJob = async (
         pattern_interrupt_density: selectedPatternInterruptDensity || (job.analysis as any)?.pattern_interrupt_density || 0,
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
         story_reorder_map: selectedStoryReorderMap,
+        style_profile: styleProfileForAnalysis,
+        beat_anchors: beatAnchorsForAnalysis,
+        hook_variants: hookVariantsForAnalysis,
+        output_upload_fallback: outputUploadFallbackUsed
+          ? {
+              used: true,
+              failedOutputs: failedOutputUploads,
+              mode: 'local',
+              updatedAt: toIsoNow()
+            }
+          : ((job.analysis as any)?.output_upload_fallback ?? null),
         content_signal_strength: Number(contentSignalStrength.toFixed(4)),
         has_transcript_signals: hasTranscriptSignals,
         retentionAggressionLevel: aggressionLevel,
@@ -6950,24 +7400,30 @@ router.get('/:id', async (req: any, res) => {
     }
     const outputPaths = getOutputPathsForJob(job)
     if (job.status === 'completed' && outputPaths.length > 0) {
-      try {
-        await ensureBucket(OUTPUT_BUCKET, false)
-        const expires = 60 * 10
+      const resolvedUrls: string[] = []
+      const resolvedSources: string[] = []
+      for (let idx = 0; idx < outputPaths.length; idx += 1) {
+        const outputPath = outputPaths[idx]
         try {
-          const signedUrls: string[] = []
-          for (const outputPath of outputPaths) {
-            const signed = await getSignedOutputUrl({ key: outputPath, expiresIn: expires })
-            signedUrls.push(signed)
-          }
-          if (signedUrls.length > 0) {
-            jobPayload.outputUrls = signedUrls
-            jobPayload.outputUrl = signedUrls[0]
-          }
-        } catch (err) {
-          // ignore signed URL failures; client can fallback to output-url endpoint
+          const resolved = await resolveOutputUrlWithLocalFallback({
+            req,
+            job,
+            outputPath,
+            clipIndex: idx
+          })
+          resolvedUrls.push(resolved.url)
+          resolvedSources.push(resolved.source)
+        } catch (error) {
+          console.warn(`[${req.requestId || 'noid'}] failed to resolve output URL`, {
+            outputPath,
+            error: (error as any)?.message || error
+          })
         }
-      } catch (err) {
-        // ignore
+      }
+      if (resolvedUrls.length > 0) {
+        jobPayload.outputUrls = resolvedUrls
+        jobPayload.outputUrl = resolvedUrls[0]
+        jobPayload.outputUrlSources = resolvedSources
       }
     }
     if (outputPaths.length > 0) {
@@ -6999,34 +7455,39 @@ router.post('/:id/download-url', async (req: any, res) => {
     const requestedClip = Number.parseInt(String(req.body?.clip ?? req.query?.clip ?? '1'), 10)
     const clipIndex = Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0
     const selectedOutputPath = outputPaths[clipIndex]
-    await ensureBucket(OUTPUT_BUCKET, false)
-    const expires = 60 * 10
     try {
-      const url = await getSignedOutputUrl({ key: selectedOutputPath, expiresIn: expires })
+      const resolved = await resolveOutputUrlWithLocalFallback({
+        req,
+        job,
+        outputPath: selectedOutputPath,
+        clipIndex
+      })
 
       // schedule auto-delete 1 minute after user requests download
-      try {
-        const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
-        if (keyToDelete) {
-          setTimeout(async () => {
-            try {
-              await deleteOutputObject(keyToDelete)
+      if (resolved.source === 'remote') {
+        try {
+          const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
+          if (keyToDelete) {
+            setTimeout(async () => {
               try {
-                await updateJob(id, { outputPath: null })
-              } catch (e) {
-                // ignore DB update failures
+                await deleteOutputObject(keyToDelete)
+                try {
+                  await updateJob(id, { outputPath: null })
+                } catch (e) {
+                  // ignore DB update failures
+                }
+                console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
+              } catch (err) {
+                console.error('auto-delete failed', err)
               }
-              console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
-            } catch (err) {
-              console.error('auto-delete failed', err)
-            }
-          }, 60_000)
+            }, 60_000)
+          }
+        } catch (e) {
+          // scheduling failure shouldn't block download
         }
-      } catch (e) {
-        // scheduling failure shouldn't block download
       }
 
-      return res.json({ url })
+      return res.json({ url: resolved.url, source: resolved.source })
     } catch (err) {
       return res.status(500).json({ error: 'signed_url_failed' })
     }
@@ -7217,37 +7678,95 @@ router.get('/:id/output-url', async (req: any, res) => {
     const requestedClip = Number.parseInt(String(req.query?.clip ?? '1'), 10)
     const clipIndex = Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0
     const selectedOutputPath = outputPaths[clipIndex]
-    await ensureBucket(OUTPUT_BUCKET, false)
-    const expires = 60 * 10
     try {
-      const url = await getSignedOutputUrl({ key: selectedOutputPath, expiresIn: expires })
+      const resolved = await resolveOutputUrlWithLocalFallback({
+        req,
+        job,
+        outputPath: selectedOutputPath,
+        clipIndex
+      })
 
       // schedule auto-delete 1 minute after user requests download
-      try {
-        const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
-        if (keyToDelete) {
-          setTimeout(async () => {
-            try {
-              await deleteOutputObject(keyToDelete)
+      if (resolved.source === 'remote') {
+        try {
+          const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
+          if (keyToDelete) {
+            setTimeout(async () => {
               try {
-                await updateJob(id, { outputPath: null })
-              } catch (e) {
-                // ignore DB update failures
+                await deleteOutputObject(keyToDelete)
+                try {
+                  await updateJob(id, { outputPath: null })
+                } catch (e) {
+                  // ignore DB update failures
+                }
+                console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
+              } catch (err) {
+                console.error('auto-delete failed', err)
               }
-              console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
-            } catch (err) {
-              console.error('auto-delete failed', err)
-            }
-          }, 60_000)
+            }, 60_000)
+          }
+        } catch (e) {
+          // scheduling failure shouldn't block download
         }
-      } catch (e) {
-        // scheduling failure shouldn't block download
       }
 
-      res.json({ url })
+      res.json({ url: resolved.url, source: resolved.source })
     } catch (err) {
       res.status(500).json({ error: 'signed_url_failed' })
     }
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+// Stream local output file when remote output storage/signing is unavailable.
+router.get('/:id/local-output', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+    const outputPaths = getOutputPathsForJob(job)
+    if (!outputPaths.length) return res.status(404).json({ error: 'not_found' })
+    const requestedClip = Number.parseInt(String(req.query?.clip ?? '1'), 10)
+    const clipIndex = Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0
+    const localOutput = getLocalOutputFileInfo(job, clipIndex)
+    if (!localOutput) return res.status(404).json({ error: 'local_output_not_found' })
+
+    const fileSize = localOutput.size
+    const rangeHeader = String(req.headers?.range || '').trim()
+    const rangeMatch = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader)
+    const fileName = path.basename(outputPaths[clipIndex] || localOutput.filePath)
+    const wantsDownload = String(req.query?.download || '').toLowerCase() === '1' || String(req.query?.download || '').toLowerCase() === 'true'
+    res.setHeader('Content-Type', 'video/mp4')
+    res.setHeader('Accept-Ranges', 'bytes')
+    if (wantsDownload) {
+      res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`)
+    }
+
+    if (rangeMatch) {
+      const rawStart = rangeMatch[1] ? Number.parseInt(rangeMatch[1], 10) : 0
+      const rawEnd = rangeMatch[2] ? Number.parseInt(rangeMatch[2], 10) : fileSize - 1
+      const start = clamp(Number.isFinite(rawStart) ? rawStart : 0, 0, Math.max(0, fileSize - 1))
+      const end = clamp(Number.isFinite(rawEnd) ? rawEnd : fileSize - 1, start, Math.max(start, fileSize - 1))
+      if (start >= fileSize || end >= fileSize || start > end) {
+        res.setHeader('Content-Range', `bytes */${fileSize}`)
+        return res.status(416).end()
+      }
+      const chunkSize = end - start + 1
+      res.status(206)
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${fileSize}`)
+      res.setHeader('Content-Length', chunkSize)
+      const stream = fs.createReadStream(localOutput.filePath, { start, end })
+      stream.on('error', () => res.status(500).end())
+      stream.pipe(res)
+      return
+    }
+
+    res.setHeader('Content-Length', fileSize)
+    const stream = fs.createReadStream(localOutput.filePath)
+    stream.on('error', () => res.status(500).end())
+    stream.pipe(res)
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -7259,6 +7778,11 @@ export const __retentionTestUtils = {
   buildRetentionJudgeReport,
   resolveQualityGateThresholds,
   computeContentSignalStrength,
+  inferContentStyleProfile,
+  getStyleAdjustedAggressionLevel,
+  applyStyleToPacingProfile,
+  detectRhythmAnchors,
+  alignSegmentsToRhythm,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,

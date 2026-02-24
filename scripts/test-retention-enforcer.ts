@@ -6,6 +6,10 @@ const {
   buildRetentionJudgeReport,
   resolveQualityGateThresholds,
   computeContentSignalStrength,
+  inferContentStyleProfile,
+  getStyleAdjustedAggressionLevel,
+  applyStyleToPacingProfile,
+  alignSegmentsToRhythm,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
@@ -103,6 +107,62 @@ const run = () => {
   assert.ok(representedSections.size >= 3, 'top hook candidates should represent multiple timeline sections')
   assert.strictEqual(sectionIndex(longPick.selected.start), 2, 'selected hook should come from strongest section')
   assert.ok(longPick.selected.duration >= 7 && longPick.selected.duration <= 8, 'partition hook winner should stay near 8 seconds')
+
+  // 1c) Style inference should adapt pacing/aggression for different content archetypes.
+  const reactionWindows = new Array(36).fill(null).map((_, idx) =>
+    makeWindow(idx, {
+      speechIntensity: 0.72,
+      sceneChangeRate: 0.58,
+      emotionIntensity: 0.82,
+      emotionalSpike: idx % 6 === 0 ? 1 : 0,
+      vocalExcitement: 0.8,
+      audioVariance: 0.7
+    })
+  )
+  const reactionProfile = inferContentStyleProfile({
+    windows: reactionWindows,
+    transcriptCues: [
+      { start: 0, end: 3, text: 'No way chat, this changed everything.', keywordIntensity: 0.7, curiosityTrigger: 0.6, fillerDensity: 0 }
+    ],
+    durationSeconds: 36
+  })
+  assert.strictEqual(reactionProfile.style, 'reaction', 'reaction signals should map to reaction style profile')
+  const reactionAggression = getStyleAdjustedAggressionLevel('medium', reactionProfile)
+  assert.ok(reactionAggression === 'high' || reactionAggression === 'viral', 'reaction profile should elevate aggression level')
+  const basePacing = {
+    niche: 'story',
+    minLen: 4.8,
+    maxLen: 8.2,
+    earlyTarget: 5.1,
+    middleTarget: 6.1,
+    lateTarget: 5.2,
+    jitter: 0.24,
+    speedCap: 1.32
+  }
+  const reactionPacing = applyStyleToPacingProfile(basePacing as any, reactionProfile, true)
+  assert.ok(reactionPacing.minLen < basePacing.minLen, 'reaction style should tighten minimum segment length')
+  assert.ok(reactionPacing.speedCap >= basePacing.speedCap, 'reaction style should allow equal or higher speed cap')
+
+  // 1d) Rhythm alignment should snap near-beat boundaries without breaking segment continuity.
+  const rhythmAligned = alignSegmentsToRhythm({
+    segments: [
+      { start: 0, end: 3.12, speed: 1 },
+      { start: 3.12, end: 6.14, speed: 1.05 },
+      { start: 6.14, end: 9.2, speed: 1.08 }
+    ],
+    durationSeconds: 9.2,
+    anchors: [3, 6, 9],
+    styleProfile: {
+      style: 'reaction',
+      confidence: 0.78,
+      rationale: ['test'],
+      tempoBias: -0.5,
+      interruptBias: 0.2,
+      hookBias: 0.08
+    }
+  })
+  assert.strictEqual(Number(rhythmAligned[0].end.toFixed(2)), 3.0, 'first rhythm boundary should snap to nearest anchor')
+  assert.strictEqual(Number(rhythmAligned[1].end.toFixed(2)), 6.0, 'second rhythm boundary should snap to nearest anchor')
 
   // 2) Quality gate thresholds
   const strongSegments = [
@@ -276,7 +336,21 @@ const run = () => {
       hook_score: 0.91,
       retention_attempts: attemptsAllFail,
       retention_judge: weakJudge,
-      selected_strategy: 'PACING_FIRST'
+      selected_strategy: 'PACING_FIRST',
+      style_profile: {
+        style: 'reaction',
+        confidence: 0.74,
+        rationale: ['test'],
+        tempoBias: -0.5,
+        interruptBias: 0.2,
+        hookBias: 0.08
+      },
+      beat_anchors: [2.5, 5.2, 8.1],
+      output_upload_fallback: {
+        used: true,
+        mode: 'local',
+        failedOutputs: ['u1/j1/output.mp4']
+      }
     },
     renderConfig: {
       mode: 'horizontal',
@@ -289,6 +363,9 @@ const run = () => {
   assert.strictEqual(persisted.hook_start_time, 12.1, 'hook metadata should persist')
   assert.strictEqual(Array.isArray(persisted.retention_attempts), true, 'attempt metadata should persist')
   assert.strictEqual(persisted.selected_strategy, 'PACING_FIRST', 'selected strategy should persist')
+  assert.strictEqual(persisted.style_profile?.style, 'reaction', 'style profile should persist')
+  assert.strictEqual(Array.isArray(persisted.beat_anchors), true, 'beat anchors should persist')
+  assert.strictEqual(Boolean(persisted.output_upload_fallback?.used), true, 'upload fallback metadata should persist')
 
   console.log('PASS retention enforcer tests')
 }
