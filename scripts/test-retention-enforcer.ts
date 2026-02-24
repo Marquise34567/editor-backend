@@ -6,6 +6,9 @@ const {
   buildRetentionJudgeReport,
   resolveQualityGateThresholds,
   computeContentSignalStrength,
+  parseRetentionFeedbackPayload,
+  computeHookCalibrationProfileFromHistory,
+  normalizeHookCalibrationWeights,
   inferContentStyleProfile,
   getStyleAdjustedAggressionLevel,
   applyStyleToPacingProfile,
@@ -163,6 +166,62 @@ const run = () => {
   })
   assert.strictEqual(Number(rhythmAligned[0].end.toFixed(2)), 3.0, 'first rhythm boundary should snap to nearest anchor')
   assert.strictEqual(Number(rhythmAligned[1].end.toFixed(2)), 6.0, 'second rhythm boundary should snap to nearest anchor')
+
+  // 1e) Retention feedback payload parsing should normalize 0-100 and 0-1 values.
+  const parsedFeedback = parseRetentionFeedbackPayload({
+    watchPercent: 63,
+    hookHoldPercent: 0.51,
+    completionPercent: 44,
+    manualScore: 8.5,
+    source: 'analytics'
+  })
+  assert.ok(parsedFeedback, 'feedback payload should parse')
+  assert.strictEqual(parsedFeedback?.watchPercent, 0.63, 'watch percent should normalize to 0-1')
+  assert.strictEqual(parsedFeedback?.hookHoldPercent, 0.51, 'hook hold should keep normalized values')
+  assert.strictEqual(parsedFeedback?.manualScore, 85, 'manual score 0-10 should normalize to 0-100')
+
+  // 1f) Hook calibration should adapt weights when historical feedback shows weak opening retention.
+  const calibration = computeHookCalibrationProfileFromHistory([
+    {
+      analysis: {
+        retention_feedback: { watchPercent: 0.52, hookHoldPercent: 0.41, completionPercent: 0.34, manualScore: 58 },
+        retention_judge: { emotional_pull: 56, pacing_score: 64 },
+        style_profile: { style: 'reaction' }
+      },
+      retentionScore: 54
+    },
+    {
+      analysis: {
+        retention_feedback: { watchPercent: 0.48, hookHoldPercent: 0.39, completionPercent: 0.31, manualScore: 55 },
+        retention_judge: { emotional_pull: 58, pacing_score: 62 },
+        style_profile: { style: 'reaction' }
+      },
+      retentionScore: 51
+    },
+    {
+      analysis: {
+        retention_feedback: { watchPercent: 0.57, hookHoldPercent: 0.45, completionPercent: 0.36, manualScore: 61 },
+        retention_judge: { emotional_pull: 60, pacing_score: 66 },
+        style_profile: { style: 'gaming' }
+      },
+      retentionScore: 56
+    },
+    {
+      analysis: {
+        retention_feedback: { watchPercent: 0.55, hookHoldPercent: 0.43, completionPercent: 0.33, manualScore: 59 },
+        retention_judge: { emotional_pull: 59, pacing_score: 63 },
+        style_profile: { style: 'reaction' }
+      },
+      retentionScore: 53
+    }
+  ])
+  assert.ok(calibration.enabled, 'calibration should enable with enough feedback samples')
+  assert.ok(calibration.earlyDropRate > 0.3, 'calibration should detect early drop-off trend')
+  assert.ok(calibration.weights.curiosity > 0.1, 'calibration should increase curiosity weight on weak hooks')
+  assert.ok(calibration.weights.auditScore >= 0.24, 'calibration should preserve or increase audit weighting')
+  const normalizedWeights = normalizeHookCalibrationWeights(calibration.weights)
+  const weightSum = normalizedWeights.candidateScore + normalizedWeights.auditScore + normalizedWeights.energy + normalizedWeights.curiosity + normalizedWeights.emotionalSpike
+  assert.ok(Math.abs(weightSum - 1) < 0.01, 'calibration weights should stay normalized')
 
   // 2) Quality gate thresholds
   const strongSegments = [
