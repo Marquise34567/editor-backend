@@ -3485,7 +3485,29 @@ const processJob = async (
       const ffCrf = (options as any)?.fastMode
         ? '28'
         : (process.env.FFMPEG_CRF || defaultCrf)
-      const argsBase = ['-y', '-nostdin', '-hide_banner', '-loglevel', 'error', '-i', tmpIn, '-movflags', '+faststart', '-c:v', 'libx264', '-preset', ffPreset, '-crf', ffCrf, '-threads', '0', '-pix_fmt', 'yuv420p']
+      const argsBase = [
+        '-y',
+        '-nostdin',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-filter_threads',
+        '1',
+        '-i',
+        tmpIn,
+        '-movflags',
+        '+faststart',
+        '-c:v',
+        'libx264',
+        '-preset',
+        ffPreset,
+        '-crf',
+        ffCrf,
+        '-threads',
+        '0',
+        '-pix_fmt',
+        'yuv420p'
+      ]
       if (withAudio) argsBase.push('-c:a', 'aac')
 
       const watermarkFont = getSystemFontFile()
@@ -3559,6 +3581,113 @@ const processJob = async (
         }
       }
 
+      const runSegmentFileFallback = async (segments: Segment[]) => {
+        const segmentFiles: string[] = []
+        const concatListPath = path.join(workDir, `segment-list-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.txt`)
+        try {
+          for (let idx = 0; idx < segments.length; idx += 1) {
+            const seg = segments[idx]
+            const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
+            const vTrim = `trim=start=${toFilterNumber(seg.start)}:end=${toFilterNumber(seg.end)}`
+            const vSpeed = speed !== 1 ? `setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : 'setpts=PTS-STARTPTS'
+            const vChain = `[0:v]${vTrim},${vSpeed},${buildFrameFitFilter(horizontalFit, target.width, target.height)}[vout]`
+            const filterParts = [vChain]
+            if (withAudio) {
+              const segDuration = Math.max(0.01, roundForFilter((seg.end - seg.start) / speed))
+              const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
+              if (hasAudio) {
+                const aChain = [
+                  `[0:a]atrim=start=${toFilterNumber(Math.max(0, seg.start - 0.02))}:end=${toFilterNumber(seg.end + 0.02)}`,
+                  'asetpts=PTS-STARTPTS',
+                  aSpeed,
+                  'aformat=sample_rates=48000:channel_layouts=stereo[aout]'
+                ].filter(Boolean).join(',')
+                filterParts.push(aChain)
+              } else {
+                const aChain = [
+                  'anullsrc=r=48000:cl=stereo',
+                  `atrim=duration=${toFilterNumber(segDuration)}`,
+                  'asetpts=PTS-STARTPTS',
+                  aSpeed,
+                  'aformat=sample_rates=48000:channel_layouts=stereo[aout]'
+                ].filter(Boolean).join(',')
+                filterParts.push(aChain)
+              }
+            }
+            const segmentFilter = filterParts.join(';')
+            const segmentPath = path.join(workDir, `segment-${String(idx).padStart(4, '0')}.mp4`)
+            const mapArgs = ['-map', '[vout]']
+            if (withAudio) mapArgs.push('-map', '[aout]')
+            await runFfmpegWithFilter(argsBase, segmentFilter, mapArgs, segmentPath, `segment-${idx}`)
+            segmentFiles.push(segmentPath)
+          }
+
+          if (!segmentFiles.length) {
+            throw new Error('segment_file_fallback_empty')
+          }
+
+          const concatLines = segmentFiles
+            .map((filePath) => `file '${filePath.replace(/'/g, "'\\''")}'`)
+            .join('\n')
+          fs.writeFileSync(concatListPath, concatLines)
+
+          const concatCopyArgs = [
+            '-y',
+            '-nostdin',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-c',
+            'copy',
+            '-movflags',
+            '+faststart',
+            tmpOut
+          ]
+          try {
+            await runFfmpeg(concatCopyArgs)
+          } catch (concatCopyErr) {
+            logFfmpegFailure('segment-concat-copy', concatCopyArgs, concatCopyErr)
+            const concatEncodeArgs = [
+              '-y',
+              '-nostdin',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              '-f',
+              'concat',
+              '-safe',
+              '0',
+              '-i',
+              concatListPath,
+              '-movflags',
+              '+faststart',
+              '-c:v',
+              'libx264',
+              '-preset',
+              ffPreset,
+              '-crf',
+              ffCrf,
+              '-threads',
+              '0',
+              '-pix_fmt',
+              'yuv420p'
+            ]
+            if (withAudio) concatEncodeArgs.push('-c:a', 'aac')
+            concatEncodeArgs.push(tmpOut)
+            await runFfmpeg(concatEncodeArgs)
+          }
+        } finally {
+          safeUnlink(concatListPath)
+          for (const filePath of segmentFiles) safeUnlink(filePath)
+        }
+      }
+
       try {
         if (hasSegments) {
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
@@ -3616,7 +3745,17 @@ const processJob = async (
           }
           if (!ran) {
             const reason = summarizeFfmpegError(lastErr)
-            throw new Error(`edited_render_failed:${reason}`)
+            try {
+              await runSegmentFileFallback(finalSegments)
+              ran = true
+              optimizationNotes.push(`Render fallback: segment-file stitch used (${reason}).`)
+            } catch (segmentFallbackErr) {
+              lastErr = segmentFallbackErr
+            }
+            if (!ran) {
+              const finalReason = summarizeFfmpegError(lastErr)
+              throw new Error(`edited_render_failed:${finalReason}`)
+            }
           }
         } else {
           const fallbackArgs = [
