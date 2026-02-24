@@ -79,7 +79,7 @@ router.get('/plan', async (req: any, res) => {
   res.json({
     tier,
     status: effectiveStatus,
-    currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
+    currentPeriodEnd: trial?.active ? trial.endsAt : subscription?.currentPeriodEnd ?? null,
     stripeCustomerId: subscription?.stripeCustomerId ?? null,
     stripeSubscriptionId: subscription?.stripeSubscriptionId ?? null,
     priceId: subscription?.priceId ?? null,
@@ -96,7 +96,7 @@ router.get('/subscription', async (req: any, res) => {
   res.json({
     plan: tier,
     status: effectiveStatus,
-    currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
+    currentPeriodEnd: trial?.active ? trial.endsAt : subscription?.currentPeriodEnd ?? null,
     features,
     subtitlePresets: SUBTITLE_PRESET_REGISTRY,
     trial
