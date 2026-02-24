@@ -354,6 +354,17 @@ const ZOOM_HARD_MAX = 1.15
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
 const STITCH_FADE_SEC = 0.08
+const MIN_RENDER_SEGMENT_SECONDS = 0.08
+const MERGE_ADJACENT_SEGMENT_GAP_SEC = 0.06
+const FILTER_TIME_DECIMALS = 3
+const MAX_RENDER_SEGMENTS = (() => {
+  const envValue = Number(process.env.MAX_RENDER_SEGMENTS || 180)
+  return Number.isFinite(envValue) && envValue > 0 ? Math.round(envValue) : 180
+})()
+const FILTER_COMPLEX_SCRIPT_THRESHOLD = (() => {
+  const envValue = Number(process.env.FILTER_COMPLEX_SCRIPT_THRESHOLD || 16_000)
+  return Number.isFinite(envValue) && envValue > 2_000 ? Math.round(envValue) : 16_000
+})()
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const SILENCE_KEEP_PADDING_SEC = 0.2
@@ -386,6 +397,11 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+const roundForFilter = (value: number, decimals: number = FILTER_TIME_DECIMALS) => {
+  if (!Number.isFinite(value)) return 0
+  return Number(value.toFixed(decimals))
+}
+const toFilterNumber = (value: number, decimals: number = FILTER_TIME_DECIMALS) => String(roundForFilter(value, decimals))
 
 const parseRenderMode = (value?: any): RenderMode => {
   const raw = String(value || '').trim().toLowerCase()
@@ -2218,6 +2234,77 @@ const applyZoomEasing = (segments: Segment[]) => {
   return eased
 }
 
+const normalizeSegmentForRender = (segment: Segment, durationSeconds: number): Segment | null => {
+  const rawStart = Number(segment.start)
+  const rawEnd = Number(segment.end)
+  if (!Number.isFinite(rawStart) || !Number.isFinite(rawEnd)) return null
+  const maxDuration = Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? durationSeconds
+    : Number.MAX_SAFE_INTEGER
+  const start = roundForFilter(clamp(Math.min(rawStart, rawEnd), 0, maxDuration))
+  const end = roundForFilter(clamp(Math.max(rawStart, rawEnd), 0, maxDuration))
+  if (end - start < MIN_RENDER_SEGMENT_SECONDS) return null
+  const speed = Number.isFinite(segment.speed) && Number(segment.speed) > 0
+    ? clamp(Number(segment.speed), 0.25, 4)
+    : 1
+  const zoom = Number.isFinite(segment.zoom)
+    ? clamp(Number(segment.zoom), 0, ZOOM_HARD_MAX - 1)
+    : 0
+  const brightness = Number.isFinite(segment.brightness)
+    ? clamp(Number(segment.brightness), -0.45, 0.45)
+    : 0
+  return { ...segment, start, end, speed, zoom, brightness }
+}
+
+const mergeSegmentsToLimitCount = (segments: Segment[], maxSegments: number) => {
+  if (segments.length <= maxSegments) return segments
+  const merged = segments.map((seg) => ({ ...seg }))
+  while (merged.length > maxSegments && merged.length > 1) {
+    let mergeIdx = 0
+    let bestGap = Number.POSITIVE_INFINITY
+    for (let i = 0; i < merged.length - 1; i += 1) {
+      const gap = Math.max(0, merged[i + 1].start - merged[i].end)
+      if (gap < bestGap) {
+        bestGap = gap
+        mergeIdx = i
+      }
+    }
+    const left = merged[mergeIdx]
+    const right = merged[mergeIdx + 1]
+    merged.splice(mergeIdx, 2, {
+      start: left.start,
+      end: right.end,
+      speed: 1,
+      zoom: 0,
+      brightness: 0
+    })
+  }
+  return merged
+}
+
+const prepareSegmentsForRender = (segments: Segment[], durationSeconds: number) => {
+  const normalized = segments
+    .map((segment) => normalizeSegmentForRender(segment, durationSeconds))
+    .filter((segment): segment is Segment => Boolean(segment))
+    .sort((a, b) => a.start - b.start)
+  if (!normalized.length) return normalized
+  const compacted: Segment[] = [{ ...normalized[0] }]
+  for (let i = 1; i < normalized.length; i += 1) {
+    const next = normalized[i]
+    const prev = compacted[compacted.length - 1]
+    const gap = next.start - prev.end
+    if (gap <= MERGE_ADJACENT_SEGMENT_GAP_SEC) {
+      prev.end = roundForFilter(Math.max(prev.end, next.end))
+      prev.speed = 1
+      prev.zoom = 0
+      prev.brightness = 0
+      continue
+    }
+    compacted.push({ ...next })
+  }
+  return mergeSegmentsToLimitCount(compacted, MAX_RENDER_SEGMENTS)
+}
+
 const buildAtempoChain = (speed: number) => {
   if (!Number.isFinite(speed) || speed === 1) return ''
   const chain: number[] = []
@@ -2253,10 +2340,10 @@ const buildConcatFilter = (
     const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
     const zoom = seg.zoom && seg.zoom > 0 ? seg.zoom : 0
     const brightness = seg.brightness && seg.brightness !== 0 ? seg.brightness : 0
-    const segDuration = Math.max(0.01, (seg.end - seg.start) / speed)
+    const segDuration = Math.max(0.01, roundForFilter((seg.end - seg.start) / speed))
     durations.push(segDuration)
-    const vTrim = `trim=start=${seg.start}:end=${seg.end}`
-    const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${speed}` : ',setpts=PTS-STARTPTS'
+    const vTrim = `trim=start=${toFilterNumber(seg.start)}:end=${toFilterNumber(seg.end)}`
+    const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : ',setpts=PTS-STARTPTS'
     const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
     const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
     parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
@@ -2264,16 +2351,16 @@ const buildConcatFilter = (
     if (opts.withAudio) {
       const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
       const aNormalize = 'aformat=sample_rates=48000:channel_layouts=stereo'
-      const fadeLen = 0.04
-      const afadeIn = `afade=t=in:st=0:d=${fadeLen}`
-      const afadeOut = `afade=t=out:st=${Math.max(0, segDuration - fadeLen)}:d=${fadeLen}`
+      const fadeLen = roundForFilter(0.04)
+      const afadeIn = `afade=t=in:st=0:d=${toFilterNumber(fadeLen)}`
+      const afadeOut = `afade=t=out:st=${toFilterNumber(Math.max(0, segDuration - fadeLen))}:d=${toFilterNumber(fadeLen)}`
       if (opts.hasAudioStream) {
-        const guard = 0.04
-        const aTrim = `atrim=start=${Math.max(0, seg.start - guard)}:end=${seg.end + guard}`
+        const guard = roundForFilter(0.04)
+        const aTrim = `atrim=start=${toFilterNumber(Math.max(0, seg.start - guard))}:end=${toFilterNumber(seg.end + guard)}`
         const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize].filter(Boolean).join(',')
         parts.push(`[0:a]${chain}[a${idx}]`)
       } else {
-        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${segDuration}`, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize]
+        const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${toFilterNumber(segDuration)}`, 'asetpts=PTS-STARTPTS', aSpeed, afadeIn, afadeOut, aNormalize]
           .filter(Boolean)
           .join(',')
         parts.push(`${chain}[a${idx}]`)
@@ -2298,9 +2385,9 @@ const buildConcatFilter = (
   let vPrev = `v0`
   for (let i = 1; i < segments.length; i += 1) {
     const fade = Math.min(STITCH_FADE_SEC, (durations[i - 1] || STITCH_FADE_SEC) / 2, (durations[i] || STITCH_FADE_SEC) / 2)
-    const offset = Math.max(0, Number((cumulative - fade).toFixed(3)))
+    const offset = Math.max(0, roundForFilter(cumulative - fade))
     const outLabel = `vx${i}`
-    parts.push(`[${vPrev}][v${i}]xfade=transition=fade:duration=${fade}:offset=${offset}[${outLabel}]`)
+    parts.push(`[${vPrev}][v${i}]xfade=transition=fade:duration=${toFilterNumber(fade)}:offset=${toFilterNumber(offset)}[${outLabel}]`)
     fades.push(fade)
     vPrev = outLabel
     cumulative += (durations[i] || 0) - fade
@@ -2311,7 +2398,7 @@ const buildConcatFilter = (
     for (let i = 1; i < segments.length; i += 1) {
       const fade = fades[i - 1] ?? STITCH_FADE_SEC
       const outLabel = `ax${i}`
-      parts.push(`[${aPrev}][a${i}]acrossfade=d=${fade}:c1=tri:c2=tri[${outLabel}]`)
+      parts.push(`[${aPrev}][a${i}]acrossfade=d=${toFilterNumber(fade)}:c1=tri:c2=tri[${outLabel}]`)
       aPrev = outLabel
     }
     parts.push(`[${vPrev}]format=yuv420p[outv]`)
@@ -2453,7 +2540,7 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
 const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
   const width = opts?.width ?? 960
   const height = opts?.height ?? 540
-  const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+  const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease:eval=frame,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
   const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'copy', outPath]
   await runFfmpeg(args)
 }
@@ -2477,14 +2564,14 @@ const buildVerticalClipRanges = (durationSeconds: number, requestedCount: number
 const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
   if (fit === 'cover') {
     return [
-      `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+      `scale=${width}:${height}:force_original_aspect_ratio=increase:eval=frame`,
       `crop=${width}:${height}`,
       'setsar=1',
       'format=yuv420p'
     ].join(',')
   }
   return [
-    `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+    `scale=${width}:${height}:force_original_aspect_ratio=decrease:eval=frame`,
     `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
     'setsar=1',
     'format=yuv420p'
@@ -3265,6 +3352,18 @@ const processJob = async (
         optimizationNotes = [...optimizationNotes, ...bestRetention.notes]
       }
 
+      const plannedSegmentCount = finalSegments.length
+      finalSegments = prepareSegmentsForRender(finalSegments, durationSeconds)
+      if (finalSegments.length !== plannedSegmentCount) {
+        optimizationNotes.push(
+          `Render stabilization adjusted segments (${plannedSegmentCount} -> ${finalSegments.length}) for long-form reliability.`
+        )
+      }
+      if (!finalSegments.length) {
+        await updateJob(jobId, { status: 'failed', error: 'no_renderable_segments' })
+        throw new Error('no_renderable_segments')
+      }
+
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
@@ -3322,6 +3421,33 @@ const processJob = async (
         return combined.length > 200 ? combined.slice(0, 200) : combined
       }
 
+      const runFfmpegWithFilter = async (
+        argsPrefix: string[],
+        filter: string,
+        mapArgs: string[],
+        outputPath: string,
+        label: string
+      ) => {
+        const args = [...argsPrefix]
+        let filterScriptPath: string | null = null
+        if (filter.length > FILTER_COMPLEX_SCRIPT_THRESHOLD) {
+          filterScriptPath = path.join(workDir, `filter-${label}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.txt`)
+          fs.writeFileSync(filterScriptPath, filter)
+          args.push('-filter_complex_script', filterScriptPath)
+        } else {
+          args.push('-filter_complex', filter)
+        }
+        args.push(...mapArgs, outputPath)
+        try {
+          await runFfmpeg(args)
+        } catch (err) {
+          logFfmpegFailure(label, args, err)
+          throw err
+        } finally {
+          safeUnlink(filterScriptPath)
+        }
+      }
+
       try {
         if (hasSegments) {
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
@@ -3350,15 +3476,9 @@ const processJob = async (
             const filter = filterParts.join(';')
             const videoMap = videoChain ? '[vout]' : '[outv]'
             const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
-            const args = [...argsWithWatermark, '-filter_complex', filter, '-map', videoMap]
-            if (audioMap) args.push('-map', audioMap)
-            const fullArgs = [...args, tmpOut]
-            try {
-              await runFfmpeg(fullArgs)
-            } catch (err) {
-              logFfmpegFailure('concat', fullArgs, err)
-              throw err
-            }
+            const mapArgs = ['-map', videoMap]
+            if (audioMap) mapArgs.push('-map', audioMap)
+            await runFfmpegWithFilter(argsWithWatermark, filter, mapArgs, tmpOut, 'concat')
           }
 
           let lastErr: any = null
@@ -3404,21 +3524,33 @@ const processJob = async (
         processed = true
       } catch (err) {
         processed = false
-        const emergencyArgs = [
-          ...argsBase,
-          '-vf',
-          buildFrameFitFilter(horizontalFit, target.width, target.height),
-          tmpOut
-        ]
-        try {
-          await runFfmpeg(emergencyArgs)
-          processed = true
-          const reason = summarizeFfmpegError(err)
-          optimizationNotes.push(`Emergency fallback render used (${reason}).`)
-        } catch (emergencyErr) {
-          logFfmpegFailure('emergency', emergencyArgs, emergencyErr)
-          throw err
+        const reason = summarizeFfmpegError(err)
+        if (hasSegments && finalSegments.length) {
+          const emergencySegments = prepareSegmentsForRender(
+            finalSegments.map((segment) => ({ ...segment, speed: 1, zoom: 0, brightness: 0 })),
+            durationSeconds
+          )
+          if (emergencySegments.length) {
+            const emergencyFilter = buildConcatFilter(emergencySegments, {
+              withAudio,
+              hasAudioStream: hasAudio,
+              targetWidth: target.width,
+              targetHeight: target.height,
+              fit: horizontalFit,
+              enableFades: false
+            })
+            const emergencyMapArgs = ['-map', '[outv]']
+            if (withAudio) emergencyMapArgs.push('-map', '[outa]')
+            try {
+              await runFfmpegWithFilter(argsBase, emergencyFilter, emergencyMapArgs, tmpOut, 'emergency-edited')
+              processed = true
+              optimizationNotes.push(`Emergency edited fallback render used (${reason}).`)
+            } catch {
+              throw err
+            }
+          }
         }
+        if (!processed) throw err
       }
     }
 

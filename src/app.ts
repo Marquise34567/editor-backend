@@ -33,6 +33,30 @@ const parseOriginList = (value?: string | null) =>
     .map((item) => item.trim().replace(/\/+$/, ''))
     .filter(Boolean)
 
+const normalizeOrigin = (value?: string | null) => {
+  if (!value) return null
+  const trimmed = String(value).trim().replace(/\/+$/, '')
+  if (!trimmed) return null
+  try {
+    const parsed = new URL(trimmed)
+    const protocol = parsed.protocol.toLowerCase()
+    const hostname = parsed.hostname.toLowerCase()
+    const port = parsed.port
+    const hasDefaultPort = (protocol === 'https:' && (!port || port === '443'))
+      || (protocol === 'http:' && (!port || port === '80'))
+    return `${protocol}//${hostname}${hasDefaultPort ? '' : `:${port}`}`
+  } catch {
+    return trimmed.toLowerCase()
+  }
+}
+
+const normalizeHostSuffix = (value?: string | null) =>
+  String(value || '')
+    .trim()
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '')
+    .toLowerCase()
+
 const envOrigins = parseOriginList(process.env.CORS_ALLOWED_ORIGINS)
   .concat(parseOriginList(process.env.FRONTEND_URL))
   .concat(parseOriginList(process.env.APP_URL))
@@ -49,29 +73,55 @@ const allowedOrigins = [
   'http://127.0.0.1:8080',
   ...envOrigins
 ]
+const allowedOriginSet = new Set(
+  allowedOrigins
+    .map((origin) => normalizeOrigin(origin))
+    .filter((origin): origin is string => Boolean(origin))
+)
 
-const vercelSuffixes = parseOriginList(process.env.CORS_VERCEL_SUFFIXES).concat([
-  '-quises-projects-89577714.vercel.app'
-])
+const vercelSuffixes = parseOriginList(process.env.CORS_VERCEL_SUFFIXES)
+  .concat(['-quises-projects-89577714.vercel.app'])
+  .map((suffix) => normalizeHostSuffix(suffix))
+  .filter(Boolean)
+const AUTOEDITOR_ROOT_DOMAIN = 'autoeditor.app'
 
 const isAllowedVercelOrigin = (origin: string) => {
   try {
     const url = new URL(origin)
     if (url.protocol !== 'https:') return false
     const host = url.hostname.toLowerCase()
-    return vercelSuffixes.some((suffix) => host.endsWith(String(suffix).toLowerCase()))
+    return vercelSuffixes.some((suffix) => host.endsWith(suffix))
   } catch {
     return false
   }
+}
+
+const isAllowedAutoeditorOrigin = (origin: string) => {
+  try {
+    const url = new URL(origin)
+    if (url.protocol !== 'https:') return false
+    const host = url.hostname.toLowerCase()
+    return host === AUTOEDITOR_ROOT_DOMAIN || host.endsWith(`.${AUTOEDITOR_ROOT_DOMAIN}`)
+  } catch {
+    return false
+  }
+}
+
+const isAllowedOrigin = (origin?: string | null) => {
+  if (!origin) return true
+  const normalized = normalizeOrigin(origin)
+  if (!normalized) return false
+  if (allowedOriginSet.has(normalized)) return true
+  if (isAllowedAutoeditorOrigin(normalized)) return true
+  if (isAllowedVercelOrigin(normalized)) return true
+  return false
 }
 
 // Central origin check used by CORS middleware (handles null/undefined origin safely)
 const originCallback = (origin: any, cb: any) => {
   try {
     // Allow requests with no origin (server-to-server, curl, etc.)
-    if (!origin) return cb(null, true)
-    if (allowedOrigins.includes(origin)) return cb(null, true)
-    if (isAllowedVercelOrigin(origin)) return cb(null, true)
+    if (isAllowedOrigin(origin)) return cb(null, true)
     // Build a CORS-specific error so downstream error middleware can respond safely
     const err: any = new Error('Not allowed by CORS')
     err.type = 'cors'
@@ -85,16 +135,37 @@ const originCallback = (origin: any, cb: any) => {
 }
 
 // Register CORS globally before routes
+const CORS_METHODS = ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS']
+const CORS_EXPOSE_HEADERS = ['x-request-id', 'etag']
 app.use(cors({
   origin: originCallback,
   credentials: true,
-  allowedHeaders: ['Authorization', 'Content-Type', 'Accept'],
-  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: CORS_METHODS,
+  exposedHeaders: CORS_EXPOSE_HEADERS,
+  maxAge: 86400,
   optionsSuccessStatus: 204
 }))
 
 // Ensure OPTIONS preflight responses are handled quickly for all routes using same origin logic
-app.options('*', cors({ origin: originCallback, credentials: true, optionsSuccessStatus: 204 }))
+app.options('*', cors({
+  origin: originCallback,
+  credentials: true,
+  methods: CORS_METHODS,
+  maxAge: 86400,
+  optionsSuccessStatus: 204
+}))
+
+// Ensure CORS headers are present on downstream 401/4xx responses for allowed browser origins.
+app.use((req, res, next) => {
+  const origin = req.get('origin')
+  if (origin && isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Access-Control-Allow-Credentials', 'true')
+    res.setHeader('Access-Control-Expose-Headers', CORS_EXPOSE_HEADERS.join(','))
+    res.setHeader('Vary', 'Origin')
+  }
+  next()
+})
 
 app.use((req, res, next) => {
   const id = crypto.randomUUID().slice(0, 12)
