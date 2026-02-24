@@ -8411,7 +8411,9 @@ const processJob = async (
       patternInterruptCount: selectedPatternInterruptCount,
       patternInterruptDensity: selectedPatternInterruptDensity,
       boredomRemovedRatio: selectedBoredomRemovalRatio,
-      qualityGateOverride
+      qualityGateOverride,
+      optimizationNotes,
+      hookSelectionSource: selectedHookSelectionSource
     })
 
     const nextAnalysis = buildPersistedRenderAnalysis({
@@ -8426,6 +8428,7 @@ const processJob = async (
         hook_text: selectedHook?.text ?? (job.analysis as any)?.hook_text ?? null,
         hook_reason: selectedHook?.reason ?? (job.analysis as any)?.hook_reason ?? null,
         hook_synthetic: selectedHook?.synthetic ?? (job.analysis as any)?.hook_synthetic ?? false,
+        hook_selection_source: selectedHookSelectionSource,
         selected_strategy: selectedStrategy,
         retention_attempts: retentionAttempts,
         retention_judge: selectedJudge,
@@ -9310,6 +9313,28 @@ router.post('/:id/process', async (req: any, res) => {
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: getRetentionAggressionFromJob(job)
     })
+    const hasPreferredHookPayload =
+      req.body?.preferredHook !== undefined ||
+      req.body?.selectedHook !== undefined
+    const preferredHookPayload = parsePreferredHookCandidateFromPayload(
+      req.body?.preferredHook ?? req.body?.selectedHook
+    )
+    const availableHookCandidates = normalizeStoredHookCandidates(
+      (job.analysis as any)?.hook_variants ||
+      (job.analysis as any)?.hook_candidates ||
+      (job.analysis as any)?.editPlan?.hookVariants ||
+      (job.analysis as any)?.editPlan?.hookCandidates
+    )
+    const preferredHookCandidate = matchPreferredHookCandidate({
+      preferred: preferredHookPayload,
+      candidates: availableHookCandidates
+    })
+    if (hasPreferredHookPayload && !preferredHookCandidate) {
+      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    }
+    if (preferredHookCandidate) {
+      options.preferredHookCandidate = preferredHookCandidate
+    }
     if (req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel) {
       const overrideLevel = parseRetentionAggressionLevel(req.body?.retentionLevel || req.body?.retentionAggressionLevel || req.body?.aggressionLevel)
       options.retentionAggressionLevel = overrideLevel
@@ -9352,6 +9377,90 @@ router.post('/:id/process', async (req: any, res) => {
       // ignore
     }
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/reprocess', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+
+    const user = await getOrCreateUser(req.user.id, req.user?.email)
+    const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
+    const hasAggressionOverride =
+      req.body?.retentionLevel !== undefined ||
+      req.body?.retentionAggressionLevel !== undefined ||
+      req.body?.aggressionLevel !== undefined
+    const requestedAggressionLevel = hasAggressionOverride
+      ? getRetentionAggressionFromPayload(req.body)
+      : getRetentionAggressionFromJob(job)
+
+    const hasPreferredHookPayload =
+      req.body?.preferredHook !== undefined ||
+      req.body?.selectedHook !== undefined
+    const preferredHookPayload = parsePreferredHookCandidateFromPayload(
+      req.body?.preferredHook ?? req.body?.selectedHook
+    )
+    const availableHookCandidates = normalizeStoredHookCandidates(
+      (job.analysis as any)?.hook_variants ||
+      (job.analysis as any)?.hook_candidates ||
+      (job.analysis as any)?.editPlan?.hookVariants ||
+      (job.analysis as any)?.editPlan?.hookCandidates
+    )
+    const preferredHookCandidate = matchPreferredHookCandidate({
+      preferred: preferredHookPayload,
+      candidates: availableHookCandidates
+    })
+    if (hasPreferredHookPayload && !preferredHookCandidate) {
+      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    }
+
+    const nextRenderSettings = {
+      ...((job as any)?.renderSettings || {}),
+      retentionAggressionLevel: requestedAggressionLevel,
+      retentionLevel: requestedAggressionLevel
+    }
+    const nextAnalysis = {
+      ...((job.analysis as any) || {}),
+      retentionAggressionLevel: requestedAggressionLevel,
+      retentionLevel: requestedAggressionLevel,
+      preferred_hook: preferredHookCandidate ?? null,
+      preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
+    }
+
+    const priorityLevel = Number(job.priorityLevel ?? 2) || 2
+    await updateJob(id, {
+      status: 'queued',
+      progress: 1,
+      error: null,
+      requestedQuality: requestedQuality || job.requestedQuality,
+      outputPath: null,
+      renderSettings: nextRenderSettings,
+      analysis: nextAnalysis,
+      priorityLevel
+    })
+
+    enqueuePipeline({
+      jobId: id,
+      user: { id: user.id, email: user.email },
+      requestedQuality: requestedQuality as ExportQuality | undefined,
+      requestId: req.requestId,
+      priorityLevel
+    })
+    return res.json({
+      ok: true,
+      queued: true,
+      preferredHook: preferredHookCandidate
+        ? {
+            start: preferredHookCandidate.start,
+            duration: preferredHookCandidate.duration
+          }
+        : null
+    })
+  } catch (err) {
+    console.error('reprocess error', err)
+    return res.status(500).json({ error: 'server_error' })
   }
 })
 
