@@ -9385,6 +9385,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const id = req.params.id
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const status = String(job.status || '').toLowerCase()
+    if (status !== 'completed' && status !== 'failed') {
+      return res.status(409).json({ error: 'job_not_ready_for_reprocess' })
+    }
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
