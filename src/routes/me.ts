@@ -14,7 +14,7 @@ router.get('/', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
   const user = await getOrCreateUser(id, req.user?.email)
-  const { subscription, tier, plan } = await getUserPlan(id)
+  const { subscription, tier, plan, trial } = await getUserPlan(id)
   const month = getMonthKey()
   const usage = await getUsageForMonth(id, month)
   const horizontalModeUsage = await getRenderModeUsageForMonth(id, 'horizontal')
@@ -29,9 +29,16 @@ router.get('/', async (req: any, res) => {
           tier,
           status: subscription.status,
           currentPeriodEnd: subscription.currentPeriodEnd,
-          cancelAtPeriodEnd: subscription.cancelAtPeriodEnd
+          cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
+          trial
         }
-      : { tier: 'free', status: 'free', currentPeriodEnd: null, cancelAtPeriodEnd: false },
+      : {
+          tier,
+          status: trial?.active ? 'trial' : 'free',
+          currentPeriodEnd: trial?.active ? trial.endsAt : null,
+          cancelAtPeriodEnd: false,
+          trial
+        },
     flags: { dev: isDev },
     usage: {
       month,
@@ -60,28 +67,30 @@ router.get('/', async (req: any, res) => {
 router.get('/plan', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
-  const { subscription, tier } = await getUserPlan(id)
+  const { subscription, tier, trial } = await getUserPlan(id)
   res.json({
     tier,
-    status: subscription?.status ?? 'free',
-    currentPeriodEnd: subscription?.currentPeriodEnd ?? null,
+    status: subscription?.status ?? (trial?.active ? 'trial' : 'free'),
+    currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
     stripeCustomerId: subscription?.stripeCustomerId ?? null,
     stripeSubscriptionId: subscription?.stripeSubscriptionId ?? null,
-    priceId: subscription?.priceId ?? null
+    priceId: subscription?.priceId ?? null,
+    trial
   })
 })
 
 router.get('/subscription', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
-  const { subscription, tier } = await getUserPlan(id)
+  const { subscription, tier, trial } = await getUserPlan(id)
   const features = getPlanFeatures(tier)
   res.json({
     plan: tier,
-    status: subscription?.status ?? 'free',
-    currentPeriodEnd: subscription?.currentPeriodEnd ?? null,
+    status: subscription?.status ?? (trial?.active ? 'trial' : 'free'),
+    currentPeriodEnd: subscription?.currentPeriodEnd ?? (trial?.active ? trial.endsAt : null),
     features,
-    subtitlePresets: SUBTITLE_PRESET_REGISTRY
+    subtitlePresets: SUBTITLE_PRESET_REGISTRY,
+    trial
   })
 })
 

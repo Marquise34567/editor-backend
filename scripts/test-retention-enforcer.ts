@@ -137,16 +137,17 @@ const run = () => {
   assert.ok(reactionAggression === 'high' || reactionAggression === 'viral', 'reaction profile should elevate aggression level')
   const basePacing = {
     niche: 'story',
-    minLen: 4.8,
-    maxLen: 8.2,
-    earlyTarget: 5.1,
-    middleTarget: 6.1,
-    lateTarget: 5.2,
+    minLen: 5.8,
+    maxLen: 8.4,
+    earlyTarget: 6.0,
+    middleTarget: 6.6,
+    lateTarget: 6.1,
     jitter: 0.24,
     speedCap: 1.32
   }
   const reactionPacing = applyStyleToPacingProfile(basePacing as any, reactionProfile, true)
-  assert.ok(reactionPacing.minLen < basePacing.minLen, 'reaction style should tighten minimum segment length')
+  assert.ok(reactionPacing.minLen >= 5 && reactionPacing.minLen <= 8, 'reaction style should keep minimum segment length in 5-8s window')
+  assert.ok(reactionPacing.maxLen >= reactionPacing.minLen && reactionPacing.maxLen <= 8, 'reaction style should keep max segment length in 5-8s window')
   assert.ok(reactionPacing.speedCap >= basePacing.speedCap, 'reaction style should allow equal or higher speed cap')
 
   // 1d) Rhythm alignment should snap near-beat boundaries without breaking segment continuity.

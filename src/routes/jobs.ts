@@ -378,6 +378,12 @@ const getTargetDimensions = (quality?: ExportQuality | null) => {
 }
 
 type TimeRange = { start: number; end: number }
+type AudioStreamProfile = {
+  channels: number
+  channelLayout: string | null
+  sampleRate: number | null
+  bitRate: number | null
+}
 type Segment = {
   start: number
   end: number
@@ -635,13 +641,13 @@ const HOOK_MIN = 5
 const HOOK_MAX = 8
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
-const CUT_MIN = 2
-const CUT_MAX = 5
+const CUT_MIN = 5
+const CUT_MAX = 8
 const PACE_MIN = 5
-const PACE_MAX = 10
+const PACE_MAX = 8
 const CUT_GUARD_SEC = 0.35
-const CUT_LEN_PATTERN = [2.8, 3.8, 3.2, 4.2]
-const CUT_GAP_PATTERN = [0.9, 1.3, 1.0, 0.7]
+const CUT_LEN_PATTERN = [5.2, 6.1, 5.8, 7.1]
+const CUT_GAP_PATTERN = [1.3, 1.8, 1.5, 1.2]
 const MAX_CUT_RATIO = 0.68
 const AGGRESSIVE_MAX_CUT_RATIO = 0.74
 const AGGRESSIVE_CUT_GAP_MULTIPLIER = 0.78
@@ -669,6 +675,7 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MAX_VERTICAL_CLIPS = 3
 const MIN_VERTICAL_CLIP_SECONDS = 8
+const MAX_VERTICAL_CLIP_SECONDS = 55
 const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
 const LONG_FORM_MIN_EDIT_SECONDS = 20
@@ -2088,6 +2095,60 @@ const hasAudioStream = (filePath: string) => {
   }
 }
 
+let cachedFfmpegFilterCatalog: string | null = null
+const hasFfmpegFilter = (name: string) => {
+  if (!name || !hasFfmpeg()) return false
+  try {
+    if (cachedFfmpegFilterCatalog === null) {
+      const result = spawnSync(FFMPEG_PATH, ['-hide_banner', '-filters'], { encoding: 'utf8' })
+      if (result.status !== 0) return false
+      cachedFfmpegFilterCatalog = String(result.stdout || '')
+    }
+    const pattern = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+    return pattern.test(cachedFfmpegFilterCatalog)
+  } catch (e) {
+    return false
+  }
+}
+
+const probeAudioStream = (filePath: string): AudioStreamProfile | null => {
+  if (!hasFfprobe()) return null
+  try {
+    const result = spawnSync(
+      FFPROBE_PATH,
+      [
+        '-v',
+        'error',
+        '-select_streams',
+        'a:0',
+        '-show_entries',
+        'stream=channels,channel_layout,sample_rate,bit_rate',
+        '-of',
+        'json',
+        filePath
+      ],
+      { encoding: 'utf8' }
+    )
+    if (result.status !== 0) return null
+    const parsed = JSON.parse(String(result.stdout || '{}'))
+    const stream = Array.isArray(parsed?.streams) ? parsed.streams[0] : null
+    if (!stream) return null
+    const channels = Number(stream.channels)
+    const sampleRateRaw = Number(stream.sample_rate)
+    const bitRateRaw = Number(stream.bit_rate)
+    return {
+      channels: Number.isFinite(channels) && channels > 0 ? Math.round(channels) : 2,
+      channelLayout: typeof stream.channel_layout === 'string' && stream.channel_layout.trim()
+        ? String(stream.channel_layout).trim().toLowerCase()
+        : null,
+      sampleRate: Number.isFinite(sampleRateRaw) && sampleRateRaw > 0 ? Math.round(sampleRateRaw) : null,
+      bitRate: Number.isFinite(bitRateRaw) && bitRateRaw > 0 ? Math.round(bitRateRaw) : null
+    }
+  } catch (e) {
+    return null
+  }
+}
+
 const probeVideoStream = (filePath: string) => {
   if (!hasFfprobe()) return null
   try {
@@ -2327,8 +2388,9 @@ const applyStyleToPacingProfile = (
   const weight = clamp01(styleProfile.confidence)
   const tempoShift = styleProfile.tempoBias * (0.65 + 0.35 * weight)
   const interruptShift = styleProfile.interruptBias * (0.7 + 0.3 * weight)
-  const adjustedMin = clamp(profile.minLen + tempoShift, 3.2, 9)
-  const adjustedMax = clamp(profile.maxLen + tempoShift * 1.25, adjustedMin + 0.8, 11.5)
+  const adjustedMin = clamp(profile.minLen + tempoShift, CUT_MIN, CUT_MAX - 0.4)
+  const adjustedMaxLower = Math.min(CUT_MAX - 0.1, Math.max(CUT_MIN + 0.5, adjustedMin + 0.6))
+  const adjustedMax = clamp(profile.maxLen + tempoShift * 1.25, adjustedMaxLower, CUT_MAX)
   const adjustedJitter = clamp(profile.jitter + interruptShift * 0.16, 0.12, 0.52)
   const adjustedSpeedCap = clamp(
     profile.speedCap + (aggressiveMode ? 0.03 : 0) - tempoShift * 0.06 + interruptShift * 0.05,
@@ -3307,6 +3369,35 @@ const scoreHookFaceoffCandidate = ({
   windows: EngagementWindow[]
   hookCalibration?: HookCalibrationProfile | null
 }) => {
+  const computeEmotionalHookPull = (start: number, end: number) => {
+    const duration = Math.max(0.5, end - start)
+    const earlyEnd = start + duration * 0.38
+    const lateStart = start + duration * 0.62
+    const earlyEmotion = averageWindowMetric(windows, start, earlyEnd, (window) => (
+      0.5 * window.emotionIntensity +
+      0.25 * window.vocalExcitement +
+      0.25 * (window.curiosityTrigger ?? 0)
+    ))
+    const lateEmotion = averageWindowMetric(windows, lateStart, end, (window) => (
+      0.54 * window.emotionIntensity +
+      0.24 * window.vocalExcitement +
+      0.12 * (window.actionSpike ?? 0) +
+      0.1 * window.sceneChangeRate
+    ))
+    const peakEmotion = averageWindowMetric(windows, start, end, (window) => (
+      0.48 * window.emotionIntensity +
+      0.2 * window.vocalExcitement +
+      0.14 * (window.actionSpike ?? 0) +
+      0.1 * (window.curiosityTrigger ?? 0) +
+      0.08 * window.motionScore
+    ))
+    const emotionalRamp = clamp01((lateEmotion - earlyEmotion) * 0.9 + 0.5)
+    return clamp01(
+      0.5 * peakEmotion +
+      0.32 * emotionalRamp +
+      0.18 * clamp01(Math.max(0, lateEmotion - earlyEmotion) * 1.35)
+    )
+  }
   const weights = normalizeHookCalibrationWeights(
     hookCalibration?.weights || DEFAULT_HOOK_FACEOFF_WEIGHTS
   )
@@ -3321,15 +3412,20 @@ const scoreHookFaceoffCandidate = ({
     0.6 * (window.curiosityTrigger ?? 0) +
     0.4 * (window.keywordIntensity ?? 0)
   ))
+  const emotionalPull = computeEmotionalHookPull(start, end)
   const emotionalSpike = averageWindowMetric(windows, start, end, (window) => (
-    0.7 * window.emotionIntensity + 0.3 * window.motionScore
+    0.48 * window.emotionIntensity +
+    0.16 * window.motionScore +
+    0.16 * (window.actionSpike ?? 0) +
+    0.2 * emotionalPull
   ))
   const faceoffScore = clamp01(
     weights.candidateScore * candidate.score +
     weights.auditScore * candidate.auditScore +
     weights.energy * energy +
     weights.curiosity * curiosity +
-    weights.emotionalSpike * emotionalSpike
+    weights.emotionalSpike * emotionalSpike +
+    0.12 * emotionalPull
   )
   return Number(faceoffScore.toFixed(4))
 }
@@ -3385,6 +3481,13 @@ const pickTopHookCandidates = ({
         0.25 * window.textDensity
       ))
       const emotionImpact = averageWindowMetric(windows, aligned.start, aligned.end, (window) => window.emotionIntensity)
+      const emotionalHookPull = averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
+        0.42 * window.emotionIntensity +
+        0.2 * window.vocalExcitement +
+        0.18 * (window.actionSpike ?? 0) +
+        0.1 * (window.curiosityTrigger ?? 0) +
+        0.1 * window.sceneChangeRate
+      ))
       const durationSecondsActual = aligned.end - aligned.start
       const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 8) / 3))
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
@@ -3395,13 +3498,14 @@ const pickTopHookCandidates = ({
         windows
       })
       const totalScore = clamp01(
-        0.28 * baseHookScore +
-        0.2 * speechImpact +
-        0.16 * transcriptImpact +
-        0.14 * visualImpact +
-        0.11 * emotionImpact +
-        0.07 * durationAlignment +
-        0.14 * audit.auditScore -
+        0.22 * baseHookScore +
+        0.16 * speechImpact +
+        0.15 * transcriptImpact +
+        0.11 * visualImpact +
+        0.16 * emotionImpact +
+        0.14 * emotionalHookPull +
+        0.06 * durationAlignment +
+        0.16 * audit.auditScore -
         0.2 * contextPenalty
       )
       evaluated.push({
@@ -4259,12 +4363,13 @@ const buildStrategicFallbackCuts = (windows: EngagementWindow[], durationSeconds
   const minDuration = aggressiveMode ? 35 : 40
   if (!windows.length || durationSeconds < minDuration) return [] as TimeRange[]
   const edgePadding = aggressiveMode ? 7 : 8
-  const cutHalfLength = aggressiveMode ? 2.8 : 2.5
+  const cutLead = aggressiveMode ? 2.4 : 2.2
+  const cutTail = aggressiveMode ? 4.2 : 3.8
   const candidates = windows
     .filter((window) => window.time >= edgePadding && window.time <= Math.max(edgePadding, durationSeconds - 6))
     .map((window) => ({
-      start: Math.max(0, window.time - 1),
-      end: Math.min(durationSeconds, window.time + cutHalfLength),
+      start: Math.max(0, window.time - cutLead),
+      end: Math.min(durationSeconds, window.time + cutTail),
       score:
         0.58 * window.score +
         0.16 * window.speechIntensity +
@@ -4317,7 +4422,7 @@ const buildLongFormRescueCuts = (
     return [] as TimeRange[]
   }
   const edgePadding = aggressiveMode ? 6 : 8
-  const cutLength = aggressiveMode ? 3.5 : 3.1
+  const cutLength = aggressiveMode ? 6.1 : 5.6
   const minSpacing = aggressiveMode ? 8.5 : 10.5
   const existing = mergeRanges(existingCuts)
   const candidates = windows
@@ -4338,11 +4443,11 @@ const buildLongFormRescueCuts = (
         score: engagementCost
       }
     })
-    .filter((entry) => entry.end - entry.start >= (aggressiveMode ? 1.9 : 2.2))
+    .filter((entry) => entry.end - entry.start >= CUT_MIN - 0.4)
     .sort((a, b) => a.score - b.score)
 
   const targetCuts = clamp(
-    Math.ceil(missingSeconds / Math.max(1.8, cutLength - 0.2)),
+    Math.ceil(missingSeconds / Math.max(CUT_MIN - 0.4, cutLength - 0.2)),
     1,
     Math.max(4, Math.floor(durationSeconds / (aggressiveMode ? 20 : 24)))
   )
@@ -4372,7 +4477,7 @@ const buildConservativeFallbackSegments = (durationSeconds: number, aggressiveMo
   const base: Segment[] = [{ start: 0, end: Number(total.toFixed(3)), speed: 1 }]
   if (total < LONG_FORM_RESCUE_MIN_DURATION) return base
 
-  const cutLength = aggressiveMode ? 2.9 : 2.4
+  const cutLength = aggressiveMode ? 5.6 : 5.1
   const spacing = aggressiveMode ? 42 : 55
   const startOffset = aggressiveMode ? 12 : 14
   const edgePadding = aggressiveMode ? 6 : 8
@@ -4656,8 +4761,8 @@ const inferPacingProfile = (
   const base = profiles[niche]
   const shortFormFactor = durationSeconds < 55 ? 0.7 : durationSeconds < 90 ? 0.35 : 0
   const aggressiveShift = aggressiveMode ? 0.55 : 0
-  const minLen = Number(clamp(base.minLen - aggressiveShift * 0.6 - shortFormFactor * 0.2, 3.8, PACE_MAX).toFixed(2))
-  const maxLen = Number(clamp(base.maxLen - aggressiveShift * 0.8 - shortFormFactor * 0.5, minLen + 1, 11).toFixed(2))
+  const minLen = Number(clamp(base.minLen - aggressiveShift * 0.45 - shortFormFactor * 0.12, CUT_MIN, PACE_MAX).toFixed(2))
+  const maxLen = Number(clamp(base.maxLen - aggressiveShift * 0.5 - shortFormFactor * 0.2, Math.min(CUT_MAX - 0.4, minLen + 0.8), CUT_MAX).toFixed(2))
   const speedCap = Number(clamp(base.speedCap + (aggressiveMode ? 0.1 : 0), 1.2, 1.5).toFixed(3))
   return {
     niche,
@@ -5549,20 +5654,141 @@ const generateProxy = async (inputPath: string, outPath: string, opts?: { width?
   await runFfmpeg(args)
 }
 
-const buildVerticalClipRanges = (durationSeconds: number, requestedCount: number) => {
+const normalizeStoredEngagementWindows = (raw: any): EngagementWindow[] => {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((window: any) => ({
+      time: Number(window?.time),
+      audioEnergy: clamp01(Number(window?.audioEnergy ?? 0)),
+      speechIntensity: clamp01(Number(window?.speechIntensity ?? 0)),
+      motionScore: clamp01(Number(window?.motionScore ?? 0)),
+      facePresence: clamp01(Number(window?.facePresence ?? 0)),
+      textDensity: clamp01(Number(window?.textDensity ?? 0)),
+      sceneChangeRate: clamp01(Number(window?.sceneChangeRate ?? 0)),
+      emotionalSpike: Number(window?.emotionalSpike ? 1 : 0),
+      vocalExcitement: clamp01(Number(window?.vocalExcitement ?? 0)),
+      emotionIntensity: clamp01(Number(window?.emotionIntensity ?? 0)),
+      score: clamp01(Number(window?.score ?? 0)),
+      hookScore: Number.isFinite(Number(window?.hookScore)) ? clamp01(Number(window.hookScore)) : undefined,
+      curiosityTrigger: Number.isFinite(Number(window?.curiosityTrigger)) ? clamp01(Number(window.curiosityTrigger)) : undefined,
+      actionSpike: Number.isFinite(Number(window?.actionSpike)) ? clamp01(Number(window.actionSpike)) : undefined
+    }))
+    .filter((window: EngagementWindow) => Number.isFinite(window.time) && window.time >= 0)
+}
+
+const normalizeStoredHookCandidates = (raw: any): HookCandidate[] => {
+  if (!Array.isArray(raw)) return []
+  return raw
+    .map((candidate: any) => {
+      const start = Number(candidate?.start)
+      const duration = Number(candidate?.duration)
+      if (!Number.isFinite(start) || !Number.isFinite(duration) || duration <= 0) return null
+      const score = Number.isFinite(Number(candidate?.score)) ? clamp01(Number(candidate.score)) : 0
+      const auditScore = Number.isFinite(Number(candidate?.auditScore))
+        ? clamp01(Number(candidate.auditScore))
+        : score
+      return {
+        start: Number(start.toFixed(3)),
+        duration: Number(duration.toFixed(3)),
+        score: Number(score.toFixed(4)),
+        auditScore: Number(auditScore.toFixed(4)),
+        auditPassed: Boolean(candidate?.auditPassed),
+        text: typeof candidate?.text === 'string' ? candidate.text : '',
+        reason: typeof candidate?.reason === 'string' ? candidate.reason : '',
+        synthetic: Boolean(candidate?.synthetic)
+      } as HookCandidate
+    })
+    .filter((candidate): candidate is HookCandidate => Boolean(candidate))
+}
+
+const buildVerticalClipRanges = (
+  durationSeconds: number,
+  requestedCount: number,
+  opts?: {
+    windows?: EngagementWindow[]
+    hookCandidates?: HookCandidate[]
+  }
+) => {
   const total = Math.max(0, durationSeconds || 0)
   if (total <= 0) return [{ start: 0, end: 0 }]
   let clipCount = clamp(requestedCount || 1, 1, MAX_VERTICAL_CLIPS)
   const maxFeasibleByLength = Math.max(1, Math.floor(total / MIN_VERTICAL_CLIP_SECONDS))
   clipCount = Math.min(clipCount, maxFeasibleByLength)
-  const chunk = total / clipCount
-  const ranges: TimeRange[] = []
-  for (let index = 0; index < clipCount; index += 1) {
-    const start = Number((index * chunk).toFixed(3))
-    const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
-    if (end - start > 0.2) ranges.push({ start, end })
+  const windows = Array.isArray(opts?.windows) ? opts!.windows! : []
+  const hookCandidates = Array.isArray(opts?.hookCandidates) ? opts!.hookCandidates! : []
+
+  const fallbackRanges = (() => {
+    const chunk = total / clipCount
+    const ranges: TimeRange[] = []
+    for (let index = 0; index < clipCount; index += 1) {
+      const start = Number((index * chunk).toFixed(3))
+      const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
+      if (end - start > 0.2) ranges.push({ start, end })
+    }
+    return ranges.length ? ranges : [{ start: 0, end: total }]
+  })()
+
+  if (!windows.length) return fallbackRanges
+
+  const targetClipDuration = Number(clamp(
+    total / Math.max(1, clipCount * 3.2),
+    MIN_VERTICAL_CLIP_SECONDS,
+    MAX_VERTICAL_CLIP_SECONDS
+  ).toFixed(3))
+  const step = total > 300 ? 2 : 1
+  const candidates: Array<{ range: TimeRange; score: number }> = []
+  const hookCenters = hookCandidates.map((candidate) => candidate.start + candidate.duration / 2)
+
+  for (let start = 0; start + targetClipDuration <= total; start += step) {
+    const end = Number((start + targetClipDuration).toFixed(3))
+    const startRounded = Number(start.toFixed(3))
+    const coreScore = averageWindowMetric(windows, startRounded, end, (window) => (
+      0.34 * (window.hookScore ?? window.score) +
+      0.18 * window.emotionIntensity +
+      0.14 * window.vocalExcitement +
+      0.12 * (window.curiosityTrigger ?? 0) +
+      0.1 * window.sceneChangeRate +
+      0.06 * window.speechIntensity +
+      0.06 * (window.actionSpike ?? 0)
+    ))
+    const center = startRounded + targetClipDuration / 2
+    const hookBoost = hookCenters.length
+      ? clamp01(1 - Math.min(...hookCenters.map((point) => Math.abs(point - center))) / Math.max(1, targetClipDuration * 1.8))
+      : 0
+    const score = Number((coreScore + hookBoost * 0.12).toFixed(5))
+    candidates.push({
+      range: { start: startRounded, end },
+      score
+    })
   }
-  return ranges.length ? ranges : [{ start: 0, end: total }]
+
+  if (!candidates.length) return fallbackRanges
+  const sorted = candidates
+    .slice()
+    .sort((a, b) => b.score - a.score || a.range.start - b.range.start)
+  const selected: TimeRange[] = []
+  const minSpacing = Math.max(2, targetClipDuration * 0.22)
+  for (const entry of sorted) {
+    if (selected.length >= clipCount) break
+    const overlaps = selected.some((range) => (
+      entry.range.start < range.end + minSpacing &&
+      entry.range.end > range.start - minSpacing
+    ))
+    if (overlaps) continue
+    selected.push(entry.range)
+  }
+  if (selected.length < clipCount) {
+    for (const range of fallbackRanges) {
+      if (selected.length >= clipCount) break
+      const overlaps = selected.some((existing) => (
+        range.start < existing.end + minSpacing &&
+        range.end > existing.start - minSpacing
+      ))
+      if (overlaps) continue
+      selected.push(range)
+    }
+  }
+  return selected.length ? selected.slice(0, clipCount) : fallbackRanges
 }
 
 const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
@@ -5806,11 +6032,16 @@ const applyAudioPolishToSegments = ({
 
 const buildAudioFilters = ({
   aggressionLevel,
-  styleProfile
+  styleProfile,
+  audioProfile
 }: {
   aggressionLevel: RetentionAggressionLevel
   styleProfile?: ContentStyleProfile | null
+  audioProfile?: AudioStreamProfile | null
 }) => {
+  const sourceChannels = Math.max(1, Number(audioProfile?.channels || 2))
+  const sourceLayout = String(audioProfile?.channelLayout || '').toLowerCase()
+  const sourceIsMono = sourceChannels <= 1 || sourceLayout.includes('mono')
   const targetLoudness = aggressionLevel === 'viral'
     ? -13.4
     : aggressionLevel === 'high'
@@ -5821,13 +6052,35 @@ const buildAudioFilters = ({
   const compressionRatio = styleProfile?.style === 'tutorial' ? 2.8 : 3.2
   const attackMs = styleProfile?.style === 'tutorial' ? 18 : 12
   const releaseMs = styleProfile?.style === 'tutorial' ? 240 : 170
-  return [
+  const denoiseFloor = aggressionLevel === 'viral' ? -21 : aggressionLevel === 'high' ? -22 : -23
+  const filters: string[] = [
     'highpass=f=78',
-    'lowpass=f=16000',
-    'afftdn=nf=-22',
+    'lowpass=f=17200',
+    `afftdn=nf=${toFilterNumber(denoiseFloor)}`,
+    // Mild tonal shaping for clearer dialog without harshness.
+    'equalizer=f=180:t=q:w=0.9:g=-1.2',
+    'equalizer=f=3200:t=q:w=1.3:g=2.1',
+    'equalizer=f=7800:t=q:w=1.0:g=1.2'
+  ]
+  if (hasFfmpegFilter('deesser')) {
+    filters.push('deesser')
+  }
+  if (sourceIsMono) {
+    if (hasFfmpegFilter('haas')) {
+      // Haas stereoization gives mono footage a subtle spatial spread.
+      filters.push('haas')
+    } else if (hasFfmpegFilter('extrastereo')) {
+      filters.push('extrastereo=m=1.6:c=0.0')
+    }
+  }
+  if (hasFfmpegFilter('dynaudnorm')) {
+    filters.push('dynaudnorm=f=75:g=13:p=0.9:m=8')
+  }
+  filters.push(
     `acompressor=threshold=-17dB:ratio=${toFilterNumber(compressionRatio)}:attack=${toFilterNumber(attackMs)}:release=${toFilterNumber(releaseMs)}:makeup=2`,
     `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.5:LRA=10`
-  ]
+  )
+  return filters
 }
 
 const RETENTION_RENDER_THRESHOLD = 58
@@ -6577,6 +6830,22 @@ const processJob = async (
       if (!sourceStream?.width || !sourceStream?.height) {
         throw new Error('vertical_source_dimensions_unavailable')
       }
+      const latestVerticalJob = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { analysis: true }
+      })
+      const verticalAnalysis = (latestVerticalJob?.analysis as any) || (job.analysis as any) || {}
+      const verticalWindows = normalizeStoredEngagementWindows(
+        verticalAnalysis?.editPlan?.engagementWindows ||
+        verticalAnalysis?.engagement_windows ||
+        verticalAnalysis?.engagementWindows
+      )
+      const verticalHookCandidates = normalizeStoredHookCandidates(
+        verticalAnalysis?.hook_variants ||
+        verticalAnalysis?.editPlan?.hookVariants ||
+        verticalAnalysis?.editPlan?.hookCandidates ||
+        verticalAnalysis?.hook_candidates
+      )
       const resolvedVerticalMode = renderConfig.verticalMode
         ? {
             ...defaultVerticalModeSettings(),
@@ -6587,7 +6856,10 @@ const processJob = async (
             }
           }
         : defaultVerticalModeSettings()
-      const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount)
+      const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount, {
+        windows: verticalWindows,
+        hookCandidates: verticalHookCandidates
+      })
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
       const hasInputAudio = hasAudioStream(tmpIn)
@@ -6717,6 +6989,8 @@ const processJob = async (
       ? ((job.analysis as any).hook_variants as HookCandidate[])
       : []
     let hookCalibrationForAnalysis: HookCalibrationProfile | null = ((job.analysis as any)?.hook_calibration as HookCalibrationProfile) || hookCalibration
+    let audioProfileForAnalysis: AudioStreamProfile | null = null
+    let audioFiltersForAnalysis: string[] = []
     if (hasFfmpeg()) {
       const qualityTarget = getTargetDimensions(finalQuality)
       const sourceProbe = probeVideoStream(tmpIn)
@@ -6878,8 +7152,8 @@ const processJob = async (
         if (!editPlan) return segments
         const stricter = enforceSegmentLengths(
           segments.map((segment) => ({ ...segment })),
-          2.5,
-          4,
+          CUT_MIN,
+          CUT_MAX,
           editPlan.engagementWindows
         )
         return stricter.map((segment) => {
@@ -6940,7 +7214,7 @@ const processJob = async (
             }
             const filteredStory = story.filter((_, index) => !removeIndexes.has(index))
             story = filteredStory.length ? filteredStory : story
-            story = enforceSegmentLengths(story, 2.2, 3.2, editPlan.engagementWindows).map((segment) => {
+            story = enforceSegmentLengths(story, CUT_MIN, CUT_MAX, editPlan.engagementWindows).map((segment) => {
               const score = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.score)
               const speech = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.speechIntensity)
               const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
@@ -7308,6 +7582,7 @@ const processJob = async (
       await updateJob(jobId, { status: 'audio', progress: 68 })
 
       const hasAudio = hasAudioStream(tmpIn)
+      audioProfileForAnalysis = hasAudio ? probeAudioStream(tmpIn) : null
       const withAudio = true
       if (withAudio && finalSegments.length) {
         finalSegments = applyAudioPolishToSegments({
@@ -7319,8 +7594,13 @@ const processJob = async (
         })
       }
       const audioFilters = withAudio
-        ? buildAudioFilters({ aggressionLevel, styleProfile: styleProfileForAnalysis })
+        ? buildAudioFilters({
+            aggressionLevel,
+            styleProfile: styleProfileForAnalysis,
+            audioProfile: audioProfileForAnalysis
+          })
         : []
+      audioFiltersForAnalysis = audioFilters.slice()
       await updateJob(jobId, { status: 'retention', progress: 72 })
 
       const plannedSegmentCount = finalSegments.length
@@ -7756,6 +8036,15 @@ const processJob = async (
         beat_anchors: beatAnchorsForAnalysis,
         hook_variants: hookVariantsForAnalysis,
         hook_calibration: hookCalibrationForAnalysis,
+        audio_profile: audioProfileForAnalysis
+          ? {
+              channels: audioProfileForAnalysis.channels,
+              channelLayout: audioProfileForAnalysis.channelLayout,
+              sampleRate: audioProfileForAnalysis.sampleRate,
+              bitRate: audioProfileForAnalysis.bitRate
+            }
+          : null,
+        audio_polish_chain: audioFiltersForAnalysis,
         output_upload_fallback: outputUploadFallbackUsed
           ? {
               used: true,
