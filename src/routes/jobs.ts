@@ -599,6 +599,7 @@ type EditPlan = {
     hasTranscript: boolean
   }
   styleProfile?: ContentStyleProfile
+  nicheProfile?: VideoNicheProfile | null
   beatAnchors?: number[]
   hookVariants?: HookCandidate[]
   hookCalibration?: HookCalibrationProfile | null
@@ -636,6 +637,20 @@ type PacingProfile = {
   lateTarget: number
   jitter: number
   speedCap: number
+}
+type VideoNicheProfile = {
+  niche: PacingNiche
+  confidence: number
+  rationale: string[]
+  styleAlignment: ContentStyle | null
+  metrics: {
+    avgSpeech: number
+    avgScene: number
+    avgEmotion: number
+    spikeRatio: number
+    transcriptCueCount: number
+    durationSeconds: number
+  }
 }
 
 const HOOK_MIN = 5
@@ -4610,6 +4625,7 @@ const buildRetentionMetadataSummary = ({
   segments,
   windows,
   hook,
+  nicheProfile,
   judge,
   strategy,
   retentionScore,
@@ -4625,6 +4641,7 @@ const buildRetentionMetadataSummary = ({
   segments: Segment[]
   windows: EngagementWindow[]
   hook?: HookCandidate | null
+  nicheProfile?: VideoNicheProfile | null
   judge?: RetentionJudgeReport | null
   strategy?: RetentionRetryStrategy | null
   retentionScore?: number | null
@@ -4647,6 +4664,11 @@ const buildRetentionMetadataSummary = ({
     ? clamp01((safeDuration - segmentStats.editedRuntimeSeconds) / safeDuration)
     : 0
   const improvements: string[] = []
+  if (nicheProfile?.niche) {
+    improvements.push(
+      `Detected ${nicheProfile.niche.replace('_', ' ')} niche (confidence ${(nicheProfile.confidence * 100).toFixed(0)}%) and tuned pacing accordingly.`
+    )
+  }
   if (hook) {
     const hookSourceLabel =
       hookSelectionSource === 'user_selected'
@@ -4707,6 +4729,13 @@ const buildRetentionMetadataSummary = ({
       targetWindowSeconds: { min: CUT_MIN, max: CUT_MAX },
       ...segmentStats
     },
+    niche: nicheProfile
+      ? {
+          name: nicheProfile.niche,
+          confidence: nicheProfile.confidence,
+          rationale: nicheProfile.rationale.slice(0, 3)
+        }
+      : null,
     timeline: {
       sourceDurationSeconds: Number(safeDuration.toFixed(3)),
       removedSeconds: Number(removedSeconds.toFixed(3)),
@@ -4878,6 +4907,20 @@ const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: Ed
       : 'Fallback hook is shorter than required 5-8s range.',
     synthetic: true
   }
+  const fallbackNicheProfile: VideoNicheProfile = {
+    niche: 'story',
+    confidence: 0.5,
+    rationale: ['Fallback mode used; defaulting niche to story pacing.'],
+    styleAlignment: null,
+    metrics: {
+      avgSpeech: 0,
+      avgScene: 0,
+      avgEmotion: 0,
+      spikeRatio: 0,
+      transcriptCueCount: 0,
+      durationSeconds: Number(total.toFixed(3))
+    }
+  }
   return {
     hook: fallbackHook,
     segments,
@@ -4894,7 +4937,8 @@ const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: Ed
       sourceEnd: Number(segment.end.toFixed(3)),
       orderedIndex
     })),
-    hookFailureReason: fallbackHook.auditPassed ? null : fallbackHook.reason
+    hookFailureReason: fallbackHook.auditPassed ? null : fallbackHook.reason,
+    nicheProfile: fallbackNicheProfile
   }
 }
 
@@ -5070,6 +5114,104 @@ const inferPacingProfile = (
     lateTarget: Math.max(minLen, base.lateTarget - aggressiveShift * 0.5),
     jitter: base.jitter + (aggressiveMode ? 0.04 : 0),
     speedCap
+  }
+}
+
+const inferVideoNicheProfile = ({
+  windows,
+  transcriptCues,
+  durationSeconds,
+  pacingProfile,
+  styleProfile
+}: {
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+  pacingProfile: PacingProfile
+  styleProfile?: ContentStyleProfile | null
+}): VideoNicheProfile => {
+  if (!windows.length || durationSeconds <= 0) {
+    return {
+      niche: pacingProfile?.niche || 'story',
+      confidence: 0.52,
+      rationale: ['Limited signal detected, defaulting to story pacing niche.'],
+      styleAlignment: styleProfile?.style || null,
+      metrics: {
+        avgSpeech: 0,
+        avgScene: 0,
+        avgEmotion: 0,
+        spikeRatio: 0,
+        transcriptCueCount: Array.isArray(transcriptCues) ? transcriptCues.length : 0,
+        durationSeconds: Number(durationSeconds || 0)
+      }
+    }
+  }
+  const activeWindows = windows.filter((window) => (
+    window.audioEnergy > 0.02 ||
+    window.sceneChangeRate > 0 ||
+    window.speechIntensity > 0.05 ||
+    window.score > 0.08
+  ))
+  const basis = activeWindows.length ? activeWindows : windows
+  const total = Math.max(1, basis.length)
+  const avgSpeech = basis.reduce((sum, window) => sum + window.speechIntensity, 0) / total
+  const avgScene = basis.reduce((sum, window) => sum + window.sceneChangeRate, 0) / total
+  const avgEmotion = basis.reduce((sum, window) => sum + window.emotionIntensity, 0) / total
+  const spikeRatio = basis.filter((window) => window.emotionalSpike > 0 || window.emotionIntensity > 0.72).length / total
+  const transcriptText = transcriptCues.map((cue) => cue.text).join(' ').toLowerCase()
+  const tutorialHits = countPhraseHits(transcriptText, TUTORIAL_STYLE_KEYWORDS)
+  const gamingHits = countPhraseHits(transcriptText, GAMING_STYLE_KEYWORDS)
+  const reactionHits = countPhraseHits(transcriptText, REACTION_STYLE_KEYWORDS)
+  const niche = pacingProfile.niche
+  const rationale: string[] = []
+  let confidence = 0.55
+  if (niche === 'high_energy') {
+    confidence += 0.2 * clamp01((avgScene - 0.26) / 0.4)
+    confidence += 0.14 * clamp01((avgEmotion - 0.42) / 0.35)
+    confidence += 0.11 * clamp01((spikeRatio - 0.1) / 0.25)
+    if (gamingHits > 0 || reactionHits > 0) confidence += 0.05
+    rationale.push('High scene-change and emotion spikes suggest high-energy content.')
+  } else if (niche === 'talking_head') {
+    confidence += 0.22 * clamp01((avgSpeech - 0.42) / 0.4)
+    confidence += 0.1 * clamp01((0.34 - avgScene) / 0.34)
+    if (styleProfile?.style === 'vlog' || styleProfile?.style === 'tutorial') confidence += 0.05
+    rationale.push('Consistent speech with lower scene churn suggests talking-head pacing.')
+  } else if (niche === 'education') {
+    confidence += 0.2 * clamp01((avgSpeech - 0.4) / 0.4)
+    confidence += 0.08 * clamp01((0.36 - avgScene) / 0.36)
+    confidence += 0.1 * clamp01(tutorialHits / 3)
+    rationale.push('Instructional language and steady cadence indicate education niche.')
+  } else {
+    confidence += 0.12 * clamp01(avgEmotion / 0.65)
+    confidence += 0.08 * clamp01(avgSpeech / 0.65)
+    confidence += 0.08 * clamp01(1 - Math.abs(avgScene - 0.34))
+    rationale.push('Balanced narrative signals indicate story niche.')
+  }
+  if (!rationale.length) rationale.push('Niche inferred from pacing and engagement windows.')
+  if (styleProfile) {
+    const aligned =
+      (niche === 'high_energy' && (styleProfile.style === 'reaction' || styleProfile.style === 'gaming')) ||
+      (niche === 'talking_head' && styleProfile.style === 'vlog') ||
+      (niche === 'education' && styleProfile.style === 'tutorial') ||
+      (niche === 'story' && styleProfile.style === 'story')
+    if (aligned) {
+      confidence += 0.07
+      rationale.push(`Style profile (${styleProfile.style}) aligns with detected niche.`)
+    }
+  }
+  return {
+    niche,
+    confidence: Number(clamp01(confidence).toFixed(4)),
+    rationale: rationale.slice(0, 4),
+    styleAlignment: styleProfile?.style || null,
+    metrics: {
+      avgSpeech: Number(avgSpeech.toFixed(4)),
+      avgScene: Number(avgScene.toFixed(4)),
+      avgEmotion: Number(avgEmotion.toFixed(4)),
+      spikeRatio: Number(spikeRatio.toFixed(4)),
+      transcriptCueCount: transcriptCues.length,
+      durationSeconds: Number(durationSeconds.toFixed(3))
+    }
   }
 }
 
@@ -5306,6 +5448,13 @@ const buildEditPlan = async (
     styleProfile,
     options.aggressiveMode
   )
+  const nicheProfile = inferVideoNicheProfile({
+    windows,
+    transcriptCues,
+    durationSeconds,
+    pacingProfile,
+    styleProfile
+  })
   const silenceTrimCuts = options.removeBoring
     ? buildSilenceTrimCuts(silences, durationSeconds, options.aggressiveMode)
     : []
@@ -5456,6 +5605,7 @@ const buildEditPlan = async (
       hasTranscript: transcriptCues.length > 0
     },
     styleProfile,
+    nicheProfile,
     beatAnchors,
     hookVariants,
     hookCalibration: context?.hookCalibration ?? null
@@ -6983,6 +7133,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       segments: editPlan?.segments ?? [],
       windows: editPlan?.engagementWindows ?? [],
       hook: editPlan?.hook ?? null,
+      nicheProfile: editPlan?.nicheProfile ?? null,
       patternInterruptCount: editPlan?.patternInterruptCount ?? 0,
       patternInterruptDensity: editPlan?.patternInterruptDensity ?? 0,
       boredomRemovedRatio: editPlan?.boredomRemovedRatio ?? 0
@@ -7013,6 +7164,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         retentionAggressionLevel: aggressionLevel,
         retentionLevel: aggressionLevel,
         style_profile: editPlan?.styleProfile ?? null,
+        niche_profile: editPlan?.nicheProfile ?? null,
         beat_anchors: editPlan?.beatAnchors ?? [],
         transcript_signals: editPlan?.transcriptSignals ?? {
           cueCount: transcriptCues.length,
@@ -7337,6 +7489,7 @@ const processJob = async (
     let engagementWindowsForAnalysis: EngagementWindow[] = []
     let finalSegmentsForAnalysis: Segment[] = []
     let styleProfileForAnalysis: ContentStyleProfile | null = ((job.analysis as any)?.style_profile as ContentStyleProfile) || null
+    let nicheProfileForAnalysis: VideoNicheProfile | null = ((job.analysis as any)?.niche_profile as VideoNicheProfile) || null
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
@@ -7372,6 +7525,7 @@ const processJob = async (
         }
       }
       if (editPlan?.styleProfile) styleProfileForAnalysis = editPlan.styleProfile
+      if (editPlan?.nicheProfile) nicheProfileForAnalysis = editPlan.nicheProfile
       engagementWindowsForAnalysis = editPlan?.engagementWindows ?? []
       if (Array.isArray(editPlan?.beatAnchors)) beatAnchorsForAnalysis = editPlan.beatAnchors
       if (Array.isArray(editPlan?.hookVariants) && editPlan.hookVariants.length) {
@@ -8404,6 +8558,7 @@ const processJob = async (
           })),
       windows: engagementWindowsForAnalysis,
       hook: selectedHook,
+      nicheProfile: nicheProfileForAnalysis,
       judge: selectedJudge,
       strategy: selectedStrategy,
       retentionScore,
@@ -8439,6 +8594,7 @@ const processJob = async (
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
         story_reorder_map: selectedStoryReorderMap,
         style_profile: styleProfileForAnalysis,
+        niche_profile: nicheProfileForAnalysis,
         beat_anchors: beatAnchorsForAnalysis,
         hook_variants: hookVariantsForAnalysis,
         hook_calibration: hookCalibrationForAnalysis,
