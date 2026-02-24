@@ -2259,6 +2259,58 @@ const buildSyntheticHookCandidate = ({
   }
 }
 
+const buildHookPartitions = (durationSeconds: number) => {
+  const total = Math.max(0, durationSeconds || 0)
+  if (total <= 0) return [] as TimeRange[]
+  const maxByLength = Math.max(1, Math.floor(total / HOOK_MIN))
+  let partitionCount = 4
+  if (total < 42) partitionCount = 3
+  else if (total >= 180 && total < 360) partitionCount = 6
+  else if (total >= 360) partitionCount = 8
+  partitionCount = Math.max(1, Math.min(partitionCount, maxByLength))
+  const chunk = total / partitionCount
+  const partitions: TimeRange[] = []
+  for (let index = 0; index < partitionCount; index += 1) {
+    const start = Number((index * chunk).toFixed(3))
+    const end = Number((index === partitionCount - 1 ? total : (index + 1) * chunk).toFixed(3))
+    if (end - start >= Math.min(2, HOOK_MIN * 0.4)) {
+      partitions.push({ start, end })
+    }
+  }
+  return partitions.length ? partitions : [{ start: 0, end: total }]
+}
+
+const scoreHookFaceoffCandidate = ({
+  candidate,
+  windows
+}: {
+  candidate: HookCandidate
+  windows: EngagementWindow[]
+}) => {
+  const start = candidate.start
+  const end = candidate.start + candidate.duration
+  const energy = averageWindowMetric(windows, start, end, (window) => (
+    0.38 * window.speechIntensity +
+    0.32 * window.vocalExcitement +
+    0.3 * (window.audioVariance ?? 0)
+  ))
+  const curiosity = averageWindowMetric(windows, start, end, (window) => (
+    0.6 * (window.curiosityTrigger ?? 0) +
+    0.4 * (window.keywordIntensity ?? 0)
+  ))
+  const emotionalSpike = averageWindowMetric(windows, start, end, (window) => (
+    0.7 * window.emotionIntensity + 0.3 * window.motionScore
+  ))
+  const faceoffScore = clamp01(
+    0.4 * candidate.score +
+    0.24 * candidate.auditScore +
+    0.16 * energy +
+    0.1 * curiosity +
+    0.1 * emotionalSpike
+  )
+  return Number(faceoffScore.toFixed(4))
+}
+
 const pickTopHookCandidates = ({
   durationSeconds,
   segments,
@@ -2308,6 +2360,8 @@ const pickTopHookCandidates = ({
         0.25 * window.textDensity
       ))
       const emotionImpact = averageWindowMetric(windows, aligned.start, aligned.end, (window) => window.emotionIntensity)
+      const durationSecondsActual = aligned.end - aligned.start
+      const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 8) / 3))
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
       const audit = runHookAudit({
         start: aligned.start,
@@ -2320,7 +2374,8 @@ const pickTopHookCandidates = ({
         0.2 * speechImpact +
         0.16 * transcriptImpact +
         0.14 * visualImpact +
-        0.12 * emotionImpact +
+        0.11 * emotionImpact +
+        0.07 * durationAlignment +
         0.14 * audit.auditScore -
         0.2 * contextPenalty
       )
@@ -2335,12 +2390,15 @@ const pickTopHookCandidates = ({
       })
     }
   }
+  const rankedEvaluated = evaluated
+    .slice()
+    .sort((a, b) => b.score - a.score || a.start - b.start)
   const uniqueTop: HookCandidate[] = []
-  for (const candidate of evaluated.sort((a, b) => b.score - a.score || a.start - b.start)) {
-    const tooClose = uniqueTop.some((entry) => Math.abs(entry.start - candidate.start) < 1.75)
+  for (const candidate of rankedEvaluated) {
+    const tooClose = uniqueTop.some((entry) => Math.abs(entry.start - candidate.start) < 1.3)
     if (tooClose) continue
     uniqueTop.push(candidate)
-    if (uniqueTop.length >= HOOK_SELECTION_MAX_CANDIDATES) break
+    if (uniqueTop.length >= Math.max(HOOK_SELECTION_MAX_CANDIDATES * 3, 12)) break
   }
   if (!uniqueTop.length) {
     const synthetic = buildSyntheticHookCandidate({ durationSeconds, segments, windows, transcriptCues })
@@ -2365,7 +2423,41 @@ const pickTopHookCandidates = ({
       hookFailureReason: 'No valid hook candidate found across timeline.'
     }
   }
-  let selected = uniqueTop.find((candidate) => candidate.auditPassed) || uniqueTop[0]
+  const partitions = buildHookPartitions(durationSeconds)
+  const partitionWinners: HookCandidate[] = []
+  for (let index = 0; index < partitions.length; index += 1) {
+    const partition = partitions[index]
+    const partitionPool = uniqueTop.filter((candidate) => {
+      const center = candidate.start + candidate.duration / 2
+      return center >= partition.start && center < partition.end
+    })
+    if (!partitionPool.length) continue
+    const nearEightPool = partitionPool.filter((candidate) => candidate.duration >= 7.4)
+    const pool = nearEightPool.length ? nearEightPool : partitionPool
+    const best = pool
+      .slice()
+      .sort((a, b) => (
+        scoreHookFaceoffCandidate({ candidate: b, windows }) - scoreHookFaceoffCandidate({ candidate: a, windows }) ||
+        b.score - a.score ||
+        a.start - b.start
+      ))[0]
+    partitionWinners.push({
+      ...best,
+      reason: `${best.reason} Chosen as top 8s candidate for section ${index + 1}/${partitions.length}.`
+    })
+  }
+  const faceoffPool = partitionWinners.length ? partitionWinners : uniqueTop.slice(0, Math.max(4, HOOK_SELECTION_MAX_CANDIDATES))
+  const faceoffRanked = faceoffPool
+    .map((candidate) => ({
+      candidate,
+      faceoffScore: scoreHookFaceoffCandidate({ candidate, windows })
+    }))
+    .sort((a, b) => (
+      b.faceoffScore - a.faceoffScore ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
+    ))
+  let selected = (faceoffRanked.find((entry) => entry.candidate.auditPassed) || faceoffRanked[0]).candidate
   let hookFailureReason: string | null = null
   if (!selected.auditPassed) {
     const synthetic = buildSyntheticHookCandidate({ durationSeconds, segments, windows, transcriptCues })
@@ -2377,7 +2469,22 @@ const pickTopHookCandidates = ({
       if (synthetic) uniqueTop.push(synthetic)
     }
   }
-  return { selected, topCandidates: uniqueTop.slice(0, HOOK_SELECTION_MAX_CANDIDATES), hookFailureReason }
+  const finalRanked = [
+    selected,
+    ...faceoffRanked.map((entry) => entry.candidate),
+    ...uniqueTop
+  ]
+  const dedupedFinal: HookCandidate[] = []
+  for (const candidate of finalRanked) {
+    const duplicate = dedupedFinal.some((entry) => (
+      Math.abs(entry.start - candidate.start) < 0.01 &&
+      Math.abs(entry.duration - candidate.duration) < 0.01
+    ))
+    if (duplicate) continue
+    dedupedFinal.push(candidate)
+    if (dedupedFinal.length >= HOOK_SELECTION_MAX_CANDIDATES) break
+  }
+  return { selected, topCandidates: dedupedFinal, hookFailureReason }
 }
 
 const buildBoredomRangesFromScores = (

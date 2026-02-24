@@ -65,6 +65,45 @@ const run = () => {
   assert.strictEqual(Number(timelineWithHookFirst[0].start.toFixed(3)), Number(pickA.selected.start.toFixed(3)), 'hook must be first in timeline order')
   assert.strictEqual(Number((timelineWithHookFirst[0].end - timelineWithHookFirst[0].start).toFixed(3)), Number(pickA.selected.duration.toFixed(3)), 'first segment must match selected hook length')
 
+  // 1b) Partition-first hooking should pick one strong 8s candidate from each section, then choose best.
+  const longWindows = new Array(96).fill(null).map((_, idx) => makeWindow(idx))
+  const boostRange = (start: number, end: number, boost: Record<string, number>) => {
+    for (let second = start; second <= end; second += 1) {
+      longWindows[second] = makeWindow(second, {
+        score: 0.8,
+        hookScore: 0.82,
+        emotionIntensity: 0.74,
+        vocalExcitement: 0.7,
+        speechIntensity: 0.72,
+        motionScore: 0.64,
+        curiosityTrigger: 0.62,
+        keywordIntensity: 0.58,
+        ...boost
+      })
+    }
+  }
+  boostRange(8, 16, { score: 0.83, hookScore: 0.85 })
+  boostRange(30, 38, { score: 0.86, hookScore: 0.87 })
+  boostRange(52, 60, { score: 0.95, hookScore: 0.96, emotionIntensity: 0.9, vocalExcitement: 0.88, curiosityTrigger: 0.86 })
+  boostRange(76, 84, { score: 0.84, hookScore: 0.86 })
+  const longCues = [
+    { start: 8, end: 16, text: 'Watch this first moment.', keywordIntensity: 0.6, curiosityTrigger: 0.7, fillerDensity: 0 },
+    { start: 30, end: 38, text: "Here's another strong section.", keywordIntensity: 0.6, curiosityTrigger: 0.65, fillerDensity: 0 },
+    { start: 52, end: 60, text: 'This changed everything, biggest payoff.', keywordIntensity: 0.9, curiosityTrigger: 0.88, fillerDensity: 0 },
+    { start: 76, end: 84, text: 'Final section with energy.', keywordIntensity: 0.6, curiosityTrigger: 0.62, fillerDensity: 0 }
+  ]
+  const longPick = pickTopHookCandidates({
+    durationSeconds: 96,
+    segments: [{ start: 0, end: 96 }],
+    windows: longWindows,
+    transcriptCues: longCues
+  })
+  const sectionIndex = (start: number) => Math.min(3, Math.floor((start + 4) / 24))
+  const representedSections = new Set(longPick.topCandidates.map((candidate: any) => sectionIndex(candidate.start)))
+  assert.ok(representedSections.size >= 3, 'top hook candidates should represent multiple timeline sections')
+  assert.strictEqual(sectionIndex(longPick.selected.start), 2, 'selected hook should come from strongest section')
+  assert.ok(longPick.selected.duration >= 7 && longPick.selected.duration <= 8, 'partition hook winner should stay near 8 seconds')
+
   // 2) Quality gate thresholds
   const strongSegments = [
     { start: 0, end: 6, speed: 1 },
