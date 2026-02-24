@@ -7,6 +7,7 @@ const {
   resolveQualityGateThresholds,
   computeContentSignalStrength,
   selectRenderableHookCandidate,
+  shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
@@ -171,6 +172,56 @@ const run = () => {
   })
   assert.ok(adaptiveThresholds.hook_strength < 80, 'adaptive thresholds should reduce hook requirement when transcript is missing')
   assert.ok(adaptiveThresholds.retention_score < 75, 'adaptive thresholds should reduce retention requirement on low-signal footage')
+
+  // 2d) Rescue mode should allow minimally watchable renders instead of hard fail.
+  const rescueEligible = shouldForceRescueRender({
+    retention_score: 47,
+    hook_strength: 56,
+    pacing_score: 52,
+    clarity_score: 58,
+    emotional_pull: 49,
+    why_keep_watching: [],
+    what_is_generic: ['low emotional pull'],
+    required_fixes: {
+      stronger_hook: true,
+      raise_emotion: true,
+      improve_pacing: false,
+      increase_interrupts: false
+    },
+    applied_thresholds: {
+      hook_strength: 70,
+      emotional_pull: 62,
+      pacing_score: 64,
+      retention_score: 66
+    },
+    gate_mode: 'adaptive',
+    passed: false
+  })
+  assert.ok(rescueEligible, 'rescue override should allow minimally watchable rescue renders')
+  const rescueIneligible = shouldForceRescueRender({
+    retention_score: 39,
+    hook_strength: 44,
+    pacing_score: 41,
+    clarity_score: 55,
+    emotional_pull: 38,
+    why_keep_watching: [],
+    what_is_generic: ['too generic'],
+    required_fixes: {
+      stronger_hook: true,
+      raise_emotion: true,
+      improve_pacing: true,
+      increase_interrupts: true
+    },
+    applied_thresholds: {
+      hook_strength: 70,
+      emotional_pull: 62,
+      pacing_score: 64,
+      retention_score: 66
+    },
+    gate_mode: 'adaptive',
+    passed: false
+  })
+  assert.ok(!rescueIneligible, 'rescue override should still reject unwatchable output')
 
   // 3) Retry loop max attempts (baseline + up to 3 retries)
   const attemptsAllFail = executeQualityGateRetriesForTest([false, false, false, false, false], 3)

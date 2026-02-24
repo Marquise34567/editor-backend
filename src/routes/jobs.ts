@@ -481,7 +481,7 @@ type QualityGateThresholds = {
   pacing_score: number
   retention_score: number
 }
-type RetentionRetryStrategy = 'BASELINE' | 'HOOK_FIRST' | 'EMOTION_FIRST' | 'PACING_FIRST'
+type RetentionRetryStrategy = 'BASELINE' | 'HOOK_FIRST' | 'EMOTION_FIRST' | 'PACING_FIRST' | 'RESCUE_MODE'
 type RetentionJudgeReport = {
   retention_score: number
   hook_strength: number
@@ -622,6 +622,11 @@ const QUALITY_GATE_THRESHOLD_FLOORS: QualityGateThresholds = {
   emotional_pull: 55,
   pacing_score: 62,
   retention_score: 58
+}
+const RESCUE_RENDER_MINIMUMS = {
+  retention_score: 44,
+  hook_strength: 52,
+  pacing_score: 50
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
   low: 0.62,
@@ -1558,6 +1563,14 @@ const maybeAllowQualityGateOverride = ({
     }
   }
   return null
+}
+
+const shouldForceRescueRender = (judge: RetentionJudgeReport) => {
+  return (
+    judge.retention_score >= RESCUE_RENDER_MINIMUMS.retention_score &&
+    judge.hook_strength >= RESCUE_RENDER_MINIMUMS.hook_strength &&
+    judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score
+  )
 }
 
 const selectRenderableHookCandidate = ({
@@ -5412,6 +5425,40 @@ const processJob = async (
           story = reorderForEmotion(story)
         } else if (strategy === 'PACING_FIRST') {
           story = applyPacingRetry(story)
+        } else if (strategy === 'RESCUE_MODE') {
+          story = applyPacingRetry(story)
+          if (editPlan) {
+            const scored = story
+              .map((segment, index) => ({
+                segment,
+                index,
+                score: averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.score),
+                speech: averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.speechIntensity),
+                runtime: Math.max(0, segment.end - segment.start)
+              }))
+            const maxRemovableSeconds = Math.max(6, durationSeconds * 0.14)
+            let removedSeconds = 0
+            const removeIndexes = new Set<number>()
+            for (const entry of scored.sort((a, b) => a.score - b.score || b.runtime - a.runtime)) {
+              if (removedSeconds >= maxRemovableSeconds) break
+              if (entry.index === 0) continue
+              if (entry.runtime < 1.7) continue
+              if (entry.score > 0.5 || entry.speech > 0.58) continue
+              removeIndexes.add(entry.index)
+              removedSeconds += entry.runtime
+            }
+            const filteredStory = story.filter((_, index) => !removeIndexes.has(index))
+            story = filteredStory.length ? filteredStory : story
+            story = enforceSegmentLengths(story, 2.2, 3.2, editPlan.engagementWindows).map((segment) => {
+              const score = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.score)
+              const speech = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.speechIntensity)
+              const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
+              if (score < 0.52 && speech < 0.6) {
+                return { ...segment, speed: Number(clamp(baseSpeed + 0.12, 1, 1.22).toFixed(3)) }
+              }
+              return segment
+            })
+          }
         }
         let ordered = options.autoHookMove && !options.onlyCuts
           ? [hookSegment, ...story]
@@ -5428,6 +5475,8 @@ const processJob = async (
         const interruptAggression: RetentionAggressionLevel =
           strategy === 'HOOK_FIRST'
             ? 'viral'
+            : strategy === 'RESCUE_MODE'
+              ? 'viral'
             : strategy === 'PACING_FIRST'
               ? (aggressionLevel === 'low' ? 'medium' : 'high')
               : aggressionLevel
@@ -5550,12 +5599,94 @@ const processJob = async (
         })
       }
       if (!selectedJudge.passed) {
-        const overrideReason = maybeAllowQualityGateOverride({
+        let overrideReason = maybeAllowQualityGateOverride({
           judge: selectedJudge,
           thresholds: qualityGateThresholds,
           hasTranscript: hasTranscriptSignals,
           signalStrength: contentSignalStrength
         })
+        if (!overrideReason) {
+          const rescueHookCandidate = orderedHookCandidates.find((candidate) => candidate.auditPassed) || initialHook
+          const rescueAttempt = buildAttemptSegments('RESCUE_MODE', rescueHookCandidate)
+          const rescueRetention = computeRetentionScore(
+            rescueAttempt.segments,
+            editPlan?.engagementWindows ?? [],
+            rescueHookCandidate.score,
+            options.autoCaptions,
+            {
+              removedRanges: editPlan?.removedSegments ?? [],
+              patternInterruptCount: rescueAttempt.patternInterruptCount
+            }
+          )
+          const rescueThresholds = normalizeQualityGateThresholds({
+            hook_strength: clamp(
+              qualityGateThresholds.hook_strength - 10,
+              QUALITY_GATE_THRESHOLD_FLOORS.hook_strength,
+              qualityGateThresholds.hook_strength
+            ),
+            emotional_pull: clamp(
+              qualityGateThresholds.emotional_pull - 10,
+              QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull,
+              qualityGateThresholds.emotional_pull
+            ),
+            pacing_score: clamp(
+              qualityGateThresholds.pacing_score - 8,
+              QUALITY_GATE_THRESHOLD_FLOORS.pacing_score,
+              qualityGateThresholds.pacing_score
+            ),
+            retention_score: clamp(
+              qualityGateThresholds.retention_score - 10,
+              QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+              qualityGateThresholds.retention_score
+            )
+          })
+          const rescueClarityPenalty = rescueHookCandidate.auditPassed
+            ? 0.1
+            : hasTranscriptSignals
+              ? 0.26
+              : 0.18
+          const rescueJudge = buildRetentionJudgeReport({
+            retentionScore: rescueRetention,
+            hook: rescueHookCandidate,
+            windows: editPlan?.engagementWindows ?? [],
+            clarityPenalty: rescueClarityPenalty,
+            captionsEnabled: options.autoCaptions,
+            patternInterruptCount: rescueAttempt.patternInterruptCount,
+            removedRanges: editPlan?.removedSegments ?? [],
+            segments: rescueAttempt.segments,
+            thresholds: rescueThresholds
+          })
+          retentionAttempts.push({
+            attempt: retentionAttempts.length + 1,
+            strategy: 'RESCUE_MODE',
+            judge: rescueJudge,
+            hook: rescueHookCandidate,
+            patternInterruptCount: rescueAttempt.patternInterruptCount,
+            patternInterruptDensity: rescueAttempt.patternInterruptDensity,
+            boredomRemovalRatio: rescueRetention.details.boredomRemovalRatio
+          })
+          finalSegments = rescueAttempt.segments
+          selectedHook = rescueHookCandidate
+          selectedJudge = rescueJudge
+          retentionScore = rescueJudge.retention_score
+          selectedPatternInterruptCount = rescueAttempt.patternInterruptCount
+          selectedPatternInterruptDensity = rescueAttempt.patternInterruptDensity
+          selectedBoredomRemovalRatio = rescueRetention.details.boredomRemovalRatio
+          selectedStrategy = 'RESCUE_MODE'
+          selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+            sourceStart: Number(segment.start.toFixed(3)),
+            sourceEnd: Number(segment.end.toFixed(3)),
+            orderedIndex
+          }))
+          optimizationNotes.push(
+            'Applied rescue edit pass for low-signal footage (harder cuts, stronger pacing, extra interrupts).'
+          )
+          if (rescueJudge.passed) {
+            overrideReason = 'Rescue edit pass raised quality enough to render.'
+          } else if (shouldForceRescueRender(rescueJudge)) {
+            overrideReason = 'Rescue render forced at adaptive floor to avoid hard-failing low-signal uploads.'
+          }
+        }
         if (overrideReason) {
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
@@ -7029,6 +7160,7 @@ export const __retentionTestUtils = {
   resolveQualityGateThresholds,
   computeContentSignalStrength,
   selectRenderableHookCandidate,
+  shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis
