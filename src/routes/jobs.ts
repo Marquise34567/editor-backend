@@ -664,6 +664,17 @@ const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = 0.4
 const HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC = 0.8
+const HOOK_SELECTION_WAIT_MS = (() => {
+  const envValue = Number(process.env.HOOK_SELECTION_WAIT_MS || 12_000)
+  if (!Number.isFinite(envValue)) return 12_000
+  return Math.max(0, Math.round(envValue))
+})()
+const HOOK_SELECTION_POLL_MS = (() => {
+  const envValue = Number(process.env.HOOK_SELECTION_POLL_MS || 500)
+  if (!Number.isFinite(envValue)) return 500
+  const rounded = Math.round(envValue)
+  return Math.max(120, Math.min(2_000, rounded))
+})()
 const CUT_MIN = 5
 const CUT_MAX = 8
 const PACE_MIN = 5
@@ -6412,6 +6423,44 @@ const getHookCandidatesFromAnalysis = (analysisRaw: any): HookCandidate[] => {
   return deduped
 }
 
+const waitForPreferredHookSelection = async ({
+  jobId,
+  candidates,
+  timeoutMs = HOOK_SELECTION_WAIT_MS,
+  pollMs = HOOK_SELECTION_POLL_MS
+}: {
+  jobId: string
+  candidates: HookCandidate[]
+  timeoutMs?: number
+  pollMs?: number
+}) => {
+  if (!jobId || !Array.isArray(candidates) || candidates.length === 0) return null
+  const waitMs = Math.max(0, Number(timeoutMs || 0))
+  if (waitMs <= 0) return null
+  const pollInterval = clamp(Number(pollMs || HOOK_SELECTION_POLL_MS), 120, 2_000)
+  const deadline = Date.now() + waitMs
+  while (Date.now() < deadline) {
+    if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+    const sleepMs = Math.min(pollInterval, Math.max(40, deadline - Date.now()))
+    await delay(sleepMs)
+    const snapshot = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { status: true, analysis: true }
+    })
+    if (!snapshot) break
+    const status = String(snapshot.status || '').toLowerCase()
+    if (status === 'failed' || status === 'completed') break
+    const analysis = ((snapshot.analysis as any) || {}) as Record<string, any>
+    const preferred = parsePreferredHookCandidateFromPayload(analysis.preferred_hook)
+    const matched = matchPreferredHookCandidate({
+      preferred,
+      candidates
+    })
+    if (matched) return matched
+  }
+  return null
+}
+
 const buildVerticalClipRanges = (
   durationSeconds: number,
   requestedCount: number,
@@ -8017,12 +8066,43 @@ const processJob = async (
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
       }
-      const preferredHookCandidate = matchPreferredHookCandidate({
+      let preferredHookCandidate = matchPreferredHookCandidate({
         preferred: preferredHookCandidateRaw,
         candidates: hookCandidates
       })
       if (preferredHookCandidateRaw && !preferredHookCandidate) {
         optimizationNotes.push('Preferred hook selection was unavailable for this render; using highest-scoring hook.')
+      }
+      if (!preferredHookCandidate && hookCandidates.length > 1 && HOOK_SELECTION_WAIT_MS > 0) {
+        const selectionWindowEndsAt = new Date(Date.now() + HOOK_SELECTION_WAIT_MS).toISOString()
+        await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
+          status: 'running',
+          attempts: 1,
+          startedAt: toIsoNow(),
+          lastError: null,
+          meta: {
+            waitingForUserSelection: true,
+            selectionWindowMs: HOOK_SELECTION_WAIT_MS,
+            selectionWindowEndsAt,
+            hookCandidates: hookCandidates.slice(0, HOOK_SELECTION_MAX_CANDIDATES),
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
+          }
+        })
+        await updateJob(jobId, { status: 'hooking', progress: 56 })
+        const waitedPreferredHook = await waitForPreferredHookSelection({
+          jobId,
+          candidates: hookCandidates,
+          timeoutMs: HOOK_SELECTION_WAIT_MS,
+          pollMs: HOOK_SELECTION_POLL_MS
+        })
+        if (waitedPreferredHook) {
+          preferredHookCandidate = waitedPreferredHook
+          optimizationNotes.push(
+            `User-selected hook applied during hook stage (${waitedPreferredHook.start.toFixed(1)}s-${(waitedPreferredHook.start + waitedPreferredHook.duration).toFixed(1)}s).`
+          )
+        }
+        await updateJob(jobId, { status: 'story', progress: 55 })
       }
       const initialHook = preferredHookCandidate || resolvedHookDecision.candidate
       selectedHookSelectionSource = preferredHookCandidate
@@ -10000,7 +10080,8 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
       'analyzing',
       'hooking',
       'cutting',
-      'pacing'
+      'pacing',
+      'story'
     ])
     if (!mutableHookStatuses.has(status)) {
       return res.status(409).json({
