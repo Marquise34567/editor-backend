@@ -99,6 +99,7 @@ const buildSubscriptionTrialInfo = (
 
 type ActivateManualFreeTrialResult = {
   alreadyActive: boolean
+  alreadyUsed: boolean
   tier: PlanTier
   trial: TrialInfo
 }
@@ -108,17 +109,17 @@ export const activateManualFreeTrial = async (userId: string): Promise<ActivateM
   const unlockTier = getFreeTrialUnlockTier()
   const endsAt = new Date(now.getTime() + FREE_TRIAL_DAYS * DAY_MS)
   const existing = await getSubscriptionForUser(userId)
-  const existingTrialInfo =
-    existing?.status === 'trialing'
-      ? buildSubscriptionTrialInfo(
-          existing.currentPeriodEnd ?? null,
-          resolveTrialTier(existing.planTier),
-          existing.updatedAt ?? now
-        )
-      : emptyTrialInfo()
-  if (existingTrialInfo.active) {
+  const hasUsedManualTrial = existing?.priceId === FREE_TRIAL_PRICE_ID || existing?.status === 'trialing'
+  if (hasUsedManualTrial) {
+    const existingTrialInfo = buildSubscriptionTrialInfo(
+      existing?.currentPeriodEnd ?? null,
+      resolveTrialTier(existing?.planTier),
+      existing?.updatedAt ?? null
+    )
+    const alreadyActive = existing?.status === 'trialing' && existingTrialInfo.active
     return {
-      alreadyActive: true,
+      alreadyActive,
+      alreadyUsed: true,
       tier: existingTrialInfo.trialTier ?? unlockTier,
       trial: existingTrialInfo
     }
@@ -152,6 +153,7 @@ export const activateManualFreeTrial = async (userId: string): Promise<ActivateM
   })
   return {
     alreadyActive: false,
+    alreadyUsed: false,
     tier: unlockTier,
     trial: buildSubscriptionTrialInfo(endsAt, unlockTier, now)
   }

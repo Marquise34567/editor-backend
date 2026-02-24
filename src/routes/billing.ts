@@ -52,18 +52,38 @@ const handleCheckout = async (req: any, res: any) => {
         })
       }
       const activated = await activateManualFreeTrial(user.id)
+      if (activated.alreadyUsed && !activated.alreadyActive) {
+        return res.status(409).json({
+          error: 'trial_already_used',
+          message: 'Free trial already used. Upgrade to keep full access.',
+          trial: {
+            tier: activated.tier,
+            active: activated.trial.active,
+            startedAt: activated.trial.startedAt,
+            endsAt: activated.trial.endsAt,
+            daysRemaining: activated.trial.daysRemaining,
+            alreadyActive: activated.alreadyActive,
+            alreadyUsed: activated.alreadyUsed
+          }
+        })
+      }
       const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'http://localhost:3000'
       const trialStatus = activated.alreadyActive ? 'active' : 'started'
-      const trialUrl = `${baseUrl}/editor?trial=${trialStatus}`
+      const trialUrl = new URL('/billing/success', baseUrl)
+      trialUrl.searchParams.set('source', 'trial')
+      trialUrl.searchParams.set('trial', trialStatus)
+      trialUrl.searchParams.set('tier', activated.tier)
+      if (activated.trial.endsAt) trialUrl.searchParams.set('endsAt', activated.trial.endsAt)
       return res.json({
-        url: trialUrl,
+        url: trialUrl.toString(),
         trial: {
           tier: activated.tier,
           active: activated.trial.active,
           startedAt: activated.trial.startedAt,
           endsAt: activated.trial.endsAt,
           daysRemaining: activated.trial.daysRemaining,
-          alreadyActive: activated.alreadyActive
+          alreadyActive: activated.alreadyActive,
+          alreadyUsed: activated.alreadyUsed
         }
       })
     }
