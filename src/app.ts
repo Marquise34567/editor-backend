@@ -107,11 +107,24 @@ const isAllowedAutoeditorOrigin = (origin: string) => {
   }
 }
 
+const isAllowedLocalDevOrigin = (origin: string) => {
+  try {
+    const url = new URL(origin)
+    const protocol = url.protocol.toLowerCase()
+    if (protocol !== 'http:' && protocol !== 'https:') return false
+    const host = url.hostname.toLowerCase()
+    return host === 'localhost' || host === '127.0.0.1' || host === '::1'
+  } catch {
+    return false
+  }
+}
+
 const isAllowedOrigin = (origin?: string | null) => {
   if (!origin) return true
   const normalized = normalizeOrigin(origin)
   if (!normalized) return false
   if (allowedOriginSet.has(normalized)) return true
+  if (isAllowedLocalDevOrigin(normalized)) return true
   if (isAllowedAutoeditorOrigin(normalized)) return true
   if (isAllowedVercelOrigin(normalized)) return true
   return false

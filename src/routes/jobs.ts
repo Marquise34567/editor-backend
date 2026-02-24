@@ -5319,20 +5319,43 @@ const processJob = async (
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength
       })
-      if (!hookDecision) {
-        await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: 'Hook candidate unavailable for render',
-          meta: {
-            hasTranscriptSignals,
-            contentSignalStrength
-          }
-        })
-        await updateJob(jobId, { status: 'failed', error: 'FAILED_HOOK: Hook candidate unavailable for render' })
-        throw new HookGateError('Hook candidate unavailable for render')
+      let resolvedHookDecision: HookSelectionDecision | null = hookDecision
+      if (!resolvedHookDecision) {
+        const fallbackStart = Number((storySegments[0]?.start ?? 0).toFixed(3))
+        const fallbackDuration = Number(
+          clamp(
+            storySegments[0] ? (storySegments[0].end - storySegments[0].start) : 6,
+            HOOK_MIN,
+            HOOK_MAX
+          ).toFixed(3)
+        )
+        const fallbackHook: HookCandidate = {
+          start: fallbackStart,
+          duration: fallbackDuration,
+          score: 0.48,
+          auditScore: 0.46,
+          auditPassed: false,
+          text: '',
+          reason: 'Fallback hook generated from earliest stable segment due weak candidate pool.',
+          synthetic: true
+        }
+        resolvedHookDecision = {
+          candidate: fallbackHook,
+          confidence: getHookCandidateConfidence(fallbackHook),
+          threshold: resolveHookScoreThreshold({
+            aggressionLevel,
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength
+          }),
+          usedFallback: true,
+          reason: fallbackHook.reason
+        }
+        optimizationNotes.push('Hook fallback applied: no strong candidate passed; used earliest stable highlight.')
       }
-      const initialHook = hookDecision.candidate
+      if (!resolvedHookDecision) {
+        throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
+      }
+      const initialHook = resolvedHookDecision.candidate
       const orderedHookCandidates = [
         initialHook,
         ...hookCandidates.filter((candidate) => (
@@ -5345,16 +5368,16 @@ const processJob = async (
         completedAt: toIsoNow(),
         meta: {
           selectedHook: initialHook,
-          confidence: Number(hookDecision.confidence.toFixed(4)),
-          threshold: hookDecision.threshold,
-          usedFallback: hookDecision.usedFallback,
-          reason: hookDecision.reason,
+          confidence: Number(resolvedHookDecision.confidence.toFixed(4)),
+          threshold: resolvedHookDecision.threshold,
+          usedFallback: resolvedHookDecision.usedFallback,
+          reason: resolvedHookDecision.reason,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4))
         }
       })
-      if (hookDecision.usedFallback && hookDecision.reason) {
-        optimizationNotes.push(hookDecision.reason)
+      if (resolvedHookDecision.usedFallback && resolvedHookDecision.reason) {
+        optimizationNotes.push(resolvedHookDecision.reason)
       }
 
       const reorderForEmotion = (segments: Segment[]) => {
@@ -5691,39 +5714,9 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
-          const reason = selectedJudge.what_is_generic.join('; ') || 'Video is still generic after retries'
-          await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-            status: 'failed',
-            completedAt: toIsoNow(),
-            lastError: reason,
-            meta: {
-              attempts: retentionAttempts,
-              judge: selectedJudge,
-              thresholds: qualityGateThresholds,
-              hasTranscriptSignals,
-              contentSignalStrength: Number(contentSignalStrength.toFixed(4))
-            }
-          })
-          await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-            status: 'failed',
-            completedAt: toIsoNow(),
-            lastError: reason,
-            meta: {
-              attempts: retentionAttempts,
-              judge: selectedJudge,
-              thresholds: qualityGateThresholds,
-              hasTranscriptSignals,
-              contentSignalStrength: Number(contentSignalStrength.toFixed(4))
-            }
-          })
-          await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
-          throw new QualityGateError(reason, {
-            attempts: retentionAttempts,
-            judge: selectedJudge,
-            thresholds: qualityGateThresholds,
-            hasTranscriptSignals,
-            contentSignalStrength: Number(contentSignalStrength.toFixed(4))
-          })
+          const forcedReason = 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
+          qualityGateOverride = { applied: true, reason: forcedReason }
+          optimizationNotes.push(forcedReason)
         }
       }
 
