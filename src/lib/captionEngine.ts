@@ -21,6 +21,8 @@ export type CaptionEngineStatus = {
 const CAPTION_ENGINE_CACHE_TTL_MS = 20_000
 const CAPTION_PROBE_TIMEOUT_MS = 5_000
 const CAPTION_USAGE_SIGNATURE = /usage|--output_format|--model|transcribe/i
+const DEFAULT_PYTHON_UTF8_ENV = '1'
+const DEFAULT_PYTHON_IO_ENCODING = 'utf-8'
 
 let cachedStatus: CaptionEngineStatus | null = null
 let cacheUpdatedAtMs = 0
@@ -54,10 +56,16 @@ const buildProbeAttempts = () => {
 
 const probeAttempt = (attempt: CaptionProbeAttempt) => {
   try {
+    const probeEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PYTHONUTF8: process.env.PYTHONUTF8 || DEFAULT_PYTHON_UTF8_ENV,
+      PYTHONIOENCODING: process.env.PYTHONIOENCODING || DEFAULT_PYTHON_IO_ENCODING
+    }
     const result = spawnSync(attempt.command, attempt.args, {
       timeout: CAPTION_PROBE_TIMEOUT_MS,
       encoding: 'utf8',
-      windowsHide: true
+      windowsHide: true,
+      env: probeEnv
     })
     if (result.error) return false
     const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`
@@ -103,4 +111,3 @@ export const getCaptionEngineStatus = (opts?: { force?: boolean }) => {
   cacheUpdatedAtMs = now
   return cachedStatus
 }
-
