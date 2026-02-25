@@ -196,3 +196,18 @@ export const sampleFootageTestRequestSchema = z
     params: algorithmConfigParamsSchema.optional()
   })
   .strict()
+
+export const promptTuneRequestSchema = z
+  .object({
+    prompt: z.string().trim().min(4).max(2_000),
+    fallback_limit: z.number().int().min(50).max(5_000).optional(),
+    fallback_range: z.string().trim().min(2).max(12).optional()
+  })
+  .strict()
+
+export const autoOptimizeRequestSchema = z
+  .object({
+    limit: z.number().int().min(50).max(5_000).optional(),
+    range: z.string().trim().min(2).max(12).optional()
+  })
+  .strict()

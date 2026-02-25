@@ -23,10 +23,12 @@ import { requireAlgorithmDevAccess } from '../security/requireAlgorithmDevAccess
 import { analyzeRenderImprovements } from '../suggestions/suggestionEngine'
 import {
   analyzeRendersRequestSchema,
+  autoOptimizeRequestSchema,
   algorithmConfigParamsSchema,
   applyPresetRequestSchema,
   createConfigRequestSchema,
   experimentStartRequestSchema,
+  promptTuneRequestSchema,
   sampleFootageTestRequestSchema
 } from '../types'
 
@@ -61,6 +63,427 @@ const parseLimit = (raw: unknown, fallback: number, min: number, max: number) =>
 const canRunRawSql = () =>
   typeof (prisma as any)?.$queryRawUnsafe === 'function' &&
   typeof (prisma as any)?.$executeRawUnsafe === 'function'
+
+type AlgorithmConfigParams = z.infer<typeof algorithmConfigParamsSchema>
+type NumericParamKey = Exclude<keyof AlgorithmConfigParams, 'subtitle_style_mode'>
+
+type PromptChange = {
+  key: keyof AlgorithmConfigParams
+  previous: number | string
+  next: number | string
+  delta: number | null
+  source: 'prompt_directive' | 'prompt_intent' | 'suggestion_fallback'
+  reason: string
+}
+
+const NUMERIC_PARAM_LIMITS: Record<NumericParamKey, { min: number; max: number; integer?: boolean }> = {
+  cut_aggression: { min: 0, max: 100 },
+  min_clip_len_ms: { min: 120, max: 30_000, integer: true },
+  max_clip_len_ms: { min: 300, max: 120_000, integer: true },
+  silence_db_threshold: { min: -80, max: -5 },
+  silence_min_ms: { min: 80, max: 8_000, integer: true },
+  filler_word_weight: { min: 0, max: 4 },
+  redundancy_weight: { min: 0, max: 4 },
+  energy_floor: { min: 0, max: 1 },
+  spike_boost: { min: 0, max: 3 },
+  pattern_interrupt_every_sec: { min: 2, max: 60 },
+  hook_priority_weight: { min: 0, max: 3 },
+  story_coherence_guard: { min: 0, max: 100 },
+  jank_guard: { min: 0, max: 100 },
+  pacing_multiplier: { min: 0.3, max: 3 }
+}
+
+const PARAM_ALIASES: Record<NumericParamKey, string[]> = {
+  cut_aggression: ['cut aggression', 'aggression', 'cut_aggr'],
+  min_clip_len_ms: ['min clip', 'minimum clip', 'min clip len', 'min clip length'],
+  max_clip_len_ms: ['max clip', 'maximum clip', 'max clip len', 'max clip length'],
+  silence_db_threshold: ['silence db threshold', 'silence threshold', 'silence db'],
+  silence_min_ms: ['silence min', 'minimum silence', 'silence min ms', 'pause min'],
+  filler_word_weight: ['filler weight', 'filler penalty', 'filler_word_weight'],
+  redundancy_weight: ['redundancy weight', 'repeat penalty', 'redundancy'],
+  energy_floor: ['energy floor', 'minimum energy'],
+  spike_boost: ['spike boost', 'emotion spike boost'],
+  pattern_interrupt_every_sec: ['pattern interrupt', 'interrupt cycle', 'pattern cadence'],
+  hook_priority_weight: ['hook priority', 'hook weight', 'opening priority'],
+  story_coherence_guard: ['story guard', 'coherence guard', 'narrative guard'],
+  jank_guard: ['jank guard', 'continuity guard'],
+  pacing_multiplier: ['pacing multiplier', 'tempo multiplier']
+}
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+
+const normalizeSubtitleMode = (value: string) =>
+  value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_\- ]+/g, ' ')
+    .replace(/\s+/g, '_')
+    .slice(0, 120) || 'premium_clean'
+
+const applyNumericChange = ({
+  next,
+  changes,
+  key,
+  targetRaw,
+  source,
+  reason
+}: {
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+  key: NumericParamKey
+  targetRaw: number
+  source: PromptChange['source']
+  reason: string
+}) => {
+  if (!Number.isFinite(targetRaw)) return
+  const limits = NUMERIC_PARAM_LIMITS[key]
+  const previous = Number(next[key])
+  let target = clamp(targetRaw, limits.min, limits.max)
+  if (limits.integer) target = Math.round(target)
+  if (Math.abs(target - previous) < 0.0001) return
+  next[key] = target as any
+  changes.push({
+    key,
+    previous,
+    next: target,
+    delta: Number((target - previous).toFixed(4)),
+    source,
+    reason
+  })
+}
+
+const applyNumericDelta = ({
+  next,
+  changes,
+  key,
+  delta,
+  source,
+  reason
+}: {
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+  key: NumericParamKey
+  delta: number
+  source: PromptChange['source']
+  reason: string
+}) => {
+  if (!Number.isFinite(delta) || Math.abs(delta) < 0.0001) return
+  applyNumericChange({
+    next,
+    changes,
+    key,
+    targetRaw: Number(next[key]) + delta,
+    source,
+    reason
+  })
+}
+
+const applySubtitleModeChange = ({
+  next,
+  changes,
+  nextModeRaw,
+  source,
+  reason
+}: {
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+  nextModeRaw: string
+  source: PromptChange['source']
+  reason: string
+}) => {
+  const previous = String(next.subtitle_style_mode || 'premium_clean')
+  const normalized = normalizeSubtitleMode(nextModeRaw)
+  if (!normalized || normalized === previous) return
+  next.subtitle_style_mode = normalized
+  changes.push({
+    key: 'subtitle_style_mode',
+    previous,
+    next: normalized,
+    delta: null,
+    source,
+    reason
+  })
+}
+
+const parsePromptIntoParams = async ({
+  prompt,
+  base,
+  fallbackLimit,
+  fallbackRange
+}: {
+  prompt: string
+  base: AlgorithmConfigParams
+  fallbackLimit?: number
+  fallbackRange?: string
+}) => {
+  const normalizedPrompt = String(prompt || '').trim()
+  const lower = normalizedPrompt.toLowerCase()
+  const next: AlgorithmConfigParams = { ...base }
+  const changes: PromptChange[] = []
+  const warnings: string[] = []
+  let strategy: 'prompt_directive' | 'prompt_intent' | 'suggestion_fallback' = 'prompt_intent'
+
+  const directMatches: NumericParamKey[] = []
+  for (const [key, aliases] of Object.entries(PARAM_ALIASES) as Array<[NumericParamKey, string[]]>) {
+    const aliasPattern = aliases
+      .map((value) => escapeRegExp(value).replace(/\s+/g, '[\\s_-]*'))
+      .join('|')
+
+    const setMatch = normalizedPrompt.match(new RegExp(`(?:${aliasPattern})\\s*(?:=|:|to)\\s*(-?\\d+(?:\\.\\d+)?)`, 'i'))
+    if (setMatch?.[1] != null) {
+      directMatches.push(key)
+      applyNumericChange({
+        next,
+        changes,
+        key,
+        targetRaw: Number(setMatch[1]),
+        source: 'prompt_directive',
+        reason: `Direct ${key} assignment in prompt`
+      })
+      continue
+    }
+
+    const increaseMatch = normalizedPrompt.match(
+      new RegExp(`(?:increase|raise|boost)\\s+(?:the\\s+)?(?:${aliasPattern})(?:\\s+by)?\\s*(-?\\d+(?:\\.\\d+)?)`, 'i')
+    )
+    if (increaseMatch?.[1] != null) {
+      directMatches.push(key)
+      applyNumericDelta({
+        next,
+        changes,
+        key,
+        delta: Math.abs(Number(increaseMatch[1])),
+        source: 'prompt_directive',
+        reason: `Increase ${key} from prompt`
+      })
+      continue
+    }
+
+    const decreaseMatch = normalizedPrompt.match(
+      new RegExp(`(?:decrease|lower|reduce)\\s+(?:the\\s+)?(?:${aliasPattern})(?:\\s+by)?\\s*(-?\\d+(?:\\.\\d+)?)`, 'i')
+    )
+    if (decreaseMatch?.[1] != null) {
+      directMatches.push(key)
+      applyNumericDelta({
+        next,
+        changes,
+        key,
+        delta: -Math.abs(Number(decreaseMatch[1])),
+        source: 'prompt_directive',
+        reason: `Decrease ${key} from prompt`
+      })
+    }
+  }
+  if (directMatches.length) strategy = 'prompt_directive'
+
+  const subtitleModeMatch = normalizedPrompt.match(
+    /(?:subtitle(?:_style_mode)?|caption(?:s)?\s*style)\s*(?:=|:|to)\s*([a-z0-9 _-]{2,60})/i
+  )
+  if (subtitleModeMatch?.[1]) {
+    strategy = strategy === 'prompt_directive' ? strategy : 'prompt_intent'
+    applySubtitleModeChange({
+      next,
+      changes,
+      nextModeRaw: subtitleModeMatch[1],
+      source: strategy === 'prompt_directive' ? 'prompt_directive' : 'prompt_intent',
+      reason: 'Subtitle style instruction in prompt'
+    })
+  }
+
+  if (/(hook|opening|first\s*(3|5|8)\s*s|intro)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'hook_priority_weight',
+      delta: 0.18,
+      source: 'prompt_intent',
+      reason: 'Prompt emphasizes hook strength'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'pattern_interrupt_every_sec',
+      delta: -1.4,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger early retention cadence'
+    })
+  }
+
+  if (/(faster|fast[-\s]?paced|snappy|snappier|aggressive|viral|more cuts|punchy)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'cut_aggression',
+      delta: 8,
+      source: 'prompt_intent',
+      reason: 'Prompt requests faster/high-retention pacing'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'pacing_multiplier',
+      delta: 0.12,
+      source: 'prompt_intent',
+      reason: 'Prompt requests faster pacing multiplier'
+    })
+  }
+
+  if (/(smooth|stable|stability|less jank|reduce jank|clean transitions|safer)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'jank_guard',
+      delta: 8,
+      source: 'prompt_intent',
+      reason: 'Prompt requests smoother output'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'cut_aggression',
+      delta: -6,
+      source: 'prompt_intent',
+      reason: 'Lower aggression to reduce abrupt transitions'
+    })
+  }
+
+  if (/(story|narrative|context|coherence)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'story_coherence_guard',
+      delta: 9,
+      source: 'prompt_intent',
+      reason: 'Prompt asks for stronger story continuity'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'max_clip_len_ms',
+      delta: 900,
+      source: 'prompt_intent',
+      reason: 'Allow longer segments to preserve story context'
+    })
+  }
+
+  if (/(filler|um\\b|uh\\b|dead words)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'filler_word_weight',
+      delta: 0.22,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger filler suppression'
+    })
+  }
+
+  if (/(redundan|repeat|repetition)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'redundancy_weight',
+      delta: 0.18,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger redundancy suppression'
+    })
+  }
+
+  if (/(emotion|emotional|spike|energy)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'spike_boost',
+      delta: 0.16,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger emotional spike emphasis'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'energy_floor',
+      delta: 0.04,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger energy baseline'
+    })
+  }
+
+  if (/(silence|dead air|pauses?)/i.test(lower)) {
+    if (/(cut more silence|remove silence|trim pauses|remove dead air)/i.test(lower)) {
+      applyNumericDelta({
+        next,
+        changes,
+        key: 'silence_min_ms',
+        delta: -160,
+        source: 'prompt_intent',
+        reason: 'Prompt requests more aggressive silence removal'
+      })
+      applyNumericDelta({
+        next,
+        changes,
+        key: 'silence_db_threshold',
+        delta: 3,
+        source: 'prompt_intent',
+        reason: 'Prompt requests broader silence detection'
+      })
+    } else if (/(keep pauses|preserve pauses|less silence cut|natural pauses)/i.test(lower)) {
+      applyNumericDelta({
+        next,
+        changes,
+        key: 'silence_min_ms',
+        delta: 180,
+        source: 'prompt_intent',
+        reason: 'Prompt requests preserving pauses'
+      })
+      applyNumericDelta({
+        next,
+        changes,
+        key: 'silence_db_threshold',
+        delta: -3,
+        source: 'prompt_intent',
+        reason: 'Prompt requests stricter silence detection'
+      })
+    }
+  }
+
+  if (!changes.length) {
+    const report = await analyzeRenderImprovements({
+      limit: Math.max(50, Math.min(5_000, Math.round(Number(fallbackLimit || 800)))),
+      range: String(fallbackRange || '7d')
+    })
+    const fallback = report.suggestions.find((item) => item.predicted_delta_score > 0) || report.suggestions[0] || null
+    if (fallback) {
+      strategy = 'suggestion_fallback'
+      if (Object.prototype.hasOwnProperty.call(fallback.change, 'rollback_to_config_version')) {
+        warnings.push('Prompt did not map cleanly to config params. Suggested rollback action instead.')
+      } else {
+        for (const [rawKey, rawDelta] of Object.entries(fallback.change)) {
+          if (!Object.prototype.hasOwnProperty.call(NUMERIC_PARAM_LIMITS, rawKey)) continue
+          const key = rawKey as NumericParamKey
+          const delta = Number(rawDelta)
+          applyNumericDelta({
+            next,
+            changes,
+            key,
+            delta,
+            source: 'suggestion_fallback',
+            reason: `Fallback suggestion: ${fallback.title}`
+          })
+        }
+      }
+    } else {
+      warnings.push('No deterministic prompt mapping or fallback suggestion was available.')
+    }
+  }
+
+  const parsed = parseConfigParams(next)
+  return {
+    strategy,
+    params: parsed,
+    changes,
+    warnings
+  }
+}
 
 const configVersionResponseSchema = z
   .object({
@@ -225,6 +648,35 @@ const retentionScoringResultSchema = z
     subscores: retentionSubscoresSchema,
     features: z.record(z.string(), z.unknown()),
     flags: z.record(z.string(), z.unknown())
+  })
+  .strict()
+
+const promptChangeSchema = z
+  .object({
+    key: z.string(),
+    previous: z.union([z.number(), z.string()]),
+    next: z.union([z.number(), z.string()]),
+    delta: z.number().nullable(),
+    source: z.enum(['prompt_directive', 'prompt_intent', 'suggestion_fallback']),
+    reason: z.string()
+  })
+  .strict()
+
+const promptApplyResponseSchema = z
+  .object({
+    prompt: z.string(),
+    strategy: z.enum(['prompt_directive', 'prompt_intent', 'suggestion_fallback']),
+    warnings: z.array(z.string()),
+    applied_changes: z.array(promptChangeSchema),
+    config: configVersionResponseSchema
+  })
+  .strict()
+
+const autoOptimizeResponseSchema = z
+  .object({
+    analyzed_sample_size: z.number(),
+    suggestion: suggestionSchema,
+    config: configVersionResponseSchema
   })
   .strict()
 
@@ -454,6 +906,115 @@ router.post('/analyze-renders', async (req, res) => {
   })
 
   return sendValidated(res, analyzeResponseSchema, report)
+})
+
+router.post('/prompt/apply', async (req: any, res) => {
+  const payload = parseWith(promptTuneRequestSchema, req.body || {}, res)
+  if (!payload) return
+
+  const active = await getActiveConfigVersion()
+  const promptResult = await parsePromptIntoParams({
+    prompt: payload.prompt,
+    base: active.params,
+    fallbackLimit: payload.fallback_limit,
+    fallbackRange: payload.fallback_range
+  })
+
+  if (!promptResult.changes.length) {
+    return res.status(422).json({
+      error: 'prompt_not_actionable',
+      message: 'Could not derive deterministic config changes from the prompt.'
+    })
+  }
+
+  const created = await createConfigVersion({
+    createdByUserId: req.user?.id || null,
+    presetName: active.preset_name || 'Prompt Tuning',
+    params: promptResult.params,
+    activate: true,
+    note: `Prompt tune: ${payload.prompt.slice(0, 160)}`
+  })
+
+  return sendValidated(
+    res,
+    promptApplyResponseSchema,
+    {
+      prompt: payload.prompt,
+      strategy: promptResult.strategy,
+      warnings: promptResult.warnings,
+      applied_changes: promptResult.changes,
+      config: {
+        ...created,
+        params: created.params
+      }
+    },
+    201
+  )
+})
+
+router.post('/auto-optimize', async (req: any, res) => {
+  const payload = parseWith(autoOptimizeRequestSchema, req.body || {}, res)
+  if (!payload) return
+
+  const report = await analyzeRenderImprovements({
+    limit: payload.limit || 1000,
+    range: payload.range
+  })
+  const suggestion = report.suggestions.find((item) => item.predicted_delta_score > 0) || report.suggestions[0] || null
+  if (!suggestion) {
+    return res.status(422).json({
+      error: 'no_optimization_suggestion',
+      message: 'No deterministic optimization suggestion is currently available.'
+    })
+  }
+
+  let config = null as Awaited<ReturnType<typeof createConfigVersion>> | null
+  if (Object.prototype.hasOwnProperty.call(suggestion.change, 'rollback_to_config_version')) {
+    const rolled = await rollbackConfigVersion()
+    if (!rolled) {
+      return res.status(422).json({
+        error: 'rollback_unavailable',
+        message: 'Suggestion requested rollback but no previous config was available.'
+      })
+    }
+    config = rolled
+  } else {
+    const active = await getActiveConfigVersion()
+    const next = parseConfigParams(active.params)
+    for (const [rawKey, rawDelta] of Object.entries(suggestion.change)) {
+      if (!Object.prototype.hasOwnProperty.call(NUMERIC_PARAM_LIMITS, rawKey)) continue
+      applyNumericDelta({
+        next,
+        changes: [],
+        key: rawKey as NumericParamKey,
+        delta: Number(rawDelta),
+        source: 'suggestion_fallback',
+        reason: `Auto optimize: ${suggestion.title}`
+      })
+    }
+
+    config = await createConfigVersion({
+      createdByUserId: req.user?.id || null,
+      presetName: active.preset_name || 'Auto Optimized',
+      params: parseConfigParams(next),
+      activate: true,
+      note: `Auto optimize: ${suggestion.title}`
+    })
+  }
+
+  return sendValidated(
+    res,
+    autoOptimizeResponseSchema,
+    {
+      analyzed_sample_size: report.summary.sample_size,
+      suggestion,
+      config: {
+        ...config,
+        params: config.params
+      }
+    },
+    201
+  )
 })
 
 router.post('/experiment/start', async (req: any, res) => {
