@@ -528,6 +528,12 @@ type RenderConfig = {
   horizontalMode: HorizontalModeSettings
   verticalMode: VerticalModeSettings | null
 }
+type EmotionStyleMode = 'cinematic' | 'hype' | 'comedy' | 'story'
+type EmotionModeSettings = {
+  enabled: boolean
+  style: EmotionStyleMode
+  intensity: number
+}
 type EngagementWindow = {
   time: number
   audioEnergy: number
@@ -657,6 +663,62 @@ type HookSelectionDecision = {
   usedFallback: boolean
   reason: string | null
 }
+type EmotionModeProfile = {
+  enabled: boolean
+  style: EmotionStyleMode
+  intensity: number
+  confidence: number
+  hookBias: number
+  cutBias: number
+  pacingBias: number
+  peakBias: number
+  buildUpPreserve: number
+  thresholdShift: number
+}
+type EmotionAnalysisSegment = {
+  start_time: number
+  end_time: number
+  text_intensity: number
+  audio_energy: number
+  hook_clarity_score: number
+  emotion_score: number
+  emotion_type: string
+  confidence: number
+}
+type EmotionPeakAnalysis = {
+  start_time: number
+  end_time: number
+  peak_score: number
+  emotion_type: string
+  hook_candidate: boolean
+  clarity_score: number
+  build_up_start: number
+  drop_off_window: {
+    start_time: number
+    end_time: number
+  }
+}
+type EmotionAnalysisReport = {
+  enabled: boolean
+  style: EmotionStyleMode
+  intensity: number
+  confidence: number
+  peak_threshold: number
+  segments: EmotionAnalysisSegment[]
+  peaks: EmotionPeakAnalysis[]
+  selected_hook_segment: {
+    start_time: number
+    end_time: number
+    source: 'peak' | 'fallback'
+  } | null
+}
+type EmotionSummaryReport = {
+  emotion_density: number
+  peak_count: number
+  dead_air_removed_seconds: number
+  avg_scene_length: number
+  hook_strength_score: number
+}
 type HookCalibrationWeights = {
   candidateScore: number
   auditScore: number
@@ -750,6 +812,7 @@ type EditOptions = {
   autoZoomMax: number
   retentionAggressionLevel: RetentionAggressionLevel
   retentionStrategyProfile: RetentionStrategyProfile
+  maxCutsRequested?: number | null
   preferredHookCandidate?: HookCandidate | null
   styleArchetypeBlend?: Partial<StyleArchetypeBlend> | null
   fastMode?: boolean
@@ -797,6 +860,8 @@ const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSel
 const HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchDurationToleranceSec
 const HOOK_SELECTION_WAIT_MS = EDITOR_RETENTION_CONFIG.hookSelectionWaitMs
 const HOOK_SELECTION_POLL_MS = EDITOR_RETENTION_CONFIG.hookSelectionPollMs
+const USER_MAX_CUTS_MIN = 1
+const USER_MAX_CUTS_MAX = 15
 const CUT_MIN = EDITOR_RETENTION_CONFIG.cutMin
 const CUT_MAX = EDITOR_RETENTION_CONFIG.cutMax
 const PACE_MIN = EDITOR_RETENTION_CONFIG.cutMin
@@ -1312,7 +1377,8 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   subtitleStyle: DEFAULT_SUBTITLE_PRESET,
   autoZoomMax: 1.1,
   retentionAggressionLevel: 'medium',
-  retentionStrategyProfile: 'balanced'
+  retentionStrategyProfile: 'balanced',
+  maxCutsRequested: null
 }
 
 const applyRetentionStyleReferencePreset = ({
@@ -1574,6 +1640,13 @@ const parseVerticalClipCount = (value?: any) => {
   return clamp(parsed, 1, MAX_VERTICAL_CLIPS)
 }
 
+const parseMaxCutsPreference = (value: any): number | null => {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number.parseInt(String(value), 10)
+  if (!Number.isFinite(parsed)) return null
+  return clamp(parsed, USER_MAX_CUTS_MIN, USER_MAX_CUTS_MAX)
+}
+
 const parseBooleanFlag = (value: any): boolean | null => {
   if (value === true) return true
   if (value === false) return false
@@ -1784,6 +1857,17 @@ const getOnlyCutsFromPayload = (payload?: any): boolean | null => {
   )
 }
 
+const getMaxCutsFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseMaxCutsPreference((payload as any).maxCuts) ??
+    parseMaxCutsPreference((payload as any).max_cuts) ??
+    parseMaxCutsPreference((payload as any).maxCutsRequested) ??
+    parseMaxCutsPreference((payload as any).cutCount) ??
+    null
+  )
+}
+
 const getAutoCaptionsFromPayload = (payload?: any): boolean | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).subtitles
@@ -1915,6 +1999,20 @@ const getOnlyCutsFromJob = (job?: any): boolean | null => {
   )
 }
 
+const getMaxCutsFromJob = (job?: any): number | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseMaxCutsPreference(settings?.maxCuts) ??
+    parseMaxCutsPreference(settings?.max_cuts) ??
+    parseMaxCutsPreference(settings?.maxCutsRequested) ??
+    parseMaxCutsPreference(analysis?.maxCuts) ??
+    parseMaxCutsPreference(analysis?.max_cuts) ??
+    parseMaxCutsPreference(analysis?.maxCutsRequested) ??
+    null
+  )
+}
+
 const getRetentionStrategyFromJob = (job?: any): RetentionStrategyProfile => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -2025,6 +2123,7 @@ const buildPersistedRenderSettings = (
     retentionTargetPlatform?: RetentionTargetPlatform | null
     platformProfile?: PlatformProfile | null
     onlyCuts?: boolean | null
+    maxCuts?: number | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -2036,6 +2135,7 @@ const buildPersistedRenderSettings = (
   const retentionTargetPlatform = parseRetentionTargetPlatform(opts?.retentionTargetPlatform || 'auto')
   const platformProfile = parsePlatformProfile(opts?.platformProfile || retentionTargetPlatform, 'auto')
   const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
+  const maxCuts = parseMaxCutsPreference(opts?.maxCuts)
   return {
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
@@ -2050,7 +2150,8 @@ const buildPersistedRenderSettings = (
     targetPlatform: retentionTargetPlatform,
     platformProfile,
     platform_profile: platformProfile,
-    ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts })
+    ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
+    ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts })
   }
 }
 
@@ -2059,6 +2160,7 @@ const buildPersistedRenderAnalysis = ({
   renderConfig,
   outputPaths,
   onlyCuts,
+  maxCuts,
   retentionTargetPlatform,
   platformProfile
 }: {
@@ -2066,6 +2168,7 @@ const buildPersistedRenderAnalysis = ({
   renderConfig: RenderConfig
   outputPaths?: string[] | null
   onlyCuts?: boolean | null
+  maxCuts?: number | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
   platformProfile?: PlatformProfile | null
 }) => {
@@ -2076,6 +2179,12 @@ const buildPersistedRenderAnalysis = ({
       parseBooleanFlag((existing as any)?.onlyHookAndCut) ??
       null
     )
+  const resolvedMaxCuts = parseMaxCutsPreference(
+    maxCuts ??
+    (existing as any)?.maxCuts ??
+    (existing as any)?.max_cuts ??
+    (existing as any)?.maxCutsRequested
+  )
   const verticalCrop = renderConfig.verticalMode?.webcamCrop
     ? {
         x: renderConfig.verticalMode.webcamCrop.x,
@@ -2130,6 +2239,11 @@ const buildPersistedRenderAnalysis = ({
   if (resolvedOnlyCuts !== null) {
     payload.onlyCuts = resolvedOnlyCuts
     payload.onlyHookAndCut = resolvedOnlyCuts
+  }
+  if (resolvedMaxCuts !== null) {
+    payload.maxCuts = resolvedMaxCuts
+    payload.max_cuts = resolvedMaxCuts
+    payload.maxCutsRequested = resolvedMaxCuts
   }
   return normalizeAnalysisPayload(payload)
 }
@@ -7777,16 +7891,22 @@ const enforceCutDensityLimit = ({
   segments,
   durationSeconds,
   renderMode,
-  targetPlatform
+  targetPlatform,
+  maxCutsRequested
 }: {
   segments: Segment[]
   durationSeconds: number
   renderMode: RenderMode
   targetPlatform: RetentionTargetPlatform
+  maxCutsRequested?: number | null
 }) => {
   const safeDuration = Math.max(1, Number(durationSeconds || 0))
   const maxCutsPerTen = getMaxCutsPer10Seconds({ renderMode, targetPlatform })
-  const maxCuts = Math.max(1, Math.floor((safeDuration / 10) * maxCutsPerTen))
+  const platformMaxCuts = Math.max(1, Math.floor((safeDuration / 10) * maxCutsPerTen))
+  const userRequestedMaxCuts = parseMaxCutsPreference(maxCutsRequested)
+  const maxCuts = userRequestedMaxCuts === null
+    ? platformMaxCuts
+    : Math.max(1, Math.min(platformMaxCuts, userRequestedMaxCuts))
   const maxSegments = Math.max(2, maxCuts + 1)
   return mergeSegmentsToLimitCount(segments, maxSegments)
 }
@@ -9512,6 +9632,7 @@ const getEditOptionsForUser = async (
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
     onlyCuts?: boolean | null
+    maxCuts?: number | null
     autoCaptions?: boolean | null
     subtitleStyle?: string | null
   }
@@ -9528,6 +9649,12 @@ const getEditOptionsForUser = async (
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
     : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
+  const maxCutsRequested = parseMaxCutsPreference(
+    overrides?.maxCuts ??
+    (settings as any)?.maxCuts ??
+    (settings as any)?.max_cuts ??
+    (settings as any)?.maxCutsRequested
+  )
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   const requestedStrategy = parseRetentionStrategyProfile(
     overrides?.retentionStrategyProfile ??
@@ -9562,7 +9689,8 @@ const getEditOptionsForUser = async (
     subtitleStyle,
     autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
     retentionAggressionLevel: allowedAggression,
-    retentionStrategyProfile: allowedStrategy
+    retentionStrategyProfile: allowedStrategy,
+    maxCutsRequested
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
@@ -9950,7 +10078,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       renderConfig,
       retentionTargetPlatform: resolvedTargetPlatform,
       platformProfile: resolvedPlatformProfile,
-      onlyCuts: options.onlyCuts
+      onlyCuts: options.onlyCuts,
+      maxCuts: options.maxCutsRequested
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -9967,7 +10096,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         retentionStrategyProfile: strategyProfile,
         retentionTargetPlatform: resolvedTargetPlatform,
         platformProfile: resolvedPlatformProfile,
-        onlyCuts: options.onlyCuts
+        onlyCuts: options.onlyCuts,
+        maxCuts: options.maxCutsRequested
       }),
       analysis: analysis
     })
@@ -10341,6 +10471,7 @@ const processJob = async (
         retentionTargetPlatform: retentionTargetPlatform,
         platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts,
+        maxCuts: options.maxCutsRequested,
         outputPaths
       })
 
@@ -10368,7 +10499,8 @@ const processJob = async (
           retentionStrategyProfile: strategyProfile,
           retentionTargetPlatform: retentionTargetPlatform,
           platformProfile: platformProfileId,
-          onlyCuts: options.onlyCuts
+          onlyCuts: options.onlyCuts,
+          maxCuts: options.maxCutsRequested
         }),
         analysis: nextAnalysis
       })
@@ -10673,6 +10805,11 @@ const processJob = async (
         : resolvedHookDecision.usedFallback
           ? 'fallback'
           : 'auto'
+      // User-selected hooks must always be stitched to the opening so the
+      // chosen intro is guaranteed to lead the final edit.
+      const shouldMoveHookForRender =
+        !options.onlyCuts &&
+        (options.autoHookMove || selectedHookSelectionSource === 'user_selected')
       if (preferredHookCandidate) {
         optimizationNotes.push(
           `User-selected hook pinned to opening (${preferredHookCandidate.start.toFixed(1)}s-${(preferredHookCandidate.start + preferredHookCandidate.duration).toFixed(1)}s).`
@@ -10769,7 +10906,7 @@ const processJob = async (
         }
         const hookSegment: Segment = { ...hookRange, speed: 1, emphasize: true }
         let story = storySegments.map((segment) => ({ ...segment }))
-        if (options.autoHookMove && !options.onlyCuts) {
+        if (shouldMoveHookForRender) {
           story = subtractRange(story, hookRange)
         }
         if (strategy === 'HOOK_FIRST') {
@@ -10820,7 +10957,7 @@ const processJob = async (
             })
           }
         }
-        let ordered = options.autoHookMove && !options.onlyCuts
+        let ordered = shouldMoveHookForRender
           ? [hookSegment, ...story]
           : story
         ordered = ordered.filter((segment) => segment.end - segment.start > 0.25)
@@ -10869,7 +11006,8 @@ const processJob = async (
           segments: withZoom,
           durationSeconds,
           renderMode: renderConfig.mode,
-          targetPlatform: retentionTargetPlatform
+          targetPlatform: retentionTargetPlatform,
+          maxCutsRequested: options.maxCutsRequested
         })
         const escalationLowEnergyThreshold = behaviorStyleProfileForAnalysis?.energyEscalationCurve === 'aggressive'
           ? 0.52
@@ -11989,6 +12127,7 @@ const processJob = async (
       retentionTargetPlatform: retentionTargetPlatform,
       platformProfile: platformProfileId,
       onlyCuts: options.onlyCuts,
+      maxCuts: options.maxCutsRequested,
       outputPaths
     })
 
@@ -12011,7 +12150,8 @@ const processJob = async (
         retentionStrategyProfile: strategyProfile,
         retentionTargetPlatform: retentionTargetPlatform,
         platformProfile: platformProfileId,
-        onlyCuts: options.onlyCuts
+        onlyCuts: options.onlyCuts,
+        maxCuts: options.maxCutsRequested
       }),
       analysis: nextAnalysis
     })
@@ -12063,6 +12203,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
         onlyCuts: getOnlyCutsFromJob(existing),
+        maxCuts: getMaxCutsFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       })
@@ -12404,6 +12545,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
     const renderConfig = parseRenderConfigFromRequest(req.body)
     const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
+    const maxCutsOverride = getMaxCutsFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -12494,7 +12636,8 @@ const handleCreateJob = async (req: any, res: any) => {
             retentionStrategyProfile,
             retentionTargetPlatform,
             platformProfile,
-            onlyCuts: onlyCutsOverride
+            onlyCuts: onlyCutsOverride,
+            maxCuts: maxCutsOverride
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
@@ -12520,12 +12663,14 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
             ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
             pipelineSteps: normalizePipelineStepMap({}),
-            ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride })
+            ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride }),
+            ...(maxCutsOverride === null ? {} : { maxCuts: maxCutsOverride, max_cuts: maxCutsOverride, maxCutsRequested: maxCutsOverride })
           },
           renderConfig,
           retentionTargetPlatform,
           platformProfile,
           onlyCuts: onlyCutsOverride,
+          maxCuts: maxCutsOverride,
           outputPaths: null
         })
       }
@@ -12892,7 +13037,9 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
     const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
+    const maxCutsOverride = getMaxCutsFromPayload(req.body)
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
+    const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -12930,7 +13077,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
-      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
+      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
+      ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -12948,7 +13096,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
+      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
+      ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts })
     }
 
     const { plan, tier } = await getUserPlan(req.user.id)
@@ -13022,6 +13171,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -13033,7 +13183,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
-      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -13051,7 +13202,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts })
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -13061,6 +13213,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
       onlyCuts: requestedOnlyCuts,
+      maxCuts: requestedMaxCuts,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -13119,6 +13272,7 @@ router.post('/:id/process', async (req: any, res) => {
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -13130,7 +13284,8 @@ router.post('/:id/process', async (req: any, res) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
-      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -13148,7 +13303,8 @@ router.post('/:id/process', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts })
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -13158,6 +13314,7 @@ router.post('/:id/process', async (req: any, res) => {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
       onlyCuts: requestedOnlyCuts,
+      maxCuts: requestedMaxCuts,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -13368,6 +13525,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
+    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -13396,7 +13554,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
-      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {})
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -13414,6 +13573,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }
