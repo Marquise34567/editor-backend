@@ -1675,13 +1675,14 @@ const buildCommandCenterPayload = async () => {
     dropOffPct: index === 0 ? 0 : Number((100 - toPct(row.count, Math.max(1, arr[index - 1].count))).toFixed(1))
   }))
 
-  const pageHeatmapAnalytics = Array.from(
+  const pageHeatmapAnalyticsEntries = Array.from(
     apiEvents30d.reduce((map: Map<string, number>, event: any) => {
       const path = String(event?.pagePath || event?.eventName || '/')
       map.set(path, (map.get(path) || 0) + 1)
       return map
     }, new Map<string, number>()).entries()
-  )
+  ) as Array<[string, number]>
+  const pageHeatmapAnalytics = pageHeatmapAnalyticsEntries
     .map(([page, count]) => ({ page, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 16)
@@ -2658,13 +2659,14 @@ router.post('/ai-self-improvement', async (req: any, res) => {
     .catch(() => [] as any[])
   const completed = jobs.filter((job) => String(job?.status || '').toLowerCase() === 'completed')
   const failed = jobs.filter((job) => String(job?.status || '').toLowerCase() === 'failed')
-  const failureReasons = Array.from(
+  const failureReasonEntries = Array.from(
     failed.reduce((map: Map<string, number>, job: any) => {
       const reason = String(job?.error || 'unknown_failure')
       map.set(reason, (map.get(reason) || 0) + 1)
       return map
     }, new Map<string, number>()).entries()
-  )
+  ) as Array<[string, number]>
+  const failureReasons: Array<{ reason: string; count: number }> = failureReasonEntries
     .map(([reason, count]) => ({ reason, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 8)
@@ -2690,7 +2692,7 @@ router.post('/ai-self-improvement', async (req: any, res) => {
       )
     : 0
   const feedback = extractFeedback(jobs, RANGE_MS['30d'])
-  const complaintTags = Array.from(
+  const complaintTagEntries = Array.from(
     feedback
       .filter((item) => item.sentiment === 'negative' || item.sentiment === 'bug')
       .reduce((map, item) => {
@@ -2698,7 +2700,8 @@ router.post('/ai-self-improvement', async (req: any, res) => {
         map.set(key, (map.get(key) || 0) + 1)
         return map
       }, new Map<string, number>()).entries()
-  )
+  ) as Array<[string, number]>
+  const complaintTags: Array<{ tag: string; count: number }> = complaintTagEntries
     .map(([tag, count]) => ({ tag, count }))
     .sort((a, b) => b.count - a.count)
     .slice(0, 8)
