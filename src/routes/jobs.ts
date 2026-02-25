@@ -4316,6 +4316,104 @@ const parseSrtTimestamp = (raw: string) => {
   return hh * 3600 + mm * 60 + ss + ms / 1000
 }
 
+const formatSrtTimestamp = (seconds: number) => {
+  const safe = Math.max(0, Number(seconds) || 0)
+  const totalMs = Math.floor(safe * 1000)
+  const hh = Math.floor(totalMs / 3_600_000)
+  const mm = Math.floor((totalMs % 3_600_000) / 60_000)
+  const ss = Math.floor((totalMs % 60_000) / 1_000)
+  const ms = totalMs % 1_000
+  return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')},${String(ms).padStart(3, '0')}`
+}
+
+const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Segment[]) => {
+  if (!cues.length || !segments.length) return [] as TranscriptCue[]
+  type TimelineSegment = {
+    sourceStart: number
+    sourceEnd: number
+    speed: number
+    outputStart: number
+    outputEnd: number
+  }
+  let outputCursor = 0
+  const timeline = segments
+    .map((segment) => {
+      const sourceStart = Number(segment.start)
+      const sourceEnd = Number(segment.end)
+      const speed = Number(segment.speed) > 0 ? Number(segment.speed) : 1
+      if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd) || sourceEnd <= sourceStart) return null
+      const outputDuration = (sourceEnd - sourceStart) / speed
+      if (!Number.isFinite(outputDuration) || outputDuration <= 0) return null
+      const item: TimelineSegment = {
+        sourceStart,
+        sourceEnd,
+        speed,
+        outputStart: outputCursor,
+        outputEnd: outputCursor + outputDuration
+      }
+      outputCursor = item.outputEnd
+      return item
+    })
+    .filter((item): item is TimelineSegment => Boolean(item))
+  if (!timeline.length) return [] as TranscriptCue[]
+
+  const remapped: TranscriptCue[] = []
+  for (const cue of cues) {
+    const cueStart = Number(cue.start)
+    const cueEnd = Number(cue.end)
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart) continue
+    for (const segment of timeline) {
+      const overlapStart = Math.max(cueStart, segment.sourceStart)
+      const overlapEnd = Math.min(cueEnd, segment.sourceEnd)
+      if (overlapEnd - overlapStart <= 0.01) continue
+      const mappedStart = segment.outputStart + (overlapStart - segment.sourceStart) / segment.speed
+      const mappedEnd = segment.outputStart + (overlapEnd - segment.sourceStart) / segment.speed
+      if (!Number.isFinite(mappedStart) || !Number.isFinite(mappedEnd) || mappedEnd - mappedStart <= 0.01) continue
+      remapped.push({
+        ...cue,
+        start: Number(mappedStart.toFixed(3)),
+        end: Number(mappedEnd.toFixed(3))
+      })
+    }
+  }
+  if (!remapped.length) return [] as TranscriptCue[]
+
+  const sorted = remapped.sort((a, b) => a.start - b.start || a.end - b.end)
+  const merged: TranscriptCue[] = []
+  for (const cue of sorted) {
+    const previous = merged.length ? merged[merged.length - 1] : null
+    if (
+      previous &&
+      previous.text === cue.text &&
+      cue.start - previous.end <= 0.08
+    ) {
+      previous.end = Number(Math.max(previous.end, cue.end).toFixed(3))
+      continue
+    }
+    merged.push({ ...cue })
+  }
+  return merged
+}
+
+const writeTranscriptCuesToSrt = (cues: TranscriptCue[], outputPath: string) => {
+  if (!cues.length) return null
+  const blocks: string[] = []
+  let index = 1
+  for (const cue of cues) {
+    const start = Number(cue.start)
+    const end = Number(cue.end)
+    const text = String(cue.text || '').trim()
+    if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.01) continue
+    blocks.push(
+      `${index}\n${formatSrtTimestamp(start)} --> ${formatSrtTimestamp(end)}\n${text}\n`
+    )
+    index += 1
+  }
+  if (index === 1) return null
+  fs.writeFileSync(outputPath, blocks.join('\n'))
+  return outputPath
+}
+
 const scoreTranscriptSignals = (text: string) => {
   const normalized = String(text || '').toLowerCase().replace(/\s+/g, ' ').trim()
   if (!normalized) {
@@ -7969,25 +8067,94 @@ const buildSubtitleStyle = (style?: string | null) => {
     .join(',')
 }
 
-const generateSubtitles = async (inputPath: string, workingDir: string) => {
-  const whisperBin = process.env.WHISPER_BIN
-  if (!whisperBin) return null
-  const model = process.env.WHISPER_MODEL || 'base'
-  const extraArgs = process.env.WHISPER_ARGS ? process.env.WHISPER_ARGS.split(' ') : []
-  const args = extraArgs.length
-    ? extraArgs
-    : ['--model', model, '--output_format', 'srt', '--output_dir', workingDir, '--word_timestamps', 'True']
+const splitWhisperArgs = (raw?: string | null) => {
+  if (!raw) return [] as string[]
+  return String(raw)
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+}
+
+const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => {
+  const baseName = path.basename(inputPath, path.extname(inputPath))
+  const exact = path.join(workingDir, `${baseName}.srt`)
+  if (fs.existsSync(exact)) return exact
+  const candidates = fs.readdirSync(workingDir)
+    .filter((name) => name.startsWith(`${baseName}.`) && name.toLowerCase().endsWith('.srt'))
+    .map((name) => {
+      const fullPath = path.join(workingDir, name)
+      let mtimeMs = 0
+      try {
+        mtimeMs = fs.statSync(fullPath).mtimeMs
+      } catch {
+        mtimeMs = 0
+      }
+      return { fullPath, mtimeMs }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return candidates.length ? candidates[0].fullPath : null
+}
+
+const runWhisperTranscribe = async ({
+  command,
+  args,
+  inputPath,
+  workingDir,
+  label
+}: {
+  command: string
+  args: string[]
+  inputPath: string
+  workingDir: string
+  label: string
+}) => {
   return new Promise<string | null>((resolve) => {
-    const proc = spawn(whisperBin, [inputPath, ...args])
+    const proc = spawn(command, args)
     proc.on('error', () => resolve(null))
     proc.on('close', (code) => {
-      if (code !== 0) return resolve(null)
-      const baseName = path.basename(inputPath, path.extname(inputPath))
-      const output = path.join(workingDir, `${baseName}.srt`)
-      if (!fs.existsSync(output)) return resolve(null)
-      resolve(output)
+      if (code !== 0) {
+        console.warn(`subtitle generation failed via ${label} (exit ${code})`)
+        return resolve(null)
+      }
+      resolve(resolveGeneratedSubtitlePath(inputPath, workingDir))
     })
   })
+}
+
+const generateSubtitles = async (inputPath: string, workingDir: string) => {
+  const model = process.env.WHISPER_MODEL || 'base'
+  const configuredArgs = splitWhisperArgs(process.env.WHISPER_ARGS)
+  const baseArgs = configuredArgs.length
+    ? configuredArgs
+    : ['--model', model, '--output_format', 'srt', '--output_dir', workingDir, '--word_timestamps', 'True']
+
+  const attempts: Array<{ command: string; args: string[]; label: string }> = []
+  const addAttempt = (command: string | undefined, args: string[], label: string) => {
+    if (!command) return
+    const normalized = String(command).trim()
+    if (!normalized) return
+    const duplicate = attempts.some((attempt) => attempt.command === normalized && attempt.args.join('\u001f') === args.join('\u001f'))
+    if (duplicate) return
+    attempts.push({ command: normalized, args, label })
+  }
+
+  addAttempt(process.env.WHISPER_BIN, [inputPath, ...baseArgs], 'WHISPER_BIN')
+  addAttempt('whisper', [inputPath, ...baseArgs], 'whisper')
+  addAttempt('python', ['-m', 'whisper', inputPath, ...baseArgs], 'python -m whisper')
+  addAttempt('python3', ['-m', 'whisper', inputPath, ...baseArgs], 'python3 -m whisper')
+  addAttempt('py', ['-m', 'whisper', inputPath, ...baseArgs], 'py -m whisper')
+
+  for (const attempt of attempts) {
+    const output = await runWhisperTranscribe({
+      command: attempt.command,
+      args: attempt.args,
+      inputPath,
+      workingDir,
+      label: attempt.label
+    })
+    if (output) return output
+  }
+  return null
 }
 
 const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
@@ -10816,19 +10983,6 @@ const processJob = async (
         subtitlePath = await generateSubtitles(tmpIn, workDir)
         if (!subtitlePath) {
           optimizationNotes.push('Auto subtitles skipped: no caption engine available.')
-        } else if (normalizedSubtitle === 'mrbeast_animated') {
-          const assPath = buildMrBeastAnimatedAss({
-            srtPath: subtitlePath,
-            workingDir: workDir,
-            style: subtitleStyle
-          })
-          if (assPath) {
-            subtitlePath = assPath
-            subtitleIsAss = true
-            optimizationNotes.push('Applied high-energy animated caption style.')
-          } else {
-            optimizationNotes.push('Animated caption fallback applied: using static caption styling.')
-          }
         }
       }
 
@@ -10908,6 +11062,41 @@ const processJob = async (
       autoEscalationEventsForAnalysis = selectedAutoEscalationEvents
       if (behaviorStyleProfileForAnalysis && !styleArchetypeBlendForAnalysis) {
         styleArchetypeBlendForAnalysis = behaviorStyleProfileForAnalysis.archetypeBlend
+      }
+      if (options.autoCaptions && subtitlePath) {
+        const sourceCues = parseTranscriptCues(subtitlePath)
+        const remappedCues = remapTranscriptCuesToEditedTimeline(sourceCues, finalSegments)
+        if (!remappedCues.length) {
+          subtitlePath = null
+          subtitleIsAss = false
+          optimizationNotes.push('Auto subtitles skipped: no transcript overlap after edits.')
+        } else {
+          const remappedSubtitlePath = path.join(
+            workDir,
+            `${path.basename(subtitlePath, path.extname(subtitlePath))}-edited.srt`
+          )
+          const writtenSubtitlePath = writeTranscriptCuesToSrt(remappedCues, remappedSubtitlePath)
+          if (writtenSubtitlePath) {
+            subtitlePath = writtenSubtitlePath
+          }
+          if (normalizedSubtitle === 'mrbeast_animated') {
+            const assPath = buildMrBeastAnimatedAss({
+              srtPath: subtitlePath,
+              workingDir: workDir,
+              style: subtitleStyle
+            })
+            if (assPath) {
+              subtitlePath = assPath
+              subtitleIsAss = true
+              optimizationNotes.push('Applied high-energy animated caption style.')
+            } else {
+              subtitleIsAss = false
+              optimizationNotes.push('Animated caption fallback applied: using static caption styling.')
+            }
+          } else {
+            subtitleIsAss = false
+          }
+        }
       }
 
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
@@ -11130,6 +11319,54 @@ const processJob = async (
             concatEncodeArgs.push(tmpOut)
             await runFfmpeg(concatEncodeArgs)
           }
+
+          if (subtitleFilter && subtitlePath) {
+            const burnArgs = [
+              '-y',
+              '-nostdin',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              '-i',
+              tmpOut,
+              '-movflags',
+              '+faststart',
+              '-c:v',
+              'libx264',
+              '-preset',
+              ffPreset,
+              '-crf',
+              ffCrf,
+              '-threads',
+              '0',
+              '-pix_fmt',
+              'yuv420p',
+              '-vf',
+              subtitleIsAss
+                ? `subtitles=${escapeFilterPath(subtitlePath)}`
+                : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+            ]
+            if (withAudio) {
+              burnArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            } else {
+              burnArgs.push('-an')
+            }
+            const captionedFallbackPath = path.join(
+              workDir,
+              `segment-fallback-captioned-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+            )
+            burnArgs.push(captionedFallbackPath)
+            try {
+              await runFfmpeg(burnArgs)
+              safeUnlink(tmpOut)
+              fs.renameSync(captionedFallbackPath, tmpOut)
+            } catch (burnErr) {
+              logFfmpegFailure('segment-subtitle-burn', burnArgs, burnErr)
+              safeUnlink(captionedFallbackPath)
+              const reason = summarizeFfmpegError(burnErr)
+              optimizationNotes.push(`Render fallback: subtitles could not be burned (${reason}).`)
+            }
+          }
         } finally {
           safeUnlink(concatListPath)
           for (const filePath of segmentFiles) safeUnlink(filePath)
@@ -11143,7 +11380,18 @@ const processJob = async (
           // so ffmpeg can reference it as input index 1 in the overlay filter.
           const argsWithWatermark = [...argsBase]
           if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
-          const videoChains = [fullVideoChain, ''].filter((value, idx, arr) => arr.indexOf(value) === idx)
+          const candidateVideoChains = [fullVideoChain]
+          if (subtitleFilter && watermarkFilter) candidateVideoChains.push(subtitleFilter)
+          if (!subtitleFilter && watermarkFilter) candidateVideoChains.push(watermarkFilter)
+          if (!subtitleFilter || !options.autoCaptions) candidateVideoChains.push('')
+          const videoChains = candidateVideoChains.filter((value, idx, arr) => arr.indexOf(value) === idx)
+          if (!videoChains.length) videoChains.push('')
+          const describeVideoChainFallback = (videoChain: string) => {
+            if (!videoChain) return 'without subtitles/watermark'
+            if (videoChain === subtitleFilter) return 'without watermark'
+            if (videoChain === watermarkFilter) return 'without subtitles'
+            return 'with reduced overlays'
+          }
 
           const runWithChain = async (videoChain: string, enableFades: boolean) => {
             const concatFilter = buildConcatFilter(finalSegments, {
@@ -11179,7 +11427,7 @@ const processJob = async (
                 ran = true
                 if (chain !== fullVideoChain) {
                   const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                  optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
+                  optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
                 }
                 if (options.transitions && !enableFades) {
                   const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
