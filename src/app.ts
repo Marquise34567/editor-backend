@@ -15,9 +15,11 @@ import settingsRoutes from './routes/settings'
 import publicRoutes from './routes/public'
 import adminRoutes from './routes/admin'
 import debugRoutes from './routes/debug'
+import analyticsRoutes from './routes/analytics'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
+import { recordAdminErrorLog } from './services/adminTelemetry'
 
 loadEnv()
 const app = express()
@@ -218,6 +220,7 @@ app.use('/api/jobs', requireAuth, jobsRoutes)
 app.use('/api/uploads', requireAuth, uploadsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
+app.use('/api/analytics', requireAuth, analyticsRoutes)
 app.use('/api/admin', adminRoutes)
 
 app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
@@ -245,6 +248,15 @@ app.use((err: any, req: any, res: any, next: any) => {
 
   // Log full stack for debugging in Railway logs (avoid logging sensitive headers)
   console.error('Unhandled error', requestId, err?.stack || err)
+  void recordAdminErrorLog({
+    severity: Number(err?.status || 500) >= 500 ? 'high' : 'medium',
+    message: String(err?.message || 'internal_error'),
+    stackSnippet: err?.stack ? String(err.stack).split('\n').slice(0, 4).join('\n') : null,
+    route: req?.path || req?.originalUrl || null,
+    endpoint: req?.originalUrl || null,
+    userId: req?.user?.id || null,
+    jobId: req?.params?.id || null
+  })
   const message = err?.message || 'Internal error'
   res.status(err?.status || 500).json({ error: 'internal_error', message, path: req?.originalUrl, requestId })
 })

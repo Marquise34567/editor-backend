@@ -54,6 +54,7 @@ model User {
   subscription          Subscription?
   exportCounter         ExportCounter?
   lessonProgress        LessonProgress[]
+  analyticsEvents       SiteAnalyticsEvent[]
 
   @@map("profiles")
 }
@@ -178,6 +179,28 @@ model LessonProgress {
   completedAt DateTime?
   user       User     @relation(fields: [userId], references: [id])
   @@index([userId])
+}
+
+model SiteAnalyticsEvent {
+  id               String   @id @default(uuid())
+  userId           String   @map("user_id")
+  sessionId        String?  @map("session_id")
+  eventName        String   @map("event_name")
+  category         String   @default("interaction")
+  pagePath         String?  @map("page_path")
+  retentionProfile String?  @map("retention_profile")
+  targetPlatform   String?  @map("target_platform")
+  captionStyle     String?  @map("caption_style")
+  jobId            String?  @map("job_id")
+  metadata         Json?
+  createdAt        DateTime @default(now()) @map("created_at")
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_site_analytics_events_created_at")
+  @@index([eventName], map: "idx_site_analytics_events_event_name")
+  @@index([category], map: "idx_site_analytics_events_category")
+  @@index([userId], map: "idx_site_analytics_events_user_id")
+  @@map("site_analytics_events")
 }
 
 model AdminAudit {

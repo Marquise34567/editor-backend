@@ -17,6 +17,7 @@ class StubDB {
   exports = new Map<string, any>()
   founderInventoryStore = new Map<string, any>()
   adminAudits = new Map<string, any>()
+  analyticsEvents = new Map<string, any>()
 
   async $queryRaw() { return 1 }
 
@@ -27,6 +28,23 @@ class StubDB {
       if (id) return this.users.get(id) ?? null
       if (email) return Array.from(this.users.values()).find((u:any)=>u.email===email) ?? null
       return null
+    },
+    findMany: async ({ where, orderBy, take }: any = {}) => {
+      let rows = Array.from(this.users.values())
+      if (where?.email) rows = rows.filter((user: any) => user.email === where.email)
+      if (where?.id) rows = rows.filter((user: any) => user.id === where.id)
+      if (orderBy?.createdAt) {
+        const dir = String(orderBy.createdAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.createdAt || 0).getTime()
+          const bMs = new Date(b?.createdAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      if (Number.isFinite(Number(take)) && Number(take) > 0) {
+        rows = rows.slice(0, Number(take))
+      }
+      return rows
     },
     create: async ({ data }: any) => {
       const id = data.id || `stub-${Math.random().toString(36).slice(2,9)}`
@@ -71,6 +89,82 @@ class StubDB {
     }
   }
 
+  siteAnalyticsEvent = {
+    create: async ({ data }: any) => {
+      const id = data?.id || `evt-${Math.random().toString(36).slice(2, 10)}`
+      const rec = {
+        id,
+        userId: data?.userId,
+        sessionId: data?.sessionId ?? null,
+        eventName: data?.eventName ?? 'unknown',
+        category: data?.category ?? 'interaction',
+        pagePath: data?.pagePath ?? null,
+        retentionProfile: data?.retentionProfile ?? null,
+        targetPlatform: data?.targetPlatform ?? null,
+        captionStyle: data?.captionStyle ?? null,
+        jobId: data?.jobId ?? null,
+        metadata: data?.metadata ?? null,
+        createdAt: data?.createdAt ? new Date(data.createdAt) : new Date()
+      }
+      this.analyticsEvents.set(id, rec)
+      return rec
+    },
+    findMany: async ({ where, orderBy, take, select }: any = {}) => {
+      let rows = Array.from(this.analyticsEvents.values())
+      if (where?.createdAt?.gte) {
+        const gte = new Date(where.createdAt.gte).getTime()
+        rows = rows.filter((row: any) => new Date(row.createdAt).getTime() >= gte)
+      }
+      if (where?.createdAt?.lte) {
+        const lte = new Date(where.createdAt.lte).getTime()
+        rows = rows.filter((row: any) => new Date(row.createdAt).getTime() <= lte)
+      }
+      if (where?.userId) {
+        rows = rows.filter((row: any) => row.userId === where.userId)
+      }
+      if (where?.category) {
+        rows = rows.filter((row: any) => row.category === where.category)
+      }
+      if (where?.eventName) {
+        rows = rows.filter((row: any) => row.eventName === where.eventName)
+      }
+      const byCreatedAt = orderBy?.createdAt
+      if (byCreatedAt === 'desc') {
+        rows.sort((a: any, b: any) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      } else if (byCreatedAt === 'asc') {
+        rows.sort((a: any, b: any) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
+      }
+      if (Number.isFinite(Number(take)) && Number(take) > 0) {
+        rows = rows.slice(0, Number(take))
+      }
+      if (!select) return rows
+      return rows.map((row: any) =>
+        Object.fromEntries(
+          Object.entries(select)
+            .filter(([, enabled]) => Boolean(enabled))
+            .map(([key]) => [key, (row as any)[key]])
+        )
+      )
+    },
+    count: async ({ where }: any = {}) => {
+      let rows = Array.from(this.analyticsEvents.values())
+      if (where?.createdAt?.gte) {
+        const gte = new Date(where.createdAt.gte).getTime()
+        rows = rows.filter((row: any) => new Date(row.createdAt).getTime() >= gte)
+      }
+      if (where?.userId) {
+        rows = rows.filter((row: any) => row.userId === where.userId)
+      }
+      if (where?.category) {
+        rows = rows.filter((row: any) => row.category === where.category)
+      }
+      if (where?.eventName) {
+        rows = rows.filter((row: any) => row.eventName === where.eventName)
+      }
+      return rows.length
+    }
+  }
+
   job = {
     create: async ({ data }: any) => {
       const id = data.id || `job-${Math.random().toString(36).slice(2,9)}`
@@ -78,19 +172,49 @@ class StubDB {
       this.jobs.set(id, rec)
       return rec
     },
-    findMany: async ({ where }: any) => {
+    findMany: async ({ where, orderBy, take }: any = {}) => {
       const userId = where?.userId
-      return Array.from(this.jobs.values()).filter((j:any)=>!userId || j.userId===userId)
+      const createdAtGte = where?.createdAt?.gte ? new Date(where.createdAt.gte).getTime() : null
+      const statusIn = Array.isArray(where?.status?.in) ? where.status.in.map((s: any) => String(s).toLowerCase()) : null
+      let rows = Array.from(this.jobs.values()).filter((job: any) => {
+        if (userId && job.userId !== userId) return false
+        const createdMs = new Date(job.createdAt || 0).getTime()
+        if (createdAtGte !== null && createdMs < createdAtGte) return false
+        if (statusIn && statusIn.length > 0 && !statusIn.includes(String(job.status || '').toLowerCase())) return false
+        return true
+      })
+      if (orderBy?.createdAt) {
+        const dir = String(orderBy.createdAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.createdAt || 0).getTime()
+          const bMs = new Date(b?.createdAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      if (orderBy?.updatedAt) {
+        const dir = String(orderBy.updatedAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.updatedAt || 0).getTime()
+          const bMs = new Date(b?.updatedAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      if (Number.isFinite(Number(take)) && Number(take) > 0) {
+        rows = rows.slice(0, Number(take))
+      }
+      return rows
     },
     count: async ({ where }: any = {}) => {
       const userId = where?.userId
       const createdAtGte = where?.createdAt?.gte ? new Date(where.createdAt.gte).getTime() : null
       const createdAtLt = where?.createdAt?.lt ? new Date(where.createdAt.lt).getTime() : null
+      const statusIn = Array.isArray(where?.status?.in) ? where.status.in.map((s: any) => String(s).toLowerCase()) : null
       return Array.from(this.jobs.values()).filter((j: any) => {
         if (userId && j.userId !== userId) return false
         const createdAt = new Date(j.createdAt || 0).getTime()
         if (createdAtGte !== null && createdAt < createdAtGte) return false
         if (createdAtLt !== null && createdAt >= createdAtLt) return false
+        if (statusIn && statusIn.length > 0 && !statusIn.includes(String(j.status || '').toLowerCase())) return false
         return true
       }).length
     },
@@ -166,6 +290,20 @@ class StubDB {
         return Array.from(this.subscriptions.values()).find((s:any)=>s.stripeSubscriptionId===where.stripeSubscriptionId) ?? null
       }
       return null
+    },
+    findMany: async ({ where, orderBy }: any = {}) => {
+      let rows = Array.from(this.subscriptions.values())
+      if (where?.userId) rows = rows.filter((sub: any) => sub.userId === where.userId)
+      if (where?.status) rows = rows.filter((sub: any) => String(sub.status || '').toLowerCase() === String(where.status).toLowerCase())
+      if (orderBy?.updatedAt) {
+        const dir = String(orderBy.updatedAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.updatedAt || 0).getTime()
+          const bMs = new Date(b?.updatedAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      return rows
     },
     upsert: async ({ where, update, create }: any) => {
       const existing =
