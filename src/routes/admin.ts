@@ -114,7 +114,11 @@ type LiveGeoHeatmapPoint = {
 const DAY_MS = 24 * 60 * 60 * 1000
 const YEAR_MS = 365 * DAY_MS
 const SYSTEM_LATENCY_SPIKE_MS = 1500
+const BANK_TAKEOUT_MAX_USD = 1000
+const BANK_TAKEOUT_COOLDOWN_MS = 10 * 60 * 1000
+const BANK_TAKEOUT_CURRENCY = 'usd'
 const geoCache = new Map<string, { expiresAt: number; payload: GeoLookup }>()
+const bankTakeoutCooldownByActor = new Map<string, { nextAllowedAt: number; lastPayoutId: string | null; lastAmountUsd: number; lastTakeoutAt: string }>()
 let cpuSample: { usage: NodeJS.CpuUsage; hrtime: bigint } | null = null
 
 const parseRange = (raw: unknown, fallback: keyof typeof RANGE_MS) =>
@@ -425,6 +429,82 @@ const parsePlanTier = (value: unknown) => {
 }
 
 const normalizeEmail = (value: unknown) => String(value || '').trim().toLowerCase()
+
+const resolveAdminActorKey = (req: any) => {
+  const userId = String(req?.user?.id || '').trim()
+  const email = String(req?.user?.email || '').trim().toLowerCase()
+  const ip = String(req?.ip || '').trim()
+  return userId || email || ip || 'unknown'
+}
+
+const parseUsdAmount = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  const rounded = Math.round(parsed * 100) / 100
+  if (rounded <= 0) return null
+  return rounded
+}
+
+const parseTakeoutAmountFromAuditReason = (reason: unknown) => {
+  const raw = String(reason || '').trim().toLowerCase()
+  const match = raw.match(/^takeout_([0-9]+(?:\.[0-9]{1,2})?)_/)
+  if (!match) return null
+  const parsed = Number(match[1])
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+const cleanExpiredTakeoutCooldown = (actorKey: string) => {
+  const existing = bankTakeoutCooldownByActor.get(actorKey)
+  if (!existing) return null
+  if (existing.nextAllowedAt <= Date.now()) {
+    bankTakeoutCooldownByActor.delete(actorKey)
+    return null
+  }
+  return existing
+}
+
+const readTakeoutCooldownFromAudit = async (actor: string | null) => {
+  const normalizedActor = String(actor || '').trim()
+  if (!normalizedActor) return null
+  try {
+    const rows = await prisma.adminAudit.findMany({
+      where: { action: 'admin_bank_takeout' },
+      orderBy: { createdAt: 'desc' },
+      take: 25
+    } as any)
+    const list = Array.isArray(rows) ? rows : []
+    const latest = list
+      .filter((row: any) => String(row?.action || '') === 'admin_bank_takeout')
+      .filter((row: any) => String(row?.actor || '').trim() === normalizedActor)
+      .sort((a: any, b: any) => asMs(b?.createdAt) - asMs(a?.createdAt))[0]
+    if (!latest) return null
+    const createdMs = asMs((latest as any)?.createdAt)
+    if (!createdMs) return null
+    const nextAllowedAt = createdMs + BANK_TAKEOUT_COOLDOWN_MS
+    if (nextAllowedAt <= Date.now()) return null
+    return {
+      nextAllowedAt,
+      lastPayoutId: String((latest as any)?.planKey || '').trim() || null,
+      lastAmountUsd: parseTakeoutAmountFromAuditReason((latest as any)?.reason),
+      lastTakeoutAt: new Date(createdMs).toISOString()
+    }
+  } catch {
+    return null
+  }
+}
+
+const readAvailableUsdBalance = async () => {
+  if (!isStripeEnabled() || !stripe) return null
+  try {
+    const balance = await stripe.balance.retrieve()
+    const available = Array.isArray(balance?.available) ? balance.available : []
+    const usd = available.find((row: any) => String(row?.currency || '').toLowerCase() === BANK_TAKEOUT_CURRENCY)
+    const amountCents = Math.max(0, Number(usd?.amount || 0))
+    return Number((amountCents / 100).toFixed(2))
+  } catch {
+    return null
+  }
+}
 
 const isImpressionEvent = (event: { category?: unknown; eventName?: unknown }) => {
   const category = String(event?.category || '').toLowerCase()
@@ -2171,6 +2251,116 @@ router.get('/payments', async (req, res) => {
     return map
   }, new Map<string, number>()).entries()).map(([day, cents]) => ({ t: `${day}T00:00:00.000Z`, v: Number((cents / 100).toFixed(2)) }))
   res.json({ rangeMs, revenueTotal: Number(revenueByDay.reduce((sum, row) => sum + row.v, 0).toFixed(2)), recentPayments, refundsOrChargebacks, revenueByDay })
+})
+
+router.get('/bank/takeout/status', async (req: any, res) => {
+  const actorKey = resolveAdminActorKey(req)
+  const actor = String(req.user?.email || req.user?.id || '').trim() || null
+  const memoryCooldown = cleanExpiredTakeoutCooldown(actorKey)
+  const auditCooldown = await readTakeoutCooldownFromAudit(actor)
+  const cooldown = [memoryCooldown, auditCooldown]
+    .filter(Boolean)
+    .sort((a: any, b: any) => Number(b?.nextAllowedAt || 0) - Number(a?.nextAllowedAt || 0))[0] || null
+  const availableBalanceUsd = await readAvailableUsdBalance()
+  const canTakeOut = isStripeEnabled() && Boolean(stripe) && (!cooldown || cooldown.nextAllowedAt <= Date.now())
+  return res.json({
+    maxAmountUsd: BANK_TAKEOUT_MAX_USD,
+    cooldownMinutes: Math.round(BANK_TAKEOUT_COOLDOWN_MS / 60_000),
+    currency: BANK_TAKEOUT_CURRENCY.toUpperCase(),
+    stripeConfigured: isStripeEnabled() && Boolean(stripe),
+    availableBalanceUsd,
+    nextAllowedAt: cooldown ? new Date(cooldown.nextAllowedAt).toISOString() : null,
+    lastTakeoutAt: cooldown?.lastTakeoutAt || null,
+    lastAmountUsd: cooldown?.lastAmountUsd ?? null,
+    lastPayoutId: cooldown?.lastPayoutId ?? null,
+    canTakeOut,
+    serverTime: new Date().toISOString()
+  })
+})
+
+router.post('/bank/takeout', async (req: any, res) => {
+  const actorKey = resolveAdminActorKey(req)
+  const actor = String(req.user?.email || req.user?.id || '').trim() || null
+  const amountUsd = parseUsdAmount(req.body?.amountUsd)
+  if (amountUsd === null) {
+    return res.status(400).json({
+      error: 'invalid_amount',
+      message: 'Enter a valid withdrawal amount in USD.'
+    })
+  }
+  if (amountUsd > BANK_TAKEOUT_MAX_USD) {
+    return res.status(400).json({
+      error: 'amount_exceeds_limit',
+      message: `Take out amount cannot exceed $${BANK_TAKEOUT_MAX_USD.toFixed(2)} every 10 minutes.`
+    })
+  }
+  if (!isStripeEnabled() || !stripe) {
+    return res.status(400).json({
+      error: 'stripe_not_configured',
+      message: 'Stripe is not enabled in this environment.'
+    })
+  }
+
+  const memoryCooldown = cleanExpiredTakeoutCooldown(actorKey)
+  const auditCooldown = await readTakeoutCooldownFromAudit(actor)
+  const cooldown = [memoryCooldown, auditCooldown]
+    .filter(Boolean)
+    .sort((a: any, b: any) => Number(b?.nextAllowedAt || 0) - Number(a?.nextAllowedAt || 0))[0] || null
+  if (cooldown && cooldown.nextAllowedAt > Date.now()) {
+    return res.status(429).json({
+      error: 'takeout_cooldown_active',
+      message: 'Take out is limited to once every 10 minutes.',
+      nextAllowedAt: new Date(cooldown.nextAllowedAt).toISOString()
+    })
+  }
+
+  const availableBalanceUsd = await readAvailableUsdBalance()
+  if (availableBalanceUsd !== null && amountUsd > availableBalanceUsd) {
+    return res.status(400).json({
+      error: 'insufficient_stripe_balance',
+      message: `Requested $${amountUsd.toFixed(2)} exceeds available Stripe balance of $${availableBalanceUsd.toFixed(2)}.`,
+      availableBalanceUsd
+    })
+  }
+
+  const payoutAmountCents = Math.round(amountUsd * 100)
+  try {
+    const payout = await stripe.payouts.create({
+      amount: payoutAmountCents,
+      currency: BANK_TAKEOUT_CURRENCY,
+      description: `Admin take out by ${req.user?.email || req.user?.id || 'unknown'}`
+    })
+    const now = Date.now()
+    const nextAllowedAt = now + BANK_TAKEOUT_COOLDOWN_MS
+    bankTakeoutCooldownByActor.set(actorKey, {
+      nextAllowedAt,
+      lastPayoutId: String(payout?.id || ''),
+      lastAmountUsd: amountUsd,
+      lastTakeoutAt: new Date(now).toISOString()
+    })
+    await auditAdminAction({
+      actor: req.user?.email || req.user?.id || null,
+      action: 'admin_bank_takeout',
+      targetEmail: req.user?.email || null,
+      planKey: String(payout?.id || 'unknown'),
+      reason: `takeout_${amountUsd.toFixed(2)}_${BANK_TAKEOUT_CURRENCY}`
+    })
+    return res.json({
+      ok: true,
+      payoutId: payout?.id || null,
+      status: payout?.status || 'pending',
+      amountUsd,
+      currency: BANK_TAKEOUT_CURRENCY.toUpperCase(),
+      nextAllowedAt: new Date(nextAllowedAt).toISOString(),
+      availableBalanceUsd: await readAvailableUsdBalance(),
+      processedAt: new Date().toISOString()
+    })
+  } catch (err: any) {
+    return res.status(502).json({
+      error: 'stripe_takeout_failed',
+      message: String(err?.message || 'Stripe payout failed')
+    })
+  }
 })
 
 router.get('/subscriptions', async (req, res) => {
