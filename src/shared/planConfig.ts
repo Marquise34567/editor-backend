@@ -93,7 +93,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     exportQuality: '1080p',
     watermark: false,
     priority: false,
-    allowedSubtitlePresets: ['basic_clean', 'bold_pop', 'caption_box'],
+    allowedSubtitlePresets: ['basic_clean', 'bold_pop', 'caption_box', 'mrbeast_animated'],
     autoZoomMax: 1.12,
     advancedEffects: false,
     lifetime: false,
@@ -103,8 +103,9 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
       '1080p exports',
       '20 renders / month',
       'No watermark',
-      'Subtitles: 3 presets',
-      'Auto zoom max 1.12'
+      'Subtitles: 4 presets',
+      'Auto zoom max 1.12',
+      'MrBeast animated captions'
     ]
   },
   creator: {
