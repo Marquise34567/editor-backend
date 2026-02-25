@@ -1,25 +1,7 @@
-const DEV_ACCOUNT_EMAILS = (
-  process.env.DEV_ADMIN_EMAILS ||
-  process.env.DEV_ACCOUNT_EMAILS ||
-  process.env.DEV_ACCOUNT_EMAIL ||
-  ''
-)
-  .split(',')
-  .map((value) => value.trim().toLowerCase())
-  .filter(Boolean)
-
-const DEV_ACCOUNT_USER_IDS = (
-  process.env.DEV_ADMIN_USER_IDS ||
-  process.env.DEV_ACCOUNT_USER_IDS ||
-  ''
-)
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean)
+const ONLY_DEV_PANEL_EMAIL = 'fyequise03@gmail.com'
+const ONLY_DEV_PANEL_EMAIL_NORMALIZED = ONLY_DEV_PANEL_EMAIL.trim().toLowerCase()
 
 export const isDevAccount = (userId?: string | null, email?: string | null) => {
   const normalizedEmail = String(email || '').trim().toLowerCase()
-  if (normalizedEmail && DEV_ACCOUNT_EMAILS.includes(normalizedEmail)) return true
-  if (userId && DEV_ACCOUNT_USER_IDS.includes(userId)) return true
-  return false
+  return Boolean(normalizedEmail && normalizedEmail === ONLY_DEV_PANEL_EMAIL_NORMALIZED)
 }

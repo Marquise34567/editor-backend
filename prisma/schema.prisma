@@ -214,3 +214,29 @@ model AdminAudit {
 
   @@map("admin_audit")
 }
+
+model BannedIp {
+  ip        String   @id
+  reason    String?
+  createdBy String?  @map("created_by")
+  active    Boolean  @default(true)
+  expiresAt DateTime? @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("banned_ips")
+}
+
+model WeeklyReportSubscription {
+  id         String   @id @default(uuid())
+  email      String   @unique
+  enabled    Boolean  @default(true)
+  createdBy  String?  @map("created_by")
+  lastSentAt DateTime? @map("last_sent_at")
+  nextSendAt DateTime? @map("next_send_at")
+  lastError  String?  @map("last_error")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@map("weekly_report_subscriptions")
+}

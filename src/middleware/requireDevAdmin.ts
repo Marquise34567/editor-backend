@@ -1,8 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
-import { isDevAccount } from '../lib/devAccounts'
-import { resolveProfileAdminFlags } from '../services/adminTelemetry'
 
 declare global {
   namespace Express {
@@ -20,6 +18,7 @@ const getClientIp = (req: Request) => {
 }
 
 const safeLower = (value?: string | null) => String(value || '').trim().toLowerCase()
+const ONLY_DEV_PANEL_EMAIL = 'fyequise03@gmail.com'
 
 const getTokenFromRequest = (req: Request) => {
   const authHeader = req.headers.authorization
@@ -81,32 +80,16 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
 
     const userId = data.user.id
     const email = data.user.email ?? null
+    const normalizedEmail = safeLower(email)
     req.user = { id: userId, email: email ?? undefined }
 
-    const userRecord = await prisma.user.findUnique({ where: { id: userId } }).catch(() => null)
-    const profileFlags = await resolveProfileAdminFlags(userId)
-
-    const recordRole = String(
-      (userRecord as any)?.role ??
-      (userRecord as any)?.devRole ??
-      (userRecord as any)?.userRole ??
-      ''
-    ).trim().toUpperCase()
-    const recordIsAdmin = Boolean(
-      (userRecord as any)?.isDevAdmin ??
-      (userRecord as any)?.is_dev_admin ??
-      (userRecord as any)?.isAdmin ??
-      false
-    )
-    const roleAllowed = recordIsAdmin || recordRole === 'DEV_ADMIN' || profileFlags.isDevAdmin || profileFlags.role === 'DEV_ADMIN'
-    const allowlistAllowed = isDevAccount(userId, email)
-    if (!roleAllowed && !allowlistAllowed) {
+    if (normalizedEmail !== ONLY_DEV_PANEL_EMAIL) {
       await auditAccessAttempt({
         req,
         allowed: false,
         email,
         userId,
-        reason: 'not_dev_admin_or_allowlisted'
+        reason: 'email_not_authorized'
       })
       return stealthNotFound(res)
     }
@@ -114,9 +97,9 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
     await auditAccessAttempt({
       req,
       allowed: true,
-      email: safeLower(email),
+      email: normalizedEmail,
       userId,
-      reason: roleAllowed ? 'role_check_passed' : 'allowlist_check_passed'
+      reason: 'email_authorized'
     })
     return next()
   } catch (err) {
@@ -130,4 +113,3 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
     return stealthNotFound(res)
   }
 }
-

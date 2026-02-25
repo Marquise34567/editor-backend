@@ -18,6 +18,8 @@ class StubDB {
   founderInventoryStore = new Map<string, any>()
   adminAudits = new Map<string, any>()
   analyticsEvents = new Map<string, any>()
+  bannedIps = new Map<string, any>()
+  weeklyReportSubscriptions = new Map<string, any>()
 
   async $queryRaw() { return 1 }
 
@@ -62,9 +64,10 @@ class StubDB {
     updateMany: async ({ where, data }: any) => {
       let count = 0
       for (const [id,u] of this.users.entries()) {
+        const matchId = where?.id ? u.id === where.id : true
         const matchCustomer = where?.stripeCustomerId ? u.stripeCustomerId === where.stripeCustomerId : true
         const matchSub = where?.stripeSubscriptionId ? u.stripeSubscriptionId === where.stripeSubscriptionId : true
-        if (matchCustomer && matchSub) {
+        if (matchId && matchCustomer && matchSub) {
           this.users.set(id, { ...u, ...data })
           count++
         }
@@ -86,6 +89,140 @@ class StubDB {
         if (where.targetEmail) return a.targetEmail === where.targetEmail
         return true
       })
+    }
+  }
+
+  bannedIp = {
+    findUnique: async ({ where }: any) => {
+      const ip = where?.ip
+      if (!ip) return null
+      return this.bannedIps.get(ip) ?? null
+    },
+    findMany: async ({ where, orderBy }: any = {}) => {
+      let rows = Array.from(this.bannedIps.values())
+      if (typeof where?.active === 'boolean') {
+        rows = rows.filter((row: any) => Boolean(row.active) === where.active)
+      }
+      if (where?.ip) {
+        rows = rows.filter((row: any) => row.ip === where.ip)
+      }
+      if (orderBy?.createdAt) {
+        const dir = String(orderBy.createdAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.createdAt || 0).getTime()
+          const bMs = new Date(b?.createdAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      return rows
+    },
+    upsert: async ({ where, update, create }: any) => {
+      const ip = where?.ip || create?.ip
+      if (!ip) return null
+      const existing = this.bannedIps.get(ip)
+      if (existing) {
+        const next = { ...existing, ...update, updatedAt: new Date() }
+        this.bannedIps.set(ip, next)
+        return next
+      }
+      const created = {
+        ...create,
+        ip,
+        active: create?.active ?? true,
+        createdAt: create?.createdAt || new Date(),
+        updatedAt: new Date()
+      }
+      this.bannedIps.set(ip, created)
+      return created
+    },
+    delete: async ({ where }: any) => {
+      const ip = where?.ip
+      const existing = ip ? this.bannedIps.get(ip) : null
+      if (!ip || !existing) throw new Error('record_not_found')
+      this.bannedIps.delete(ip)
+      return existing
+    },
+    update: async ({ where, data }: any) => {
+      const ip = where?.ip
+      const existing = ip ? this.bannedIps.get(ip) : null
+      if (!ip || !existing) throw new Error('record_not_found')
+      const next = { ...existing, ...data, updatedAt: new Date() }
+      this.bannedIps.set(ip, next)
+      return next
+    }
+  }
+
+  weeklyReportSubscription = {
+    findUnique: async ({ where }: any) => {
+      if (where?.id) return this.weeklyReportSubscriptions.get(where.id) ?? null
+      if (where?.email) {
+        return (
+          Array.from(this.weeklyReportSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ) ?? null
+        )
+      }
+      return null
+    },
+    findMany: async ({ where, orderBy }: any = {}) => {
+      let rows = Array.from(this.weeklyReportSubscriptions.values())
+      if (where?.email) {
+        rows = rows.filter((row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase())
+      }
+      if (typeof where?.enabled === 'boolean') {
+        rows = rows.filter((row: any) => Boolean(row.enabled) === where.enabled)
+      }
+      if (where?.nextSendAt?.lte) {
+        const lte = new Date(where.nextSendAt.lte).getTime()
+        rows = rows.filter((row: any) => {
+          const value = row?.nextSendAt ? new Date(row.nextSendAt).getTime() : Number.POSITIVE_INFINITY
+          return value <= lte
+        })
+      }
+      if (orderBy?.updatedAt) {
+        const dir = String(orderBy.updatedAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.updatedAt || 0).getTime()
+          const bMs = new Date(b?.updatedAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      return rows
+    },
+    upsert: async ({ where, update, create }: any) => {
+      const existing =
+        (where?.id && this.weeklyReportSubscriptions.get(where.id)) ||
+        (where?.email &&
+          Array.from(this.weeklyReportSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ))
+      if (existing) {
+        const next = { ...existing, ...update, updatedAt: new Date() }
+        this.weeklyReportSubscriptions.set(next.id, next)
+        return next
+      }
+      const id = create?.id || `wrs-${Math.random().toString(36).slice(2, 9)}`
+      const created = {
+        id,
+        ...create,
+        enabled: create?.enabled ?? true,
+        createdAt: create?.createdAt || new Date(),
+        updatedAt: new Date()
+      }
+      this.weeklyReportSubscriptions.set(id, created)
+      return created
+    },
+    update: async ({ where, data }: any) => {
+      const existing =
+        (where?.id && this.weeklyReportSubscriptions.get(where.id)) ||
+        (where?.email &&
+          Array.from(this.weeklyReportSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ))
+      if (!existing) throw new Error('record_not_found')
+      const next = { ...existing, ...data, updatedAt: new Date() }
+      this.weeklyReportSubscriptions.set(next.id, next)
+      return next
     }
   }
 

@@ -1,6 +1,8 @@
 import express from 'express'
 import fetch from 'node-fetch'
-import { prisma } from '../db/prisma'
+import os from 'os'
+import { ListObjectsV2Command } from '@aws-sdk/client-s3'
+import { checkDb, isStubDb, prisma } from '../db/prisma'
 import { rateLimit } from '../middleware/rateLimit'
 import { requireDevAdmin } from '../middleware/requireDevAdmin'
 import {
@@ -14,7 +16,20 @@ import {
   getRealtimeActiveUsersSeries,
   getRealtimePresenceSessions
 } from '../realtime'
-import { isActiveSubscriptionStatus } from '../services/plans'
+import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
+import { stripe, isStripeEnabled } from '../services/stripe'
+import { cancelJobById } from './jobs'
+import { r2 } from '../lib/r2'
+import { supabaseAdmin } from '../supabaseClient'
+import { banIpAddress, listIpBans, normalizeIpAddress, unbanIpAddress } from '../services/ipBan'
+import {
+  getWeeklyReportProviderStatus,
+  isValidEmail,
+  listWeeklyReportSubscriptions,
+  runDueWeeklyReportDispatch,
+  sendWeeklyReportNow,
+  upsertWeeklyReportSubscription
+} from '../services/weeklyReports'
 
 const router = express.Router()
 
@@ -39,6 +54,11 @@ const QUEUE_STATUSES = new Set([
   'rendering'
 ])
 
+const IMPRESSION_EVENT_PATTERN = /(page[_:\-]?view|impression)/i
+const SUBSCRIPTION_CANCEL_REASON_MAX_LEN = 240
+const ADMIN_REASON_MAX_LEN = 300
+const PLAN_TIERS = new Set(['starter', 'creator', 'studio', 'founder'])
+
 type FeedbackSentiment = 'positive' | 'negative' | 'bug' | 'request'
 type FeedbackItem = {
   id: string
@@ -62,6 +82,149 @@ const renderSeconds = (job: any) => {
   const start = asMs(job?.createdAt)
   const end = asMs(job?.updatedAt)
   return start > 0 && end > start ? (end - start) / 1000 : null
+}
+
+const parseBool = (value: unknown, fallback = false) => {
+  if (typeof value === 'boolean') return value
+  if (value == null) return fallback
+  const normalized = String(value).trim().toLowerCase()
+  if (!normalized) return fallback
+  return normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'y'
+}
+
+const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+
+const sanitizeReason = (value: unknown, maxLen = ADMIN_REASON_MAX_LEN) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  return raw.slice(0, maxLen)
+}
+
+const parsePlanTier = (value: unknown) => {
+  const tier = coercePlanTier(String(value || '').trim().toLowerCase())
+  if (!PLAN_TIERS.has(tier)) return null
+  return tier
+}
+
+const normalizeEmail = (value: unknown) => String(value || '').trim().toLowerCase()
+
+const isImpressionEvent = (event: { category?: unknown; eventName?: unknown }) => {
+  const category = String(event?.category || '').toLowerCase()
+  const eventName = String(event?.eventName || '').toLowerCase()
+  return category === 'page_view' || IMPRESSION_EVENT_PATTERN.test(eventName)
+}
+
+const getImpressionEventsSince = async (rangeMs: number) => {
+  const floor = new Date(Date.now() - Math.max(1_000, rangeMs))
+  try {
+    const events = await prisma.siteAnalyticsEvent.findMany({
+      where: { createdAt: { gte: floor } },
+      select: { createdAt: true, category: true, eventName: true },
+      orderBy: { createdAt: 'asc' }
+    })
+    return Array.isArray(events) ? events.filter(isImpressionEvent) : []
+  } catch {
+    return []
+  }
+}
+
+const getImpressionCountSince = async (rangeMs: number) => {
+  const events = await getImpressionEventsSince(rangeMs)
+  return events.length
+}
+
+const getImpressionSeries = async ({
+  rangeMs,
+  bucketMs
+}: {
+  rangeMs: number
+  bucketMs: number
+}) => {
+  const safeBucketMs = Math.max(60_000, bucketMs)
+  const startMs = Date.now() - Math.max(rangeMs, safeBucketMs)
+  const firstBucket = Math.floor(startMs / safeBucketMs) * safeBucketMs
+  const buckets = new Map<number, number>()
+  for (let t = firstBucket; t <= Date.now(); t += safeBucketMs) {
+    buckets.set(t, 0)
+  }
+  const events = await getImpressionEventsSince(rangeMs)
+  for (const event of events) {
+    const createdMs = asMs((event as any)?.createdAt)
+    if (!createdMs || createdMs < startMs) continue
+    const bucket = Math.floor(createdMs / safeBucketMs) * safeBucketMs
+    buckets.set(bucket, (buckets.get(bucket) || 0) + 1)
+  }
+  return Array.from(buckets.entries()).map(([bucket, value]) => ({
+    t: new Date(bucket).toISOString(),
+    v: value
+  }))
+}
+
+const pingUrl = async (url: string) => {
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 5_000)
+  const startedAt = Date.now()
+  try {
+    const response = await fetch(url, { method: 'GET', signal: controller.signal } as any)
+    return {
+      ok: response.ok,
+      statusCode: response.status,
+      latencyMs: Date.now() - startedAt,
+      url
+    }
+  } catch (err: any) {
+    return {
+      ok: false,
+      statusCode: null,
+      latencyMs: Date.now() - startedAt,
+      url,
+      error: String(err?.message || 'request_failed')
+    }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+const resolveUserFromPayload = async (payload: { userId?: unknown; email?: unknown }) => {
+  const userId = String(payload?.userId || '').trim()
+  const email = normalizeEmail(payload?.email)
+  if (userId) {
+    const user = await prisma.user.findUnique({ where: { id: userId } })
+    return user || null
+  }
+  if (email && isValidEmail(email)) {
+    const user = await prisma.user.findUnique({ where: { email } })
+    return user || null
+  }
+  return null
+}
+
+const auditAdminAction = async ({
+  actor,
+  action,
+  targetEmail,
+  planKey,
+  reason
+}: {
+  actor?: string | null
+  action: string
+  targetEmail?: string | null
+  planKey?: string | null
+  reason?: string | null
+}) => {
+  try {
+    await prisma.adminAudit.create({
+      data: {
+        actor: actor || null,
+        action,
+        targetEmail: targetEmail || 'unknown',
+        planKey: planKey || null,
+        reason: reason || null
+      }
+    })
+  } catch {
+    // best-effort audit
+  }
 }
 
 const getJobsSince = async (rangeMs: number) => {
@@ -235,6 +398,8 @@ router.get('/overview', async (_req, res) => {
   const jobs30d = await getJobsSince(RANGE_MS['30d'])
   const subscriptions = await getSubscriptions()
   const payments7d = await getStripeWebhookEvents({ rangeMs: RANGE_MS['7d'] })
+  const impressions24h = await getImpressionCountSince(RANGE_MS['24h'])
+  const impressions5m = await getImpressionCountSince(5 * 60 * 1000)
   const completed24h = jobs24h.filter((job) => String(job?.status || '').toLowerCase() === 'completed').length
   const failed24h = jobs24h.filter((job) => String(job?.status || '').toLowerCase() === 'failed').length
   const durations = jobs30d.map((job) => renderSeconds(job)).filter((v): v is number => v !== null)
@@ -258,10 +423,16 @@ router.get('/overview', async (_req, res) => {
       activeSubscriptions: subscriptions.filter((sub) => isActiveSubscriptionStatus(String(sub?.status || '').toLowerCase())).length,
       avgRenderTime,
       successRate,
-      usersTotal: (await getUsers()).length
+      usersTotal: (await getUsers()).length,
+      websiteImpressions24h: impressions24h,
+      websiteImpressions5m: impressions5m
     },
     graphs: {
       activeUsers: getRealtimeActiveUsersSeries(),
+      websiteImpressions: await getImpressionSeries({
+        rangeMs: RANGE_MS['24h'],
+        bucketMs: 60 * 60 * 1000
+      }),
       jobSuccessVsFailure: jobs30d.map((job) => ({
         t: new Date(job?.updatedAt || job?.createdAt || Date.now()).toISOString(),
         success: String(job?.status || '').toLowerCase() === 'completed' ? 1 : 0,
@@ -295,6 +466,24 @@ router.get('/realtime-users', async (_req, res) => {
   res.json({
     activeUsers: getRealtimeActiveUsersCount(),
     sessions: getRealtimePresenceSessions(),
+    updatedAt: new Date().toISOString()
+  })
+})
+
+router.get('/site-live', async (_req, res) => {
+  const impressionsLast5m = await getImpressionCountSince(5 * 60 * 1000)
+  const impressionsLast60m = await getImpressionCountSince(60 * 60 * 1000)
+  const impressionsLast24h = await getImpressionCountSince(RANGE_MS['24h'])
+  const series = await getImpressionSeries({
+    rangeMs: 60 * 60 * 1000,
+    bucketMs: 60 * 1000
+  })
+  res.json({
+    activeUsers: getRealtimeActiveUsersCount(),
+    impressionsLast5m,
+    impressionsLast60m,
+    impressionsLast24h,
+    series,
     updatedAt: new Date().toISOString()
   })
 })
@@ -367,6 +556,435 @@ router.get('/subscriptions', async (req, res) => {
     return { t: new Date(bucket).toISOString(), v: value }
   })
   res.json({ distribution, activeSubscriptions: active.length, churnCount, upcomingRenewals, trend, updatedAt: new Date().toISOString() })
+})
+
+router.post('/subscriptions/grant', async (req: any, res) => {
+  const tier = parsePlanTier(req.body?.planTier || req.body?.tier)
+  if (!tier) {
+    return res.status(400).json({ error: 'invalid_plan_tier' })
+  }
+  const user = await resolveUserFromPayload({ userId: req.body?.userId, email: req.body?.email })
+  if (!user) {
+    return res.status(404).json({ error: 'user_not_found' })
+  }
+  const durationDays = clamp(Number.parseInt(String(req.body?.durationDays ?? '30'), 10) || 30, 1, 3650)
+  const reason = sanitizeReason(req.body?.reason)
+  const currentPeriodEnd = new Date(Date.now() + durationDays * 24 * 60 * 60 * 1000)
+  const existingSubscription = await prisma.subscription.findUnique({ where: { userId: user.id } }).catch(() => null)
+  const granted = await prisma.subscription.upsert({
+    where: { userId: user.id },
+    create: {
+      userId: user.id,
+      stripeCustomerId: existingSubscription?.stripeCustomerId || user?.stripeCustomerId || null,
+      stripeSubscriptionId: null,
+      status: 'active',
+      planTier: tier,
+      priceId: `admin_grant_${tier}`,
+      currentPeriodEnd,
+      cancelAtPeriodEnd: true
+    },
+    update: {
+      status: 'active',
+      planTier: tier,
+      priceId: `admin_grant_${tier}`,
+      currentPeriodEnd,
+      cancelAtPeriodEnd: true
+    }
+  })
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      planStatus: 'active',
+      currentPeriodEnd
+    }
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_subscription_grant',
+    targetEmail: user.email || null,
+    planKey: `${user.id}:${tier}`,
+    reason: reason || null
+  })
+  return res.json({
+    ok: true,
+    userId: user.id,
+    email: user.email,
+    tier,
+    currentPeriodEnd: granted?.currentPeriodEnd || currentPeriodEnd,
+    durationDays
+  })
+})
+
+router.post('/subscriptions/cancel', async (req: any, res) => {
+  const user = await resolveUserFromPayload({ userId: req.body?.userId, email: req.body?.email })
+  if (!user) {
+    return res.status(404).json({ error: 'user_not_found' })
+  }
+  const reason = sanitizeReason(req.body?.reason, SUBSCRIPTION_CANCEL_REASON_MAX_LEN)
+  const immediate = parseBool(req.body?.immediate, true)
+  const subscription = await prisma.subscription.findUnique({ where: { userId: user.id } }).catch(() => null)
+  if (!subscription) {
+    return res.status(404).json({ error: 'subscription_not_found' })
+  }
+  const stripeSubscriptionId = String(subscription?.stripeSubscriptionId || '').trim()
+  if (stripeSubscriptionId && isStripeEnabled() && stripe) {
+    try {
+      if (immediate) {
+        await stripe.subscriptions.cancel(stripeSubscriptionId)
+      } else {
+        await stripe.subscriptions.update(stripeSubscriptionId, { cancel_at_period_end: true })
+      }
+    } catch (err: any) {
+      return res.status(502).json({
+        error: 'stripe_cancel_failed',
+        message: String(err?.message || 'Stripe cancellation failed')
+      })
+    }
+  }
+  const canceledAt = new Date()
+  const nextStatus = immediate ? 'canceled' : String(subscription.status || 'active')
+  const nextPlanTier = immediate ? 'free' : subscription.planTier
+  const currentPeriodEnd = immediate ? canceledAt : subscription.currentPeriodEnd
+  const updatedSubscription = await prisma.subscription.update({
+    where: { userId: user.id },
+    data: {
+      status: nextStatus,
+      planTier: nextPlanTier,
+      cancelAtPeriodEnd: true,
+      currentPeriodEnd,
+      ...(immediate ? { stripeSubscriptionId: null } : {})
+    }
+  })
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      planStatus: immediate ? 'canceled' : 'active',
+      currentPeriodEnd: currentPeriodEnd || null,
+      ...(immediate ? { stripeSubscriptionId: null } : {})
+    }
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_subscription_cancel',
+    targetEmail: user.email || null,
+    planKey: `${user.id}:${String(subscription.planTier || 'unknown')}`,
+    reason: reason || (immediate ? 'immediate_cancel' : 'cancel_at_period_end')
+  })
+  return res.json({
+    ok: true,
+    immediate,
+    userId: user.id,
+    email: user.email,
+    subscription: {
+      status: updatedSubscription.status,
+      planTier: updatedSubscription.planTier,
+      cancelAtPeriodEnd: updatedSubscription.cancelAtPeriodEnd,
+      currentPeriodEnd: updatedSubscription.currentPeriodEnd
+    }
+  })
+})
+
+router.post('/jobs/:id/cancel', async (req: any, res) => {
+  try {
+    const result = await cancelJobById({
+      jobId: req.params.id,
+      reason: 'queue_canceled_by_admin'
+    })
+    const owner = await prisma.user.findUnique({ where: { id: result.ownerUserId } }).catch(() => null)
+    await auditAdminAction({
+      actor: req.user?.email || req.user?.id || null,
+      action: 'admin_job_cancel',
+      targetEmail: owner?.email || result.ownerUserId || null,
+      planKey: result.id,
+      reason: sanitizeReason(req.body?.reason) || 'queue_canceled_by_admin'
+    })
+    return res.json({
+      ok: true,
+      id: result.id,
+      status: result.status,
+      running: result.running,
+      killedCount: result.killedCount,
+      userId: result.ownerUserId
+    })
+  } catch (err: any) {
+    const status = Number(err?.statusCode || 500)
+    const code = String(err?.code || 'server_error')
+    const message = String(err?.message || 'server_error')
+    if (status >= 500) return res.status(500).json({ error: 'server_error' })
+    return res.status(status).json({ error: code, message })
+  }
+})
+
+router.get('/ip-bans', async (_req, res) => {
+  const rows = await listIpBans()
+  res.json({
+    items: rows,
+    updatedAt: new Date().toISOString()
+  })
+})
+
+router.post('/ip-bans', async (req: any, res) => {
+  const requestedUserId = String(req.body?.userId || '').trim()
+  const directIp = normalizeIpAddress(req.body?.ip)
+  const sessionIp = requestedUserId
+    ? normalizeIpAddress(
+        getRealtimePresenceSessions().find((session) => String(session?.userId || '') === requestedUserId)?.ip
+      )
+    : null
+  const ip = directIp || sessionIp
+  if (!ip) {
+    return res.status(400).json({ error: 'invalid_ip' })
+  }
+  const reason = sanitizeReason(req.body?.reason)
+  const durationHoursRaw = Number.parseInt(String(req.body?.durationHours ?? '0'), 10)
+  const durationHours = Number.isFinite(durationHoursRaw) ? clamp(durationHoursRaw, 0, 24 * 365) : 0
+  const expiresAt = durationHours > 0 ? new Date(Date.now() + durationHours * 60 * 60 * 1000) : null
+  const created = await banIpAddress({
+    ip,
+    reason: reason || null,
+    createdBy: req.user?.id || null,
+    expiresAt
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_ip_ban_create',
+    targetEmail: ip,
+    planKey: requestedUserId || null,
+    reason: reason || null
+  })
+  return res.json({
+    ok: true,
+    ban: {
+      ip: created.ip,
+      reason: created.reason || null,
+      expiresAt: created.expiresAt || null,
+      active: created.active
+    }
+  })
+})
+
+router.delete('/ip-bans/:ip', async (req: any, res) => {
+  const ipRaw = decodeURIComponent(String(req.params.ip || ''))
+  const normalized = normalizeIpAddress(ipRaw)
+  if (!normalized) {
+    return res.status(400).json({ error: 'invalid_ip' })
+  }
+  const removed = await unbanIpAddress(normalized)
+  if (!removed) {
+    return res.status(404).json({ error: 'not_found' })
+  }
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_ip_ban_remove',
+    targetEmail: normalized,
+    reason: sanitizeReason(req.body?.reason) || null
+  })
+  return res.json({ ok: true, ip: normalized })
+})
+
+router.get('/health-status', async (_req, res) => {
+  const backendStartedAtMs = Date.now() - Math.round(process.uptime() * 1000)
+  const dbConnected = await checkDb()
+  const frontendTarget = String(process.env.FRONTEND_URL || process.env.APP_URL || '').trim()
+  const frontendHealth = frontendTarget
+    ? await pingUrl(frontendTarget)
+    : {
+        ok: false,
+        statusCode: null,
+        latencyMs: 0,
+        url: null,
+        error: 'frontend_url_not_configured'
+      }
+  const inputBucket = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
+  const outputBucket = process.env.SUPABASE_BUCKET_OUTPUT || process.env.SUPABASE_BUCKET_OUTPUTS || 'outputs'
+  const storageHealth = {
+    provider: r2.isConfigured ? 'r2' : 'supabase',
+    ok: false,
+    details: null as any
+  }
+  if (r2.isConfigured) {
+    try {
+      await r2.client.send(new ListObjectsV2Command({ Bucket: r2.bucket, MaxKeys: 1 }))
+      storageHealth.ok = true
+      storageHealth.details = { bucket: r2.bucket, endpoint: r2.endpoint || null }
+    } catch (err: any) {
+      storageHealth.ok = false
+      storageHealth.details = { error: String(err?.message || 'r2_check_failed'), bucket: r2.bucket }
+    }
+  } else {
+    try {
+      const [inputResult, outputResult] = await Promise.all([
+        supabaseAdmin.storage.getBucket(inputBucket),
+        supabaseAdmin.storage.getBucket(outputBucket)
+      ])
+      const inputOk = Boolean(inputResult?.data)
+      const outputOk = Boolean(outputResult?.data)
+      storageHealth.ok = inputOk && outputOk
+      storageHealth.details = {
+        inputBucket,
+        outputBucket,
+        inputOk,
+        outputOk,
+        inputError: inputResult?.error?.message || null,
+        outputError: outputResult?.error?.message || null
+      }
+    } catch (err: any) {
+      storageHealth.ok = false
+      storageHealth.details = { error: String(err?.message || 'storage_check_failed') }
+    }
+  }
+  const memory = process.memoryUsage()
+  const queue = await countQueue()
+  const status = dbConnected && frontendHealth.ok && storageHealth.ok ? 'healthy' : 'degraded'
+  res.json({
+    status,
+    checkedAt: new Date().toISOString(),
+    backend: {
+      ok: dbConnected,
+      db: isStubDb() ? 'stub' : 'prisma',
+      uptimeSeconds: Math.round(process.uptime()),
+      startedAt: new Date(backendStartedAtMs).toISOString(),
+      queueDepth: queue,
+      nodeVersion: process.version,
+      platform: `${os.platform()} ${os.release()}`,
+      memory: {
+        rss: memory.rss,
+        heapUsed: memory.heapUsed,
+        heapTotal: memory.heapTotal
+      }
+    },
+    frontend: frontendHealth,
+    storage: storageHealth
+  })
+})
+
+router.get('/security', async (_req, res) => {
+  const providerStatus = getWeeklyReportProviderStatus()
+  const dbConnected = await checkDb()
+  const frontendUrl = String(process.env.FRONTEND_URL || process.env.APP_URL || '').trim()
+  const checks = [
+    {
+      key: 'database',
+      label: 'Database Connected',
+      ok: dbConnected && !isStubDb(),
+      detail: dbConnected && !isStubDb() ? 'Connected to primary database.' : 'Running in stub/fallback DB mode.'
+    },
+    {
+      key: 'https_frontend',
+      label: 'HTTPS Frontend',
+      ok: frontendUrl.startsWith('https://'),
+      detail: frontendUrl ? `Frontend URL: ${frontendUrl}` : 'Frontend URL not configured.'
+    },
+    {
+      key: 'stripe_webhook_secret',
+      label: 'Stripe Webhook Secret',
+      ok: String(process.env.STRIPE_WEBHOOK_SECRET || '').trim().length >= 8,
+      detail: 'Webhook signing secret should be configured in production.'
+    },
+    {
+      key: 'supabase_service_key',
+      label: 'Supabase Service Role Key',
+      ok: String(process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim().length >= 20,
+      detail: 'Server key required for privileged backend operations.'
+    },
+    {
+      key: 'cors_wildcard',
+      label: 'CORS Wildcard Disabled',
+      ok: !String(process.env.CORS_ALLOWED_ORIGINS || '').includes('*'),
+      detail: 'Wildcard CORS origins should stay disabled.'
+    },
+    {
+      key: 'ip_ban_enforcement',
+      label: 'IP Ban Enforcement',
+      ok: true,
+      detail: 'Global IP block middleware is active.'
+    },
+    {
+      key: 'weekly_report_provider',
+      label: 'Weekly Report Provider',
+      ok: providerStatus.configured,
+      detail: providerStatus.configured
+        ? `Provider configured: ${providerStatus.provider}`
+        : 'No weekly report email provider configured.'
+    }
+  ]
+  const okCount = checks.filter((check) => check.ok).length
+  const score = Number(((okCount / checks.length) * 100).toFixed(1))
+  const riskLevel = score >= 85 ? 'low' : score >= 60 ? 'medium' : 'high'
+  res.json({
+    score,
+    riskLevel,
+    checks,
+    generatedAt: new Date().toISOString()
+  })
+})
+
+router.get('/reports/weekly', async (_req, res) => {
+  const subscriptions = await listWeeklyReportSubscriptions()
+  res.json({
+    provider: getWeeklyReportProviderStatus(),
+    subscriptions,
+    updatedAt: new Date().toISOString()
+  })
+})
+
+router.post('/reports/weekly', async (req: any, res) => {
+  const email = normalizeEmail(req.body?.email)
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'invalid_email' })
+  }
+  const enabled = parseBool(req.body?.enabled, true)
+  const row = await upsertWeeklyReportSubscription({
+    email,
+    enabled,
+    actor: req.user?.id || null
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_weekly_report_subscription',
+    targetEmail: email,
+    planKey: enabled ? 'enabled' : 'disabled',
+    reason: sanitizeReason(req.body?.reason) || null
+  })
+  res.json({
+    ok: true,
+    provider: getWeeklyReportProviderStatus(),
+    subscription: row
+  })
+})
+
+router.post('/reports/weekly/send-now', async (req: any, res) => {
+  const email = normalizeEmail(req.body?.email)
+  if (!isValidEmail(email)) {
+    return res.status(400).json({ error: 'invalid_email' })
+  }
+  try {
+    const sent = await sendWeeklyReportNow({
+      email,
+      actor: req.user?.id || null
+    })
+    await auditAdminAction({
+      actor: req.user?.email || req.user?.id || null,
+      action: 'admin_weekly_report_send_now',
+      targetEmail: email,
+      reason: sanitizeReason(req.body?.reason) || null
+    })
+    return res.json(sent)
+  } catch (err: any) {
+    return res.status(502).json({
+      error: 'weekly_report_send_failed',
+      message: String(err?.message || 'weekly report send failed')
+    })
+  }
+})
+
+router.post('/reports/weekly/dispatch', async (_req, res) => {
+  const result = await runDueWeeklyReportDispatch()
+  return res.json({
+    ok: true,
+    ...result,
+    dispatchedAt: new Date().toISOString()
+  })
 })
 
 router.get('/editor-insights', async (req, res) => {
@@ -452,6 +1070,8 @@ router.get('/stream', async (req, res) => {
       activeUsers: getRealtimeActiveUsersCount(),
       jobsInQueue: await countQueue(),
       jobsFailed24h: jobs.filter((job) => String(job?.status || '').toLowerCase() === 'failed').length,
+      websiteImpressions5m: await getImpressionCountSince(5 * 60 * 1000),
+      websiteImpressions24h: await getImpressionCountSince(RANGE_MS['24h']),
       t: new Date().toISOString()
     }
   }

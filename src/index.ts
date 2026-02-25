@@ -3,6 +3,8 @@ import { exec } from 'child_process'
 import app from './app'
 import { initRealtime } from './realtime'
 import { FFMPEG_PATH, formatCommand } from './lib/ffmpeg'
+import { initWeeklyReportScheduler } from './services/weeklyReports'
+import { warmIpBanCache } from './services/ipBan'
 
 const PORT = Number(process.env.PORT || 4000)
 const STARTUP_LOG_LIMIT = 64 * 1024
@@ -53,6 +55,8 @@ const verifyFfmpegOnStartup = async () => {
 const start = async () => {
   const ffmpegOk = await verifyFfmpegOnStartup()
   if (!ffmpegOk) process.exit(1)
+  await warmIpBanCache().catch(() => null)
+  initWeeklyReportScheduler()
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`)
   })

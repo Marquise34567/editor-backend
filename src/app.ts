@@ -20,6 +20,7 @@ import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
 import { recordAdminErrorLog } from './services/adminTelemetry'
+import { blockBannedIp } from './middleware/blockBannedIp'
 
 loadEnv()
 const app = express()
@@ -193,6 +194,8 @@ app.use((req, res, next) => {
   })
   next()
 })
+
+app.use(blockBannedIp)
 
 app.post('/webhooks/stripe', rateLimit({ windowMs: 60_000, max: 120 }), bodyParser.raw({ type: '*/*' }), (req, res, next) => {
   ;(req as any).rawBody = req.body

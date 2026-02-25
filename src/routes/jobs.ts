@@ -12383,35 +12383,90 @@ router.post('/:id/upload-url', async (req: any, res) => {
   }
 })
 
+type CancelJobByIdArgs = {
+  jobId: string
+  requesterUserId?: string | null
+  reason?: string
+}
+
+type CancelJobByIdResult = {
+  id: string
+  status: 'failed'
+  running: boolean
+  killedCount: number
+  ownerUserId: string
+}
+
+const buildCancelError = (statusCode: number, code: string, message: string) => {
+  const err: any = new Error(message)
+  err.statusCode = statusCode
+  err.code = code
+  return err
+}
+
+export const cancelJobById = async ({
+  jobId,
+  requesterUserId,
+  reason
+}: CancelJobByIdArgs): Promise<CancelJobByIdResult> => {
+  const id = String(jobId || '').trim()
+  if (!id) throw buildCancelError(400, 'invalid_job_id', 'Missing job ID.')
+
+  const job = await prisma.job.findUnique({ where: { id } })
+  if (!job) throw buildCancelError(404, 'not_found', 'Job not found.')
+  if (requesterUserId && job.userId !== requesterUserId) {
+    throw buildCancelError(404, 'not_found', 'Job not found.')
+  }
+
+  const status = String(job.status || '').toLowerCase()
+  if (status === 'completed' || status === 'failed') {
+    throw buildCancelError(409, 'cannot_cancel', 'Job is already finished.')
+  }
+  if (!CANCELABLE_PIPELINE_STATUSES.has(status)) {
+    throw buildCancelError(409, 'cannot_cancel', 'Job cannot be canceled in its current state.')
+  }
+
+  markPipelineCanceled(id)
+  removeJobFromQueue(id)
+  processQueue()
+  const killedCount = killJobFfmpegProcesses(id)
+  const isRunning = runningPipelineJobIds.has(id)
+  const progress = Math.max(0, Math.min(100, Number(job.progress || 0)))
+  await updateJob(id, {
+    status: 'failed',
+    progress,
+    error: reason || 'queue_canceled_by_user'
+  })
+  if (!isRunning) clearPipelineCanceled(id)
+  return {
+    id,
+    status: 'failed',
+    running: isRunning,
+    killedCount,
+    ownerUserId: String(job.userId || '')
+  }
+}
+
 const handleCancelJob = async (req: any, res: any) => {
   try {
-    const id = req.params.id
-    const job = await prisma.job.findUnique({ where: { id } })
-    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
-
-    const status = String(job.status || '').toLowerCase()
-    if (status === 'completed' || status === 'failed') {
-      return res.status(409).json({ error: 'cannot_cancel', message: 'Job is already finished.' })
-    }
-    if (!CANCELABLE_PIPELINE_STATUSES.has(status)) {
-      return res.status(409).json({ error: 'cannot_cancel', message: 'Job cannot be canceled in its current state.' })
-    }
-
-    markPipelineCanceled(id)
-    removeJobFromQueue(id)
-    processQueue()
-    const killedCount = killJobFfmpegProcesses(id)
-    const isRunning = runningPipelineJobIds.has(id)
-    const progress = Math.max(0, Math.min(100, Number(job.progress || 0)))
-    await updateJob(id, {
-      status: 'failed',
-      progress,
-      error: 'queue_canceled_by_user'
+    const canceled = await cancelJobById({
+      jobId: req.params.id,
+      requesterUserId: req.user?.id || null,
+      reason: 'queue_canceled_by_user'
     })
-    if (!isRunning) clearPipelineCanceled(id)
-    return res.json({ ok: true, id, status: 'failed', running: isRunning, killedCount })
+    return res.json({
+      ok: true,
+      id: canceled.id,
+      status: canceled.status,
+      running: canceled.running,
+      killedCount: canceled.killedCount
+    })
   } catch (err) {
-    return res.status(500).json({ error: 'server_error' })
+    const status = Number((err as any)?.statusCode || 500)
+    const code = String((err as any)?.code || 'server_error')
+    const message = String((err as any)?.message || 'server_error')
+    if (status >= 500) return res.status(500).json({ error: 'server_error' })
+    return res.status(status).json({ error: code, message })
   }
 }
 
