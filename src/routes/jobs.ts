@@ -706,6 +706,9 @@ type EditOptions = {
   removeBoring: boolean
   onlyCuts: boolean
   smartZoom: boolean
+  jumpCuts: boolean
+  transitions: boolean
+  soundFx: boolean
   emotionalBoost: boolean
   aggressiveMode: boolean
   autoCaptions: boolean
@@ -1151,6 +1154,9 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   removeBoring: true,
   onlyCuts: false,
   smartZoom: true,
+  jumpCuts: true,
+  transitions: true,
+  soundFx: true,
   emotionalBoost: true,
   aggressiveMode: false,
   autoCaptions: false,
@@ -6619,13 +6625,17 @@ const applySegmentEffects = (
       (score?.speechIntensity ?? 0) >= Math.max(0.62, speechBaseline * 1.24) ||
       Boolean(score?.isHook && options.aggressiveMode)
     )
-    const transitionStyle: SegmentTransitionStyle = jumpTrigger ? 'jump' : 'smooth'
+    const transitionStyle: SegmentTransitionStyle = options.jumpCuts && jumpTrigger ? 'jump' : 'smooth'
     const soundFxLevel = Number(clamp(
-      (score?.isHook ? 0.2 : 0) +
-      (jumpTrigger ? 0.32 : 0) +
-      (speechPeak ? 0.2 : 0) +
-      (motionEmphasis ? 0.24 : 0) +
-      (options.aggressiveMode ? 0.1 : 0),
+      options.soundFx
+        ? (
+          (score?.isHook ? 0.2 : 0) +
+          (jumpTrigger ? 0.32 : 0) +
+          (speechPeak ? 0.2 : 0) +
+          (motionEmphasis ? 0.24 : 0) +
+          (options.aggressiveMode ? 0.1 : 0)
+        )
+        : 0,
       0,
       0.9
     ).toFixed(3))
@@ -6774,6 +6784,7 @@ const buildConcatFilter = (
   const parts: string[] = []
   const scalePad = buildFrameFitFilter(opts.fit, opts.targetWidth, opts.targetHeight)
   const durations: number[] = []
+  const canGenerateNoiseFx = opts.withAudio && hasFfmpegFilter('anoisesrc')
   const nonZoomIndexes = segments
     .map((segment, idx) => ({
       idx,
@@ -6807,7 +6818,15 @@ const buildConcatFilter = (
     durations.push(segDuration)
     const vTrim = `trim=start=${toFilterNumber(seg.start)}:end=${toFilterNumber(seg.end)}`
     const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : ',setpts=PTS-STARTPTS'
-    const vZoom = zoom > 0 ? `,scale=iw*${1 + zoom}:ih*${1 + zoom},crop=iw:ih` : ''
+    const zoomScale = 1 + zoom
+    const zoomCropScale = zoomScale > 0 ? 1 / zoomScale : 1
+    const focusX = Number.isFinite(seg.faceFocusX) ? clamp(Number(seg.faceFocusX), 0.08, 0.92) : 0.5
+    const focusY = Number.isFinite(seg.faceFocusY) ? clamp(Number(seg.faceFocusY), 0.08, 0.88) : 0.42
+    const cropXExpr = `'max(0,min(iw-ow,${toFilterNumber(focusX)}*iw-ow/2))'`
+    const cropYExpr = `'max(0,min(ih-oh,${toFilterNumber(focusY)}*ih-oh/2))'`
+    const vZoom = zoom > 0
+      ? `,scale=iw*${toFilterNumber(zoomScale)}:ih*${toFilterNumber(zoomScale)},crop=iw*${toFilterNumber(zoomCropScale)}:ih*${toFilterNumber(zoomCropScale)}:${cropXExpr}:${cropYExpr}`
+      : ''
     const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
     const nonZoomLabel = nonZoomSourceLabels.get(idx)
     if (nonZoomLabel) {
@@ -6824,16 +6843,36 @@ const buildConcatFilter = (
       const fadeLen = roundForFilter(0.04)
       const afadeIn = `afade=t=in:st=0:d=${toFilterNumber(fadeLen)}`
       const afadeOut = `afade=t=out:st=${toFilterNumber(Math.max(0, segDuration - fadeLen))}:d=${toFilterNumber(fadeLen)}`
+      const soundFxLevel = Number.isFinite(seg.soundFxLevel) ? clamp(Number(seg.soundFxLevel), 0, 1) : 0
+      const addSoundFx = canGenerateNoiseFx && soundFxLevel >= 0.16 && segDuration >= 0.14
+      const baseAudioLabel = addSoundFx ? `ab${idx}` : `a${idx}`
       if (opts.hasAudioStream) {
         const guard = roundForFilter(0.04)
         const aTrim = `atrim=start=${toFilterNumber(Math.max(0, seg.start - guard))}:end=${toFilterNumber(seg.end + guard)}`
         const chain = [aTrim, 'asetpts=PTS-STARTPTS', aSpeed, aGain, afadeIn, afadeOut, aNormalize].filter(Boolean).join(',')
-        parts.push(`[0:a]${chain}[a${idx}]`)
+        parts.push(`[0:a]${chain}[${baseAudioLabel}]`)
       } else {
         const chain = [`anullsrc=r=48000:cl=stereo`, `atrim=duration=${toFilterNumber(segDuration)}`, 'asetpts=PTS-STARTPTS', aSpeed, aGain, afadeIn, afadeOut, aNormalize]
           .filter(Boolean)
           .join(',')
-        parts.push(`${chain}[a${idx}]`)
+        parts.push(`${chain}[${baseAudioLabel}]`)
+      }
+      if (addSoundFx) {
+        const noiseDuration = clamp(0.09 + 0.12 * soundFxLevel, 0.08, Math.min(0.24, Math.max(0.08, segDuration - 0.02)))
+        const noiseFadeDur = Math.max(0.03, noiseDuration * 0.74)
+        const noiseFadeStart = Math.max(0.01, noiseDuration - noiseFadeDur)
+        const noiseVolume = clamp(0.012 + 0.026 * soundFxLevel, 0.008, 0.05)
+        const noiseLabel = `nfx${idx}`
+        const noiseChain = [
+          `anoisesrc=r=48000:color=white:duration=${toFilterNumber(segDuration)}`,
+          'aformat=sample_rates=48000:channel_layouts=stereo',
+          'highpass=f=1300',
+          'lowpass=f=9000',
+          `volume=${toFilterNumber(noiseVolume)}`,
+          `afade=t=out:st=${toFilterNumber(noiseFadeStart)}:d=${toFilterNumber(noiseFadeDur)}`
+        ].join(',')
+        parts.push(`${noiseChain}[${noiseLabel}]`)
+        parts.push(`[${baseAudioLabel}][${noiseLabel}]amix=inputs=2:weights='1 0.95':normalize=0[a${idx}]`)
       }
     }
   })
@@ -6854,13 +6893,18 @@ const buildConcatFilter = (
   let cumulative = durations[0] || 0
   let vPrev = `v0`
   for (let i = 1; i < segments.length; i += 1) {
-    const fade = Math.min(STITCH_FADE_SEC, (durations[i - 1] || STITCH_FADE_SEC) / 2, (durations[i] || STITCH_FADE_SEC) / 2)
-    const offset = Math.max(0, roundForFilter(cumulative - fade))
+    const prevTransition = segments[i - 1]?.transitionStyle
+    const nextTransition = segments[i]?.transitionStyle
+    const jumpBoundary = prevTransition === 'jump' || nextTransition === 'jump'
+    const desiredFade = jumpBoundary ? JUMPCUT_FADE_SEC : STITCH_FADE_SEC
+    const fade = Math.min(desiredFade, (durations[i - 1] || desiredFade) / 2, (durations[i] || desiredFade) / 2)
+    const safeFade = Math.max(0.004, roundForFilter(fade))
+    const offset = Math.max(0, roundForFilter(cumulative - safeFade))
     const outLabel = `vx${i}`
-    parts.push(`[${vPrev}][v${i}]xfade=transition=fade:duration=${toFilterNumber(fade)}:offset=${toFilterNumber(offset)}[${outLabel}]`)
-    fades.push(fade)
+    parts.push(`[${vPrev}][v${i}]xfade=transition=fade:duration=${toFilterNumber(safeFade)}:offset=${toFilterNumber(offset)}[${outLabel}]`)
+    fades.push(safeFade)
     vPrev = outLabel
-    cumulative += (durations[i] || 0) - fade
+    cumulative += (durations[i] || 0) - safeFade
   }
 
   if (opts.withAudio) {
@@ -8060,6 +8104,9 @@ const getEditOptionsForUser = async (
       removeBoring,
       onlyCuts,
       smartZoom: onlyCuts ? false : (settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
+      jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
+      transitions: onlyCuts ? false : (settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
+      soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
       emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
       aggressiveMode,
       autoCaptions: onlyCuts ? false : (subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false),
@@ -9771,7 +9818,8 @@ const processJob = async (
           let lastErr: any = null
           let ran = false
           for (const chain of videoChains) {
-            for (const enableFades of [true, false]) {
+            const fadeVariants = options.transitions ? [true, false] : [false]
+            for (const enableFades of fadeVariants) {
               try {
                 await runWithChain(chain, enableFades)
                 ran = true
@@ -9779,7 +9827,7 @@ const processJob = async (
                   const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
                   optimizationNotes.push(`Render fallback: without subtitles/watermark (${reason}).`)
                 }
-                if (!enableFades) {
+                if (options.transitions && !enableFades) {
                   const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
                   optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
                 }
