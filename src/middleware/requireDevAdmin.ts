@@ -1,7 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
-import { getAllowedDevAdminEmails, resolveDevAdminAccess } from '../lib/devAccounts'
 
 declare global {
   namespace Express {
@@ -11,14 +10,15 @@ declare global {
   }
 }
 
-const stealthNotFound = (res: Response) => res.status(404).json({ error: 'not_found' })
+const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password' | 'unauthorized') =>
+  res.status(401).json({ error: reason })
 
 const getClientIp = (req: Request) => {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim()
   return forwarded || req.ip || 'unknown'
 }
 
-const safeLower = (value?: string | null) => String(value || '').trim().toLowerCase()
+const CONTROL_PANEL_PASSWORD = String(process.env.CONTROL_PANEL_PASSWORD || 'Quise').trim()
 
 const getTokenFromRequest = (req: Request) => {
   const authHeader = req.headers.authorization
@@ -29,6 +29,15 @@ const getTokenFromRequest = (req: Request) => {
   if (tokenQuery) return tokenQuery
   const tokenHeader = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'] : ''
   return tokenHeader || ''
+}
+
+const getPasswordFromRequest = (req: Request) => {
+  const headerPassword = req.headers['x-dev-password']
+  if (typeof headerPassword === 'string' && headerPassword.trim()) return headerPassword.trim()
+  const queryPassword = typeof req.query?.password === 'string' ? req.query.password.trim() : ''
+  if (queryPassword) return queryPassword
+  const bodyPassword = typeof (req.body as any)?.password === 'string' ? String((req.body as any).password).trim() : ''
+  return bodyPassword
 }
 
 const auditAccessAttempt = async ({
@@ -70,39 +79,34 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
     const token = getTokenFromRequest(req)
     if (!token) {
       await auditAccessAttempt({ req, allowed: false, reason: 'missing_token' })
-      return stealthNotFound(res)
+      return unauthorized(res, 'unauthorized')
     }
     const { data, error } = await supabaseAdmin.auth.getUser(token)
     if (error || !data?.user) {
       await auditAccessAttempt({ req, allowed: false, reason: 'invalid_token' })
-      return stealthNotFound(res)
+      return unauthorized(res, 'unauthorized')
     }
 
     const userId = data.user.id
     const email = data.user.email ?? null
-    const normalizedEmail = safeLower(email)
     req.user = { id: userId, email: email ?? undefined }
 
-    const access = await resolveDevAdminAccess(userId, normalizedEmail)
-    if (!access.allowed) {
-      await auditAccessAttempt({
-        req,
-        allowed: false,
-        email,
-        userId,
-        reason: access.emailAuthorized
-          ? `admin_role_required; role=${access.role}; isDevAdmin=${access.isDevAdmin}`
-          : `email_not_authorized; allowed=${getAllowedDevAdminEmails().join('|')}`
-      })
-      return stealthNotFound(res)
+    const password = getPasswordFromRequest(req)
+    if (!password) {
+      await auditAccessAttempt({ req, allowed: false, email, userId, reason: 'password_required' })
+      return unauthorized(res, 'password_required')
+    }
+    if (password !== CONTROL_PANEL_PASSWORD) {
+      await auditAccessAttempt({ req, allowed: false, email, userId, reason: 'invalid_password' })
+      return unauthorized(res, 'invalid_password')
     }
 
     await auditAccessAttempt({
       req,
       allowed: true,
-      email: normalizedEmail,
+      email,
       userId,
-      reason: 'email_authorized'
+      reason: 'password_ok'
     })
     return next()
   } catch (err) {
@@ -113,6 +117,6 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
       userId: req.user?.id || null,
       reason: 'middleware_error'
     })
-    return stealthNotFound(res)
+    return unauthorized(res, 'unauthorized')
   }
 }

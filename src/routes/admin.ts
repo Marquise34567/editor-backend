@@ -102,6 +102,15 @@ type GeoLookup = {
   longitude: number | null
 }
 
+type LiveGeoHeatmapPoint = {
+  country: string | null
+  city: string | null
+  latitude: number | null
+  longitude: number | null
+  sessions: number
+  users: number
+}
+
 const DAY_MS = 24 * 60 * 60 * 1000
 const YEAR_MS = 365 * DAY_MS
 const SYSTEM_LATENCY_SPIKE_MS = 1500
@@ -338,6 +347,53 @@ const lookupGeo = async (ipRaw: unknown): Promise<GeoLookup> => {
     geoCache.set(ip, { expiresAt: Date.now() + 15 * 60 * 1000, payload: fallback })
     return fallback
   }
+}
+
+const buildLiveGeoHeatmap = async (
+  sessions: Array<any>,
+  limit = 30
+): Promise<LiveGeoHeatmapPoint[]> => {
+  const liveMapRows = await Promise.all(
+    sessions.map(async (session) => {
+      const geo = await lookupGeo((session as any)?.ip)
+      return {
+        sessionId: String((session as any)?.sessionId || ''),
+        userId: String((session as any)?.userId || ''),
+        country: geo.country,
+        city: geo.city,
+        latitude: geo.latitude,
+        longitude: geo.longitude
+      }
+    })
+  )
+
+  return Array.from(
+    liveMapRows.reduce((map, row) => {
+      const key = `${row.country || 'Unknown'}|${row.city || '-'}|${row.latitude || '-'}|${row.longitude || '-'}`
+      const existing = map.get(key) || {
+        country: row.country,
+        city: row.city,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        sessions: 0,
+        users: new Set<string>()
+      }
+      existing.sessions += 1
+      if (row.userId) existing.users.add(row.userId)
+      map.set(key, existing)
+      return map
+    }, new Map<string, any>()).values()
+  )
+    .map((row) => ({
+      country: row.country,
+      city: row.city,
+      latitude: row.latitude,
+      longitude: row.longitude,
+      sessions: row.sessions,
+      users: row.users.size
+    }))
+    .sort((a, b) => b.sessions - a.sessions)
+    .slice(0, Math.max(1, limit))
 }
 
 const renderSeconds = (job: any) => {
@@ -927,49 +983,7 @@ const buildCommandCenterPayload = async () => {
       )
     : 0
 
-  const liveMapRows = await Promise.all(
-    sessions.map(async (session) => {
-      const geo = await lookupGeo((session as any)?.ip)
-      return {
-        sessionId: String((session as any)?.sessionId || ''),
-        userId: String((session as any)?.userId || ''),
-        ip: parseIpForGeo((session as any)?.ip),
-        country: geo.country,
-        region: geo.region,
-        city: geo.city,
-        latitude: geo.latitude,
-        longitude: geo.longitude
-      }
-    })
-  )
-
-  const liveMap = Array.from(
-    liveMapRows.reduce((map, row) => {
-      const key = `${row.country || 'Unknown'}|${row.city || '-'}|${row.latitude || '-'}|${row.longitude || '-'}`
-      const existing = map.get(key) || {
-        country: row.country,
-        city: row.city,
-        latitude: row.latitude,
-        longitude: row.longitude,
-        sessions: 0,
-        users: new Set<string>()
-      }
-      existing.sessions += 1
-      if (row.userId) existing.users.add(row.userId)
-      map.set(key, existing)
-      return map
-    }, new Map<string, any>()).values()
-  )
-    .map((row) => ({
-      country: row.country,
-      city: row.city,
-      latitude: row.latitude,
-      longitude: row.longitude,
-      sessions: row.sessions,
-      users: row.users.size
-    }))
-    .sort((a, b) => b.sessions - a.sessions)
-    .slice(0, 30)
+  const liveMap = await buildLiveGeoHeatmap(sessions)
 
   const activeSubscriptions = subscriptions.filter((sub) =>
     isActiveSubscriptionStatus(String(sub?.status || '').toLowerCase())
@@ -2018,6 +2032,13 @@ router.use(async (_req, _res, next) => {
   next()
 })
 
+router.get('/auth-check', async (_req, res) => {
+  res.json({
+    ok: true,
+    checkedAt: new Date().toISOString()
+  })
+})
+
 router.get('/overview', async (_req, res) => {
   const jobs24h = await getJobsSince(RANGE_MS['24h'])
   const jobs30d = await getJobsSince(RANGE_MS['30d'])
@@ -2640,6 +2661,16 @@ router.post('/feature-lab', async (req: any, res) => {
     ok: true,
     controls,
     updatedAt: controls.updatedAt
+  })
+})
+
+router.get('/live-geo', async (_req, res) => {
+  const sessions = getRealtimePresenceSessions()
+  const geoHeatmap = await buildLiveGeoHeatmap(sessions)
+  return res.json({
+    activeUsers: getRealtimeActiveUsersCount(),
+    geoHeatmap,
+    updatedAt: new Date().toISOString()
   })
 })
 

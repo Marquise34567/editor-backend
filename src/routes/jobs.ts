@@ -58,6 +58,7 @@ import {
   type TimelineFeatureSnapshot
 } from '../lib/multiStyleRetention'
 import { applyWatermarkOverride, getFeatureLabControls } from '../services/featureLab'
+import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
 
 const router = express.Router()
@@ -7510,6 +7511,7 @@ const applySegmentEffects = (
     const avg = (key: keyof EngagementWindow) =>
       relevant.length ? relevant.reduce((sum, w) => sum + (w[key] as number), 0) / relevant.length : 0
     const facePresence = avg('facePresence')
+    const audioEnergy = avg('audioEnergy')
     const emotionIntensity = avg('emotionIntensity')
     const vocalExcitement = avg('vocalExcitement')
     const speechIntensity = avg('speechIntensity')
@@ -7546,11 +7548,19 @@ const applySegmentEffects = (
     const isHook = hookRange ? seg.start < hookRange.end && seg.end > hookRange.start : false
     const emphasisScore = Math.min(
       1,
-      emotionIntensity * 0.38 +
-      vocalExcitement * 0.2 +
-      speechIntensity * 0.18 +
-      motionScore * 0.16 +
-      emotionalSpike * 0.08
+      emotionIntensity * 0.3 +
+      vocalExcitement * 0.17 +
+      speechIntensity * 0.2 +
+      motionScore * 0.18 +
+      audioEnergy * 0.1 +
+      emotionalSpike * 0.05
+    )
+    const energyScore = clamp01(
+      audioEnergy * 0.32 +
+      motionScore * 0.26 +
+      speechIntensity * 0.2 +
+      vocalExcitement * 0.14 +
+      emotionIntensity * 0.08
     )
     const speechEmphasis = speechIntensity > 0.58 ? 0.06 : 0
     const scoreBoost = isHook ? 0.12 : 0
@@ -7558,11 +7568,13 @@ const applySegmentEffects = (
     return {
       seg,
       facePresence,
+      audioEnergy,
       speechIntensity,
       motionScore,
       emotionIntensity,
       vocalExcitement,
       emotionalSpike,
+      energyScore,
       faceFocusX,
       faceFocusY,
       isHook,
@@ -7572,16 +7584,28 @@ const applySegmentEffects = (
   const speechBaseline = segmentScores.length
     ? segmentScores.reduce((sum, entry) => sum + entry.speechIntensity, 0) / segmentScores.length
     : 0.4
+  const energyBaseline = segmentScores.length
+    ? segmentScores.reduce((sum, entry) => sum + entry.energyScore, 0) / segmentScores.length
+    : 0.45
 
   const zoomCandidates = segmentScores
-    .filter((entry) => hasFaceSignal && entry.facePresence >= 0.25)
     .filter((entry) => {
-      if (options.aggressiveMode) return entry.score >= 0.33 || entry.speechIntensity >= 0.58
-      if (entry.isHook) return entry.score >= 0.42
-      const hasSpeechOrMotion = entry.speechIntensity >= speechBaseline * 0.72 || entry.motionScore >= 0.42
-      return entry.score >= 0.52 && hasSpeechOrMotion
+      const energyTrigger = entry.energyScore >= (options.aggressiveMode ? 0.34 : 0.46)
+      if (entry.isHook) return entry.score >= 0.38 || entry.energyScore >= 0.4
+      if (hasFaceSignal) {
+        if (entry.facePresence < 0.18 && entry.energyScore < 0.62) return false
+        const hasSpeechOrMotion =
+          entry.speechIntensity >= speechBaseline * 0.68 ||
+          entry.motionScore >= 0.34 ||
+          energyTrigger
+        return entry.score >= (options.aggressiveMode ? 0.28 : 0.42) && hasSpeechOrMotion
+      }
+      const hasMotionOrSpeech =
+        entry.motionScore >= 0.36 ||
+        entry.speechIntensity >= speechBaseline * 0.7
+      return energyTrigger && hasMotionOrSpeech
     })
-    .sort((a, b) => b.score - a.score)
+    .sort((a, b) => b.energyScore - a.energyScore || b.score - a.score)
 
   let remainingZoom = maxZoomDuration
   const zoomMap = new Map<Segment, number>()
@@ -7592,8 +7616,19 @@ const applySegmentEffects = (
     if (duration <= 0) continue
     if (duration > remainingZoom) continue
     const speechFactor = Math.min(1, entry.speechIntensity / Math.max(0.2, speechBaseline))
-    const baseZoom = (0.045 + 0.05 * entry.score + 0.015 * speechFactor + (entry.isHook ? 0.02 : 0)) * aggressionPreset.zoomBoost
-    zoomMap.set(entry.seg, Math.min(maxZoomDelta, baseZoom))
+    const motionFactor = clamp01(entry.motionScore)
+    const energyFactor = clamp01(entry.energyScore)
+    const faceFactor = hasFaceSignal ? clamp01(entry.facePresence) : 0.35
+    const energyNudge = entry.energyScore > Math.max(0.5, energyBaseline) ? 0.008 : 0
+    const baseZoom = (
+      0.024 +
+      0.034 * energyFactor +
+      0.016 * speechFactor +
+      0.012 * motionFactor +
+      0.01 * faceFactor +
+      (entry.isHook ? 0.018 : 0)
+    ) * aggressionPreset.zoomBoost
+    zoomMap.set(entry.seg, Math.min(maxZoomDelta, baseZoom + energyNudge))
     remainingZoom -= duration
   }
 
@@ -7601,13 +7636,14 @@ const applySegmentEffects = (
     const score = segmentScores.find((entry) => entry.seg === seg)
     const hasSpike = (score?.emotionalSpike ?? 0) > 0.05
     const speechPeak = (score?.speechIntensity ?? 0) >= Math.max(0.58, speechBaseline * 1.2)
+    const energeticMoment = (score?.energyScore ?? 0) >= Math.max(0.48, energyBaseline)
     const motionEmphasis = (score?.motionScore ?? 0) > 0.5 && (score?.emotionIntensity ?? 0) > 0.48
     const calmNarrative = (score?.emotionIntensity ?? 0) < 0.4 && (score?.speechIntensity ?? 0) < 0.3 && (score?.motionScore ?? 0) < 0.25
     const alreadyStrong = (score?.score ?? 0) >= 0.74 && (score?.speechIntensity ?? 0) >= 0.45
     const hookBoost = score?.isHook ? 0.02 : 0
     let zoom = seg.zoom ?? 0
     let brightness = seg.brightness ?? 0
-    if (!alreadyStrong && hasFaceSignal && options.smartZoom && (!calmNarrative || options.aggressiveMode)) {
+    if (!alreadyStrong && options.smartZoom && (!calmNarrative || options.aggressiveMode || energeticMoment)) {
       const desired = zoomMap.get(seg) ?? 0
       zoom = Math.max(zoom, desired + hookBoost)
     }
@@ -7633,8 +7669,9 @@ const applySegmentEffects = (
       0,
       0.9
     ).toFixed(3))
+    const fallbackFocusY = motionEmphasis ? 0.48 : 0.42
     const faceFocusX = Number(clamp(score?.faceFocusX ?? 0.5, 0.08, 0.92).toFixed(4))
-    const faceFocusY = Number(clamp(score?.faceFocusY ?? 0.42, 0.08, 0.88).toFixed(4))
+    const faceFocusY = Number(clamp(score?.faceFocusY ?? fallbackFocusY, 0.08, 0.88).toFixed(4))
     zoom = Math.min(maxZoomDelta || 0, zoom)
     return {
       ...seg,
@@ -8266,6 +8303,11 @@ const runWhisperTranscribe = async ({
 }
 
 const generateSubtitles = async (inputPath: string, workingDir: string) => {
+  const captionEngine = getCaptionEngineStatus()
+  if (!captionEngine.available) {
+    console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
+    return null
+  }
   const model = process.env.WHISPER_MODEL || 'base'
   const configuredArgs = splitWhisperArgs(process.env.WHISPER_ARGS)
   const baseArgs = configuredArgs.length
@@ -8282,6 +8324,12 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
     attempts.push({ command: normalized, args, label })
   }
 
+  if (captionEngine.command) {
+    const args = captionEngine.mode === 'python_module'
+      ? ['-m', 'whisper', inputPath, ...baseArgs]
+      : [inputPath, ...baseArgs]
+    addAttempt(captionEngine.command, args, 'CAPTION_ENGINE')
+  }
   addAttempt(process.env.WHISPER_BIN, [inputPath, ...baseArgs], 'WHISPER_BIN')
   addAttempt('whisper', [inputPath, ...baseArgs], 'whisper')
   addAttempt('python', ['-m', 'whisper', inputPath, ...baseArgs], 'python -m whisper')
@@ -11240,9 +11288,14 @@ const processJob = async (
 
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })
-        subtitlePath = await generateSubtitles(tmpIn, workDir)
-        if (!subtitlePath) {
-          optimizationNotes.push('Auto subtitles skipped: no caption engine available.')
+        const captionEngine = getCaptionEngineStatus()
+        if (!captionEngine.available) {
+          optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
+        } else {
+          subtitlePath = await generateSubtitles(tmpIn, workDir)
+          if (!subtitlePath) {
+            optimizationNotes.push('Auto subtitles skipped: subtitle generation failed.')
+          }
         }
       }
 

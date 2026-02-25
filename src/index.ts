@@ -3,6 +3,7 @@ import { exec } from 'child_process'
 import app from './app'
 import { initRealtime } from './realtime'
 import { FFMPEG_PATH, formatCommand } from './lib/ffmpeg'
+import { getCaptionEngineStatus } from './lib/captionEngine'
 import { initWeeklyReportScheduler } from './services/weeklyReports'
 import { warmIpBanCache } from './services/ipBan'
 
@@ -55,6 +56,12 @@ const verifyFfmpegOnStartup = async () => {
 const start = async () => {
   const ffmpegOk = await verifyFfmpegOnStartup()
   if (!ffmpegOk) process.exit(1)
+  const captions = getCaptionEngineStatus({ force: true })
+  if (captions.available) {
+    console.log(`[startup] Caption engine ready: ${captions.provider} (${captions.command})`)
+  } else {
+    console.warn(`[startup] Caption engine unavailable: ${captions.reason}`)
+  }
   await warmIpBanCache().catch(() => null)
   initWeeklyReportScheduler()
   server.listen(PORT, () => {

@@ -23,6 +23,7 @@ import { rateLimit } from './middleware/rateLimit'
 import { recordAdminErrorLog } from './services/adminTelemetry'
 import { blockBannedIp } from './middleware/blockBannedIp'
 import { recordRequestMetric } from './services/requestMetrics'
+import { getCaptionEngineStatus } from './lib/captionEngine'
 
 loadEnv()
 const app = express()
@@ -244,15 +245,39 @@ app.use('/api/admin', adminRoutes)
 app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
   const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'
   const time = new Date().toISOString()
+  const captions = getCaptionEngineStatus()
   await checkDb()
-  res.json({ ok: true, version, time, db: isStubDb() ? 'stub' : 'prisma' })
+  res.json({
+    ok: true,
+    version,
+    time,
+    db: isStubDb() ? 'stub' : 'prisma',
+    captions: {
+      available: captions.available,
+      provider: captions.provider,
+      mode: captions.mode,
+      reason: captions.reason
+    }
+  })
 })
 
 app.get('/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
   const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'
   const time = new Date().toISOString()
+  const captions = getCaptionEngineStatus()
   await checkDb()
-  res.json({ ok: true, version, time, db: isStubDb() ? 'stub' : 'prisma' })
+  res.json({
+    ok: true,
+    version,
+    time,
+    db: isStubDb() ? 'stub' : 'prisma',
+    captions: {
+      available: captions.available,
+      provider: captions.provider,
+      mode: captions.mode,
+      reason: captions.reason
+    }
+  })
 })
 
 app.use((err: any, req: any, res: any, next: any) => {

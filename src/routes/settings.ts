@@ -12,6 +12,7 @@ import {
   isSubtitlePresetAllowed
 } from '../lib/planFeatures'
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
+import { getCaptionEngineStatus } from '../lib/captionEngine'
 
 const router = express.Router()
 
@@ -45,6 +46,18 @@ const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message:
   return res.status(403).json({ error: 'PLAN_LIMIT_EXCEEDED', requiredPlan, feature, message })
 }
 
+const getCaptionCapabilities = () => {
+  const captionEngine = getCaptionEngineStatus()
+  return {
+    captions: {
+      available: captionEngine.available,
+      provider: captionEngine.provider,
+      mode: captionEngine.mode,
+      reason: captionEngine.reason
+    }
+  }
+}
+
 router.get('/', async (req: any, res) => {
   try {
     // Require full env only in production with a real DB. Stub mode should stay usable in local dev.
@@ -57,8 +70,9 @@ router.get('/', async (req: any, res) => {
     }
 
     const userId = req.user?.id
+    const capabilities = getCaptionCapabilities()
     // If not authenticated, return safe defaults (do not 500)
-    if (!userId) return res.status(200).json({ settings: DEFAULT_SETTINGS })
+    if (!userId) return res.status(200).json({ settings: DEFAULT_SETTINGS, capabilities })
 
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
@@ -91,7 +105,7 @@ router.get('/', async (req: any, res) => {
       } catch (e) {
         // If DB write fails, fall back to defaults in-memory
         console.warn('failed to create settings, falling back to defaults', e)
-        return res.status(200).json({ settings: { ...DEFAULT_SETTINGS, userId } })
+        return res.status(200).json({ settings: { ...DEFAULT_SETTINGS, userId }, capabilities })
       }
     }
 
@@ -105,7 +119,7 @@ router.get('/', async (req: any, res) => {
       userId,
       watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
-      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? false) : false,
+      autoCaptions: subtitlesEnabled && capabilities.captions.available ? (settings?.autoCaptions ?? false) : false,
       autoHookMove: settings?.autoHookMove ?? true,
       removeBoring: settings?.removeBoring ?? true,
       onlyCuts: settings?.onlyCuts ?? false,
@@ -119,7 +133,7 @@ router.get('/', async (req: any, res) => {
       subtitleStyle: enforcedSubtitle,
       autoZoomMax: enforcedAutoZoomMax
     }
-    res.json({ settings: enforced })
+    res.json({ settings: enforced, capabilities })
   } catch (err: any) {
     // Log full stack to Railway logs for diagnosis (do not log auth tokens)
     console.error('get settings error', err?.stack || err)
@@ -132,6 +146,7 @@ router.patch('/', async (req: any, res) => {
   try {
     const userId = req.user.id
     const payload = req.body || {}
+    const capabilities = getCaptionCapabilities()
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
     const features = getPlanFeatures(tier)
@@ -142,6 +157,13 @@ router.patch('/', async (req: any, res) => {
     const requestedSubtitle = payload.subtitleStyle ? normalizeSubtitlePreset(payload.subtitleStyle) : null
     if (!subtitlesEnabled && (payload.autoCaptions === true || payload.subtitleStyle)) {
       return sendPlanLimit(res, 'creator', 'subtitles', 'Subtitles are temporarily disabled.')
+    }
+    if (payload.autoCaptions === true && !capabilities.captions.available) {
+      return res.status(409).json({
+        error: 'CAPTION_ENGINE_UNAVAILABLE',
+        message: 'Auto captions require a Whisper runtime on the backend.',
+        capabilities
+      })
     }
     if (features.watermark && payload.watermarkEnabled === false) {
       return sendPlanLimit(res, 'starter', 'watermark', 'Upgrade to remove watermark')
@@ -172,7 +194,9 @@ router.patch('/', async (req: any, res) => {
     const sanitized = {
       watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, tier),
-      autoCaptions: subtitlesEnabled ? (payload.autoCaptions ?? existing?.autoCaptions ?? false) : false,
+      autoCaptions: subtitlesEnabled && capabilities.captions.available
+        ? (payload.autoCaptions ?? existing?.autoCaptions ?? false)
+        : false,
       autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
       removeBoring: payload.removeBoring ?? existing?.removeBoring ?? true,
       onlyCuts: payload.onlyCuts ?? existing?.onlyCuts ?? false,
@@ -187,7 +211,13 @@ router.patch('/', async (req: any, res) => {
       autoZoomMax: sanitizedAutoZoom
     }
     const updated = await prisma.userSettings.upsert({ where: { userId }, create: { userId, ...sanitized }, update: sanitized })
-    res.json({ settings: updated })
+    res.json({
+      settings: {
+        ...updated,
+        autoCaptions: capabilities.captions.available ? Boolean(updated?.autoCaptions) : false
+      },
+      capabilities
+    })
   } catch (err: any) {
     console.error('save settings error', err?.stack || err)
     const message = err?.message || String(err) || 'Unknown error'

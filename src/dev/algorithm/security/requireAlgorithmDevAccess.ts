@@ -1,31 +1,31 @@
 import { NextFunction, Request, Response } from 'express'
-import { getAllowedDevAdminEmails } from '../../../lib/devAccounts'
 import { supabaseAdmin } from '../../../supabaseClient'
 import { recordSecurityEvent } from './securityEvents'
 
-const stealthNotFound = (res: Response) => res.status(404).json({ error: 'not_found' })
+const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password') =>
+  res.status(401).json({ error: reason })
 
-const normalizeEmail = (value: unknown) => String(value || '').trim().toLowerCase()
-
-const parseAllowlist = () => {
-  const raw =
-    String(process.env.DEV_EMAIL_ALLOWLIST || '').trim() ||
-    String(process.env.DEV_ADMIN_EMAILS || process.env.ADMIN_EMAILS || '').trim()
-
-  const fromEnv = raw
-    .split(',')
-    .map((entry) => normalizeEmail(entry))
-    .filter(Boolean)
-
-  if (fromEnv.length > 0) return new Set(fromEnv)
-  return new Set(getAllowedDevAdminEmails().map((email) => normalizeEmail(email)))
-}
-
-const DEV_EMAIL_ALLOWLIST = parseAllowlist()
+const DEV_ALGORITHM_PASSWORD = String(process.env.DEV_ALGORITHM_PASSWORD || 'Quise').trim()
 
 const getClientIp = (req: Request) => {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim()
   return forwarded || req.ip || 'unknown'
+}
+
+const getPasswordFromRequest = (req: Request) => {
+  const headerPassword = req.headers['x-dev-password']
+  if (typeof headerPassword === 'string' && headerPassword.trim()) {
+    return headerPassword.trim()
+  }
+  const queryPassword = req.query?.password
+  if (typeof queryPassword === 'string' && queryPassword.trim()) {
+    return queryPassword.trim()
+  }
+  const bodyPassword = (req.body as any)?.password
+  if (typeof bodyPassword === 'string' && bodyPassword.trim()) {
+    return bodyPassword.trim()
+  }
+  return ''
 }
 
 const resolveAuthUser = async (req: Request): Promise<{ id: string; email?: string } | null> => {
@@ -56,8 +56,10 @@ export const requireAlgorithmDevAccess = async (req: Request, res: Response, nex
   }
 
   const userId = req.user?.id || null
-  const email = normalizeEmail(req.user?.email)
-  const allowed = Boolean(userId && email && DEV_EMAIL_ALLOWLIST.has(email))
+  const password = getPasswordFromRequest(req)
+  const hasPassword = Boolean(password)
+  const allowed = hasPassword && password === DEV_ALGORITHM_PASSWORD
+  const failureReason = hasPassword ? 'invalid_password' : 'password_required'
 
   await recordSecurityEvent({
     type: allowed ? 'dev_algorithm_access_granted' : 'dev_algorithm_access_denied',
@@ -66,12 +68,11 @@ export const requireAlgorithmDevAccess = async (req: Request, res: Response, nex
       method: req.method,
       ip: getClientIp(req),
       user_id: userId,
-      email: email || null,
       allowed,
-      reason: allowed ? 'allowlisted_email' : !userId ? 'missing_or_invalid_session' : 'email_not_allowlisted'
+      reason: allowed ? 'password_ok' : failureReason
     }
   })
 
-  if (!allowed) return stealthNotFound(res)
+  if (!allowed) return unauthorized(res, failureReason)
   return next()
 }
