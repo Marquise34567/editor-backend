@@ -179,7 +179,9 @@ const sendWeeklyReportEmail = async ({
 
   const resendKey = String(process.env.RESEND_API_KEY || '').trim()
   if (!resendKey) {
-    throw new Error('weekly_report_email_provider_not_configured')
+    const err: any = new Error('weekly_report_provider_not_configured')
+    err.code = 'weekly_report_provider_not_configured'
+    throw err
   }
   const from = String(process.env.REPORTS_EMAIL_FROM || 'reports@autoeditor.app').trim()
   const response = await fetch('https://api.resend.com/emails', {
@@ -288,6 +290,12 @@ export const sendWeeklyReportNow = async ({
   email: string
   actor?: string | null
 }) => {
+  const providerStatus = getWeeklyReportProviderStatus()
+  if (!providerStatus.configured) {
+    const err: any = new Error('weekly_report_provider_not_configured')
+    err.code = 'weekly_report_provider_not_configured'
+    throw err
+  }
   const normalized = normalizeEmail(email)
   if (!isValidEmail(normalized)) {
     const err: any = new Error('invalid_email')
@@ -314,6 +322,10 @@ export const sendWeeklyReportNow = async ({
 }
 
 export const runDueWeeklyReportDispatch = async () => {
+  const providerStatus = getWeeklyReportProviderStatus()
+  if (!providerStatus.configured) {
+    return { processed: 0, sent: 0, failed: 0, skipped: 'provider_not_configured' as const }
+  }
   const dueNow = new Date()
   const rows = await prisma.weeklyReportSubscription
     .findMany({

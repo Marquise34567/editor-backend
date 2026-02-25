@@ -3,10 +3,11 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth } from '../services/usage'
 import { getRenderModeUsageForMonth } from '../services/renderModeUsage'
+import { getRerenderUsageForDay } from '../services/rerenderUsage'
 import { getMonthKey } from '../shared/planConfig'
 import { getPlanFeatures } from '../lib/planFeatures'
 import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
-import { isDevAccount } from '../lib/devAccounts'
+import { resolveDevAdminAccess } from '../lib/devAccounts'
 
 const router = express.Router()
 
@@ -26,7 +27,9 @@ router.get('/', async (req: any, res) => {
   const usage = await getUsageForMonth(id, month)
   const horizontalModeUsage = await getRenderModeUsageForMonth(id, 'horizontal')
   const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
-  const isDev = isDevAccount(user.id, user.email)
+  const rerenderUsageDaily = await getRerenderUsageForDay(id)
+  const devAccess = await resolveDevAdminAccess(user.id, user.email)
+  const isDev = devAccess.allowed
   const rendersUsed = usage?.rendersUsed ?? 0
 
   res.json({
@@ -46,7 +49,11 @@ router.get('/', async (req: any, res) => {
           cancelAtPeriodEnd: false,
           trial
         },
-    flags: { dev: isDev },
+    flags: {
+      dev: isDev,
+      role: devAccess.role,
+      isAdmin: devAccess.isDevAdmin
+    },
     usage: {
       month,
       rendersUsed,
@@ -58,10 +65,16 @@ router.get('/', async (req: any, res) => {
       standardRendersUsed: horizontalModeUsage.rendersCount,
       verticalRendersUsed: verticalModeUsage.rendersCount
     },
+    rerenderUsageDaily: {
+      day: rerenderUsageDaily.dayKey,
+      rerendersUsed: rerenderUsageDaily.rerendersUsed,
+      rerendersLimit: isDev ? null : plan.maxRerendersPerDay
+    },
     usageDaily: null,
     limits: {
       maxRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
       maxRendersPerDay: null,
+      maxRerendersPerDay: isDev ? null : plan.maxRerendersPerDay,
       maxVerticalRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
       maxMinutesPerMonth: plan.maxMinutesPerMonth,
       exportQuality: plan.exportQuality,

@@ -14,6 +14,7 @@ export const getPlanFeatures = (tier: PlanTier): PlanFeatures => {
     maxResolution: plan.exportQuality,
     rendersPerMonth: plan.maxRendersPerMonth,
     maxRendersPerMonth: plan.maxRendersPerMonth,
+    maxRerendersPerDay: plan.maxRerendersPerDay,
     watermark: plan.watermark,
     queuePriority: plan.priority ? 'priority' : 'standard',
     priorityQueue: plan.priority,

@@ -129,6 +129,7 @@ model UsageDaily {
   date     String
   chatCount Int     @default(0)
   rizzCount Int     @default(0)
+  rerenderCount Int @default(0)
   @@id([userId, date])
   user     User @relation(fields: [userId], references: [id])
 }

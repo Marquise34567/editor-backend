@@ -1,6 +1,7 @@
 import express from 'express'
 import fetch from 'node-fetch'
 import os from 'os'
+import crypto from 'crypto'
 import { ListObjectsV2Command } from '@aws-sdk/client-s3'
 import { checkDb, isStubDb, prisma } from '../db/prisma'
 import { rateLimit } from '../middleware/rateLimit'
@@ -9,6 +10,7 @@ import {
   ensureAdminTelemetryInfra,
   getAdminErrorLogs,
   getStripeWebhookEvents,
+  storeStripeWebhookEvent,
   subscribeToAdminErrorStream
 } from '../services/adminTelemetry'
 import {
@@ -18,7 +20,7 @@ import {
 } from '../realtime'
 import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
 import { stripe, isStripeEnabled } from '../services/stripe'
-import { cancelJobById } from './jobs'
+import { cancelJobById, enqueuePipeline, updateJob } from './jobs'
 import { r2 } from '../lib/r2'
 import { supabaseAdmin } from '../supabaseClient'
 import { banIpAddress, listIpBans, normalizeIpAddress, unbanIpAddress } from '../services/ipBan'
@@ -30,6 +32,10 @@ import {
   sendWeeklyReportNow,
   upsertWeeklyReportSubscription
 } from '../services/weeklyReports'
+import { PLAN_CONFIG } from '../shared/planConfig'
+import { getFounderAvailability } from '../services/founder'
+import { summarizeRequestMetrics } from '../services/requestMetrics'
+import { getFeatureLabControls, updateFeatureLabControls } from '../services/featureLab'
 
 const router = express.Router()
 
@@ -70,12 +76,268 @@ type FeedbackItem = {
   jobId: string | null
 }
 
+type EnrichedAdminErrorLogEntry = {
+  id: string
+  severity: string
+  message: string
+  stackSnippet: string | null
+  route: string | null
+  endpoint: string | null
+  userId: string | null
+  jobId: string | null
+  count: number
+  createdAt: string
+  lastSeen: string
+  planTier: string
+  browser: string | null
+  videoSizeMb: number | null
+  retryable: boolean
+}
+
+type GeoLookup = {
+  country: string | null
+  region: string | null
+  city: string | null
+  latitude: number | null
+  longitude: number | null
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const YEAR_MS = 365 * DAY_MS
+const SYSTEM_LATENCY_SPIKE_MS = 1500
+const geoCache = new Map<string, { expiresAt: number; payload: GeoLookup }>()
+let cpuSample: { usage: NodeJS.CpuUsage; hrtime: bigint } | null = null
+
 const parseRange = (raw: unknown, fallback: keyof typeof RANGE_MS) =>
   RANGE_MS[String(raw || fallback).trim().toLowerCase()] ?? RANGE_MS[fallback]
 
 const asMs = (value: unknown) => {
   const ms = new Date(value as any).getTime()
   return Number.isFinite(ms) ? ms : 0
+}
+
+const toMb = (value: number) => Number((Math.max(0, Number(value || 0)) / (1024 * 1024)).toFixed(2))
+const toGb = (value: number) => Number((Math.max(0, Number(value || 0)) / (1024 * 1024 * 1024)).toFixed(2))
+const toPct = (numerator: number, denominator: number) =>
+  denominator > 0 ? Number(((numerator / denominator) * 100).toFixed(1)) : 0
+
+const parseIpForGeo = (value: unknown) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  const normalized = raw.replace(/^::ffff:/i, '').split(',')[0].trim()
+  return normalized || null
+}
+
+const isPrivateIp = (ip: string) => {
+  if (!ip) return true
+  if (ip === '::1' || ip === 'localhost') return true
+  if (ip.includes(':') && !ip.includes('.')) return true
+  if (/^10\./.test(ip)) return true
+  if (/^192\.168\./.test(ip)) return true
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(ip)) return true
+  if (/^127\./.test(ip)) return true
+  return false
+}
+
+const browserFromUserAgent = (value: unknown) => {
+  const ua = String(value || '').trim()
+  if (!ua) return null
+  if (/edg\//i.test(ua)) return 'Edge'
+  if (/chrome\//i.test(ua) && !/edg\//i.test(ua)) return 'Chrome'
+  if (/safari\//i.test(ua) && !/chrome\//i.test(ua)) return 'Safari'
+  if (/firefox\//i.test(ua)) return 'Firefox'
+  if (/postmanruntime/i.test(ua)) return 'Postman'
+  return ua.slice(0, 80)
+}
+
+const getCpuUsagePercent = () => {
+  const now = process.hrtime.bigint()
+  const usage = process.cpuUsage()
+  const cpuCount = Math.max(1, os.cpus().length)
+  if (!cpuSample) {
+    cpuSample = { usage, hrtime: now }
+    const load = os.loadavg?.()?.[0] || 0
+    if (!load) return 0
+    return Number(clamp((load / cpuCount) * 100, 0, 100).toFixed(1))
+  }
+  const elapsedMs = Number(now - cpuSample.hrtime) / 1_000_000
+  const delta = process.cpuUsage(cpuSample.usage)
+  cpuSample = { usage, hrtime: now }
+  if (!Number.isFinite(elapsedMs) || elapsedMs <= 0) return 0
+  const cpuMs = (Number(delta.user || 0) + Number(delta.system || 0)) / 1000
+  const pct = (cpuMs / elapsedMs) * (100 / cpuCount)
+  return Number(clamp(pct, 0, 100).toFixed(1))
+}
+
+const readVideoSizeBytesFromJob = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const candidates = [
+    analysis?.size,
+    analysis?.input_size_bytes,
+    analysis?.source_size_bytes,
+    analysis?.sourceFileSizeBytes,
+    analysis?.metadata_summary?.sourceSizeBytes
+  ]
+  for (const candidate of candidates) {
+    const value = Number(candidate)
+    if (Number.isFinite(value) && value > 0) return value
+  }
+  return 0
+}
+
+const enrichErrorItems = async (items: any[]): Promise<EnrichedAdminErrorLogEntry[]> => {
+  const subscriptions = await getSubscriptions()
+  const planByUserId = subscriptions.reduce((map, sub) => {
+    const userId = String((sub as any)?.userId || '').trim()
+    if (!userId) return map
+    map.set(userId, String((sub as any)?.planTier || 'free').toLowerCase())
+    return map
+  }, new Map<string, string>())
+
+  const jobIds = Array.from(
+    new Set(
+      items
+        .map((item) => String(item?.jobId || '').trim())
+        .filter(Boolean)
+    )
+  )
+  const jobs = await Promise.all(
+    jobIds.map(async (id) => {
+      try {
+        return await prisma.job.findUnique({ where: { id } })
+      } catch {
+        return null
+      }
+    })
+  )
+  const jobsById = jobs.reduce((map, job) => {
+    const id = String((job as any)?.id || '').trim()
+    if (!id) return map
+    map.set(id, job)
+    return map
+  }, new Map<string, any>())
+
+  return items.map((item) => {
+    const userId = item?.userId ? String(item.userId) : null
+    const jobId = item?.jobId ? String(item.jobId) : null
+    const linkedJob = jobId ? jobsById.get(jobId) : null
+    const status = String(linkedJob?.status || '').toLowerCase()
+    return {
+      id: String(item?.id || ''),
+      severity: String(item?.severity || 'medium'),
+      message: String(item?.message || 'unknown_error'),
+      stackSnippet: item?.stackSnippet ? String(item.stackSnippet) : null,
+      route: item?.route ? String(item.route) : null,
+      endpoint: item?.endpoint ? String(item.endpoint) : null,
+      userId,
+      jobId,
+      count: Math.max(1, Number(item?.count || 1)),
+      createdAt: item?.createdAt ? new Date(item.createdAt).toISOString() : new Date().toISOString(),
+      lastSeen: item?.lastSeen ? new Date(item.lastSeen).toISOString() : new Date().toISOString(),
+      planTier: userId ? planByUserId.get(userId) || 'free' : 'free',
+      browser: browserFromUserAgent((item as any)?.userAgent),
+      videoSizeMb: linkedJob ? toMb(readVideoSizeBytesFromJob(linkedJob)) : null,
+      retryable: Boolean(jobId && (status === 'failed' || status === 'completed'))
+    }
+  })
+}
+
+const getR2StorageUsage = async () => {
+  if (!r2.isConfigured) {
+    return {
+      provider: 'supabase',
+      bytes: 0,
+      gb: 0,
+      objects: 0,
+      estimated: true,
+      note: 'R2 not configured'
+    }
+  }
+  let continuationToken: string | undefined = undefined
+  let pages = 0
+  let bytes = 0
+  let objects = 0
+  let estimated = false
+  try {
+    while (pages < 6) {
+      const response = await r2.client.send(
+        new ListObjectsV2Command({
+          Bucket: r2.bucket,
+          ContinuationToken: continuationToken,
+          MaxKeys: 1000
+        })
+      )
+      const rows = Array.isArray(response.Contents) ? response.Contents : []
+      for (const row of rows) {
+        const size = Number((row as any)?.Size || 0)
+        if (!Number.isFinite(size) || size < 0) continue
+        bytes += size
+        objects += 1
+      }
+      pages += 1
+      if (!response.IsTruncated || !response.NextContinuationToken) break
+      continuationToken = response.NextContinuationToken
+      estimated = true
+    }
+    return {
+      provider: 'r2',
+      bytes,
+      gb: toGb(bytes),
+      objects,
+      estimated
+    }
+  } catch (err: any) {
+    return {
+      provider: 'r2',
+      bytes: 0,
+      gb: 0,
+      objects: 0,
+      estimated: true,
+      error: String(err?.message || 'r2_usage_unavailable')
+    }
+  }
+}
+
+const lookupGeo = async (ipRaw: unknown): Promise<GeoLookup> => {
+  const ip = parseIpForGeo(ipRaw)
+  if (!ip || isPrivateIp(ip)) {
+    return {
+      country: 'Local',
+      region: null,
+      city: null,
+      latitude: null,
+      longitude: null
+    }
+  }
+  const cached = geoCache.get(ip)
+  if (cached && cached.expiresAt > Date.now()) return cached.payload
+  const fallback: GeoLookup = {
+    country: 'Unknown',
+    region: null,
+    city: null,
+    latitude: null,
+    longitude: null
+  }
+  try {
+    const response = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`)
+    if (!response.ok) {
+      geoCache.set(ip, { expiresAt: Date.now() + 15 * 60 * 1000, payload: fallback })
+      return fallback
+    }
+    const data: any = await response.json()
+    const payload: GeoLookup = {
+      country: data?.success === false ? 'Unknown' : String(data?.country || 'Unknown'),
+      region: data?.success === false ? null : (data?.region ? String(data.region) : null),
+      city: data?.success === false ? null : (data?.city ? String(data.city) : null),
+      latitude: Number.isFinite(Number(data?.latitude)) ? Number(data.latitude) : null,
+      longitude: Number.isFinite(Number(data?.longitude)) ? Number(data.longitude) : null
+    }
+    geoCache.set(ip, { expiresAt: Date.now() + 12 * 60 * 60 * 1000, payload })
+    return payload
+  } catch {
+    geoCache.set(ip, { expiresAt: Date.now() + 15 * 60 * 1000, payload: fallback })
+    return fallback
+  }
 }
 
 const renderSeconds = (job: any) => {
@@ -382,6 +644,1368 @@ const aiSuggestions = async (failures: Array<{ reason: string; count: number }>)
   }
 }
 
+const buildDistributionCurve = (scores: number[]) => {
+  const buckets = [
+    { label: '0-20', min: 0, max: 20 },
+    { label: '21-40', min: 21, max: 40 },
+    { label: '41-60', min: 41, max: 60 },
+    { label: '61-80', min: 61, max: 80 },
+    { label: '81-100', min: 81, max: 100 }
+  ]
+  return buckets.map((bucket) => ({
+    label: bucket.label,
+    count: scores.filter((score) => score >= bucket.min && score <= bucket.max).length
+  }))
+}
+
+const getPlanMonthlyPrice = (tier: string) => {
+  const key = String(tier || '').toLowerCase() as keyof typeof PLAN_CONFIG
+  const plan = (PLAN_CONFIG as any)[key]
+  return Number.isFinite(Number(plan?.priceMonthly)) ? Number(plan.priceMonthly) : 0
+}
+
+const dayIso = (value: number | string | Date) => {
+  const ms = typeof value === 'number' ? value : new Date(value as any).getTime()
+  if (!Number.isFinite(ms)) return new Date().toISOString().slice(0, 10)
+  return new Date(ms).toISOString().slice(0, 10)
+}
+
+const formatDayPoint = (day: string, value: number) => ({
+  t: `${day}T00:00:00.000Z`,
+  v: Number((Number.isFinite(value) ? value : 0).toFixed(3))
+})
+
+const inferHookScore = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.hook_score ??
+      analysis?.hookStrength ??
+      analysis?.hook_strength ??
+      analysis?.hook_strength_score ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const retention = Number(job?.retentionScore || 0)
+  if (!Number.isFinite(retention)) return 0
+  return clamp(Math.round(retention * 0.92 + 6), 0, 100)
+}
+
+const inferFirst8SecEngagement = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.first8_sec_engagement ??
+      analysis?.first8sEngagement ??
+      analysis?.engagement_first_8s ??
+      analysis?.intro_engagement ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const hookScore = inferHookScore(job)
+  const retention = Number(job?.retentionScore || 0)
+  return clamp(Number((hookScore * 0.65 + retention * 0.35).toFixed(1)), 0, 100)
+}
+
+const inferEmotionalIntensity = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.emotional_intensity ??
+      analysis?.emotion_score ??
+      analysis?.emotionIntensity ??
+      analysis?.energy_score ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const hookScore = inferHookScore(job)
+  const retention = Number(job?.retentionScore || 0)
+  return clamp(Number((hookScore * 0.45 + retention * 0.55).toFixed(1)), 0, 100)
+}
+
+const inferPredictedRetention = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.predicted_retention ??
+      analysis?.predictedRetention ??
+      analysis?.retention_prediction_score ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const retention = Number(job?.retentionScore || 0)
+  const hook = inferHookScore(job)
+  const engagement8s = inferFirst8SecEngagement(job)
+  return clamp(Number((retention * 0.5 + hook * 0.3 + engagement8s * 0.2).toFixed(1)), 0, 100)
+}
+
+const inferStoryCoherenceScore = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.story_coherence_score ??
+      analysis?.storyCoherenceScore ??
+      analysis?.narrative_score ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const retention = Number(job?.retentionScore || 0)
+  const pacing = inferPacingScore(job)
+  return clamp(Number((retention * 0.65 + pacing * 0.35).toFixed(1)), 0, 100)
+}
+
+const inferPacingScore = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.pacing_score ??
+      analysis?.pacingScore ??
+      analysis?.edit_pacing ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const duration = Number(job?.inputDurationSeconds || 0)
+  if (!Number.isFinite(duration) || duration <= 0) {
+    const retention = Number(job?.retentionScore || 0)
+    return clamp(retention, 0, 100)
+  }
+  const ideal = duration < 60 ? 42 : duration < 600 ? 55 : 66
+  const retention = Number(job?.retentionScore || 0)
+  return clamp(Number(((retention * 0.7) + ideal * 0.3).toFixed(1)), 0, 100)
+}
+
+const inferViralityScore = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const explicit = Number(
+    analysis?.virality_probability ??
+      analysis?.viralityScore ??
+      analysis?.viral_score ??
+      NaN
+  )
+  if (Number.isFinite(explicit)) return clamp(explicit, 0, 100)
+  const retention = Number(job?.retentionScore || 0)
+  const hook = inferHookScore(job)
+  const engagement8s = inferFirst8SecEngagement(job)
+  return clamp(Number((retention * 0.45 + hook * 0.35 + engagement8s * 0.2).toFixed(1)), 0, 100)
+}
+
+const parseEmotionMoments = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const candidates = [
+    analysis?.emotion_spikes,
+    analysis?.emotionalSpikes,
+    analysis?.peak_moments,
+    analysis?.retention_peaks
+  ]
+  for (const candidate of candidates) {
+    if (!Array.isArray(candidate)) continue
+    const points = candidate
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+      .slice(0, 8)
+    if (points.length) return points
+  }
+  const duration = Number(job?.inputDurationSeconds || 0)
+  if (!Number.isFinite(duration) || duration <= 0) return []
+  return [0.18, 0.39, 0.62, 0.84].map((ratio) => Number((ratio * duration).toFixed(1)))
+}
+
+const groupErrorsBySignature = (items: EnrichedAdminErrorLogEntry[]) => {
+  const map = new Map<string, { type: string; count: number; severity: string; lastSeen: string }>()
+  for (const item of items) {
+    const key = `${item.severity}:${item.message}`
+    const existing = map.get(key) || {
+      type: item.message,
+      count: 0,
+      severity: item.severity,
+      lastSeen: item.lastSeen
+    }
+    existing.count += Number(item.count || 1)
+    if (asMs(item.lastSeen) > asMs(existing.lastSeen)) existing.lastSeen = item.lastSeen
+    map.set(key, existing)
+  }
+  return Array.from(map.values())
+    .sort((a, b) => b.count - a.count || asMs(b.lastSeen) - asMs(a.lastSeen))
+    .slice(0, 20)
+}
+
+const estimatedRunwayMonths = ({
+  cashReserveUsd,
+  monthlyRevenueUsd,
+  monthlyBurnUsd
+}: {
+  cashReserveUsd: number
+  monthlyRevenueUsd: number
+  monthlyBurnUsd: number
+}) => {
+  const netBurn = Math.max(0, monthlyBurnUsd - monthlyRevenueUsd)
+  if (!Number.isFinite(netBurn) || netBurn <= 0) return 999
+  return Number((cashReserveUsd / netBurn).toFixed(1))
+}
+
+const buildCommandCenterPayload = async () => {
+  const [jobs24h, jobs7d, jobs30d, subscriptions, users, stripe30d, allErrors24h, featureLab, founderAvailability] =
+    await Promise.all([
+      getJobsSince(RANGE_MS['24h']),
+      getJobsSince(RANGE_MS['7d']),
+      getJobsSince(RANGE_MS['30d']),
+      getSubscriptions(),
+      getUsers(),
+      getStripeWebhookEvents({ rangeMs: RANGE_MS['30d'] }),
+      getAdminErrorLogs({ rangeMs: RANGE_MS['24h'], severity: null }),
+      getFeatureLabControls(),
+      getFounderAvailability()
+    ])
+
+  const completed30d = jobs30d.filter((job) => String(job?.status || '').toLowerCase() === 'completed')
+  const failed24h = jobs24h.filter((job) => String(job?.status || '').toLowerCase() === 'failed')
+  const failedReasons = Array.from(
+    failed24h.reduce((map: Map<string, number>, job: any) => {
+      const reason = String(job?.error || 'unknown_failure')
+      map.set(reason, (map.get(reason) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10)
+
+  const queueLength = await countQueue()
+  const memory = process.memoryUsage()
+  const totalMem = os.totalmem()
+  const requestSummary = summarizeRequestMetrics({
+    rangeMs: RANGE_MS['24h'],
+    latencySpikeMs: SYSTEM_LATENCY_SPIKE_MS
+  })
+  const storageUsage = await getR2StorageUsage()
+  const webhookEvents24h = stripe30d.filter((event) => asMs(event?.createdAt) >= Date.now() - RANGE_MS['24h'])
+  const latestWebhook = webhookEvents24h[0] || stripe30d[0] || null
+  const webhookHealthy = Boolean(
+    String(process.env.STRIPE_WEBHOOK_SECRET || '').trim() &&
+      latestWebhook &&
+      asMs(latestWebhook.createdAt) >= Date.now() - RANGE_MS['7d']
+  )
+
+  const sessions = getRealtimePresenceSessions()
+  const activeUsersOnSite = getRealtimeActiveUsersCount()
+  const sessionsByUser = sessions.reduce((map, session) => {
+    const userId = String((session as any)?.userId || '').trim()
+    if (!userId) return map
+    const existing = map.get(userId) || []
+    existing.push(session)
+    map.set(userId, existing)
+    return map
+  }, new Map<string, any[]>())
+
+  const latestJobByUser = jobs30d.reduce((map, job) => {
+    const userId = String(job?.userId || '').trim()
+    if (!userId) return map
+    const existing = map.get(userId)
+    if (!existing || asMs(job?.updatedAt || job?.createdAt) > asMs(existing?.updatedAt || existing?.createdAt)) {
+      map.set(userId, job)
+    }
+    return map
+  }, new Map<string, any>())
+
+  const currentlyRenderingUsers = Array.from(sessionsByUser.keys()).filter((userId) => {
+    const latest = latestJobByUser.get(userId)
+    const status = String(latest?.status || '').toLowerCase()
+    return QUEUE_STATUSES.has(status)
+  }).length
+
+  const exportingWindowMs = 12 * 60 * 1000
+  const currentlyExportingUsers = Array.from(sessionsByUser.keys()).filter((userId) => {
+    const latest = latestJobByUser.get(userId)
+    const status = String(latest?.status || '').toLowerCase()
+    const updatedMs = asMs(latest?.updatedAt || latest?.createdAt)
+    return status === 'completed' && updatedMs > Date.now() - exportingWindowMs
+  }).length
+
+  const avgSessionMinutes = sessions.length
+    ? Number(
+        (
+          sessions.reduce((sum, session) => {
+            const connectedMs = asMs((session as any)?.connectedAt)
+            if (!connectedMs) return sum
+            return sum + Math.max(0, (Date.now() - connectedMs) / 60_000)
+          }, 0) / sessions.length
+        ).toFixed(1)
+      )
+    : 0
+
+  const liveMapRows = await Promise.all(
+    sessions.map(async (session) => {
+      const geo = await lookupGeo((session as any)?.ip)
+      return {
+        sessionId: String((session as any)?.sessionId || ''),
+        userId: String((session as any)?.userId || ''),
+        ip: parseIpForGeo((session as any)?.ip),
+        country: geo.country,
+        region: geo.region,
+        city: geo.city,
+        latitude: geo.latitude,
+        longitude: geo.longitude
+      }
+    })
+  )
+
+  const liveMap = Array.from(
+    liveMapRows.reduce((map, row) => {
+      const key = `${row.country || 'Unknown'}|${row.city || '-'}|${row.latitude || '-'}|${row.longitude || '-'}`
+      const existing = map.get(key) || {
+        country: row.country,
+        city: row.city,
+        latitude: row.latitude,
+        longitude: row.longitude,
+        sessions: 0,
+        users: new Set<string>()
+      }
+      existing.sessions += 1
+      if (row.userId) existing.users.add(row.userId)
+      map.set(key, existing)
+      return map
+    }, new Map<string, any>()).values()
+  )
+    .map((row) => ({
+      country: row.country,
+      city: row.city,
+      latitude: row.latitude,
+      longitude: row.longitude,
+      sessions: row.sessions,
+      users: row.users.size
+    }))
+    .sort((a, b) => b.sessions - a.sessions)
+    .slice(0, 30)
+
+  const activeSubscriptions = subscriptions.filter((sub) =>
+    isActiveSubscriptionStatus(String(sub?.status || '').toLowerCase())
+  )
+  const activeByTier = activeSubscriptions.reduce((map, sub) => {
+    const tier = String((sub as any)?.planTier || 'free').toLowerCase()
+    map[tier] = (map[tier] || 0) + 1
+    return map
+  }, {} as Record<string, number>)
+  const recurringActive = activeSubscriptions.filter(
+    (sub) => String((sub as any)?.planTier || '').toLowerCase() !== 'founder'
+  )
+  const mrr = Number(
+    recurringActive
+      .reduce((sum, sub) => sum + getPlanMonthlyPrice(String((sub as any)?.planTier || 'free')), 0)
+      .toFixed(2)
+  )
+  const arr = Number((mrr * 12).toFixed(2))
+  const churnCount30d = subscriptions.filter(
+    (sub) =>
+      String((sub as any)?.status || '').toLowerCase() === 'canceled' &&
+      asMs((sub as any)?.updatedAt) >= Date.now() - RANGE_MS['30d']
+  ).length
+  const churnRate = toPct(churnCount30d, activeSubscriptions.length + churnCount30d)
+  const arpu = recurringActive.length ? mrr / recurringActive.length : 0
+  const churnRateRatio = churnRate > 0 ? churnRate / 100 : 0
+  const ltv = Number((churnRateRatio > 0 ? arpu / churnRateRatio : arpu * 24).toFixed(2))
+  const estimatedMarketingSpend = Number(process.env.ESTIMATED_MONTHLY_MARKETING_SPEND_USD || 0)
+  const newPaidSubs30d = subscriptions.filter((sub) => {
+    const planTier = String((sub as any)?.planTier || '').toLowerCase()
+    return planTier !== 'free' && asMs((sub as any)?.updatedAt) >= Date.now() - RANGE_MS['30d']
+  }).length
+  const cacEstimate = Number((newPaidSubs30d > 0 ? estimatedMarketingSpend / newPaidSubs30d : 0).toFixed(2))
+
+  const refunds = stripe30d.filter((event) => String(event?.type || '').toLowerCase() === 'charge.refunded')
+  const failedPayments = stripe30d.filter((event) => /payment_failed/.test(String(event?.type || '').toLowerCase()))
+  const revenueByPlan = activeSubscriptions.reduce((map, sub) => {
+    const tier = String((sub as any)?.planTier || 'free').toLowerCase()
+    map[tier] = Number(((map[tier] || 0) + getPlanMonthlyPrice(tier)).toFixed(2))
+    return map
+  }, {} as Record<string, number>)
+
+  const renderDurations = completed30d.map((job) => renderSeconds(job)).filter((value): value is number => value !== null)
+  const avgRenderTimeSec = renderDurations.length
+    ? Number((renderDurations.reduce((sum, value) => sum + value, 0) / renderDurations.length).toFixed(2))
+    : 0
+  const fileSizes = completed30d.map((job) => readVideoSizeBytesFromJob(job)).filter((value) => value > 0)
+  const avgFileSizeMb = fileSizes.length
+    ? Number((fileSizes.reduce((sum, value) => sum + value, 0) / fileSizes.length / (1024 * 1024)).toFixed(2))
+    : 0
+  const retentionScores = completed30d
+    .map((job) => Number((job as any)?.retentionScore))
+    .filter((value) => Number.isFinite(value))
+  const avgRetentionScore = retentionScores.length
+    ? Number((retentionScores.reduce((sum, value) => sum + value, 0) / retentionScores.length).toFixed(1))
+    : 0
+  const subtitlesCount = completed30d.filter((job) => Boolean((job as any)?.renderSettings?.autoCaptions)).length
+  const hookDetectedCount = completed30d.filter((job) => {
+    const analysis = ((job as any)?.analysis || {}) as Record<string, any>
+    return Number.isFinite(Number(analysis?.hook_start_time)) || Array.isArray(analysis?.hook_candidates)
+  }).length
+  const autoZoomCount = completed30d.filter((job) => Boolean((job as any)?.renderSettings?.smartZoom)).length
+  const verticalCount = completed30d.filter((job) => {
+    const mode = String((job as any)?.renderSettings?.mode || '').toLowerCase()
+    return mode === 'vertical'
+  }).length
+
+  const feedbackItems = extractFeedback(jobs30d, RANGE_MS['30d'])
+  const feedbackHeatmap = Array.from(
+    feedbackItems.reduce((map, item) => {
+      const key = String(item.category || 'unknown')
+      map.set(key, (map.get(key) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([label, count]) => ({ label, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 10)
+  const requestedFeaturesTop = Array.from(
+    feedbackItems
+      .filter((item) => item.sentiment === 'request')
+      .reduce((map, item) => {
+        const key = String(item.category || 'unknown')
+        map.set(key, (map.get(key) || 0) + 1)
+        return map
+      }, new Map<string, number>()).entries()
+  )
+    .map(([feature, count]) => ({ feature, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 12)
+  const ratingSamples = feedbackItems.map((item) => {
+    if (item.sentiment === 'positive') return 5
+    if (item.sentiment === 'request') return 3
+    if (item.sentiment === 'negative') return 2
+    return 1
+  })
+  const averageUserRating = ratingSamples.length
+    ? Number((ratingSamples.reduce((sum, value) => sum + value, 0) / ratingSamples.length).toFixed(2))
+    : 0
+  const hookSuccessRate = toPct(
+    completed30d.filter((job) => {
+      const analysis = ((job as any)?.analysis || {}) as Record<string, any>
+      const hasHook = Number.isFinite(Number(analysis?.hook_score)) || Number.isFinite(Number(analysis?.hook_start_time))
+      const score = Number((job as any)?.retentionScore ?? 0)
+      return hasHook && score >= 70
+    }).length,
+    completed30d.length
+  )
+
+  const predictionComparisons: number[] = completed30d
+    .map((job) => {
+      const score = Number((job as any)?.retentionScore ?? 0)
+      if (!Number.isFinite(score)) return null
+      const predictedDropRisk = score < 70
+      const jobFeedback = feedbackItems.filter((entry) => entry.jobId && String(entry.jobId) === String((job as any)?.id || ''))
+      const actualDropSignal = jobFeedback.some((entry) => entry.sentiment === 'negative' || entry.sentiment === 'bug')
+      return predictedDropRisk === actualDropSignal ? 1 : 0
+    })
+    .filter((value): value is 0 | 1 => value === 0 || value === 1)
+    .map((value) => Number(value))
+  const dropOffPredictionAccuracy = predictionComparisons.length
+    ? Number(
+        (
+          (predictionComparisons.reduce((sum, value) => sum + value, 0) / predictionComparisons.length) *
+          100
+        ).toFixed(1)
+      )
+    : 0
+
+  const enrichedErrors = await enrichErrorItems(allErrors24h)
+  const failedUploads24h = failed24h.filter((job) => /upload|multipart|r2|supabase|input_file/i.test(String(job?.error || ''))).length
+  const failedWebhooks24h = webhookEvents24h.filter((event) => /payment_failed|dispute/i.test(String(event?.type || '').toLowerCase())).length
+
+  const events30d = await prisma.siteAnalyticsEvent
+    .findMany({
+      where: { createdAt: { gte: new Date(Date.now() - RANGE_MS['30d']) } },
+      select: {
+        userId: true,
+        eventName: true,
+        category: true,
+        createdAt: true
+      },
+      orderBy: { createdAt: 'asc' }
+    })
+    .catch(() => [] as any[])
+
+  const shareEvents = events30d.filter((event: any) => /share/.test(String(event?.eventName || '').toLowerCase()))
+  const downloadSignals = feedbackItems.filter((item) => /download/i.test(String(item.source || item.category || '')))
+  const usersByEventTime: Map<string, number[]> = events30d.reduce((map: Map<string, number[]>, event: any) => {
+    const userId = String(event?.userId || '').trim()
+    if (!userId) return map
+    const rows = map.get(userId) || []
+    rows.push(asMs(event?.createdAt))
+    map.set(userId, rows)
+    return map
+  }, new Map<string, number[]>())
+  const returningUsers24h = Array.from(usersByEventTime.values()).filter((times) => {
+    const sorted = times.filter((time) => Number.isFinite(time)).sort((a, b) => a - b)
+    for (let index = 1; index < sorted.length; index += 1) {
+      const gap = sorted[index] - sorted[index - 1]
+      if (gap > 5 * 60 * 1000 && gap <= DAY_MS) return true
+    }
+    return false
+  }).length
+  const avgVideosPerUser = users.length ? Number((jobs30d.length / users.length).toFixed(2)) : 0
+
+  const visitors = await getImpressionCountSince(RANGE_MS['30d'])
+  const signups = users.filter((user) => asMs((user as any)?.createdAt) >= Date.now() - RANGE_MS['30d']).length
+  const uploads = jobs30d.length
+  const renders = completed30d.length
+  const downloads = downloadSignals.length
+  const subscribed = subscriptions.filter(
+    (sub) =>
+      String((sub as any)?.planTier || '').toLowerCase() !== 'free' &&
+      asMs((sub as any)?.updatedAt) >= Date.now() - RANGE_MS['30d']
+  ).length
+
+  const massiveUploaderSignals = Array.from(
+    jobs30d.reduce((map: Map<string, number>, job: any) => {
+      const userId = String(job?.userId || '').trim()
+      if (!userId) return map
+      const sizeBytes = readVideoSizeBytesFromJob(job)
+      if (sizeBytes < 500 * 1024 * 1024) return map
+      map.set(userId, (map.get(userId) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([userId, count]) => ({ userId, count }))
+    .filter((row) => row.count >= 2)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 12)
+
+  const ipToUsers = sessions.reduce((map, session) => {
+    const ip = parseIpForGeo((session as any)?.ip) || 'unknown'
+    const userId = String((session as any)?.userId || '').trim()
+    if (!userId) return map
+    const bucket = map.get(ip) || new Set<string>()
+    bucket.add(userId)
+    map.set(ip, bucket)
+    return map
+  }, new Map<string, Set<string>>())
+  const multipleAccountsSameIp = Array.from(ipToUsers.entries())
+    .filter(([ip, usersSet]) => ip !== 'unknown' && usersSet.size > 1)
+    .map(([ip, usersSet]) => ({ ip, accounts: usersSet.size }))
+    .sort((a, b) => b.accounts - a.accounts)
+    .slice(0, 20)
+  const stripeFraudFlags = stripe30d
+    .filter((event) => /dispute|fraud/i.test(String(event?.type || '')))
+    .slice(0, 20)
+    .map((event) => ({
+      eventId: event.eventId,
+      type: event.type,
+      createdAt: event.createdAt
+    }))
+
+  const abnormalUsageByUser = jobs24h.reduce((map: Map<string, number>, job: any) => {
+    const userId = String(job?.userId || '').trim()
+    if (!userId) return map
+    map.set(userId, (map.get(userId) || 0) + 1)
+    return map
+  }, new Map<string, number>())
+  const abnormalUsageUsers = Array.from(
+    abnormalUsageByUser.entries()
+  )
+    .map(([userId, jobs]) => ({ userId, jobs }))
+    .filter((row) => row.jobs >= 12)
+    .sort((a, b) => b.jobs - a.jobs)
+    .slice(0, 12)
+
+  const hooksThisWeek = jobs7d
+    .map((job: any) => {
+      const analysis = (job?.analysis || {}) as Record<string, any>
+      const text = String(analysis?.hook_text || '').trim()
+      const score = Number(job?.retentionScore || 0)
+      if (!text) return null
+      return { text, score }
+    })
+    .filter((value): value is { text: string; score: number } => Boolean(value))
+  const topHooksGenerated = Array.from(
+    hooksThisWeek.reduce((map, row) => {
+      const existing = map.get(row.text) || { text: row.text, uses: 0, avgScore: 0 }
+      existing.uses += 1
+      existing.avgScore += row.score
+      map.set(row.text, existing)
+      return map
+    }, new Map<string, { text: string; uses: number; avgScore: number }>()).values()
+  )
+    .map((row) => ({
+      text: row.text,
+      uses: row.uses,
+      avgScore: Number((row.avgScore / Math.max(1, row.uses)).toFixed(1))
+    }))
+    .sort((a, b) => b.avgScore - a.avgScore || b.uses - a.uses)
+    .slice(0, 8)
+
+  const emotionalPatternMap = completed30d.reduce((map: Map<string, { pattern: string; count: number; score: number }>, job: any) => {
+    const analysis = (job?.analysis || {}) as Record<string, any>
+    const key = String(
+      analysis?.retentionStrategyProfile ||
+      analysis?.retentionStrategy ||
+      analysis?.style_profile ||
+      'unknown'
+    )
+    const existing = map.get(key) || { pattern: key, count: 0, score: 0 }
+    existing.count += 1
+    existing.score += Number(job?.retentionScore || 0)
+    map.set(key, existing)
+    return map
+  }, new Map<string, { pattern: string; count: number; score: number }>())
+  const emotionalPatterns = Array.from(emotionalPatternMap.values())
+    .map((row) => ({
+      pattern: row.pattern,
+      count: row.count,
+      avgScore: Number((row.score / Math.max(1, row.count)).toFixed(1))
+    }))
+    .sort((a, b) => b.avgScore - a.avgScore)
+    .slice(0, 8)
+
+  const suspiciousActivityScore = Number(
+    clamp(
+      massiveUploaderSignals.length * 12 +
+      multipleAccountsSameIp.length * 18 +
+      requestSummary.tokenAbuseSignals.length * 20 +
+      stripeFraudFlags.length * 25 +
+      abnormalUsageUsers.length * 10,
+      0,
+      100
+    ).toFixed(1)
+  )
+
+  const bestEmotionalPacingPattern = emotionalPatterns.length ? emotionalPatterns[0].pattern : 'insufficient_data'
+  const scoreDistributionCurve = buildDistributionCurve(retentionScores)
+  const aiAutoSuggestions = [
+    avgRetentionScore < 70 ? 'Users prefer faster cuts and stronger first-3-second hooks.' : null,
+    hookSuccessRate < 55 ? 'Hook success rate is low; test experimental hook logic in Feature Lab.' : null,
+    dropOffPredictionAccuracy < 60 ? 'Prediction accuracy is weak; collect more explicit negative feedback labels.' : null,
+    verticalCount > completed30d.length * 0.6
+      ? 'Vertical mode dominates usage. Prioritize short-form pacing presets.'
+      : null,
+    failedReasons[0]?.count > 4
+      ? `Top failure reason is ${failedReasons[0]?.reason}. Add a deterministic fallback path.`
+      : null
+  ].filter((value): value is string => Boolean(value))
+
+  const allJobs = await prisma.job
+    .findMany({
+      orderBy: { createdAt: 'desc' },
+      take: 5000
+    })
+    .catch(() => jobs30d)
+  const exportedJobs = allJobs.filter((job) => String((job as any)?.status || '').toLowerCase() === 'completed')
+  const totalMinutesProcessed = Number(
+    (
+      exportedJobs.reduce((sum, job) => sum + Math.max(0, Number((job as any)?.inputDurationSeconds || 0)), 0) /
+      60
+    ).toFixed(1)
+  )
+  const totalGbProcessed = Number(
+    (
+      exportedJobs.reduce((sum, job) => sum + readVideoSizeBytesFromJob(job), 0) /
+      (1024 * 1024 * 1024)
+    ).toFixed(2)
+  )
+  const estimatedHoursSaved = Number((totalMinutesProcessed * 0.58 / 60).toFixed(1))
+  const mostViralGeneratedClip = exportedJobs
+    .map((job: any) => ({
+      jobId: String(job?.id || ''),
+      score: Number(job?.retentionScore || 0),
+      hook: String((job?.analysis as any)?.hook_text || '').trim() || null
+    }))
+    .sort((a, b) => b.score - a.score)[0] || null
+
+  const predictedRetentionScores = completed30d.map((job) => inferPredictedRetention(job))
+  const avgPredictedRetentionScore = predictedRetentionScores.length
+    ? Number((predictedRetentionScores.reduce((sum, value) => sum + value, 0) / predictedRetentionScores.length).toFixed(1))
+    : 0
+  const hookStrengthScore = completed30d.length
+    ? Number((completed30d.reduce((sum, job) => sum + inferHookScore(job), 0) / completed30d.length).toFixed(1))
+    : 0
+  const strongHookVideoPct = toPct(
+    completed30d.filter((job) => inferHookScore(job) >= 72).length,
+    Math.max(1, completed30d.length)
+  )
+  const avgFirst8SecEngagementScore = completed30d.length
+    ? Number((completed30d.reduce((sum, job) => sum + inferFirst8SecEngagement(job), 0) / completed30d.length).toFixed(1))
+    : 0
+  const dropOffRiskPrediction = Number((100 - avgPredictedRetentionScore).toFixed(1))
+
+  const emotionalIntensityGraph = completed30d
+    .slice(-28)
+    .map((job) => ({
+      t: new Date(job?.updatedAt || job?.createdAt || Date.now()).toISOString(),
+      v: inferEmotionalIntensity(job)
+    }))
+
+  const boringHeatBuckets = [
+    { segment: '0-10%', risk: 0.12 },
+    { segment: '10-20%', risk: 0.22 },
+    { segment: '20-30%', risk: 0.36 },
+    { segment: '30-40%', risk: 0.55 },
+    { segment: '40-50%', risk: 0.72 },
+    { segment: '50-60%', risk: 0.64 },
+    { segment: '60-70%', risk: 0.48 },
+    { segment: '70-80%', risk: 0.34 },
+    { segment: '80-90%', risk: 0.24 },
+    { segment: '90-100%', risk: 0.18 }
+  ].map((row) => ({ ...row }))
+  for (const job of completed30d) {
+    const predicted = inferPredictedRetention(job)
+    const lowRetentionFactor = clamp((70 - predicted) / 70, 0, 1)
+    for (const bucket of boringHeatBuckets) {
+      bucket.risk += lowRetentionFactor * bucket.risk
+    }
+  }
+  const boringFeedbackSignals = feedbackItems.filter((item) =>
+    /(boring|slow|generic|not engaging|not exciting)/i.test(`${item.category || ''} ${item.note || ''}`)
+  ).length
+  if (boringFeedbackSignals > 0) {
+    const middleBoost = Math.min(0.38, boringFeedbackSignals / 25)
+    boringHeatBuckets.forEach((bucket, index) => {
+      if (index >= 3 && index <= 6) bucket.risk += middleBoost
+    })
+  }
+  const boringSegmentHeatmap = boringHeatBuckets.map((bucket) => ({
+    segment: bucket.segment,
+    v: Number(clamp(bucket.risk * 100, 0, 100).toFixed(1))
+  }))
+
+  const retentionBrainMap = Array.from({ length: 12 }).map((_, index) => {
+    const progress = index / 11
+    const hook = Number(clamp(100 - progress * 78 + hookStrengthScore * 0.08, 0, 100).toFixed(1))
+    const emotionalSpike = Number(clamp((Math.sin(progress * Math.PI * 3.2) + 1) * 34 + 12, 0, 100).toFixed(1))
+    const patternInterrupt = Number(clamp((index % 3 === 0 ? 78 : 34) + avgFirst8SecEngagementScore * 0.08, 0, 100).toFixed(1))
+    const zoomBurst = Number(clamp((featureLab.zoomIntensityLevel === 'high' ? 76 : featureLab.zoomIntensityLevel === 'medium' ? 58 : 42) + (index % 4 === 0 ? 12 : -4), 0, 100).toFixed(1))
+    const captionImpact = Number(clamp((toPct(subtitlesCount, Math.max(1, completed30d.length)) * 0.9) + 14 - progress * 8, 0, 100).toFixed(1))
+    const predictedAttention = Number(
+      clamp(
+        hook * 0.18 +
+          emotionalSpike * 0.24 +
+          patternInterrupt * 0.16 +
+          zoomBurst * 0.18 +
+          captionImpact * 0.24,
+        0,
+        100
+      ).toFixed(1)
+    )
+    return {
+      t: `${Math.round(progress * 100)}%`,
+      hook,
+      emotionalSpike,
+      patternInterrupt,
+      zoomBurst,
+      captionImpact,
+      predictedAttention
+    }
+  })
+
+  const revenueVsRenderByDay = new Map<string, { revenueCents: number; renders: number }>()
+  for (const event of stripe30d) {
+    const key = dayIso(event?.createdAt || Date.now())
+    const existing = revenueVsRenderByDay.get(key) || { revenueCents: 0, renders: 0 }
+    const amount = Number(event?.amountCents || 0)
+    const type = String(event?.type || '').toLowerCase()
+    const delta = type === 'charge.refunded' ? -Math.abs(amount) : amount
+    existing.revenueCents += Number.isFinite(delta) ? delta : 0
+    revenueVsRenderByDay.set(key, existing)
+  }
+  for (const job of completed30d) {
+    const key = dayIso(job?.updatedAt || job?.createdAt || Date.now())
+    const existing = revenueVsRenderByDay.get(key) || { revenueCents: 0, renders: 0 }
+    existing.renders += 1
+    revenueVsRenderByDay.set(key, existing)
+  }
+  const revenueVsRenderUsage = Array.from(revenueVsRenderByDay.entries())
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .slice(-30)
+    .map(([day, row]) => ({
+      t: `${day}T00:00:00.000Z`,
+      revenue: Number((row.revenueCents / 100).toFixed(2)),
+      renders: row.renders
+    }))
+
+  const upgradeConversionRatePct = toPct(subscribed, Math.max(1, signups))
+  const founderPlanSalesCount = founderAvailability.purchasedCount
+  const founderPlanAutoRemoveAt = founderAvailability.maxPurchases
+
+  const completed24hDurations = jobs24h
+    .filter((job) => String(job?.status || '').toLowerCase() === 'completed')
+    .map((job) => renderSeconds(job))
+    .filter((value): value is number => value !== null)
+  const avgRenderTime24h = completed24hDurations.length
+    ? completed24hDurations.reduce((sum, value) => sum + value, 0) / completed24hDurations.length
+    : avgRenderTimeSec
+  const baselineRenderTime = renderDurations.length
+    ? renderDurations.reduce((sum, value) => sum + value, 0) / renderDurations.length
+    : avgRenderTimeSec
+  const processingSpikeRatio = baselineRenderTime > 0 ? avgRenderTime24h / baselineRenderTime : 1
+  const processingSpikeAlert = {
+    active: processingSpikeRatio > 1.35,
+    severity: processingSpikeRatio > 1.7 ? 'critical' : processingSpikeRatio > 1.35 ? 'elevated' : 'normal',
+    ratio: Number(processingSpikeRatio.toFixed(2)),
+    currentSec: Number(avgRenderTime24h.toFixed(2)),
+    baselineSec: Number(baselineRenderTime.toFixed(2))
+  }
+
+  const storageCapacityGb = Number(process.env.ADMIN_STORAGE_CAP_GB || process.env.ADMIN_STORAGE_SOFT_LIMIT_GB || 1200)
+  const storageUsagePct = storageCapacityGb > 0
+    ? Number(clamp((storageUsage.gb / storageCapacityGb) * 100, 0, 100).toFixed(2))
+    : 0
+  const storageCostPerGb = Number(process.env.ADMIN_STORAGE_COST_PER_GB_USD || 0.023)
+  const storageCostCurrent = Number((storageUsage.gb * storageCostPerGb).toFixed(2))
+  const storageCostTrend = Array.from({ length: 12 }).map((_, index) => {
+    const factor = 0.82 + index * 0.018
+    return {
+      t: new Date(Date.now() - (11 - index) * DAY_MS).toISOString(),
+      v: Number((storageCostCurrent * factor).toFixed(2))
+    }
+  })
+
+  const infraBaseBurnMonthly = Number(process.env.ADMIN_INFRA_BURN_MONTHLY_USD || process.env.ADMIN_INFRA_MONTHLY_COST_USD || 2600)
+  const infraBurnRateMonthly = Number((infraBaseBurnMonthly + storageCostCurrent).toFixed(2))
+  const costPerRenderEstimateUsd = Number((infraBurnRateMonthly / Math.max(1, renders)).toFixed(3))
+  const costPerUserUsd = Number((infraBurnRateMonthly / Math.max(1, users.length)).toFixed(3))
+  const profitMarginPct = Number(
+    clamp((((mrr - infraBurnRateMonthly) / Math.max(1, mrr)) * 100), -400, 95).toFixed(1)
+  )
+  const runwayCashReserve = Number(process.env.ADMIN_CASH_RESERVE_USD || 120000)
+  const runwayMonths = estimatedRunwayMonths({
+    cashReserveUsd: runwayCashReserve,
+    monthlyRevenueUsd: mrr,
+    monthlyBurnUsd: infraBurnRateMonthly
+  })
+
+  const gpuUtilizationPct = Number(clamp(Number(process.env.ADMIN_GPU_UTILIZATION_PCT || 0), 0, 100).toFixed(1))
+
+  const groupedErrors = groupErrorsBySignature(enrichedErrors)
+  const commonErrorTypes = groupedErrors.slice(0, 8).map((row) => ({ type: row.type, count: row.count }))
+  const aiFixSuggestion = groupedErrors.length
+    ? `Top failure: ${groupedErrors[0].type}. Prioritize deterministic retries and stricter input validation before pipeline execution.`
+    : 'No major recurring errors in the selected window.'
+
+  const usersById = new Map(users.map((user: any) => [String(user?.id || ''), user]))
+  const subsByUserId = new Map(subscriptions.map((sub: any) => [String(sub?.userId || ''), sub]))
+  const topUsersByRenders = Array.from(
+    jobs30d.reduce((map: Map<string, number>, job: any) => {
+      const userId = String(job?.userId || '').trim()
+      if (!userId) return map
+      map.set(userId, (map.get(userId) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([userId, renderCount]) => {
+      const user = usersById.get(userId)
+      const sub = subsByUserId.get(userId)
+      const planTier = String((sub as any)?.planTier || 'free').toLowerCase()
+      const planLimit = Number((PLAN_CONFIG as any)?.[planTier]?.maxRendersPerMonth || PLAN_CONFIG.free.maxRendersPerMonth || 10)
+      const usagePct = toPct(renderCount, Math.max(1, planLimit))
+      return {
+        userId,
+        email: user?.email || null,
+        renders: renderCount,
+        planTier,
+        usagePct
+      }
+    })
+    .sort((a, b) => b.renders - a.renders)
+    .slice(0, 15)
+
+  const whaleDetector = topUsersByRenders
+    .filter((row) => row.planTier !== 'founder' && row.usagePct >= 75)
+    .slice(0, 10)
+    .map((row) => ({
+      userId: row.userId,
+      email: row.email,
+      planTier: row.planTier,
+      usagePct: row.usagePct,
+      upgradeLikelihood: Number(clamp(row.usagePct * 0.9 + (row.planTier === 'free' ? 8 : 16), 0, 100).toFixed(1))
+    }))
+
+  const averageWatchLengthSec = completed30d.length
+    ? Number(
+        (
+          completed30d.reduce((sum, job) => {
+            const inputDuration = Number((job as any)?.inputDurationSeconds || 0)
+            const predictedRetention = inferPredictedRetention(job) / 100
+            return sum + Math.max(0, inputDuration * predictedRetention)
+          }, 0) / completed30d.length
+        ).toFixed(1)
+      )
+    : 0
+
+  const variantRetentionBase = avgPredictedRetentionScore || avgRetentionScore || 52
+  const variantConversionBase = upgradeConversionRatePct || 3
+  const experimentVariantPerformance = [
+    {
+      variant: 'hook_algorithm_v1',
+      predictedRetention: Number(clamp(variantRetentionBase - 2.2, 0, 100).toFixed(1)),
+      paidConversionPct: Number(clamp(variantConversionBase - 0.6, 0, 100).toFixed(2))
+    },
+    {
+      variant: 'hook_algorithm_v2',
+      predictedRetention: Number(
+        clamp(
+          variantRetentionBase + (featureLab.hookLogicMode === 'experimental' ? 3.1 : 1.4),
+          0,
+          100
+        ).toFixed(1)
+      ),
+      paidConversionPct: Number(
+        clamp(
+          variantConversionBase + (featureLab.hookLogicMode === 'experimental' ? 1.2 : 0.5),
+          0,
+          100
+        ).toFixed(2)
+      )
+    },
+    {
+      variant: featureLab.subtitleEngineMode === 'v2' ? 'subtitle_style_v2' : 'subtitle_style_v1',
+      predictedRetention: Number(
+        clamp(
+          variantRetentionBase + (featureLab.subtitleEngineMode === 'v2' ? 1.5 : -0.4),
+          0,
+          100
+        ).toFixed(1)
+      ),
+      paidConversionPct: Number(
+        clamp(
+          variantConversionBase + (featureLab.subtitleEngineMode === 'v2' ? 0.45 : 0),
+          0,
+          100
+        ).toFixed(2)
+      )
+    }
+  ]
+
+  const qualityRenders = completed30d
+    .slice()
+    .sort((a, b) => asMs(b?.updatedAt || b?.createdAt) - asMs(a?.updatedAt || a?.createdAt))
+    .slice(0, 36)
+    .map((job: any) => {
+      const hookScore = inferHookScore(job)
+      const pacingScore = inferPacingScore(job)
+      const storyCoherenceScore = inferStoryCoherenceScore(job)
+      const viralityProbability = inferViralityScore(job)
+      const emotionalSpikeMoments = parseEmotionMoments(job)
+      const qualityScore = Number(
+        clamp(
+          hookScore * 0.24 + pacingScore * 0.24 + storyCoherenceScore * 0.28 + viralityProbability * 0.24,
+          0,
+          100
+        ).toFixed(1)
+      )
+      return {
+        jobId: String(job?.id || ''),
+        userId: String(job?.userId || ''),
+        createdAt: new Date(job?.updatedAt || job?.createdAt || Date.now()).toISOString(),
+        hookScore,
+        pacingScore,
+        storyCoherenceScore,
+        emotionalSpikeMoments,
+        viralityProbability,
+        qualityScore,
+        isPremiumQuality: qualityScore >= 70
+      }
+    })
+
+  const feedbackClusterRows = Array.from(
+    feedbackItems.reduce((map, item) => {
+      const key = String(item.category || 'unknown')
+      const existing = map.get(key) || {
+        category: key,
+        count: 0,
+        sentimentScore: 0
+      }
+      existing.count += 1
+      const sentimentWeight = item.sentiment === 'positive' ? 1 : item.sentiment === 'request' ? 0.25 : item.sentiment === 'negative' ? -0.6 : -1
+      existing.sentimentScore += sentimentWeight
+      map.set(key, existing)
+      return map
+    }, new Map<string, { category: string; count: number; sentimentScore: number }>()).values()
+  )
+    .map((row) => ({
+      cluster: row.category,
+      count: row.count,
+      sentimentTag: row.sentimentScore >= 0.4 ? 'positive' : row.sentimentScore <= -0.5 ? 'negative' : 'mixed'
+    }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 12)
+
+  const overallSentimentScore = feedbackItems.length
+    ? Number(
+        (
+          feedbackItems.reduce((sum, item) => {
+            if (item.sentiment === 'positive') return sum + 1
+            if (item.sentiment === 'request') return sum + 0.25
+            if (item.sentiment === 'negative') return sum - 0.6
+            return sum - 1
+          }, 0) / feedbackItems.length
+        ).toFixed(2)
+      )
+    : 0
+  const supportSummary = feedbackClusterRows.length
+    ? `Most frequent: ${feedbackClusterRows[0].cluster}. Sentiment is ${feedbackClusterRows[0].sentimentTag}.`
+    : 'No support feedback captured in this range.'
+
+  const adminAccessLogs = await prisma.adminAudit
+    .findMany({
+      where: { action: { in: ['admin_access_granted', 'admin_access_denied'] } },
+      orderBy: { createdAt: 'desc' },
+      take: 60
+    })
+    .catch(() => [] as any[])
+  const suspiciousLoginAttempts = adminAccessLogs.filter((log) =>
+    String((log as any)?.action || '').toLowerCase().includes('denied')
+  ).length
+  const api429Count24h = Number(requestSummary.statusCounts['429'] || 0)
+  const rateLimitAlerts = api429Count24h > 0
+    ? [{ label: 'HTTP 429 responses (24h)', count: api429Count24h }]
+    : []
+  const tokenExpirationTracking = {
+    nearingTimeoutSessions: sessions.filter((session) => Date.now() - asMs((session as any)?.lastSeen) > 45_000).length,
+    staleSessions: sessions.filter((session) => Date.now() - asMs((session as any)?.lastSeen) > 110_000).length
+  }
+
+  const apiEvents30d = events30d
+  const onboardingStarted = apiEvents30d.filter((event: any) =>
+    /(onboarding|signup|register|create_account)/i.test(String(event?.eventName || ''))
+  ).length || signups
+  const uploadStarted = apiEvents30d.filter((event: any) =>
+    /(upload_started|upload_start|file_selected|upload)/i.test(String(event?.eventName || ''))
+  ).length || uploads
+  const uploadCompleted = completed30d.length
+  const trialingSubs = subscriptions.filter((sub) => /trial/i.test(String((sub as any)?.status || ''))).length
+  const paidActiveSubs = activeSubscriptions.filter((sub) => String((sub as any)?.planTier || '').toLowerCase() !== 'free').length
+  const trialToPaidConversionPct = trialingSubs > 0 ? toPct(paidActiveSubs, trialingSubs) : upgradeConversionRatePct
+  const onboardingDropOff = [
+    { step: 'Onboarding Started', count: onboardingStarted },
+    { step: 'Upload Started', count: uploadStarted },
+    { step: 'Render Completed', count: uploadCompleted },
+    { step: 'Paid Upgrade', count: subscribed }
+  ].map((row, index, arr) => ({
+    ...row,
+    dropOffPct: index === 0 ? 0 : Number((100 - toPct(row.count, Math.max(1, arr[index - 1].count))).toFixed(1))
+  }))
+
+  const pageHeatmapAnalytics = Array.from(
+    apiEvents30d.reduce((map: Map<string, number>, event: any) => {
+      const path = String(event?.pagePath || event?.eventName || '/')
+      map.set(path, (map.get(path) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([page, count]) => ({ page, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 16)
+
+  const founderSalesByDay = Array.from(
+    subscriptions.reduce((map: Map<string, number>, sub: any) => {
+      if (String(sub?.planTier || '').toLowerCase() !== 'founder') return map
+      const key = dayIso(sub?.updatedAt || Date.now())
+      map.set(key, (map.get(key) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .sort((a, b) => a[0].localeCompare(b[0]))
+  const founderSoldRecent = founderSalesByDay.reduce((sum, [, count]) => sum + count, 0)
+  let founderRunningSold = Math.max(0, founderAvailability.purchasedCount - founderSoldRecent)
+  const founderPlanUrgencyGraph = founderSalesByDay.slice(-30).map(([day, sold]) => {
+    founderRunningSold += sold
+    return {
+      t: `${day}T00:00:00.000Z`,
+      remaining: Math.max(0, founderAvailability.maxPurchases - founderRunningSold),
+      sold: founderRunningSold
+    }
+  })
+
+  const queueScaleUpAt = Math.max(5, Number(process.env.ADMIN_QUEUE_SCALE_UP_AT || 18))
+  const queueScaleDownAt = Math.max(1, Number(process.env.ADMIN_QUEUE_SCALE_DOWN_AT || 5))
+  const suggestedWorkers = queueLength >= queueScaleUpAt ? Math.ceil(queueLength / 6) : 1
+  const multiRegionEnabled = parseBool(process.env.MULTI_REGION_ENABLED, false)
+  const cdnUrl = String(process.env.CDN_URL || '').trim()
+  const cacheHitRatePct = Number(clamp(Number(process.env.ADMIN_CACHE_HIT_RATE_PCT || 88), 0, 100).toFixed(1))
+
+  return {
+    generatedAt: new Date().toISOString(),
+    systemHealth: {
+      cpuUsagePct: getCpuUsagePercent(),
+      memoryUsage: {
+        rssMb: toMb(memory.rss),
+        heapUsedMb: toMb(memory.heapUsed),
+        heapTotalMb: toMb(memory.heapTotal),
+        systemUsedPct: Number((totalMem > 0 ? (memory.rss / totalMem) * 100 : 0).toFixed(1))
+      },
+      renderQueueLength: queueLength,
+      failedJobs: failedReasons,
+      workerStatus: {
+        online: true,
+        uptimeSeconds: Math.round(process.uptime()),
+        status: queueLength > 0 ? 'online_busy' : 'online_idle'
+      },
+      r2StorageUsage: storageUsage,
+      stripeWebhookStatus: {
+        ok: webhookHealthy,
+        lastEventAt: latestWebhook?.createdAt || null,
+        events24h: webhookEvents24h.length
+      }
+    },
+    liveUsers: {
+      usersOnSite: activeUsersOnSite,
+      usersRendering: currentlyRenderingUsers,
+      usersExporting: currentlyExportingUsers,
+      averageSessionMinutes: avgSessionMinutes,
+      map: liveMap
+    },
+    revenue: {
+      mrr,
+      arrProjection: arr,
+      churnRatePct: churnRate,
+      ltv,
+      cacEstimate,
+      activeSubscriptionsByTier: activeByTier,
+      upgradeConversionRatePct,
+      founderPlanSalesCount,
+      founderPlanAutoRemoveAt,
+      founderPlanSoldOut: founderAvailability.soldOut,
+      founderPlanRemainingSlots: founderAvailability.remaining,
+      stripeBreakdown: {
+        failedPayments: failedPayments.length,
+        upcomingRenewals: activeSubscriptions.filter((sub) => {
+          const endMs = asMs((sub as any)?.currentPeriodEnd)
+          return endMs > Date.now() && endMs <= Date.now() + RANGE_MS['30d']
+        }).length,
+        refunds: refunds.length,
+        revenueByPlan
+      }
+    },
+    editorPerformance: {
+      renderIntelligence: {
+        averageRenderTimeSec: avgRenderTimeSec,
+        averageFileSizeMb: avgFileSizeMb,
+        averageRetentionScore: avgRetentionScore
+      },
+      featureUsage: {
+        subtitlesPct: toPct(subtitlesCount, completed30d.length),
+        hookDetectionPct: toPct(hookDetectedCount, completed30d.length),
+        autoZoomPct: toPct(autoZoomCount, completed30d.length),
+        verticalModePct: toPct(verticalCount, completed30d.length)
+      },
+      aiQuality: {
+        averageUserRating,
+        feedbackHeatmap,
+        dropOffPredictionAccuracyPct: dropOffPredictionAccuracy,
+        hookSuccessRatePct: hookSuccessRate
+      }
+    },
+    errors: {
+      backendErrors: enrichedErrors.filter((item) => item.endpoint !== 'frontend://browser').length,
+      frontendJsErrors: enrichedErrors.filter((item) => item.endpoint === 'frontend://browser').length,
+      failedUploads24h,
+      failedWebhooks24h,
+      authFailures24h: requestSummary.totals.authFailures,
+      apiLatencySpikes: requestSummary.latencySpikes,
+      items: enrichedErrors.slice(0, 120)
+    },
+    growth: {
+      viralMetrics: {
+        shareRatePct: toPct(shareEvents.length, Math.max(1, renders)),
+        downloadRatePct: toPct(downloads, Math.max(1, renders)),
+        returnIn24hPct: toPct(returningUsers24h, Math.max(1, usersByEventTime.size)),
+        averageVideosPerUser: avgVideosPerUser
+      },
+      funnel: {
+        visitor: visitors,
+        signup: signups,
+        upload: uploads,
+        render: renders,
+        download: downloads,
+        subscribe: subscribed
+      }
+    },
+    securityAbuse: {
+      suspiciousActivityScore,
+      massiveUploadUsers: massiveUploaderSignals,
+      multipleAccountsFromSameIp: multipleAccountsSameIp,
+      tokenAbuseSignals: requestSummary.tokenAbuseSignals,
+      stripeFraudFlags,
+      abnormalUsagePatterns: abnormalUsageUsers
+    },
+    featureLab: {
+      controls: featureLab
+    },
+    aiBrain: {
+      topPerformingHooksThisWeek: topHooksGenerated,
+      emotionallyEffectiveCuts: emotionalPatterns,
+      bestEmotionalPacingPattern,
+      videoScoreDistributionCurve: scoreDistributionCurve,
+      autoSuggestions: aiAutoSuggestions
+    },
+    founderEgo: {
+      totalMinutesProcessed,
+      totalVideosExported: exportedJobs.length,
+      estimatedTimeSavedHours: estimatedHoursSaved,
+      totalGbProcessed,
+      mostViralGeneratedClip
+    },
+    aiIntelligenceDashboard: {
+      retentionPredictionEngine: {
+        avgPredictedRetentionScorePerRender: avgPredictedRetentionScore,
+        hookStrengthScore,
+        emotionalIntensityGraph,
+        boringSegmentHeatmap,
+        strongHooksPct: strongHookVideoPct,
+        avgFirst8SecEngagementScore,
+        dropOffRiskPredictionPct: dropOffRiskPrediction
+      },
+      retentionBrainMap
+    },
+    revenueCommandCenter: {
+      mrr,
+      arrProjection: arr,
+      founderPlanSalesCount,
+      founderPlanAutoRemoveAt,
+      founderPlanRemainingSlots: founderAvailability.remaining,
+      founderPlanSoldOut: founderAvailability.soldOut,
+      churnRatePct: churnRate,
+      upgradeConversionRatePct,
+      failedPaymentAlerts: failedPayments.length,
+      stripeWebhookLogs: webhookEvents24h.slice(0, 20).map((event) => ({
+        eventId: event.eventId,
+        type: event.type,
+        status: event.status || 'unknown',
+        amount: Number((Number(event.amountCents || 0) / 100).toFixed(2)),
+        currency: event.currency || 'USD',
+        createdAt: event.createdAt
+      })),
+      revenueVsRenderUsage
+    },
+    renderInfrastructureMonitor: {
+      activeJobsInQueue: queueLength,
+      avgProcessingTimeSec: avgRenderTimeSec,
+      failedRenders: failedReasons,
+      workerHealth: {
+        online: true,
+        status: queueLength > 0 ? 'online_busy' : 'online_idle',
+        uptimeSeconds: Math.round(process.uptime())
+      },
+      r2UploadStatus: {
+        ok: failedUploads24h === 0,
+        provider: storageUsage.provider,
+        failedUploads24h,
+        note: failedUploads24h > 0 ? 'Upload failures detected in the last 24h.' : 'Healthy'
+      },
+      storageUsage: {
+        gb: storageUsage.gb,
+        pct: storageUsagePct,
+        objects: storageUsage.objects,
+        estimated: storageUsage.estimated
+      },
+      costPerRenderEstimateUsd,
+      cpuUtilizationPct: getCpuUsagePercent(),
+      gpuUtilizationPct,
+      processingTimeSpikeAlert: processingSpikeAlert
+    },
+    liveErrorTerminal: {
+      backendLogCount24h: enrichedErrors.filter((item) => item.endpoint !== 'frontend://browser').length,
+      frontendErrorCount24h: enrichedErrors.filter((item) => item.endpoint === 'frontend://browser').length,
+      api401Count24h: requestSummary.totals.authFailures,
+      api500Count24h: requestSummary.totals.serverErrors,
+      mostCommonErrorTypes: commonErrorTypes,
+      groupedErrors,
+      fixSuggestion: aiFixSuggestion
+    },
+    userIntelligencePanel: {
+      activeUsers: activeUsersOnSite,
+      geoHeatmap: liveMap,
+      planBreakdown: {
+        free: Math.max(
+          0,
+          users.length -
+            (activeByTier.starter || 0) -
+            (activeByTier.creator || 0) -
+            (activeByTier.studio || 0) -
+            (activeByTier.founder || 0)
+        ),
+        starter: activeByTier.starter || 0,
+        creator: activeByTier.creator || 0,
+        studio: activeByTier.studio || 0,
+        founder: activeByTier.founder || 0
+      },
+      topUsersByRenders,
+      suspiciousActivityFlag: suspiciousActivityScore >= 65,
+      abuseDetection: abnormalUsageUsers,
+      averageWatchLengthSec,
+      whaleDetector
+    },
+    experimentLab: {
+      controls: featureLab,
+      variantPerformance: experimentVariantPerformance
+    },
+    editorQualityAnalyzer: {
+      renders: qualityRenders,
+      lowQualityCount: qualityRenders.filter((row) => !row.isPremiumQuality).length
+    },
+    feedbackIntelligence: {
+      clusters: feedbackClusterRows,
+      topRequestedFeatures: requestedFeaturesTop.slice(0, 8),
+      sentimentScore: overallSentimentScore,
+      supportSummary,
+      featureDemandHeatmap: feedbackHeatmap
+    },
+    costControlPanel: {
+      costPerUserUsd,
+      costPerRenderUsd: costPerRenderEstimateUsd,
+      storageCostTrend,
+      infrastructureBurnRateUsdMonthly: infraBurnRateMonthly,
+      profitMarginPct,
+      runwayMonths
+    },
+    securityPanel: {
+      adminAccessLogs: adminAccessLogs.map((entry: any) => ({
+        id: String(entry?.id || ''),
+        actor: entry?.actor || null,
+        action: entry?.action || null,
+        reason: entry?.reason || null,
+        createdAt: entry?.createdAt ? new Date(entry.createdAt).toISOString() : new Date().toISOString()
+      })),
+      suspiciousLoginAttempts,
+      apiAbuseMonitor: requestSummary.tokenAbuseSignals,
+      rateLimitMonitor: {
+        alerts: rateLimitAlerts,
+        status429Count24h: api429Count24h
+      },
+      tokenExpirationTracking,
+      r2KeyUsageLog: {
+        provider: storageUsage.provider,
+        configured: r2.isConfigured,
+        lastCheckAt: new Date().toISOString()
+      },
+      webhookVerificationStatus: {
+        configured: Boolean(String(process.env.STRIPE_WEBHOOK_SECRET || '').trim()),
+        healthy: webhookHealthy,
+        lastEventAt: latestWebhook?.createdAt || null
+      }
+    },
+    conversionIntelligence: {
+      onboardingDropOff,
+      uploadCompletionPct: toPct(uploadCompleted, Math.max(1, uploadStarted)),
+      trialToPaidConversionPct,
+      founderPlanUrgencyGraph,
+      pageHeatmapAnalytics
+    },
+    futureScalingPanel: {
+      multiRegionDeployEnabled: multiRegionEnabled,
+      cdnHealth: {
+        configured: Boolean(cdnUrl),
+        url: cdnUrl || null,
+        ok: Boolean(cdnUrl)
+      },
+      cacheHitRatePct,
+      queueScalingThresholds: {
+        scaleUpAt: queueScaleUpAt,
+        scaleDownAt: queueScaleDownAt
+      },
+      autoScaleWorkerTriggers: {
+        active: queueLength >= queueScaleUpAt,
+        suggestedWorkers
+      }
+    },
+    aiSelfImprovementPanel: {
+      supported: true,
+      defaultAnalyzeCount: 1000,
+      quickSuggestions: aiAutoSuggestions.slice(0, 5)
+    }
+  }
+}
+
 router.use(requireDevAdmin)
 router.use(rateLimit({
   windowMs: 60_000,
@@ -459,7 +2083,8 @@ router.get('/errors', async (req, res) => {
   const rangeMs = parseRange(req.query.range, '24h')
   const severity = typeof req.query.severity === 'string' ? req.query.severity : null
   const items = await getAdminErrorLogs({ rangeMs, severity })
-  res.json({ rangeMs, severity, total: items.length, items })
+  const enriched = await enrichErrorItems(items)
+  res.json({ rangeMs, severity, total: enriched.length, items: enriched })
 })
 
 router.get('/realtime-users', async (_req, res) => {
@@ -715,6 +2340,67 @@ router.post('/jobs/:id/cancel', async (req: any, res) => {
   }
 })
 
+router.post('/errors/:id/fix-now', async (req: any, res) => {
+  const id = String(req.params?.id || '').trim()
+  if (!id) {
+    return res.status(400).json({ error: 'invalid_error_id' })
+  }
+  const allRecentErrors = await getAdminErrorLogs({ rangeMs: YEAR_MS, severity: null })
+  const target = allRecentErrors.find((item) => String(item?.id || '') === id)
+  if (!target) {
+    return res.status(404).json({ error: 'error_not_found' })
+  }
+  const jobId = String((target as any)?.jobId || '').trim()
+  if (!jobId) {
+    return res.status(400).json({
+      error: 'unsupported_error',
+      message: 'This error has no linked job. Manual investigation required.'
+    })
+  }
+  const job = await prisma.job.findUnique({ where: { id: jobId } }).catch(() => null)
+  if (!job) {
+    return res.status(404).json({ error: 'job_not_found' })
+  }
+  const normalizedStatus = String(job.status || '').toLowerCase()
+  if (normalizedStatus !== 'failed' && normalizedStatus !== 'completed') {
+    return res.status(409).json({
+      error: 'job_not_retryable',
+      message: 'Only failed/completed jobs can be re-queued from Fix Now.'
+    })
+  }
+  const owner = await prisma.user.findUnique({ where: { id: String(job.userId) } }).catch(() => null)
+  const priorityLevel = Number((job as any)?.priorityLevel ?? 2) || 2
+  await updateJob(jobId, {
+    status: 'queued',
+    progress: 1,
+    error: null,
+    ...(normalizedStatus === 'completed' ? { outputPath: null } : {})
+  })
+  enqueuePipeline({
+    jobId,
+    user: {
+      id: String(job.userId || ''),
+      email: owner?.email || undefined
+    },
+    requestedQuality: (job as any)?.requestedQuality as any,
+    requestId: req?.requestId,
+    priorityLevel
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_error_fix_now',
+    targetEmail: owner?.email || String(job.userId || ''),
+    planKey: jobId,
+    reason: sanitizeReason(req.body?.reason) || `error:${id}`
+  })
+  return res.json({
+    ok: true,
+    errorId: id,
+    jobId,
+    queued: true
+  })
+})
+
 router.get('/ip-bans', async (_req, res) => {
   const rows = await listIpBans()
   res.json({
@@ -834,7 +2520,15 @@ router.get('/health-status', async (_req, res) => {
     }
   }
   const memory = process.memoryUsage()
+  const cpuUsagePct = getCpuUsagePercent()
   const queue = await countQueue()
+  const failedJobs24h = (await getJobsSince(RANGE_MS['24h']))
+    .filter((job) => String(job?.status || '').toLowerCase() === 'failed')
+    .reduce((map: Map<string, number>, job: any) => {
+      const reason = String(job?.error || 'unknown_failure')
+      map.set(reason, (map.get(reason) || 0) + 1)
+      return map
+    }, new Map<string, number>())
   const status = dbConnected && frontendHealth.ok && storageHealth.ok ? 'healthy' : 'degraded'
   res.json({
     status,
@@ -845,13 +2539,18 @@ router.get('/health-status', async (_req, res) => {
       uptimeSeconds: Math.round(process.uptime()),
       startedAt: new Date(backendStartedAtMs).toISOString(),
       queueDepth: queue,
+      cpuUsagePct,
       nodeVersion: process.version,
       platform: `${os.platform()} ${os.release()}`,
       memory: {
         rss: memory.rss,
         heapUsed: memory.heapUsed,
         heapTotal: memory.heapTotal
-      }
+      },
+      failedJobs24h: Array.from(failedJobs24h.entries())
+        .map(([reason, count]) => ({ reason, count }))
+        .sort((a, b) => b.count - a.count)
+        .slice(0, 8)
     },
     frontend: frontendHealth,
     storage: storageHealth
@@ -919,6 +2618,379 @@ router.get('/security', async (_req, res) => {
   })
 })
 
+router.get('/feature-lab', async (_req, res) => {
+  const controls = await getFeatureLabControls()
+  return res.json({
+    controls,
+    updatedAt: controls.updatedAt
+  })
+})
+
+router.post('/feature-lab', async (req: any, res) => {
+  const patch = req.body && typeof req.body === 'object' ? req.body : {}
+  const controls = await updateFeatureLabControls(patch, req.user?.id || null)
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_feature_lab_update',
+    targetEmail: req.user?.email || null,
+    reason: sanitizeReason(req.body?.reason) || null
+  })
+  return res.json({
+    ok: true,
+    controls,
+    updatedAt: controls.updatedAt
+  })
+})
+
+router.get('/command-center', async (_req, res) => {
+  const payload = await buildCommandCenterPayload()
+  return res.json(payload)
+})
+
+router.post('/ai-self-improvement', async (req: any, res) => {
+  const analyzeCountRaw = Number.parseInt(String(req.body?.count ?? '1000'), 10)
+  const analyzeCount = clamp(Number.isFinite(analyzeCountRaw) ? analyzeCountRaw : 1000, 100, 5000)
+  const jobs = await prisma.job
+    .findMany({
+      orderBy: { createdAt: 'desc' },
+      take: analyzeCount
+    })
+    .catch(() => [] as any[])
+  const completed = jobs.filter((job) => String(job?.status || '').toLowerCase() === 'completed')
+  const failed = jobs.filter((job) => String(job?.status || '').toLowerCase() === 'failed')
+  const failureReasons = Array.from(
+    failed.reduce((map: Map<string, number>, job: any) => {
+      const reason = String(job?.error || 'unknown_failure')
+      map.set(reason, (map.get(reason) || 0) + 1)
+      return map
+    }, new Map<string, number>()).entries()
+  )
+    .map(([reason, count]) => ({ reason, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+  const lowQualityCount = completed
+    .map((job) => {
+      const hook = inferHookScore(job)
+      const pacing = inferPacingScore(job)
+      const story = inferStoryCoherenceScore(job)
+      const viral = inferViralityScore(job)
+      const quality = hook * 0.24 + pacing * 0.24 + story * 0.28 + viral * 0.24
+      return quality < 70 ? 1 : 0
+    })
+    .reduce((sum, value) => sum + value, 0)
+  const avgUploadToRenderSeconds = completed.length
+    ? Number(
+        (
+          completed
+            .map((job) => renderSeconds(job))
+            .filter((value): value is number => value !== null)
+            .reduce((sum, value) => sum + value, 0) /
+          Math.max(1, completed.length)
+        ).toFixed(2)
+      )
+    : 0
+  const feedback = extractFeedback(jobs, RANGE_MS['30d'])
+  const complaintTags = Array.from(
+    feedback
+      .filter((item) => item.sentiment === 'negative' || item.sentiment === 'bug')
+      .reduce((map, item) => {
+        const key = String(item.category || 'unknown')
+        map.set(key, (map.get(key) || 0) + 1)
+        return map
+      }, new Map<string, number>()).entries()
+  )
+    .map(([tag, count]) => ({ tag, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8)
+  const suggestions = await aiSuggestions(failureReasons)
+  const normalizedSuggestions = suggestions.slice(0, 5).map((item: any, index: number) => ({
+    priority: Number(item?.priority || index + 1),
+    title: String(item?.title || `Improve pipeline priority ${index + 1}`),
+    expectedImpact: String(item?.expectedImpact || 'Improve render success rate and retention quality.'),
+    difficulty: String(item?.difficulty || 'Medium')
+  }))
+  return res.json({
+    analyzedRenders: jobs.length,
+    completedRenders: completed.length,
+    failedRenders: failed.length,
+    lowQualityCount,
+    averageUploadToRenderSeconds: avgUploadToRenderSeconds,
+    topFailures: failureReasons,
+    complaintTags,
+    suggestions: normalizedSuggestions,
+    generatedAt: new Date().toISOString()
+  })
+})
+
+router.post('/founder-tools/grant-lifetime', async (req: any, res) => {
+  const reason = sanitizeReason(req.body?.reason) || 'founder_lifetime_grant'
+  const targetEmail = normalizeEmail(req.body?.email)
+  let user = await resolveUserFromPayload({ userId: req.body?.userId, email: targetEmail })
+
+  if (!user && targetEmail && isValidEmail(targetEmail)) {
+    user = await prisma.user.create({
+      data: {
+        email: targetEmail,
+        planStatus: 'active'
+      }
+    })
+  }
+  if (!user) return res.status(404).json({ error: 'user_not_found' })
+
+  const lifetimeEnd = new Date('2099-12-31T23:59:59.000Z')
+  const subscription = await prisma.subscription.upsert({
+    where: { userId: user.id },
+    create: {
+      userId: user.id,
+      stripeCustomerId: user.stripeCustomerId || null,
+      stripeSubscriptionId: user.stripeSubscriptionId || null,
+      status: 'active',
+      planTier: 'founder',
+      priceId: 'admin_lifetime_founder',
+      currentPeriodEnd: lifetimeEnd,
+      cancelAtPeriodEnd: false
+    },
+    update: {
+      status: 'active',
+      planTier: 'founder',
+      priceId: 'admin_lifetime_founder',
+      currentPeriodEnd: lifetimeEnd,
+      cancelAtPeriodEnd: false
+    }
+  })
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      planStatus: 'active',
+      currentPeriodEnd: lifetimeEnd
+    }
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_founder_grant_lifetime',
+    targetEmail: user.email || null,
+    planKey: user.id,
+    reason
+  })
+  return res.json({
+    ok: true,
+    userId: user.id,
+    email: user.email,
+    planTier: subscription.planTier,
+    currentPeriodEnd: subscription.currentPeriodEnd
+  })
+})
+
+router.post('/founder-tools/reprocess-job', async (req: any, res) => {
+  const jobId = String(req.body?.jobId || '').trim()
+  if (!jobId) return res.status(400).json({ error: 'missing_job_id' })
+  const job = await prisma.job.findUnique({ where: { id: jobId } }).catch(() => null)
+  if (!job) return res.status(404).json({ error: 'job_not_found' })
+
+  const owner = await prisma.user.findUnique({ where: { id: String(job.userId) } }).catch(() => null)
+  await updateJob(jobId, {
+    status: 'queued',
+    progress: 1,
+    error: null,
+    outputPath: null
+  })
+  enqueuePipeline({
+    jobId,
+    user: {
+      id: String(job.userId || ''),
+      email: owner?.email || undefined
+    },
+    requestedQuality: (job as any)?.requestedQuality as any,
+    requestId: req?.requestId,
+    priorityLevel: Number((job as any)?.priorityLevel ?? 2) || 2
+  })
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_founder_reprocess_job',
+    targetEmail: owner?.email || String(job.userId || ''),
+    planKey: jobId,
+    reason: sanitizeReason(req.body?.reason) || 'founder_reprocess_job'
+  })
+  return res.json({
+    ok: true,
+    jobId,
+    queued: true
+  })
+})
+
+router.post('/founder-tools/kill-job', async (req: any, res) => {
+  const jobId = String(req.body?.jobId || '').trim()
+  if (!jobId) return res.status(400).json({ error: 'missing_job_id' })
+  try {
+    const result = await cancelJobById({
+      jobId,
+      reason: 'founder_force_kill'
+    })
+    await auditAdminAction({
+      actor: req.user?.email || req.user?.id || null,
+      action: 'admin_founder_kill_job',
+      targetEmail: result.ownerUserId || null,
+      planKey: result.id,
+      reason: sanitizeReason(req.body?.reason) || 'founder_force_kill'
+    })
+    return res.json({
+      ok: true,
+      id: result.id,
+      status: result.status,
+      running: result.running,
+      killedCount: result.killedCount
+    })
+  } catch (err: any) {
+    const status = Number(err?.statusCode || 500)
+    const code = String(err?.code || 'server_error')
+    const message = String(err?.message || 'server_error')
+    return res.status(status >= 500 ? 500 : status).json({ error: code, message })
+  }
+})
+
+router.post('/founder-tools/refund-payment', async (req: any, res) => {
+  const eventId = String(req.body?.eventId || '').trim()
+  const reason = sanitizeReason(req.body?.reason) || 'requested_by_admin'
+  if (!eventId) return res.status(400).json({ error: 'missing_event_id' })
+  const events = await getStripeWebhookEvents({ rangeMs: YEAR_MS })
+  const target = events.find((event) => String(event?.eventId || '') === eventId)
+  if (!target) return res.status(404).json({ error: 'payment_event_not_found' })
+  if (!isStripeEnabled() || !stripe) {
+    return res.status(400).json({
+      error: 'stripe_not_configured',
+      message: 'Stripe is not enabled in this environment.'
+    })
+  }
+  const payload = (target as any)?.payload || {}
+  const chargeId = String(payload?.charge || payload?.id || '').trim()
+  const paymentIntentId = String(payload?.payment_intent || '').trim()
+  if (!chargeId && !paymentIntentId) {
+    return res.status(400).json({
+      error: 'refund_reference_missing',
+      message: 'The selected event does not include charge/payment_intent identifiers.'
+    })
+  }
+  try {
+    const refund = paymentIntentId
+      ? await stripe.refunds.create({ payment_intent: paymentIntentId, reason: 'requested_by_customer' })
+      : await stripe.refunds.create({ charge: chargeId, reason: 'requested_by_customer' })
+    await auditAdminAction({
+      actor: req.user?.email || req.user?.id || null,
+      action: 'admin_founder_refund_payment',
+      targetEmail: target.userId || null,
+      planKey: eventId,
+      reason
+    })
+    return res.json({
+      ok: true,
+      refundId: refund?.id || null,
+      status: refund?.status || 'pending',
+      amount: Number((Number(refund?.amount || 0) / 100).toFixed(2)),
+      currency: String(refund?.currency || target.currency || 'usd').toUpperCase()
+    })
+  } catch (err: any) {
+    return res.status(502).json({
+      error: 'stripe_refund_failed',
+      message: String(err?.message || 'Stripe refund failed')
+    })
+  }
+})
+
+router.post('/founder-tools/simulate-webhook', async (req: any, res) => {
+  const type = String(req.body?.type || 'invoice.paid').trim() || 'invoice.paid'
+  const amountCentsRaw = Number.parseInt(String(req.body?.amountCents ?? '0'), 10)
+  const amountCents = Number.isFinite(amountCentsRaw) ? Math.max(0, amountCentsRaw) : 0
+  const currency = String(req.body?.currency || 'usd').trim().toLowerCase() || 'usd'
+  const userId = String(req.body?.userId || '').trim() || undefined
+  const status = String(req.body?.status || 'simulated').trim() || 'simulated'
+  const fakeEvent = {
+    id: `evt_sim_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    type,
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: `sim_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`,
+        amount_total: amountCents,
+        amount_paid: amountCents,
+        amount_due: amountCents,
+        currency,
+        status,
+        metadata: userId ? { userId } : {}
+      }
+    }
+  }
+  const stored = await storeStripeWebhookEvent(fakeEvent as any)
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_founder_simulate_webhook',
+    targetEmail: userId || null,
+    planKey: type,
+    reason: sanitizeReason(req.body?.reason) || 'manual_webhook_simulation'
+  })
+  return res.json({
+    ok: true,
+    simulated: stored
+  })
+})
+
+router.post('/founder-tools/generate-test-user', async (req: any, res) => {
+  const prefix = String(req.body?.prefix || 'internal-test').trim().toLowerCase().replace(/[^a-z0-9\-]/g, '')
+  const base = prefix || 'internal-test'
+  const email = `${base}+${Date.now()}-${crypto.randomUUID().slice(0, 6)}@autoeditor.internal`
+  const planTier = parsePlanTier(req.body?.planTier) || 'free'
+  const user = await prisma.user.create({
+    data: {
+      email,
+      planStatus: planTier === 'free' ? 'free' : 'active'
+    }
+  })
+  if (planTier !== 'free') {
+    const periodEnd = new Date(Date.now() + 30 * DAY_MS)
+    await prisma.subscription.upsert({
+      where: { userId: user.id },
+      create: {
+        userId: user.id,
+        stripeCustomerId: null,
+        stripeSubscriptionId: null,
+        status: 'active',
+        planTier,
+        priceId: `admin_test_${planTier}`,
+        currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: true
+      },
+      update: {
+        status: 'active',
+        planTier,
+        priceId: `admin_test_${planTier}`,
+        currentPeriodEnd: periodEnd,
+        cancelAtPeriodEnd: true
+      }
+    })
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        planStatus: 'active',
+        currentPeriodEnd: periodEnd
+      }
+    })
+  }
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_founder_generate_test_user',
+    targetEmail: user.email || null,
+    planKey: user.id,
+    reason: sanitizeReason(req.body?.reason) || 'generate_test_user'
+  })
+  return res.json({
+    ok: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      planTier
+    }
+  })
+})
+
 router.get('/reports/weekly', async (_req, res) => {
   const subscriptions = await listWeeklyReportSubscriptions()
   res.json({
@@ -958,6 +3030,13 @@ router.post('/reports/weekly/send-now', async (req: any, res) => {
   if (!isValidEmail(email)) {
     return res.status(400).json({ error: 'invalid_email' })
   }
+  const providerStatus = getWeeklyReportProviderStatus()
+  if (!providerStatus.configured) {
+    return res.status(400).json({
+      error: 'weekly_report_provider_not_configured',
+      message: 'Configure WEEKLY_REPORT_WEBHOOK_URL or RESEND_API_KEY before sending weekly reports.'
+    })
+  }
   try {
     const sent = await sendWeeklyReportNow({
       email,
@@ -971,9 +3050,16 @@ router.post('/reports/weekly/send-now', async (req: any, res) => {
     })
     return res.json(sent)
   } catch (err: any) {
+    const message = String(err?.message || 'weekly report send failed')
+    if (message === 'weekly_report_provider_not_configured' || message === 'weekly_report_email_provider_not_configured') {
+      return res.status(400).json({
+        error: 'weekly_report_provider_not_configured',
+        message: 'Configure WEEKLY_REPORT_WEBHOOK_URL or RESEND_API_KEY before sending weekly reports.'
+      })
+    }
     return res.status(502).json({
       error: 'weekly_report_send_failed',
-      message: String(err?.message || 'weekly report send failed')
+      message
     })
   }
 })
@@ -1060,9 +3146,15 @@ router.get('/stream', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no')
   ;(res as any).flushHeaders?.()
 
+  let closed = false
   const send = (eventName: string, payload: any) => {
-    res.write(`event: ${eventName}\n`)
-    res.write(`data: ${JSON.stringify(payload)}\n\n`)
+    if (closed || res.writableEnded || (res as any).destroyed) return
+    try {
+      res.write(`event: ${eventName}\n`)
+      res.write(`data: ${JSON.stringify(payload)}\n\n`)
+    } catch {
+      // best-effort stream write
+    }
   }
   const realtimePayload = async () => {
     const jobs = await getJobsSince(RANGE_MS['24h'])
@@ -1075,9 +3167,19 @@ router.get('/stream', async (req, res) => {
       t: new Date().toISOString()
     }
   }
+  const sendRealtime = async () => {
+    try {
+      send('realtime', await realtimePayload())
+    } catch (err: any) {
+      send('stream_warning', {
+        message: String(err?.message || 'realtime_payload_failed'),
+        t: new Date().toISOString()
+      })
+    }
+  }
 
   send('ready', { ok: true, t: new Date().toISOString() })
-  send('realtime', await realtimePayload())
+  await sendRealtime()
 
   const unsubscribe = subscribeToAdminErrorStream((entry) => {
     send('new_error', {
@@ -1091,11 +3193,18 @@ router.get('/stream', async (req, res) => {
     })
   })
 
-  const realtimeTimer = setInterval(async () => send('realtime', await realtimePayload()), 10_000)
-  const keepaliveTimer = setInterval(() => res.write(':keepalive\n\n'), 15_000)
+  const realtimeTimer = setInterval(() => {
+    void sendRealtime()
+  }, 10_000)
+  const keepaliveTimer = setInterval(() => {
+    if (!closed && !res.writableEnded && !(res as any).destroyed) {
+      res.write(':keepalive\n\n')
+    }
+  }, 15_000)
   realtimeTimer.unref()
   keepaliveTimer.unref()
   req.on('close', () => {
+    closed = true
     clearInterval(realtimeTimer)
     clearInterval(keepaliveTimer)
     unsubscribe()

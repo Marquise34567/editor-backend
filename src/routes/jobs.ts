@@ -13,6 +13,7 @@ import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
+import { getRerenderUsageForDay, incrementRerenderUsageForDay } from '../services/rerenderUsage'
 import { PLAN_CONFIG, getMonthKey, isPaidTier, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
@@ -56,6 +57,7 @@ import {
   type StyleArchetypeBlend,
   type TimelineFeatureSnapshot
 } from '../lib/multiStyleRetention'
+import { applyWatermarkOverride, getFeatureLabControls } from '../services/featureLab'
 
 const router = express.Router()
 
@@ -881,6 +883,7 @@ const LONG_FORM_MAX_EDIT_SECONDS = 140
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
 const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
+const FREE_DAILY_RERENDER_LIMIT = PLAN_CONFIG.free.maxRerendersPerDay || 3
 const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
 const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
@@ -2890,8 +2893,30 @@ const buildRenderLimitPayload = (
   }
 }
 
+const buildRerenderLimitPayload = (
+  limit: number,
+  usage: { rerendersUsed?: number | null; dayKey?: string | null }
+) => {
+  const rerendersUsed = typeof usage?.rerendersUsed === 'number' ? usage.rerendersUsed : 0
+  const day = usage?.dayKey || null
+  return {
+    error: 'RERENDER_LIMIT_REACHED',
+    message: 'Daily re-render limit reached. Try again tomorrow or upgrade.',
+    rerendersRemaining: Math.max(0, limit - rerendersUsed),
+    maxRerendersPerDay: limit,
+    rerendersUsed,
+    day
+  }
+}
+
 type RenderLimitViolation = {
   code: 'RENDER_LIMIT_REACHED'
+  payload: Record<string, any>
+  requiredPlan: PlanTier
+}
+
+type RerenderLimitViolation = {
+  code: 'RERENDER_LIMIT_REACHED'
   payload: Record<string, any>
   requiredPlan: PlanTier
 }
@@ -2903,6 +2928,13 @@ type RenderLimitCheckArgs = {
   plan: { maxRendersPerMonth?: number | null }
   renderMode: RenderMode
   allowAtLimitForFree?: boolean
+}
+
+type RerenderLimitCheckArgs = {
+  userId: string
+  email?: string | null
+  tier: PlanTier
+  plan: { maxRerendersPerDay?: number | null }
 }
 
 const getRenderLimitViolation = async ({
@@ -2941,6 +2973,31 @@ const getRenderLimitViolation = async ({
     return {
       code: 'RENDER_LIMIT_REACHED',
       payload: buildRenderLimitPayload(plan, renderUsage),
+      requiredPlan
+    }
+  }
+  return null
+}
+
+const getRerenderLimitViolation = async ({
+  userId,
+  email,
+  tier,
+  plan
+}: RerenderLimitCheckArgs): Promise<RerenderLimitViolation | null> => {
+  if (isDevAccount(userId, email)) return null
+  const requiredPlan = getRequiredPlanForRenders(tier)
+  const limitRaw = tier === 'free'
+    ? FREE_DAILY_RERENDER_LIMIT
+    : Number(plan.maxRerendersPerDay ?? 0)
+  const limit = Number.isFinite(limitRaw) ? Math.max(0, Math.round(limitRaw)) : 0
+  if (limit <= 0) return null
+
+  const usage = await getRerenderUsageForDay(userId)
+  if (usage.rerendersUsed >= limit) {
+    return {
+      code: 'RERENDER_LIMIT_REACHED',
+      payload: buildRerenderLimitPayload(limit, usage),
       requiredPlan
     }
   }
@@ -9924,7 +9981,11 @@ const processJob = async (
       throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
     }
   }
-  const watermarkEnabled = renderConfig.mode === 'horizontal' ? features.watermark : false
+  const runtimeControls = await getFeatureLabControls().catch(() => null)
+  const watermarkEnabled = applyWatermarkOverride(
+    renderConfig.mode === 'horizontal' ? features.watermark : false,
+    runtimeControls?.watermarkOverride
+  )
 
   await updateJob(jobId, {
     requestedQuality: desiredQuality,
@@ -13134,6 +13195,16 @@ router.post('/:id/reprocess', async (req: any, res) => {
     }
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
+    const { tier, plan } = await getUserPlan(req.user.id)
+    const rerenderLimitViolation = await getRerenderLimitViolation({
+      userId: req.user.id,
+      email: req.user?.email,
+      tier,
+      plan
+    })
+    if (rerenderLimitViolation) {
+      return res.status(403).json(rerenderLimitViolation.payload)
+    }
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
@@ -13230,9 +13301,21 @@ router.post('/:id/reprocess', async (req: any, res) => {
       requestId: req.requestId,
       priorityLevel
     })
+    const rerenderUsage = await incrementRerenderUsageForDay(req.user.id)
+    const rerenderLimit = tier === 'free'
+      ? FREE_DAILY_RERENDER_LIMIT
+      : Math.max(0, Math.round(Number(plan.maxRerendersPerDay ?? 0)))
     return res.json({
       ok: true,
       queued: true,
+      rerenderUsage: {
+        day: rerenderUsage.dayKey,
+        rerendersUsed: rerenderUsage.rerendersUsed,
+        rerendersLimit: rerenderLimit > 0 ? rerenderLimit : null,
+        rerendersRemaining: rerenderLimit > 0
+          ? Math.max(0, rerenderLimit - rerenderUsage.rerendersUsed)
+          : null
+      },
       preferredHook: preferredHookCandidate
         ? {
             start: preferredHookCandidate.start,
