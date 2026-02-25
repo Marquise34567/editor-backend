@@ -13318,7 +13318,6 @@ const processJob = async (
           strategyProfile
         })
       }
-      const judgePassedBeforeRecovery = selectedJudge.passed
       const initialPredictedRetention = Number(selectedJudge.retention_score ?? 0)
       const lowRetentionRecoveryRequested = initialPredictedRetention < MIN_PREDICTED_COMPLETION_PERCENT
       if (
@@ -13440,52 +13439,11 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
-          if (
-            !judgePassedBeforeRecovery &&
-            Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT
-          ) {
-            const reason = `Predicted completion ${Number(selectedJudge?.retention_score ?? 0).toFixed(1)}% below ${MIN_PREDICTED_COMPLETION_PERCENT}% minimum.`
-            await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-              status: 'failed',
-              completedAt: toIsoNow(),
-              lastError: reason,
-              meta: {
-                attempts: retentionAttempts,
-                thresholds: qualityGateThresholds,
-                hasTranscriptSignals,
-                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-                contentFormat: selectedContentFormat,
-                targetPlatform: retentionTargetPlatform,
-                strategyProfile
-              }
-            })
-            await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-              status: 'failed',
-              completedAt: toIsoNow(),
-              lastError: reason,
-              meta: {
-                attempts: retentionAttempts,
-                thresholds: qualityGateThresholds,
-                hasTranscriptSignals,
-                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-                contentFormat: selectedContentFormat,
-                targetPlatform: retentionTargetPlatform,
-                strategyProfile
-              }
-            })
-            await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
-            throw new QualityGateError(reason, {
-              attempts: retentionAttempts,
-              thresholds: qualityGateThresholds,
-              hasTranscriptSignals,
-              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-              contentFormat: selectedContentFormat,
-              targetPlatform: retentionTargetPlatform,
-              strategyProfile
-            })
-          }
-          const forcedReason = lowRetentionRecoveryRequested
-            ? 'Low-retention recovery ran but remained below target; using best available rescue output.'
+          const belowMinimum = Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT
+          const forcedReason = belowMinimum
+            ? `Predicted completion ${Number(selectedJudge?.retention_score ?? 0).toFixed(1)}% below ${MIN_PREDICTED_COMPLETION_PERCENT}% minimum. Continuing with best available rescue output.`
+            : lowRetentionRecoveryRequested
+              ? 'Low-retention recovery ran but remained below target; using best available rescue output.'
             : 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
