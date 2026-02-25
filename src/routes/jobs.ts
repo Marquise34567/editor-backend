@@ -611,11 +611,65 @@ type HookCandidate = {
   start: number
   duration: number
   score: number
+  score100?: number
   auditScore: number
   auditPassed: boolean
   text: string
   reason: string
   synthetic?: boolean
+}
+type Retention2026Metrics = {
+  introHold: number
+  interruptDensity: number
+  endingReplayPotential: number
+  energyCurve: number
+  silentCaptionViability: number
+  nicheFit: number
+}
+type Retention2026Score = {
+  completionPercent: number
+  metrics: Retention2026Metrics
+  interruptIntervalSeconds: number
+}
+type RankedClipCandidate = {
+  start: number
+  end: number
+  duration: number
+  predictedCompletion: number
+  metrics: Retention2026Metrics
+  interruptIntervalSeconds: number
+  score: number
+  reason: string
+  source: 'hook_anchor' | 'timeline_scan'
+}
+type LongFormPreScanChunk = {
+  index: number
+  start: number
+  end: number
+  avgEnergy: number
+  avgEmotion: number
+  avgSpeech: number
+  avgMotion: number
+  avgScore: number
+  transcriptDensity: number
+  spikeCount: number
+}
+type LongFormPreScanSummary = {
+  chunkSeconds: number
+  totalChunks: number
+  energyCurve: 'flat' | 'rising' | 'falling' | 'volatile' | 'steady'
+  dominantNiche: PacingNiche | null
+  candidateTarget: number
+  recommendedExports: number
+  highEnergyRanges: TimeRange[]
+  chunks: LongFormPreScanChunk[]
+}
+type VerticalClipSelectionResult = {
+  clipRanges: TimeRange[]
+  candidates: RankedClipCandidate[]
+  rejectedUnderThreshold: number
+  candidateTarget: number
+  exportTarget: number
 }
 type QualityGateThresholds = {
   hook_strength: number
@@ -662,6 +716,29 @@ type HookSelectionDecision = {
   threshold: number
   usedFallback: boolean
   reason: string | null
+}
+type VerticalRetentionPredictorBreakdown = {
+  hookStrength: number
+  interruptDensityQuality: number
+  endingLoopPotential: number
+  energyCurveQuality: number
+  captionSilentViability: number
+  introRetentionProxy: number
+  verticalFramingQuality: number
+}
+type VerticalRetentionCandidate = {
+  range: TimeRange
+  predictedCompletion: number
+  predictorBreakdown: VerticalRetentionPredictorBreakdown
+  reason: string
+}
+type VerticalRetentionSelectionResult = {
+  accepted: VerticalRetentionCandidate[]
+  rejectedCount: number
+  rejectionReasonsSummary: string[]
+  candidateTarget: number
+  outputTarget: number
+  evaluatedCount: number
 }
 type EmotionModeProfile = {
   enabled: boolean
@@ -1016,7 +1093,26 @@ const RENDER_FILTER_THREADS = (() => {
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
-const MAX_VERTICAL_CLIPS = 3
+const MAX_VERTICAL_CLIPS = 20
+const MIN_PREDICTED_COMPLETION_PERCENT = 70
+const LONG_CLIP_PREDICTION_FLOOR = 75
+const LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS = 45
+const LONG_FORM_PRESCAN_MAX_CHUNK_SECONDS = 75
+const CLIP_CANDIDATE_POOL_MIN = 15
+const CLIP_CANDIDATE_POOL_MAX = 50
+const CLIP_EXPORT_TARGET_MIN = 8
+const CLIP_EXPORT_TARGET_MAX = 20
+const HOOK_INTRO_RETENTION_MIN = 0.7
+const HOOK_SELECTION_MIN_SCORE = 0.8
+const STRICT_INTERRUPT_MAX_GAP_SECONDS = 5
+const STRICT_INTERRUPT_MIN_GAP_SECONDS = 3
+const RETENTION_2026_WEIGHTS = {
+  introHold: 0.4,
+  interruptDensity: 0.25,
+  endingReplayPotential: 0.15,
+  energyCurve: 0.1,
+  silentCaptionViability: 0.1
+} as const
 const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
 const LONG_FORM_MIN_EDIT_SECONDS = 20
@@ -1495,6 +1591,386 @@ const applyDurationBandSpeedTuning = ({
     return { ...segment, speed: Number(target.toFixed(3)) }
   })
 }
+const resolveHookCandidateTarget = (durationSeconds: number) => {
+  const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
+  if (minutes >= 180) return 50
+  if (minutes >= 120) return 44
+  if (minutes >= 60) return 36
+  if (minutes >= 30) return 30
+  if (minutes >= 10) return 24
+  return 20
+}
+const resolveClipCandidateTarget = ({
+  durationSeconds,
+  editorMode,
+  nicheProfile
+}: {
+  durationSeconds: number
+  editorMode?: EditorModeSelection | null
+  nicheProfile?: VideoNicheProfile | null
+}) => {
+  const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
+  let target = 15
+  if (minutes >= 120) target = 50
+  else if (minutes >= 90) target = 44
+  else if (minutes >= 60) target = 38
+  else if (minutes >= 40) target = 32
+  else if (minutes >= 20) target = 24
+  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') target += 4
+  if (nicheProfile?.niche === 'high_energy') target += 4
+  if (editorMode === 'education' || nicheProfile?.niche === 'education') target -= 2
+  return clamp(Math.round(target), CLIP_CANDIDATE_POOL_MIN, CLIP_CANDIDATE_POOL_MAX)
+}
+const resolveAutoExportClipTarget = ({
+  durationSeconds,
+  editorMode,
+  nicheProfile
+}: {
+  durationSeconds: number
+  editorMode?: EditorModeSelection | null
+  nicheProfile?: VideoNicheProfile | null
+}) => {
+  const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
+  let target = 8
+  if (minutes >= 120) target = 20
+  else if (minutes >= 90) target = 18
+  else if (minutes >= 60) target = 15
+  else if (minutes >= 40) target = 12
+  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') target += 2
+  if (nicheProfile?.niche === 'high_energy') target += 2
+  return clamp(Math.round(target), CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX)
+}
+const resolveInterruptIntervalRange = ({
+  strategyProfile,
+  editorMode,
+  styleProfile
+}: {
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  let minSec = 3
+  let maxSec = 5
+  if (strategyProfile === 'safe') {
+    minSec = 4
+    maxSec = 6
+  } else if (strategyProfile === 'balanced') {
+    minSec = 4
+    maxSec = 5
+  } else if (strategyProfile === 'viral') {
+    minSec = 3
+    maxSec = 4
+  }
+  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') {
+    minSec = 2
+    maxSec = 4
+  } else if (editorMode === 'education' || editorMode === 'commentary') {
+    minSec = 3
+    maxSec = 5
+  }
+  if (styleProfile?.style === 'tutorial') {
+    minSec = Math.max(minSec, 3)
+    maxSec = Math.max(maxSec, 5)
+  } else if (styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') {
+    minSec = Math.min(minSec, 2.5)
+    maxSec = Math.min(maxSec, 4.2)
+  }
+  return {
+    minSec: Number(clamp(minSec, 2, 6).toFixed(2)),
+    maxSec: Number(clamp(maxSec, minSec + 0.2, 6.5).toFixed(2))
+  }
+}
+const resolveInterruptTargetSeconds = ({
+  strategyProfile,
+  editorMode,
+  styleProfile
+}: {
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+}) => {
+  const range = resolveInterruptIntervalRange({ strategyProfile, editorMode, styleProfile })
+  return Number(((range.minSec + range.maxSec) / 2).toFixed(2))
+}
+const getTranscriptTextInRange = (cues: TranscriptCue[], start: number, end: number) => {
+  if (!Array.isArray(cues) || !cues.length) return ''
+  return cues
+    .filter((cue) => cue.end > start && cue.start < end)
+    .map((cue) => cue.text || '')
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+const getEndingOpenLoopSignal = (text: string) => {
+  const normalized = String(text || '').toLowerCase()
+  if (!normalized) return 0
+  let score = 0
+  if (/[?]/.test(normalized)) score += 0.34
+  if (/\b(part\s*2|more|next|follow|comment|what happens|wait|watch)\b/.test(normalized)) score += 0.38
+  if (/\b(but|before|until|later|soon|reveal)\b/.test(normalized)) score += 0.28
+  return clamp01(score)
+}
+const computeNicheFitScore = ({
+  windows,
+  start,
+  end,
+  editorMode,
+  nicheProfile
+}: {
+  windows: EngagementWindow[]
+  start: number
+  end: number
+  editorMode?: EditorModeSelection | null
+  nicheProfile?: VideoNicheProfile | null
+}) => {
+  const speech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+  const emotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
+  const action = averageWindowMetric(windows, start, end, (window) => (
+    0.55 * (window.actionSpike ?? 0) +
+    0.45 * window.motionScore
+  ))
+  const curiosity = averageWindowMetric(windows, start, end, (window) => window.curiosityTrigger ?? 0)
+  const mode = editorMode && editorMode !== 'auto' ? editorMode : null
+  if (mode === 'reaction' || mode === 'gaming' || mode === 'sports') {
+    return clamp01(0.46 * action + 0.32 * emotion + 0.22 * curiosity)
+  }
+  if (mode === 'education' || mode === 'commentary') {
+    return clamp01(0.52 * speech + 0.22 * curiosity + 0.26 * (1 - action * 0.5))
+  }
+  if (mode === 'vlog') {
+    return clamp01(0.4 * speech + 0.3 * emotion + 0.3 * curiosity)
+  }
+  if (nicheProfile?.niche === 'high_energy') {
+    return clamp01(0.44 * action + 0.32 * emotion + 0.24 * curiosity)
+  }
+  if (nicheProfile?.niche === 'education') {
+    return clamp01(0.52 * speech + 0.24 * curiosity + 0.24 * (1 - action * 0.4))
+  }
+  return clamp01(0.34 * speech + 0.28 * emotion + 0.2 * action + 0.18 * curiosity)
+}
+const computeRetention2026Score = ({
+  start,
+  end,
+  windows,
+  transcriptCues,
+  strategyProfile,
+  editorMode,
+  styleProfile,
+  nicheProfile,
+  captionsEnabled,
+  patternInterruptCount
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  transcriptCues?: TranscriptCue[]
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  captionsEnabled: boolean
+  patternInterruptCount?: number
+}): Retention2026Score => {
+  const safeStart = Number(start)
+  const safeEnd = Number(end)
+  const duration = Math.max(0.1, safeEnd - safeStart)
+  const introEnd = Math.min(safeEnd, safeStart + 3)
+  const introHold = clamp01(averageWindowMetric(windows, safeStart, introEnd, (window) => (
+    0.4 * (window.hookScore ?? window.score) +
+    0.18 * window.emotionIntensity +
+    0.16 * window.vocalExcitement +
+    0.14 * (window.actionSpike ?? 0) +
+    0.12 * (window.curiosityTrigger ?? 0)
+  )))
+
+  const interruptRange = resolveInterruptIntervalRange({ strategyProfile, editorMode, styleProfile })
+  const interruptEvents = Number.isFinite(Number(patternInterruptCount))
+    ? Number(patternInterruptCount)
+    : windows.reduce((count, window, index) => {
+      if (window.time < safeStart || window.time >= safeEnd) return count
+      const previous = index > 0 ? windows[index - 1] : null
+      const scoreJump = previous ? Math.abs((window.score ?? 0) - (previous.score ?? 0)) : 0
+      const audioJump = previous ? Math.abs((window.audioEnergy ?? 0) - (previous.audioEnergy ?? 0)) : 0
+      const event = (
+        (window.actionSpike ?? 0) >= 0.46 ||
+        window.sceneChangeRate >= 0.62 ||
+        window.emotionalSpike > 0 ||
+        scoreJump >= 0.2 ||
+        audioJump >= 0.22 ||
+        (window.curiosityTrigger ?? 0) >= 0.62
+      )
+      return event ? count + 1 : count
+    }, 0)
+  const interruptIntervalSeconds = interruptEvents > 0 ? duration / interruptEvents : duration
+  const interruptDensity = (() => {
+    if (interruptIntervalSeconds >= interruptRange.minSec && interruptIntervalSeconds <= interruptRange.maxSec) return 1
+    if (interruptIntervalSeconds < interruptRange.minSec) {
+      return clamp01(1 - (interruptRange.minSec - interruptIntervalSeconds) / Math.max(0.75, interruptRange.minSec) * 0.65)
+    }
+    return clamp01(1 - (interruptIntervalSeconds - interruptRange.maxSec) / Math.max(1, interruptRange.maxSec))
+  })()
+
+  const endingStart = Math.max(safeStart, safeEnd - Math.min(5, Math.max(2, duration * 0.22)))
+  const endingText = getTranscriptTextInRange(transcriptCues || [], endingStart, safeEnd)
+  const endingOpenLoop = getEndingOpenLoopSignal(endingText)
+  const endingReplayPotential = clamp01(
+    0.4 * endingOpenLoop +
+    0.25 * averageWindowMetric(windows, endingStart, safeEnd, (window) => window.curiosityTrigger ?? 0) +
+    0.2 * averageWindowMetric(windows, endingStart, safeEnd, (window) => window.emotionIntensity) +
+    0.15 * averageWindowMetric(windows, endingStart, safeEnd, (window) => (
+      0.55 * (window.actionSpike ?? 0) + 0.45 * window.sceneChangeRate
+    ))
+  )
+
+  const energySeries: number[] = windows
+    .filter((window) => window.time >= safeStart && window.time < safeEnd)
+    .map((window) => (
+      0.44 * window.score +
+      0.26 * window.emotionIntensity +
+      0.16 * window.vocalExcitement +
+      0.14 * window.audioEnergy
+    ))
+  const energyMean = energySeries.length
+    ? energySeries.reduce((sum, value) => sum + value, 0) / energySeries.length
+    : 0.5
+  const energyVariance = energySeries.length
+    ? energySeries.reduce((sum, value) => sum + (value - energyMean) ** 2, 0) / energySeries.length
+    : 0.02
+  const energyStd = Math.sqrt(Math.max(0, energyVariance))
+  let flatTransitions = 0
+  for (let index = 1; index < energySeries.length; index += 1) {
+    if (Math.abs(energySeries[index] - energySeries[index - 1]) < 0.03) flatTransitions += 1
+  }
+  const flatRatio = energySeries.length > 1 ? flatTransitions / (energySeries.length - 1) : 1
+  const nicheFit = computeNicheFitScore({
+    windows,
+    start: safeStart,
+    end: safeEnd,
+    editorMode,
+    nicheProfile
+  })
+  const energyCurve = clamp01(
+    0.52 * clamp01(energyStd * 2.2) +
+    0.26 * (1 - flatRatio) +
+    0.22 * nicheFit
+  )
+
+  const silentCaptionViability = clamp01(
+    0.38 * (captionsEnabled ? 1 : 0.55) +
+    0.24 * averageWindowMetric(windows, safeStart, safeEnd, (window) => window.textDensity) +
+    0.18 * averageWindowMetric(windows, safeStart, safeEnd, (window) => window.facePresence) +
+    0.12 * averageWindowMetric(windows, safeStart, safeEnd, (window) => window.motionScore) +
+    0.08 * averageWindowMetric(windows, safeStart, safeEnd, (window) => window.speechIntensity)
+  )
+
+  const completionPercent = Number(clamp(
+    100 * (
+      RETENTION_2026_WEIGHTS.introHold * introHold +
+      RETENTION_2026_WEIGHTS.interruptDensity * interruptDensity +
+      RETENTION_2026_WEIGHTS.endingReplayPotential * endingReplayPotential +
+      RETENTION_2026_WEIGHTS.energyCurve * energyCurve +
+      RETENTION_2026_WEIGHTS.silentCaptionViability * silentCaptionViability
+    ),
+    0,
+    100
+  ).toFixed(2))
+  return {
+    completionPercent,
+    interruptIntervalSeconds: Number(interruptIntervalSeconds.toFixed(3)),
+    metrics: {
+      introHold: Number(introHold.toFixed(4)),
+      interruptDensity: Number(interruptDensity.toFixed(4)),
+      endingReplayPotential: Number(endingReplayPotential.toFixed(4)),
+      energyCurve: Number(energyCurve.toFixed(4)),
+      silentCaptionViability: Number(silentCaptionViability.toFixed(4)),
+      nicheFit: Number(nicheFit.toFixed(4))
+    }
+  }
+}
+const buildLongFormPreScanSummary = ({
+  durationSeconds,
+  windows,
+  transcriptCues,
+  styleProfile,
+  nicheProfile,
+  editorMode
+}: {
+  durationSeconds: number
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  editorMode?: EditorModeSelection | null
+}): LongFormPreScanSummary => {
+  const safeDuration = Math.max(1, Number(durationSeconds || 0))
+  const dynamicChunk = clamp(
+    Math.round(safeDuration / 80),
+    LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS,
+    LONG_FORM_PRESCAN_MAX_CHUNK_SECONDS
+  )
+  const chunkSeconds = Number(dynamicChunk.toFixed(0))
+  const chunks: LongFormPreScanChunk[] = []
+  for (let start = 0; start < safeDuration; start += chunkSeconds) {
+    const end = Math.min(safeDuration, start + chunkSeconds)
+    const avgEnergy = averageWindowMetric(windows, start, end, (window) => window.audioEnergy)
+    const avgEmotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
+    const avgSpeech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+    const avgMotion = averageWindowMetric(windows, start, end, (window) => window.motionScore)
+    const avgScore = averageWindowMetric(windows, start, end, (window) => window.score)
+    const transcriptWords = getTranscriptTextInRange(transcriptCues, start, end).split(/\s+/).filter(Boolean).length
+    const transcriptDensity = clamp01(transcriptWords / Math.max(30, (end - start) * 1.5))
+    const spikeCount = windows.filter((window) => (
+      window.time >= start &&
+      window.time < end &&
+      (window.emotionalSpike > 0 || window.emotionIntensity >= 0.66 || (window.actionSpike ?? 0) >= 0.6)
+    )).length
+    chunks.push({
+      index: chunks.length + 1,
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      avgEnergy: Number(clamp01(avgEnergy).toFixed(4)),
+      avgEmotion: Number(clamp01(avgEmotion).toFixed(4)),
+      avgSpeech: Number(clamp01(avgSpeech).toFixed(4)),
+      avgMotion: Number(clamp01(avgMotion).toFixed(4)),
+      avgScore: Number(clamp01(avgScore).toFixed(4)),
+      transcriptDensity: Number(transcriptDensity.toFixed(4)),
+      spikeCount
+    })
+  }
+  const energyValues = chunks.map((chunk) => chunk.avgEnergy)
+  const mean = energyValues.length ? energyValues.reduce((sum, value) => sum + value, 0) / energyValues.length : 0.5
+  const variance = energyValues.length
+    ? energyValues.reduce((sum, value) => sum + (value - mean) ** 2, 0) / energyValues.length
+    : 0
+  const std = Math.sqrt(Math.max(0, variance))
+  const early = chunks.length ? chunks.slice(0, Math.max(1, Math.ceil(chunks.length * 0.25))).reduce((sum, chunk) => sum + chunk.avgEnergy, 0) / Math.max(1, Math.ceil(chunks.length * 0.25)) : mean
+  const late = chunks.length ? chunks.slice(Math.max(0, chunks.length - Math.max(1, Math.ceil(chunks.length * 0.25)))).reduce((sum, chunk) => sum + chunk.avgEnergy, 0) / Math.max(1, Math.ceil(chunks.length * 0.25)) : mean
+  const energyCurve: LongFormPreScanSummary['energyCurve'] =
+    std < 0.045
+      ? 'flat'
+      : late - early > 0.08
+        ? 'rising'
+        : early - late > 0.08
+          ? 'falling'
+          : std > 0.12
+            ? 'volatile'
+            : 'steady'
+  const highEnergyRanges = mergeRanges(
+    chunks
+      .filter((chunk) => chunk.avgScore >= 0.62 || chunk.avgEmotion >= 0.58 || chunk.spikeCount >= 2)
+      .map((chunk) => ({ start: chunk.start, end: chunk.end }))
+  )
+  return {
+    chunkSeconds,
+    totalChunks: chunks.length,
+    energyCurve,
+    dominantNiche: nicheProfile?.niche ?? null,
+    candidateTarget: resolveClipCandidateTarget({ durationSeconds: safeDuration, editorMode, nicheProfile }),
+    recommendedExports: resolveAutoExportClipTarget({ durationSeconds: safeDuration, editorMode, nicheProfile }),
+    highEnergyRanges,
+    chunks
+  }
+}
 const RETENTION_AGGRESSION_PRESET: Record<RetentionAggressionLevel, {
   cutMultiplier: number
   hookRelocateBias: number
@@ -1812,7 +2288,7 @@ const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'st
 const parseVerticalClipCount = (value?: any) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   if (!Number.isFinite(parsed)) return 1
-  return clamp(parsed, 1, MAX_VERTICAL_CLIPS)
+  return clamp(parsed, 0, MAX_VERTICAL_CLIPS)
 }
 
 const parseMaxCutsPreference = (value: any): number | null => {
@@ -4548,7 +5024,7 @@ const maybeAllowQualityGateOverride = ({
   const emotionOk = judge.emotional_pull >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull, thresholds.emotional_pull - emotionBuffer)
   const pacingOk = judge.pacing_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.pacing_score, thresholds.pacing_score - pacingBuffer)
   const retentionOk = judge.retention_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.retention_score, thresholds.retention_score - retentionBuffer)
-  if (hookOk && emotionOk && pacingOk && retentionOk && judge.retention_score >= RETENTION_RENDER_THRESHOLD) {
+  if (hookOk && emotionOk && pacingOk && retentionOk && judge.retention_score >= Math.max(RETENTION_RENDER_THRESHOLD, MIN_PREDICTED_COMPLETION_PERCENT)) {
     if (!hasTranscript) {
       return 'Quality gate override: transcript unavailable, accepted strongest non-verbal retention cut.'
     }
@@ -4561,6 +5037,7 @@ const maybeAllowQualityGateOverride = ({
 
 const shouldForceRescueRender = (judge: RetentionJudgeReport) => {
   return (
+    judge.retention_score >= MIN_PREDICTED_COMPLETION_PERCENT &&
     judge.retention_score >= RESCUE_RENDER_MINIMUMS.retention_score &&
     judge.hook_strength >= RESCUE_RENDER_MINIMUMS.hook_strength &&
     judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score
@@ -5681,6 +6158,7 @@ const pickTopHookCandidates = ({
     nicheProfile,
     aggressionLevel
   })
+  const hookCandidateTarget = resolveHookCandidateTarget(durationSeconds)
   const starts = new Set<number>()
   segments.forEach((segment) => starts.add(Number(segment.start.toFixed(2))))
   windows
@@ -5760,6 +6238,7 @@ const pickTopHookCandidates = ({
         start: aligned.start,
         duration: Number((aligned.end - aligned.start).toFixed(3)),
         score: Number(totalScore.toFixed(4)),
+        score100: Number((totalScore * 100).toFixed(2)),
         auditScore: audit.auditScore,
         auditPassed: audit.passed,
         text: hookText,
@@ -5796,7 +6275,7 @@ const pickTopHookCandidates = ({
   const uniqueTop = dedupeByStartSpacing(
     rankedEvaluated,
     1.3,
-    Math.max(HOOK_SELECTION_MAX_CANDIDATES * 5, 20)
+    Math.max(hookCandidateTarget * 3, 24)
   )
   if (!uniqueTop.length) {
     const synthetic = buildSyntheticHookCandidate({ durationSeconds, segments, windows, transcriptCues })
@@ -5831,7 +6310,7 @@ const pickTopHookCandidates = ({
         return center >= partition.start && center < partition.end
       }),
       0.8,
-      Math.max(HOOK_SELECTION_MAX_CANDIDATES * 3, 10)
+      Math.max(hookCandidateTarget, 12)
     )
     if (!partitionPool.length) continue
     const nearEightPool = partitionPool.filter((candidate) => candidate.duration >= 7.4)
@@ -5850,7 +6329,7 @@ const pickTopHookCandidates = ({
   }
   const faceoffPool = partitionWinners.length
     ? partitionWinners
-    : uniqueTop.slice(0, Math.max(4, HOOK_SELECTION_MAX_CANDIDATES))
+    : uniqueTop.slice(0, Math.max(8, hookCandidateTarget))
   const faceoffRanked = faceoffPool
     .map((candidate) => ({
       candidate,
@@ -5861,7 +6340,11 @@ const pickTopHookCandidates = ({
       b.candidate.score - a.candidate.score ||
       a.candidate.start - b.candidate.start
     ))
-  let selected = (faceoffRanked.find((entry) => entry.candidate.auditPassed) || faceoffRanked[0]).candidate
+  const highConfidencePreferred = faceoffRanked.find((entry) => (
+    entry.candidate.auditPassed &&
+    Number((entry.candidate.score100 ?? entry.candidate.score * 100).toFixed(2)) >= 85
+  ))
+  let selected = (highConfidencePreferred || faceoffRanked.find((entry) => entry.candidate.auditPassed) || faceoffRanked[0]).candidate
   if (hookCalibration?.enabled && hookCalibration.sampleSize >= HOOK_CALIBRATION_MIN_SAMPLES) {
     selected = {
       ...selected,
@@ -5891,7 +6374,7 @@ const pickTopHookCandidates = ({
       ...uniqueTop
     ],
     1.05,
-    Math.max(HOOK_SELECTION_MAX_CANDIDATES * 4, 14)
+    Math.max(hookCandidateTarget, 20)
   )
   const finalRanked = [
     selected,
@@ -5907,7 +6390,7 @@ const pickTopHookCandidates = ({
     ))
     if (duplicate) continue
     dedupedFinal.push(candidate)
-    if (dedupedFinal.length >= HOOK_SELECTION_MAX_CANDIDATES) break
+    if (dedupedFinal.length >= hookCandidateTarget) break
   }
   return { selected, topCandidates: dedupedFinal, hookFailureReason }
 }
@@ -7232,49 +7715,67 @@ const buildRetentionMetadataSummary = ({
 
 const buildVerticalMetadataSummary = ({
   durationSeconds,
-  clipRanges,
-  windows,
-  hookCandidates
+  selectedCandidates,
+  selectionResult,
+  preScan
 }: {
   durationSeconds: number
-  clipRanges: TimeRange[]
-  windows: EngagementWindow[]
-  hookCandidates: HookCandidate[]
+  selectedCandidates: VerticalRetentionCandidate[]
+  selectionResult: VerticalRetentionSelectionResult
+  preScan?: LongFormPreScanSummary | null
 }) => {
   const safeDuration = Math.max(0.1, Number.isFinite(durationSeconds) ? durationSeconds : 0)
-  const clipDetails = clipRanges.map((range, index) => {
+  const clipDetails = selectedCandidates.map((candidate, index) => {
+    const range = candidate.range
     const duration = Math.max(0, range.end - range.start)
-    const engagementScore = averageWindowMetric(windows, range.start, range.end, (window) => (
-      0.36 * (window.hookScore ?? window.score) +
-      0.2 * window.emotionIntensity +
-      0.14 * window.vocalExcitement +
-      0.1 * (window.curiosityTrigger ?? 0) +
-      0.1 * (window.actionSpike ?? 0) +
-      0.1 * window.sceneChangeRate
-    ))
     return {
       clip: index + 1,
       start: Number(range.start.toFixed(3)),
       end: Number(range.end.toFixed(3)),
       duration: Number(duration.toFixed(3)),
-      engagementScore: Number(clamp01(engagementScore).toFixed(4))
+      predictedCompletion: Number(candidate.predictedCompletion.toFixed(2)),
+      reason: candidate.reason,
+      predictorBreakdown: candidate.predictorBreakdown
     }
   })
-  const coverage = clipRanges.reduce((sum, range) => sum + Math.max(0, range.end - range.start), 0)
+  const coverage = selectedCandidates.reduce(
+    (sum, candidate) => sum + Math.max(0, candidate.range.end - candidate.range.start),
+    0
+  )
+  const predictedAverage = clipDetails.length
+    ? Number((
+        clipDetails.reduce((sum, clip) => sum + Number(clip.predictedCompletion || 0), 0) / clipDetails.length
+      ).toFixed(2))
+    : null
   return {
-    metadataVersion: 2,
+    metadataVersion: 3,
     generatedAt: toIsoNow(),
-    selectionMode: 'best_parts_ranked',
-    clipCount: clipRanges.length,
+    selectionMode: 'retention_ranked_2026',
+    clipCount: selectedCandidates.length,
     coverageRatio: Number(clamp01(coverage / safeDuration).toFixed(4)),
+    predictedAverage,
+    thresholds: {
+      minPredictedCompletionPercent: MIN_PREDICTED_COMPLETION_PERCENT,
+      longClipPredictionFloor: LONG_CLIP_PREDICTION_FLOOR,
+      minIntroRetentionProxy: HOOK_INTRO_RETENTION_MIN,
+      minHookStrength: HOOK_SELECTION_MIN_SCORE,
+      maxInterruptGapSeconds: STRICT_INTERRUPT_MAX_GAP_SECONDS
+    },
+    candidatePool: {
+      acceptedCount: Number(selectionResult.accepted.length),
+      rejectedCount: Number(selectionResult.rejectedCount || 0),
+      evaluatedCount: Number(selectionResult.evaluatedCount || selectionResult.accepted.length),
+      candidateTarget: Number(selectionResult.candidateTarget || selectionResult.accepted.length),
+      exportTarget: Number(selectionResult.outputTarget || selectedCandidates.length),
+      rejectionReasonsSummary: selectionResult.rejectionReasonsSummary,
+      targetRange: {
+        min: CLIP_EXPORT_TARGET_MIN,
+        max: CLIP_EXPORT_TARGET_MAX
+      }
+    },
     clips: clipDetails,
-    topHookReference: hookCandidates.length
-      ? {
-          start: Number(hookCandidates[0].start.toFixed(3)),
-          duration: Number(hookCandidates[0].duration.toFixed(3)),
-          score: Number(hookCandidates[0].score.toFixed(4))
-        }
-      : null
+    preScan: preScan || null,
+    topHookReference: null
   }
 }
 
@@ -8078,11 +8579,20 @@ const buildEditPlan = async (
     styleProfile,
     nicheProfile
   })
+  const styleInterruptTargetSeconds = resolveInterruptTargetSeconds({
+    strategyProfile: options.retentionStrategyProfile,
+    editorMode: options.editorMode,
+    styleProfile
+  })
+  const behaviorInterruptTargetSeconds = Number(behaviorStyleProfile.patternInterruptInterval)
+  const interruptTargetSeconds = Number.isFinite(behaviorInterruptTargetSeconds)
+    ? Number(((behaviorInterruptTargetSeconds + styleInterruptTargetSeconds) / 2).toFixed(2))
+    : styleInterruptTargetSeconds
   const interruptInjected = injectPatternInterrupts({
     segments: emotionalBeatAdjusted.segments,
     durationSeconds,
     aggressionLevel: styleAdjustedAggressionLevel,
-    targetIntervalSeconds: behaviorStyleProfile.patternInterruptInterval
+    targetIntervalSeconds: interruptTargetSeconds
   })
   const endingSpikeSegments = enforceEndingSpike({
     segments: interruptInjected.segments,
@@ -9228,130 +9738,803 @@ const waitForPreferredHookSelection = async ({
   return null
 }
 
+const buildClipCandidateReason = (candidate: RankedClipCandidate) => {
+  const hookDescriptor = candidate.metrics.introHold >= 0.78 ? 'Strong 2s hook' : 'Solid intro hold'
+  const intervalDescriptor = `${candidate.interruptIntervalSeconds.toFixed(1)}s interrupts`
+  const endingDescriptor = candidate.metrics.endingReplayPotential >= 0.68
+    ? 'question/open-loop ending'
+    : 'replay-friendly ending'
+  return `${Math.round(candidate.predictedCompletion)}%: ${hookDescriptor} + ${intervalDescriptor} + ${endingDescriptor}`
+}
+
+const buildVerticalClipSelection = (
+  durationSeconds: number,
+  requestedCount: number,
+  opts?: {
+    windows?: EngagementWindow[]
+    transcriptCues?: TranscriptCue[]
+    hookCandidates?: HookCandidate[]
+    captionsEnabled?: boolean
+    strategyProfile?: RetentionStrategyProfile | null
+    editorMode?: EditorModeSelection | null
+    styleProfile?: ContentStyleProfile | null
+    nicheProfile?: VideoNicheProfile | null
+    platformProfile?: PlatformProfile
+  }
+): VerticalClipSelectionResult => {
+  const total = Math.max(0, durationSeconds || 0)
+  if (total <= 0) {
+    return {
+      clipRanges: [{ start: 0, end: 0 }],
+      candidates: [],
+      rejectedUnderThreshold: 0,
+      candidateTarget: CLIP_CANDIDATE_POOL_MIN,
+      exportTarget: 1
+    }
+  }
+  const platformProfile = PLATFORM_EDIT_PROFILES[parsePlatformProfile(opts?.platformProfile, 'auto')] || PLATFORM_EDIT_PROFILES.auto
+  const windows = Array.isArray(opts?.windows) ? opts.windows : []
+  const transcriptCues = Array.isArray(opts?.transcriptCues) ? opts.transcriptCues : []
+  const hookCandidates = Array.isArray(opts?.hookCandidates) ? opts.hookCandidates : []
+  const candidateTarget = resolveClipCandidateTarget({
+    durationSeconds: total,
+    editorMode: opts?.editorMode,
+    nicheProfile: opts?.nicheProfile ?? null
+  })
+  const recommendedExportTarget = resolveAutoExportClipTarget({
+    durationSeconds: total,
+    editorMode: opts?.editorMode,
+    nicheProfile: opts?.nicheProfile ?? null
+  })
+  const requested = Number.isFinite(Number(requestedCount)) ? Number(requestedCount) : 0
+  let exportTarget = requested > 0 ? Math.round(requested) : recommendedExportTarget
+  const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(8, platformProfile.verticalMinClipSeconds)))
+  exportTarget = clamp(exportTarget, 1, Math.min(MAX_VERTICAL_CLIPS, maxFeasibleByLength))
+  const buildFallbackRanges = (count: number) => {
+    const chunk = total / Math.max(1, count)
+    const ranges: TimeRange[] = []
+    for (let index = 0; index < count; index += 1) {
+      const start = Number((index * chunk).toFixed(3))
+      const end = Number((index === count - 1 ? total : (index + 1) * chunk).toFixed(3))
+      if (end - start > 0.2) ranges.push({ start, end })
+    }
+    return ranges.length ? ranges : [{ start: 0, end: total }]
+  }
+  if (!windows.length) {
+    return {
+      clipRanges: buildFallbackRanges(exportTarget),
+      candidates: [],
+      rejectedUnderThreshold: 0,
+      candidateTarget,
+      exportTarget
+    }
+  }
+
+  const highEnergyMode = (
+    opts?.editorMode === 'reaction' ||
+    opts?.editorMode === 'gaming' ||
+    opts?.editorMode === 'sports' ||
+    opts?.nicheProfile?.niche === 'high_energy' ||
+    opts?.styleProfile?.style === 'reaction' ||
+    opts?.styleProfile?.style === 'gaming'
+  )
+  const baseDurations = [15, 18, 21, 24, 27, 30, 33, 35]
+  const durationSet = new Set<number>(baseDurations)
+  if (highEnergyMode || opts?.strategyProfile === 'viral') durationSet.add(38)
+  if (total >= 45) [45, 50, 55, 60].forEach((duration) => durationSet.add(duration))
+  const candidateDurations = Array.from(durationSet)
+    .filter((duration) => duration <= Math.min(60, total))
+    .filter((duration) => duration >= Math.max(12, Math.min(15, platformProfile.verticalMinClipSeconds)))
+    .sort((a, b) => a - b)
+  const timelineStep = total >= 7_200
+    ? 4
+    : total >= 3_600
+      ? 3
+      : total >= 1_800
+        ? 2
+        : 1
+  const anchorStarts = new Set<number>()
+  for (let second = 0; second <= Math.max(0, Math.floor(total - 12)); second += timelineStep) {
+    anchorStarts.add(second)
+  }
+  hookCandidates
+    .slice(0, Math.max(8, resolveHookCandidateTarget(total)))
+    .forEach((candidate) => {
+      const anchors = [candidate.start - 3, candidate.start - 1.5, candidate.start, candidate.start + 1.5]
+      anchors.forEach((start) => anchorStarts.add(Number(clamp(start, 0, Math.max(0, total - 12)).toFixed(3))))
+    })
+  windows
+    .slice()
+    .sort((a, b) => (
+      (b.hookScore ?? b.score) - (a.hookScore ?? a.score) ||
+      b.emotionIntensity - a.emotionIntensity
+    ))
+    .slice(0, 80)
+    .forEach((window) => {
+      anchorStarts.add(Number(clamp(window.time - 1, 0, Math.max(0, total - 12)).toFixed(3)))
+    })
+
+  const anchorList = Array.from(anchorStarts.values()).sort((a, b) => a - b)
+  const rankedMap = new Map<string, RankedClipCandidate>()
+  let rejectedUnderThreshold = 0
+  for (const startCandidate of anchorList) {
+    for (const duration of candidateDurations) {
+      const start = Number(clamp(startCandidate, 0, Math.max(0, total - duration)).toFixed(3))
+      const end = Number((start + duration).toFixed(3))
+      if (end > total + 0.01) continue
+      const prediction = computeRetention2026Score({
+        start,
+        end,
+        windows,
+        transcriptCues,
+        strategyProfile: opts?.strategyProfile ?? null,
+        editorMode: opts?.editorMode ?? null,
+        styleProfile: opts?.styleProfile ?? null,
+        nicheProfile: opts?.nicheProfile ?? null,
+        captionsEnabled: Boolean(opts?.captionsEnabled)
+      })
+      const predictedCompletion = prediction.completionPercent
+      if (duration >= 45 && predictedCompletion < LONG_CLIP_PREDICTION_FLOOR) {
+        rejectedUnderThreshold += 1
+        continue
+      }
+      if (predictedCompletion < MIN_PREDICTED_COMPLETION_PERCENT) {
+        rejectedUnderThreshold += 1
+        continue
+      }
+      const source = hookCandidates.some((candidate) => Math.abs(candidate.start - start) <= 3)
+        ? 'hook_anchor'
+        : 'timeline_scan'
+      const score = Number(clamp01(
+        predictedCompletion / 100 * 0.78 +
+        prediction.metrics.introHold * 0.12 +
+        prediction.metrics.endingReplayPotential * 0.1
+      ).toFixed(6))
+      const rankedCandidate: RankedClipCandidate = {
+        start,
+        end,
+        duration: Number(duration.toFixed(3)),
+        predictedCompletion: Number(predictedCompletion.toFixed(2)),
+        metrics: prediction.metrics,
+        interruptIntervalSeconds: prediction.interruptIntervalSeconds,
+        score,
+        reason: '',
+        source
+      }
+      rankedCandidate.reason = buildClipCandidateReason(rankedCandidate)
+      const key = `${start.toFixed(2)}:${end.toFixed(2)}`
+      const existing = rankedMap.get(key)
+      if (!existing || rankedCandidate.score > existing.score) {
+        rankedMap.set(key, rankedCandidate)
+      }
+    }
+  }
+  const rankedCandidates = Array.from(rankedMap.values())
+    .sort((a, b) => (
+      b.predictedCompletion - a.predictedCompletion ||
+      b.score - a.score ||
+      a.start - b.start
+    ))
+    .slice(0, candidateTarget)
+  if (!rankedCandidates.length) {
+    return {
+      clipRanges: buildFallbackRanges(exportTarget),
+      candidates: [],
+      rejectedUnderThreshold,
+      candidateTarget,
+      exportTarget
+    }
+  }
+  const selected: RankedClipCandidate[] = []
+  for (const candidate of rankedCandidates) {
+    if (selected.length >= exportTarget) break
+    const minSpacing = Math.max(2, candidate.duration * clamp(platformProfile.verticalSpacingRatio, 0.18, 0.44))
+    const overlaps = selected.some((existing) => (
+      candidate.start < existing.end + minSpacing &&
+      candidate.end > existing.start - minSpacing
+    ))
+    if (overlaps) continue
+    selected.push(candidate)
+  }
+  if (selected.length < exportTarget) {
+    for (const candidate of rankedCandidates) {
+      if (selected.length >= exportTarget) break
+      const duplicate = selected.some((existing) => (
+        Math.abs(existing.start - candidate.start) < 0.01 &&
+        Math.abs(existing.end - candidate.end) < 0.01
+      ))
+      if (duplicate) continue
+      selected.push(candidate)
+    }
+  }
+  if (selected.length < exportTarget) {
+    const fallback = buildFallbackRanges(exportTarget)
+    for (const range of fallback) {
+      if (selected.length >= exportTarget) break
+      selected.push({
+        start: range.start,
+        end: range.end,
+        duration: Number(Math.max(0, range.end - range.start).toFixed(3)),
+        predictedCompletion: Number(MIN_PREDICTED_COMPLETION_PERCENT.toFixed(2)),
+        metrics: {
+          introHold: 0.7,
+          interruptDensity: 0.65,
+          endingReplayPotential: 0.62,
+          energyCurve: 0.66,
+          silentCaptionViability: 0.64,
+          nicheFit: 0.66
+        },
+        interruptIntervalSeconds: resolveInterruptTargetSeconds({
+          strategyProfile: opts?.strategyProfile ?? null,
+          editorMode: opts?.editorMode ?? null,
+          styleProfile: opts?.styleProfile ?? null
+        }),
+        score: 0.65,
+        reason: '70%: Fallback clip added to meet requested output count.',
+        source: 'timeline_scan'
+      })
+    }
+  }
+  return {
+    clipRanges: selected.slice(0, exportTarget).map((candidate) => ({
+      start: Number(candidate.start.toFixed(3)),
+      end: Number(candidate.end.toFixed(3))
+    })),
+    candidates: rankedCandidates,
+    rejectedUnderThreshold,
+    candidateTarget,
+    exportTarget
+  }
+}
+
 const buildVerticalClipRanges = (
   durationSeconds: number,
   requestedCount: number,
   opts?: {
     windows?: EngagementWindow[]
+    transcriptCues?: TranscriptCue[]
+    hookCandidates?: HookCandidate[]
+    captionsEnabled?: boolean
+    strategyProfile?: RetentionStrategyProfile | null
+    editorMode?: EditorModeSelection | null
+    styleProfile?: ContentStyleProfile | null
+    nicheProfile?: VideoNicheProfile | null
     platformProfile?: PlatformProfile
   }
-) => {
-  const total = Math.max(0, durationSeconds || 0)
-  if (total <= 0) return [{ start: 0, end: 0 }]
-  const platformProfile = PLATFORM_EDIT_PROFILES[parsePlatformProfile(opts?.platformProfile, 'auto')] || PLATFORM_EDIT_PROFILES.auto
-  let clipCount = clamp(requestedCount || 1, 1, MAX_VERTICAL_CLIPS)
-  const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(1, platformProfile.verticalMinClipSeconds)))
-  clipCount = Math.min(clipCount, maxFeasibleByLength)
-  const windows = Array.isArray(opts?.windows) ? opts!.windows! : []
+) => (
+  buildVerticalClipSelection(durationSeconds, requestedCount, opts).clipRanges
+)
 
-  const fallbackRanges = (() => {
-    const chunk = total / clipCount
-    const ranges: TimeRange[] = []
-    for (let index = 0; index < clipCount; index += 1) {
-      const start = Number((index * chunk).toFixed(3))
-      const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
-      if (end - start > 0.2) ranges.push({ start, end })
-    }
-    return ranges.length ? ranges : [{ start: 0, end: total }]
-  })()
+const getVerticalInterruptTargetIntervalSeconds = (platformProfile?: PlatformProfile): number => {
+  const normalized = parsePlatformProfile(platformProfile, 'auto')
+  if (normalized === 'tiktok') return 3.2
+  if (normalized === 'instagram_reels') return 3.6
+  if (normalized === 'youtube') return 4.6
+  return 4
+}
 
-  if (!windows.length) return fallbackRanges
+const getVerticalCandidateTargetCount = (durationSeconds: number) => {
+  const runtime = Math.max(1, Number(durationSeconds || 0))
+  const chunkSeconds = (LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS + LONG_FORM_PRESCAN_MAX_CHUNK_SECONDS) / 2
+  const scaled = Math.round(runtime / Math.max(30, chunkSeconds))
+  return Math.round(clamp(
+    CLIP_CANDIDATE_POOL_MIN - 1 + scaled,
+    CLIP_CANDIDATE_POOL_MIN,
+    CLIP_CANDIDATE_POOL_MAX
+  ))
+}
 
-  const targetClipDuration = Number(clamp(
-    total / Math.max(1, clipCount * platformProfile.verticalClipDurationDivisor),
-    Math.max(2, platformProfile.verticalMinClipSeconds),
-    Math.max(
-      Math.max(2, platformProfile.verticalMinClipSeconds),
-      platformProfile.verticalMaxClipSeconds
+const collectInterruptMarkersForRange = ({
+  windows,
+  start,
+  end
+}: {
+  windows: EngagementWindow[]
+  start: number
+  end: number
+}) => {
+  const marks: number[] = []
+  const relevant = windows.filter((window) => window.time >= start && window.time < end)
+  for (const window of relevant) {
+    const interruptSignal = clamp01(
+      0.38 * clamp01(window.sceneChangeRate * 1.8) +
+      0.22 * (window.actionSpike ?? 0) +
+      0.2 * window.motionScore +
+      0.2 * clamp01(window.vocalExcitement * 0.85 + window.emotionIntensity * 0.15)
     )
-  ).toFixed(3))
-  const step = total > 300 ? 2 : 1
-  const candidates: Array<{ range: TimeRange; score: number }> = []
+    if (!window.patternInterrupt && interruptSignal < 0.56) continue
+    const t = Number(clamp(window.time, start, end).toFixed(3))
+    if (!marks.length || t - marks[marks.length - 1] >= 0.8) {
+      marks.push(t)
+    }
+  }
+  return marks
+}
 
-  for (let start = 0; start + targetClipDuration <= total; start += step) {
-    const end = Number((start + targetClipDuration).toFixed(3))
-    const startRounded = Number(start.toFixed(3))
-    const coreScore = averageWindowMetric(windows, startRounded, end, (window) => (
-      0.3 * window.score +
-      0.2 * window.emotionIntensity +
-      0.16 * window.vocalExcitement +
-      0.13 * (window.actionSpike ?? 0) +
-      0.1 * window.motionScore +
-      0.07 * window.sceneChangeRate +
-      0.04 * window.speechIntensity
-    ))
-    const spikeScore = averageWindowMetric(windows, startRounded, end, (window) => (
-      Math.max(
-        window.emotionIntensity,
-        window.vocalExcitement,
-        window.motionScore,
-        window.sceneChangeRate,
-        window.actionSpike ?? 0
-      )
-    ))
-    const score = Number((coreScore * 0.78 + spikeScore * 0.22).toFixed(5))
-    candidates.push({
-      range: { start: startRounded, end },
-      score
+const computeInterruptGapMaxSeconds = ({
+  marks,
+  start,
+  end
+}: {
+  marks: number[]
+  start: number
+  end: number
+}) => {
+  if (end <= start) return 0
+  const sorted = marks.slice().sort((a, b) => a - b)
+  const boundaries = [start, ...sorted, end]
+  let maxGap = 0
+  for (let index = 1; index < boundaries.length; index += 1) {
+    const gap = Math.max(0, boundaries[index] - boundaries[index - 1])
+    if (gap > maxGap) maxGap = gap
+  }
+  return Number(maxGap.toFixed(3))
+}
+
+const computeVerticalFramingQuality = ({
+  start,
+  end,
+  windows
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+}) => {
+  return clamp01(averageWindowMetric(windows, start, end, (window) => {
+    const facePresence = clamp01(window.facePresence)
+    const centerX = Number.isFinite(window.faceCenterX) ? Number(window.faceCenterX) : 0.5
+    const centerY = Number.isFinite(window.faceCenterY) ? Number(window.faceCenterY) : 0.5
+    const centerOffset = clamp01(
+      0.58 * Math.min(1, Math.abs(centerX - 0.5) * 2) +
+      0.42 * Math.min(1, Math.abs(centerY - 0.5) * 2)
+    )
+    const centering = 1 - centerOffset
+    const fallbackVisual = clamp01(
+      0.55 * window.motionScore +
+      0.25 * (window.visualImpact ?? 0) +
+      0.2 * (window.actionSpike ?? 0)
+    )
+    return clamp01(
+      0.62 * Math.max(facePresence, fallbackVisual) +
+      0.38 * centering
+    )
+  }))
+}
+
+const computeVerticalIntroRetentionProxy = ({
+  start,
+  end,
+  windows,
+  framingQuality
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  framingQuality: number
+}) => {
+  const introEnd = Math.min(end, start + 3)
+  const curiosity = averageWindowMetric(windows, start, introEnd, (window) => (
+    0.58 * (window.curiosityTrigger ?? 0) +
+    0.42 * (window.keywordIntensity ?? 0)
+  ))
+  const energyLift = averageWindowMetric(windows, start, introEnd, (window) => (
+    0.34 * window.audioEnergy +
+    0.24 * window.vocalExcitement +
+    0.22 * window.speechIntensity +
+    0.2 * window.emotionIntensity
+  ))
+  const visualInterrupt = averageWindowMetric(windows, start, introEnd, (window) => (
+    0.42 * clamp01(window.sceneChangeRate * 1.8) +
+    0.34 * window.motionScore +
+    0.24 * (window.actionSpike ?? 0)
+  ))
+  return clamp01(
+    0.36 * curiosity +
+    0.3 * energyLift +
+    0.2 * visualInterrupt +
+    0.14 * framingQuality
+  )
+}
+
+const computeVerticalEndingReplayPotential = ({
+  start,
+  end,
+  windows,
+  hookStrength
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  hookStrength: number
+}) => {
+  const duration = Math.max(0.5, end - start)
+  const tailStart = Math.max(start, end - Math.min(4, duration * 0.28))
+  const midStart = start + duration * 0.3
+  const midEnd = start + duration * 0.7
+  const midEnergy = averageWindowMetric(windows, midStart, midEnd, (window) => (
+    0.5 * window.emotionIntensity + 0.5 * window.vocalExcitement
+  ))
+  const tailCuriosity = averageWindowMetric(windows, tailStart, end, (window) => (
+    0.6 * (window.curiosityTrigger ?? 0) + 0.4 * (window.keywordIntensity ?? 0)
+  ))
+  const tailAction = averageWindowMetric(windows, tailStart, end, (window) => (
+    0.35 * clamp01(window.sceneChangeRate * 1.6) +
+    0.3 * (window.actionSpike ?? 0) +
+    0.2 * window.motionScore +
+    0.15 * window.vocalExcitement
+  ))
+  const tailEnergy = averageWindowMetric(windows, tailStart, end, (window) => (
+    0.56 * window.emotionIntensity + 0.44 * window.vocalExcitement
+  ))
+  const ramp = clamp01((tailEnergy - midEnergy) * 1.15 + 0.5)
+  return clamp01(
+    0.38 * tailCuriosity +
+    0.28 * tailAction +
+    0.2 * ramp +
+    0.14 * hookStrength
+  )
+}
+
+const computeVerticalEnergyCurveQuality = ({
+  start,
+  end,
+  windows
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+}) => {
+  const relevant = windows
+    .filter((window) => window.time >= start && window.time < end)
+    .sort((a, b) => a.time - b.time)
+  if (relevant.length < 2) return 0.5
+  const series = relevant.map((window) => (
+    0.44 * window.audioEnergy +
+    0.28 * window.emotionIntensity +
+    0.18 * window.vocalExcitement +
+    0.1 * (window.actionSpike ?? 0)
+  ))
+  const mean = series.reduce((sum, value) => sum + value, 0) / series.length
+  const variance = series.reduce((sum, value) => sum + (value - mean) ** 2, 0) / series.length
+  const std = Math.sqrt(Math.max(0, variance))
+  const dynamicRange = clamp01(std / 0.2)
+  const trend = clamp01((series[series.length - 1] - series[0]) * 1.2 + 0.5)
+  let flatTransitions = 0
+  for (let index = 1; index < series.length; index += 1) {
+    if (Math.abs(series[index] - series[index - 1]) < 0.025) flatTransitions += 1
+  }
+  const flatRatio = flatTransitions / Math.max(1, series.length - 1)
+  return clamp01(
+    0.42 * dynamicRange +
+    0.28 * trend +
+    0.3 * (1 - flatRatio)
+  )
+}
+
+const computeVerticalSilentCaptionViability = ({
+  start,
+  end,
+  windows,
+  framingQuality
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  framingQuality: number
+}) => {
+  const duration = Math.max(0.5, end - start)
+  const earlyEnd = Math.min(end, start + Math.min(10, duration))
+  const captionDensityEarly = averageWindowMetric(windows, start, earlyEnd, (window) => window.textDensity)
+  const captionDensityOverall = averageWindowMetric(windows, start, end, (window) => window.textDensity)
+  const visualNarrative = averageWindowMetric(windows, start, end, (window) => (
+    0.38 * window.facePresence +
+    0.28 * window.motionScore +
+    0.2 * (window.visualImpact ?? 0) +
+    0.14 * (window.actionSpike ?? 0)
+  ))
+  const viability = clamp01(
+    0.34 * captionDensityEarly +
+    0.2 * captionDensityOverall +
+    0.26 * visualNarrative +
+    0.2 * framingQuality
+  )
+  if (captionDensityEarly < 0.12 && visualNarrative < 0.45) {
+    return clamp01(viability * 0.82)
+  }
+  return viability
+}
+
+const buildVerticalRetentionReason = ({
+  predictedCompletion,
+  interruptIntervalSeconds,
+  endingLoopPotential
+}: {
+  predictedCompletion: number
+  interruptIntervalSeconds: number
+  endingLoopPotential: number
+}) => {
+  const loopLabel = endingLoopPotential >= 0.78
+    ? 'strong question-loop ending'
+    : endingLoopPotential >= 0.68
+      ? 'clear loop ending'
+      : 'moderate loop ending'
+  return `${Math.round(predictedCompletion)}% likely: 2s curiosity hook + ${interruptIntervalSeconds.toFixed(1)}s interrupts + ${loopLabel} + strong silent-caption fit.`
+}
+
+const scoreVerticalRetentionCandidate = ({
+  range,
+  windows,
+  platformProfile
+}: {
+  range: TimeRange
+  windows: EngagementWindow[]
+  platformProfile?: PlatformProfile
+}): { candidate: VerticalRetentionCandidate | null; rejectReason: string | null } => {
+  const start = Number(range.start.toFixed(3))
+  const end = Number(range.end.toFixed(3))
+  const duration = Math.max(0.1, end - start)
+  if (duration < 15) {
+    return { candidate: null, rejectReason: 'clip_too_short' }
+  }
+  if (duration > 60) {
+    return { candidate: null, rejectReason: 'clip_too_long' }
+  }
+  const framingQuality = computeVerticalFramingQuality({ start, end, windows })
+  if (framingQuality < 0.42) {
+    return { candidate: null, rejectReason: 'poor_vertical_framing' }
+  }
+
+  const introRetentionProxy = computeVerticalIntroRetentionProxy({
+    start,
+    end,
+    windows,
+    framingQuality
+  })
+  if (introRetentionProxy < HOOK_INTRO_RETENTION_MIN) {
+    return { candidate: null, rejectReason: 'weak_intro_retention' }
+  }
+  const curiositySignal = averageWindowMetric(windows, start, Math.min(end, start + 3), (window) => (
+    0.6 * (window.curiosityTrigger ?? 0) + 0.4 * (window.keywordIntensity ?? 0)
+  ))
+  const hookStrength = clamp01(
+    0.56 * introRetentionProxy +
+    0.24 * curiositySignal +
+    0.2 * framingQuality
+  )
+  if (hookStrength < HOOK_SELECTION_MIN_SCORE) {
+    return { candidate: null, rejectReason: 'hook_below_80' }
+  }
+
+  const interruptMarks = collectInterruptMarkersForRange({ windows, start, end })
+  const targetInterval = getVerticalInterruptTargetIntervalSeconds(platformProfile)
+  const targetCount = Math.max(1, Math.ceil(duration / targetInterval))
+  const interruptCoverage = clamp01(interruptMarks.length / targetCount)
+  const maxInterruptGap = computeInterruptGapMaxSeconds({ marks: interruptMarks, start, end })
+  if (maxInterruptGap > STRICT_INTERRUPT_MAX_GAP_SECONDS + 0.25) {
+    return { candidate: null, rejectReason: 'interrupt_gap_over_5s' }
+  }
+  const gapPenalty = clamp01((maxInterruptGap - STRICT_INTERRUPT_MIN_GAP_SECONDS) / Math.max(1, STRICT_INTERRUPT_MAX_GAP_SECONDS - STRICT_INTERRUPT_MIN_GAP_SECONDS))
+  const interruptDensityQuality = clamp01(
+    0.72 * interruptCoverage +
+    0.28 * (1 - gapPenalty)
+  )
+
+  const endingLoopPotential = computeVerticalEndingReplayPotential({
+    start,
+    end,
+    windows,
+    hookStrength
+  })
+  const energyCurveQuality = computeVerticalEnergyCurveQuality({ start, end, windows })
+  const captionSilentViability = computeVerticalSilentCaptionViability({
+    start,
+    end,
+    windows,
+    framingQuality
+  })
+  const predictedCompletion = Number((100 * clamp01(
+    RETENTION_2026_WEIGHTS.introHold * hookStrength +
+    RETENTION_2026_WEIGHTS.interruptDensity * interruptDensityQuality +
+    RETENTION_2026_WEIGHTS.endingReplayPotential * endingLoopPotential +
+    RETENTION_2026_WEIGHTS.energyCurve * energyCurveQuality +
+    RETENTION_2026_WEIGHTS.silentCaptionViability * captionSilentViability
+  )).toFixed(2))
+
+  if (duration > 35 && predictedCompletion < LONG_CLIP_PREDICTION_FLOOR) {
+    return { candidate: null, rejectReason: 'long_clip_below_75' }
+  }
+  if (predictedCompletion < MIN_PREDICTED_COMPLETION_PERCENT) {
+    return { candidate: null, rejectReason: 'predicted_completion_below_70' }
+  }
+
+  const observedInterruptInterval = interruptMarks.length >= 2
+    ? (end - start) / Math.max(1, interruptMarks.length)
+    : targetInterval
+  const candidate: VerticalRetentionCandidate = {
+    range: { start, end },
+    predictedCompletion,
+    predictorBreakdown: {
+      hookStrength: Number(hookStrength.toFixed(4)),
+      interruptDensityQuality: Number(interruptDensityQuality.toFixed(4)),
+      endingLoopPotential: Number(endingLoopPotential.toFixed(4)),
+      energyCurveQuality: Number(energyCurveQuality.toFixed(4)),
+      captionSilentViability: Number(captionSilentViability.toFixed(4)),
+      introRetentionProxy: Number(introRetentionProxy.toFixed(4)),
+      verticalFramingQuality: Number(framingQuality.toFixed(4))
+    },
+    reason: buildVerticalRetentionReason({
+      predictedCompletion,
+      interruptIntervalSeconds: observedInterruptInterval,
+      endingLoopPotential
     })
   }
+  return { candidate, rejectReason: null }
+}
 
-  if (!candidates.length) return fallbackRanges
-  const sorted = candidates
+const summarizeVerticalRejections = (reasons: string[]) => {
+  if (!reasons.length) return [] as string[]
+  const counts = new Map<string, number>()
+  for (const reason of reasons) {
+    counts.set(reason, (counts.get(reason) || 0) + 1)
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 4)
+    .map(([reason, count]) => `${reason}:${count}`)
+}
+
+const buildVerticalRetentionCandidates = ({
+  durationSeconds,
+  requestedCount,
+  windows,
+  platformProfile
+}: {
+  durationSeconds: number
+  requestedCount: number
+  windows: EngagementWindow[]
+  platformProfile?: PlatformProfile
+}): VerticalRetentionSelectionResult => {
+  const total = Math.max(0, durationSeconds || 0)
+  const outputTarget = Math.round(clamp(
+    Math.max(CLIP_EXPORT_TARGET_MIN, requestedCount * 4),
+    CLIP_EXPORT_TARGET_MIN,
+    CLIP_EXPORT_TARGET_MAX
+  ))
+  if (total <= 0 || !windows.length) {
+    return {
+      accepted: [],
+      rejectedCount: 1,
+      rejectionReasonsSummary: ['insufficient_signal_windows:1'],
+      candidateTarget: getVerticalCandidateTargetCount(total),
+      outputTarget,
+      evaluatedCount: 0
+    }
+  }
+  const candidateTarget = getVerticalCandidateTargetCount(total)
+  const minDuration = 15
+  const clipDurations = [
+    15,
+    18,
+    22,
+    26,
+    30,
+    35,
+    45,
+    60
+  ].filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total)
+  const stepSeconds = total >= 3600
+    ? 6
+    : total >= 1800
+      ? 4
+      : total >= 900
+        ? 3
+        : total >= 300
+          ? 2
+          : 1
+  const preScored: Array<{ range: TimeRange; score: number }> = []
+  for (let start = 0; start + minDuration <= total; start += stepSeconds) {
+    const startTime = Number(start.toFixed(3))
+    for (const duration of clipDurations) {
+      const endTime = Number((startTime + duration).toFixed(3))
+      if (endTime > total) continue
+      const intro = averageWindowMetric(windows, startTime, Math.min(endTime, startTime + 3), (window) => (
+        0.6 * (window.hookScore ?? window.score) +
+        0.4 * (window.curiosityTrigger ?? 0)
+      ))
+      const core = averageWindowMetric(windows, startTime, endTime, (window) => (
+        0.32 * (window.hookScore ?? window.score) +
+        0.2 * window.emotionIntensity +
+        0.14 * window.vocalExcitement +
+        0.14 * window.motionScore +
+        0.1 * clamp01(window.sceneChangeRate * 1.8) +
+        0.1 * (window.actionSpike ?? 0)
+      ))
+      const tail = averageWindowMetric(windows, Math.max(startTime, endTime - 3), endTime, (window) => (
+        0.5 * (window.curiosityTrigger ?? 0) +
+        0.25 * (window.keywordIntensity ?? 0) +
+        0.25 * window.emotionIntensity
+      ))
+      const score = clamp01(0.5 * intro + 0.32 * core + 0.18 * tail)
+      if (duration > 35 && score < 0.76) continue
+      preScored.push({ range: { start: startTime, end: endTime }, score })
+    }
+  }
+  if (!preScored.length) {
+    return {
+      accepted: [],
+      rejectedCount: 1,
+      rejectionReasonsSummary: ['no_candidate_ranges:1'],
+      candidateTarget,
+      outputTarget,
+      evaluatedCount: 0
+    }
+  }
+  const preLimit = Math.round(clamp(candidateTarget * 4, 80, 260))
+  const presorted = preScored
     .slice()
     .sort((a, b) => b.score - a.score || a.range.start - b.range.start)
-  const selected: TimeRange[] = []
-  const minSpacing = Math.max(2, targetClipDuration * clamp(platformProfile.verticalSpacingRatio, 0.1, 0.5))
-  for (const entry of sorted) {
-    if (selected.length >= clipCount) break
-    const overlaps = selected.some((range) => (
-      entry.range.start < range.end + minSpacing &&
-      entry.range.end > range.start - minSpacing
+    .slice(0, preLimit)
+  const evaluated: VerticalRetentionCandidate[] = []
+  const rejectedReasons: string[] = []
+  for (const item of presorted) {
+    const scored = scoreVerticalRetentionCandidate({
+      range: item.range,
+      windows,
+      platformProfile
+    })
+    if (scored.candidate) {
+      evaluated.push(scored.candidate)
+    } else if (scored.rejectReason) {
+      rejectedReasons.push(scored.rejectReason)
+    }
+  }
+  if (!evaluated.length) {
+    return {
+      accepted: [],
+      rejectedCount: Math.max(1, presorted.length),
+      rejectionReasonsSummary: summarizeVerticalRejections(rejectedReasons),
+      candidateTarget,
+      outputTarget,
+      evaluatedCount: presorted.length
+    }
+  }
+  const sortedAccepted = evaluated
+    .slice()
+    .sort((a, b) => (
+      b.predictedCompletion - a.predictedCompletion ||
+      b.predictorBreakdown.hookStrength - a.predictorBreakdown.hookStrength ||
+      a.range.start - b.range.start
+    ))
+  const selected: VerticalRetentionCandidate[] = []
+  const minSpacing = Math.max(2, getVerticalInterruptTargetIntervalSeconds(platformProfile) * 2)
+  for (const candidate of sortedAccepted) {
+    if (selected.length >= outputTarget) break
+    const overlaps = selected.some((entry) => (
+      candidate.range.start < entry.range.end + minSpacing &&
+      candidate.range.end > entry.range.start - minSpacing
     ))
     if (overlaps) continue
-    selected.push(entry.range)
+    selected.push(candidate)
   }
-  if (selected.length < clipCount) {
-    for (const range of fallbackRanges) {
-      if (selected.length >= clipCount) break
-      const overlaps = selected.some((existing) => (
-        range.start < existing.end + minSpacing &&
-        range.end > existing.start - minSpacing
-      ))
-      if (overlaps) continue
-      selected.push(range)
-    }
-  }
-  if (selected.length < clipCount) {
-    // If spacing constraints are too strict for dense edits, fill remaining slots deterministically.
-    for (const range of fallbackRanges) {
-      if (selected.length >= clipCount) break
-      const exists = selected.some((existing) => (
-        Math.abs(existing.start - range.start) < 0.01 &&
-        Math.abs(existing.end - range.end) < 0.01
+  if (selected.length < Math.min(CLIP_EXPORT_TARGET_MIN, sortedAccepted.length)) {
+    for (const candidate of sortedAccepted) {
+      if (selected.length >= Math.min(CLIP_EXPORT_TARGET_MIN, sortedAccepted.length)) break
+      const exists = selected.some((entry) => (
+        Math.abs(entry.range.start - candidate.range.start) < 0.01 &&
+        Math.abs(entry.range.end - candidate.range.end) < 0.01
       ))
       if (exists) continue
-      selected.push(range)
+      selected.push(candidate)
     }
   }
-  if (selected.length < clipCount) {
-    const chunk = total / clipCount
-    for (let index = 0; index < clipCount && selected.length < clipCount; index += 1) {
-      const start = Number((index * chunk).toFixed(3))
-      const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
-      if (end - start <= 0.2) continue
-      const exists = selected.some((existing) => (
-        Math.abs(existing.start - start) < 0.01 &&
-        Math.abs(existing.end - end) < 0.01
-      ))
-      if (exists) continue
-      selected.push({ start, end })
-    }
+  return {
+    accepted: selected,
+    rejectedCount: Math.max(0, presorted.length - evaluated.length),
+    rejectionReasonsSummary: summarizeVerticalRejections(rejectedReasons),
+    candidateTarget,
+    outputTarget,
+    evaluatedCount: presorted.length
   }
-  if (!selected.length) return fallbackRanges
-  return selected
-    .slice(0, clipCount)
-    .sort((a, b) => a.start - b.start)
 }
 
 const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
@@ -9908,6 +11091,11 @@ const computeRetentionScore = (
     patternInterruptCount?: number
     contentFormat?: RetentionContentFormat
     targetPlatform?: RetentionTargetPlatform
+    strategyProfile?: RetentionStrategyProfile | null
+    editorMode?: EditorModeSelection | null
+    styleProfile?: ContentStyleProfile | null
+    nicheProfile?: VideoNicheProfile | null
+    transcriptCues?: TranscriptCue[]
   }
 ) => {
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
@@ -9915,26 +11103,64 @@ const computeRetentionScore = (
     runtimeSeconds,
     windows,
     renderMode: 'horizontal',
-    nicheProfile: null,
+    nicheProfile: extras?.nicheProfile || null,
     targetPlatform: extras?.targetPlatform ?? 'auto'
   })
   const targetPlatform = parseRetentionTargetPlatform(extras?.targetPlatform)
-  const formatWeights = resolvePlatformAdjustedFormatWeights({
-    contentFormat,
-    targetPlatform
+  const interruptTargetInterval = resolveInterruptTargetSeconds({
+    strategyProfile: extras?.strategyProfile ?? null,
+    editorMode: extras?.editorMode ?? null,
+    styleProfile: extras?.styleProfile ?? null
   })
-  const interruptTargetInterval = formatWeights.interruptIntervalSeconds
-  const interruptTargetCount = Math.max(1, Math.ceil(runtimeSeconds / interruptTargetInterval))
+  const interruptTargetCount = Math.max(1, Math.ceil(runtimeSeconds / Math.max(0.1, interruptTargetInterval)))
+  const windowBySecond = new Map<number, EngagementWindow>()
+  for (const window of windows) {
+    const key = Math.max(0, Math.floor(window.time))
+    if (!windowBySecond.has(key)) windowBySecond.set(key, window)
+  }
+  const timelineWindows: EngagementWindow[] = []
+  let timelineCursor = 0
+  for (const segment of segments) {
+    const speed = Number(segment.speed) > 0 ? Number(segment.speed) : 1
+    const sourceStart = Math.max(0, Math.floor(segment.start))
+    const sourceEnd = Math.max(sourceStart + 1, Math.ceil(segment.end))
+    for (let second = sourceStart; second < sourceEnd; second += 1) {
+      const source = windowBySecond.get(second) || windows.find((window) => Math.floor(window.time) === second)
+      if (!source) continue
+      timelineWindows.push({
+        ...source,
+        time: Number(timelineCursor.toFixed(3))
+      })
+      timelineCursor += 1 / Math.max(0.25, speed)
+    }
+  }
+  const predictorWindows = timelineWindows.length
+    ? timelineWindows
+    : windows.map((window, index) => ({ ...window, time: index }))
+  const remappedCues = Array.isArray(extras?.transcriptCues) && extras?.transcriptCues?.length
+    ? remapTranscriptCuesToEditedTimeline(extras.transcriptCues, segments)
+    : []
+  const basePrediction = computeRetention2026Score({
+    start: 0,
+    end: Math.max(0.5, timelineCursor || runtimeSeconds),
+    windows: predictorWindows,
+    transcriptCues: remappedCues,
+    strategyProfile: extras?.strategyProfile ?? null,
+    editorMode: extras?.editorMode ?? null,
+    styleProfile: extras?.styleProfile ?? null,
+    nicheProfile: extras?.nicheProfile ?? null,
+    captionsEnabled,
+    patternInterruptCount: extras?.patternInterruptCount
+  })
   const lengths = segments.map((seg) => seg.end - seg.start).filter((len) => len > 0)
-  const avgLen = lengths.length ? lengths.reduce((sum, len) => sum + len, 0) / lengths.length : 0
-  const pacingScore = avgLen > 0
-    ? Math.max(0, 1 - Math.abs(avgLen - formatWeights.targetSegmentSeconds) / Math.max(3.8, formatWeights.targetSegmentSeconds + 2.2))
-    : 0.5
+  const avgLen = lengths.length ? lengths.reduce((sum, len) => sum + len, 0) / lengths.length : interruptTargetInterval
+  const pacingScore = clamp01(basePrediction.metrics.interruptDensity)
   const energies = windows.map((w) => w.audioEnergy)
   const mean = energies.length ? energies.reduce((sum, v) => sum + v, 0) / energies.length : 0
   const variance = energies.length ? energies.reduce((sum, v) => sum + (v - mean) ** 2, 0) / energies.length : 0
-  const consistency = mean > 0 ? Math.max(0, 1 - Math.sqrt(variance) / (mean + 0.01)) : 0.4
+  const consistency = clamp01(basePrediction.metrics.energyCurve)
   const hook = Number.isFinite(hookScore) ? Math.max(0, Math.min(1, hookScore)) : 0.5
+  const introHold = clamp01(0.78 * basePrediction.metrics.introHold + 0.22 * hook)
   const emotionalSpikeDensity = windows.length
     ? windows.filter((window) => window.emotionalSpike > 0 || (window.emotionIntensity > 0.66)).length / windows.length
     : 0
@@ -9943,26 +11169,35 @@ const computeRetentionScore = (
   const boredomRemovalRatio = clamp01(removedSeconds / timelineSeconds)
   const interruptDensityRaw = (extras?.patternInterruptCount ?? 0) / runtimeSeconds
   const interruptDensity = clamp01((extras?.patternInterruptCount ?? 0) / interruptTargetCount)
-  const subtitleScore = captionsEnabled ? 1 : 0.6
-  const audioScore = 0.82
-  const score = Math.round(100 * (
-    formatWeights.hook * hook +
-    formatWeights.consistency * consistency +
-    formatWeights.pacing * pacingScore +
-    formatWeights.boredomRemoval * boredomRemovalRatio +
-    formatWeights.emotionalSpikeDensity * emotionalSpikeDensity +
-    formatWeights.interruptDensity * interruptDensity +
-    formatWeights.subtitle * subtitleScore +
-    formatWeights.audio * audioScore
+  const weightedCompletion = clamp(
+    100 * (
+      RETENTION_2026_WEIGHTS.introHold * introHold +
+      RETENTION_2026_WEIGHTS.interruptDensity * basePrediction.metrics.interruptDensity +
+      RETENTION_2026_WEIGHTS.endingReplayPotential * basePrediction.metrics.endingReplayPotential +
+      RETENTION_2026_WEIGHTS.energyCurve * basePrediction.metrics.energyCurve +
+      RETENTION_2026_WEIGHTS.silentCaptionViability * basePrediction.metrics.silentCaptionViability
+    ),
+    0,
+    100
+  )
+  const score = Math.round(clamp(
+    weightedCompletion * 0.92 +
+    basePrediction.completionPercent * 0.08,
+    0,
+    100
   ))
   const notes: string[] = []
-  if (avgLen > formatWeights.targetSegmentSeconds + 2.2) {
-    notes.push(`Pacing is slower than ${contentFormat.replace('_', ' ')} target; tighten mid-sections.`)
+  if (basePrediction.metrics.introHold < 0.72) {
+    notes.push('Intro hold is weak in first 3s; strengthen opening hook.')
   }
-  if (!captionsEnabled) notes.push('Enable auto subtitles for stronger retention.')
-  if (hook < 0.6) notes.push('Hook strength is moderate; consider re-recording the opening.')
-  if (boredomRemovalRatio < 0.06) notes.push('Boredom removal ratio is low; increase retention aggression level.')
-  if (interruptDensity < 0.95) notes.push('Pattern interrupts are sparse; add more emphasis beats.')
+  if (basePrediction.metrics.interruptDensity < 0.7) {
+    notes.push('Interrupt cadence is outside target; tighten changes every few seconds.')
+  }
+  if (basePrediction.metrics.endingReplayPotential < 0.62) {
+    notes.push('Ending replay signal is soft; add clearer open-loop/question payoff.')
+  }
+  if (!captionsEnabled) notes.push('Enable captions to improve silent-view completion.')
+  if (score < MIN_PREDICTED_COMPLETION_PERCENT) notes.push('Predicted completion is below the 70% minimum threshold.')
   return {
     score: Math.max(0, Math.min(100, score)),
     notes,
@@ -9976,7 +11211,13 @@ const computeRetentionScore = (
       runtimeSeconds: Number(runtimeSeconds.toFixed(3)),
       contentFormat,
       targetPlatform,
-      pacingTargetSeconds: Number(formatWeights.targetSegmentSeconds.toFixed(2))
+      pacingTargetSeconds: Number(interruptTargetInterval.toFixed(2)),
+      introHold: Number(introHold.toFixed(4)),
+      endingReplayPotential: Number(basePrediction.metrics.endingReplayPotential.toFixed(4)),
+      energyCurve: Number(basePrediction.metrics.energyCurve.toFixed(4)),
+      silentCaptionViability: Number(basePrediction.metrics.silentCaptionViability.toFixed(4)),
+      nicheFit: Number(basePrediction.metrics.nicheFit.toFixed(4)),
+      predictedCompletion: Number(score.toFixed(2))
     }
   }
 }
@@ -10611,11 +11852,20 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       targetPlatform: resolvedTargetPlatform,
       strategyProfile
     })
+    const analyzePreScan = buildLongFormPreScanSummary({
+      durationSeconds: duration,
+      windows: editPlan?.engagementWindows ?? [],
+      transcriptCues,
+      styleProfile: editPlan?.styleProfile ?? null,
+      nicheProfile: editPlan?.nicheProfile ?? null,
+      editorMode: options.editorMode ?? null
+    })
     const analysis = buildPersistedRenderAnalysis({
       existing: {
         ...existingAnalysis,
         metadata_version: 2,
         metadata_summary: analyzeMetadataSummary,
+        long_form_prescan: analyzePreScan,
         duration: duration ?? 0,
         size: fs.existsSync(tmpIn) ? fs.statSync(tmpIn).size : 0,
         filename: path.basename(job.inputPath),
@@ -10950,7 +12200,18 @@ const processJob = async (
         verticalAnalysis?.engagement_windows ||
         verticalAnalysis?.engagementWindows
       )
-      const verticalHookCandidates: HookCandidate[] = []
+      const verticalStyleProfile = (
+        verticalAnalysis?.style_profile &&
+        typeof verticalAnalysis.style_profile === 'object'
+      )
+        ? (verticalAnalysis.style_profile as ContentStyleProfile)
+        : null
+      const verticalNicheProfile = (
+        verticalAnalysis?.niche_profile &&
+        typeof verticalAnalysis.niche_profile === 'object'
+      )
+        ? (verticalAnalysis.niche_profile as VideoNicheProfile)
+        : null
       const resolvedVerticalMode = renderConfig.verticalMode
         ? {
             ...defaultVerticalModeSettings(),
@@ -10961,10 +12222,6 @@ const processJob = async (
             }
           }
         : defaultVerticalModeSettings()
-      const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount, {
-        windows: verticalWindows,
-        platformProfile: platformProfileId
-      })
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
       const hasInputAudio = hasAudioStream(tmpIn)
@@ -10979,12 +12236,76 @@ const processJob = async (
       const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
       fs.mkdirSync(localOutDir, { recursive: true })
       let verticalSourceCues: TranscriptCue[] = []
+      const storedTranscriptCuesRaw = Array.isArray(verticalAnalysis?.transcript_cues)
+        ? verticalAnalysis.transcript_cues
+        : Array.isArray(verticalAnalysis?.transcriptCues)
+          ? verticalAnalysis.transcriptCues
+          : []
+      if (storedTranscriptCuesRaw.length) {
+        verticalSourceCues = storedTranscriptCuesRaw
+          .map((cue: any) => {
+            const start = Number(cue?.start)
+            const end = Number(cue?.end)
+            const text = typeof cue?.text === 'string' ? cue.text : ''
+            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text.trim()) return null
+            return {
+              start: Number(start.toFixed(3)),
+              end: Number(end.toFixed(3)),
+              text: text.trim(),
+              keywordIntensity: clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? 0)),
+              curiosityTrigger: clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? 0)),
+              fillerDensity: clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0))
+            } as TranscriptCue
+          })
+          .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
+      }
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
         const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
         if (generatedVerticalSubtitlePath) {
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
         }
+      }
+      const verticalPreScan = buildLongFormPreScanSummary({
+        durationSeconds,
+        windows: verticalWindows,
+        transcriptCues: verticalSourceCues,
+        styleProfile: verticalStyleProfile,
+        nicheProfile: verticalNicheProfile,
+        editorMode: editorModeForRender
+      })
+      const verticalSelection = buildVerticalRetentionCandidates({
+        durationSeconds: durationSeconds || 0,
+        requestedCount: renderConfig.verticalClipCount,
+        windows: verticalWindows,
+        platformProfile: platformProfileId
+      })
+      const requestedVerticalClipCount = Math.round(clamp(
+        Number(renderConfig.verticalClipCount || 0),
+        0,
+        MAX_VERTICAL_CLIPS
+      ))
+      const targetRenderCount = requestedVerticalClipCount > 0
+        ? requestedVerticalClipCount
+        : verticalSelection.outputTarget
+      const selectedVerticalCandidates = verticalSelection.accepted.slice(0, targetRenderCount)
+      const clipRanges = selectedVerticalCandidates.map((candidate) => ({
+        start: Number(candidate.range.start.toFixed(3)),
+        end: Number(candidate.range.end.toFixed(3))
+      }))
+      if (!clipRanges.length) {
+        throw new QualityGateError(
+          `Vertical retention gate rejected all clips (${MIN_PREDICTED_COMPLETION_PERCENT}%+ required).`,
+          {
+            mode: 'vertical',
+            requestedClipCount: requestedVerticalClipCount,
+            candidateTarget: verticalSelection.candidateTarget,
+            outputTarget: verticalSelection.outputTarget,
+            rejectedCount: verticalSelection.rejectedCount,
+            evaluatedCount: verticalSelection.evaluatedCount,
+            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary
+          }
+        )
       }
 
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
@@ -11080,15 +12401,30 @@ const processJob = async (
       }
       const verticalMetadataSummary = buildVerticalMetadataSummary({
         durationSeconds,
-        clipRanges,
-        windows: verticalWindows,
-        hookCandidates: verticalHookCandidates
+        selectedCandidates: selectedVerticalCandidates,
+        selectionResult: verticalSelection,
+        preScan: verticalPreScan
       })
+      const verticalClipDetails = selectedVerticalCandidates.map((candidate, index) => {
+        const range = candidate.range
+        return {
+          clip: index + 1,
+          start: Number(range.start.toFixed(3)),
+          end: Number(range.end.toFixed(3)),
+          duration: Number(Math.max(0, range.end - range.start).toFixed(3)),
+          predictedCompletion: Number(candidate.predictedCompletion.toFixed(2)),
+          reason: candidate.reason,
+          predictorBreakdown: candidate.predictorBreakdown
+        }
+      })
+      const verticalPredictedRetention = Number.isFinite(Number(verticalMetadataSummary?.predictedAverage))
+        ? Number(verticalMetadataSummary.predictedAverage)
+        : null
       const verticalContentFormat = inferRetentionContentFormat({
         runtimeSeconds: durationSeconds,
         windows: verticalWindows,
         renderMode: finalRenderConfig.mode,
-        nicheProfile: null,
+        nicheProfile: verticalNicheProfile,
         targetPlatform: retentionTargetPlatform
       })
       const nextAnalysis = buildPersistedRenderAnalysis({
@@ -11124,12 +12460,18 @@ const processJob = async (
             qualityGateOffset: combinedQualityGateOffset,
             hookThresholdOffset
           },
-          vertical_clip_ranges: clipRanges.map((range, index) => ({
-            clip: index + 1,
-            start: Number(range.start.toFixed(3)),
-            end: Number(range.end.toFixed(3)),
-            duration: Number(Math.max(0, range.end - range.start).toFixed(3))
-          })),
+          vertical_clip_ranges: verticalClipDetails,
+          vertical_candidate_pool: verticalSelection.accepted,
+          vertical_selection: {
+            requestedClipCount: requestedVerticalClipCount,
+            renderedClipCount: clipRanges.length,
+            outputTarget: verticalSelection.outputTarget,
+            candidateTarget: verticalSelection.candidateTarget,
+            evaluatedCount: verticalSelection.evaluatedCount,
+            rejectedCount: verticalSelection.rejectedCount,
+            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary
+          },
+          long_form_prescan: verticalPreScan,
           metadata_summary: verticalMetadataSummary,
           output_upload_fallback: outputUploadFallbackUsed
             ? {
@@ -11152,12 +12494,28 @@ const processJob = async (
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
         status: 'completed',
         completedAt: toIsoNow(),
-        meta: { segmentCount: clipRanges.length, outputPaths }
+        meta: {
+          segmentCount: clipRanges.length,
+          outputPaths,
+          requestedClipCount: requestedVerticalClipCount,
+          outputTarget: verticalSelection.outputTarget,
+          candidateTarget: verticalSelection.candidateTarget,
+          evaluatedCount: verticalSelection.evaluatedCount,
+          rejectedCount: verticalSelection.rejectedCount
+        }
       })
       await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
         status: 'completed',
         completedAt: toIsoNow(),
-        meta: { score: null, mode: 'vertical' }
+        meta: {
+          score: verticalPredictedRetention,
+          mode: 'vertical',
+          requestedClipCount: requestedVerticalClipCount,
+          outputTarget: verticalSelection.outputTarget,
+          candidateTarget: verticalSelection.candidateTarget,
+          evaluatedCount: verticalSelection.evaluatedCount,
+          rejectedCount: verticalSelection.rejectedCount
+        }
       })
 
       await updateJob(jobId, {
@@ -11166,8 +12524,11 @@ const processJob = async (
         outputPath: outputPaths[0],
         finalQuality,
         watermarkApplied: false,
-        retentionScore: null,
-        optimizationNotes: null,
+        retentionScore: verticalPredictedRetention,
+        optimizationNotes: [
+          `Vertical candidate pool: ${verticalSelection.accepted.length} accepted, ${verticalSelection.rejectedCount} rejected below ${MIN_PREDICTED_COMPLETION_PERCENT}%.`,
+          `Exported top ${clipRanges.length} clips from ${verticalSelection.candidateTarget}-target candidate batch.`
+        ],
         renderSettings: buildPersistedRenderSettings(finalRenderConfig, {
           retentionAggressionLevel: aggressionLevel,
           retentionStrategyProfile: strategyProfile,
@@ -11188,7 +12549,7 @@ const processJob = async (
             userId: user.id,
             configVersionId: (job as any)?.configVersionId || (job as any)?.config_version_id || null,
             analysis: nextAnalysis,
-            retentionScore: null
+            retentionScore: verticalPredictedRetention
           }
         })
       } catch (error) {
@@ -11466,7 +12827,7 @@ const processJob = async (
             waitingForUserSelection: true,
             selectionWindowMs: HOOK_SELECTION_WAIT_MS,
             selectionWindowEndsAt,
-            hookCandidates: hookCandidates.slice(0, HOOK_SELECTION_MAX_CANDIDATES),
+            hookCandidates: hookCandidates.slice(0, Math.max(HOOK_SELECTION_MAX_CANDIDATES, resolveHookCandidateTarget(durationSeconds))),
             hasTranscriptSignals,
             contentSignalStrength: Number(contentSignalStrength.toFixed(4))
           }
@@ -11680,11 +13041,20 @@ const processJob = async (
           interruptAggression,
           editPlan?.styleProfile
         )
+        const styleInterruptTargetSeconds = resolveInterruptTargetSeconds({
+          strategyProfile,
+          editorMode: editorModeForRender,
+          styleProfile: styleProfileForAnalysis
+        })
+        const behaviorInterruptTargetSeconds = Number(behaviorStyleProfileForAnalysis?.patternInterruptInterval)
+        const interruptTargetSeconds = Number.isFinite(behaviorInterruptTargetSeconds)
+          ? Number(((behaviorInterruptTargetSeconds + styleInterruptTargetSeconds) / 2).toFixed(2))
+          : styleInterruptTargetSeconds
         const interruptInjected = injectPatternInterrupts({
           segments: effected,
           durationSeconds,
           aggressionLevel: styleAdjustedInterruptAggression,
-          targetIntervalSeconds: behaviorStyleProfileForAnalysis?.patternInterruptInterval
+          targetIntervalSeconds: interruptTargetSeconds
         })
         const withZoom = editPlan && !options.onlyCuts
           ? applyZoomEasing(interruptInjected.segments)
@@ -11774,7 +13144,11 @@ const processJob = async (
             removedRanges: editPlan?.removedSegments ?? [],
             patternInterruptCount: attempt.patternInterruptCount,
             contentFormat: selectedContentFormat,
-            targetPlatform: retentionTargetPlatform
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            editorMode: editorModeForRender,
+            styleProfile: styleProfileForAnalysis,
+            nicheProfile: nicheProfileForAnalysis
           }
         )
         const clarityPenalty = hookCandidate.auditPassed
@@ -11925,7 +13299,11 @@ const processJob = async (
               removedRanges: editPlan?.removedSegments ?? [],
               patternInterruptCount: rescueAttempt.patternInterruptCount,
               contentFormat: selectedContentFormat,
-              targetPlatform: retentionTargetPlatform
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              editorMode: editorModeForRender,
+              styleProfile: styleProfileForAnalysis,
+              nicheProfile: nicheProfileForAnalysis
             }
           )
           const rescueThresholds = normalizeQualityGateThresholds({
@@ -12005,6 +13383,47 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
+          if (Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT) {
+            const reason = `Predicted completion ${Number(selectedJudge?.retention_score ?? 0).toFixed(1)}% below ${MIN_PREDICTED_COMPLETION_PERCENT}% minimum.`
+            await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+              status: 'failed',
+              completedAt: toIsoNow(),
+              lastError: reason,
+              meta: {
+                attempts: retentionAttempts,
+                thresholds: qualityGateThresholds,
+                hasTranscriptSignals,
+                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile
+              }
+            })
+            await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+              status: 'failed',
+              completedAt: toIsoNow(),
+              lastError: reason,
+              meta: {
+                attempts: retentionAttempts,
+                thresholds: qualityGateThresholds,
+                hasTranscriptSignals,
+                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile
+              }
+            })
+            await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
+            throw new QualityGateError(reason, {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile
+            })
+          }
           const forcedReason = 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
@@ -12033,7 +13452,11 @@ const processJob = async (
             removedRanges: [],
             patternInterruptCount: 0,
             contentFormat: selectedContentFormat,
-            targetPlatform: retentionTargetPlatform
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            editorMode: editorModeForRender,
+            styleProfile: styleProfileForAnalysis,
+            nicheProfile: nicheProfileForAnalysis
           }
         )
         retentionScoreBeforeEdit = sourceBaselineRetention.score
@@ -12742,12 +14165,21 @@ const processJob = async (
       outcomeMenuProfile,
       outcomeMenuApply
     })
+    const processPreScan = buildLongFormPreScanSummary({
+      durationSeconds,
+      windows: engagementWindowsForAnalysis,
+      transcriptCues: [],
+      styleProfile: styleProfileForAnalysis,
+      nicheProfile: nicheProfileForAnalysis,
+      editorMode: editorModeForRender
+    })
 
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
         ...((job.analysis as any) || {}),
         metadata_version: 2,
         metadata_summary: retentionMetadataSummary,
+        long_form_prescan: processPreScan,
         hook_start_time: selectedHook?.start ?? (job.analysis as any)?.hook_start_time ?? null,
         hook_end_time: selectedHook ? selectedHook.start + selectedHook.duration : (job.analysis as any)?.hook_end_time ?? null,
         hook_score: selectedHook?.score ?? (job.analysis as any)?.hook_score ?? null,
