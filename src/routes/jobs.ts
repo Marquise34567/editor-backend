@@ -456,6 +456,15 @@ type AudioStreamProfile = {
   sampleRate: number | null
   bitRate: number | null
 }
+type FaceSample = {
+  time: number
+  presence: number
+  intensity?: number
+  faceCount?: number
+  centerX?: number
+  centerY?: number
+}
+type SegmentTransitionStyle = 'jump' | 'smooth'
 type Segment = {
   start: number
   end: number
@@ -464,6 +473,10 @@ type Segment = {
   brightness?: number
   emphasize?: boolean
   audioGain?: number
+  faceFocusX?: number
+  faceFocusY?: number
+  transitionStyle?: SegmentTransitionStyle
+  soundFxLevel?: number
 }
 type WebcamCrop = { x: number; y: number; width: number; height: number }
 type HorizontalFitMode = 'cover' | 'contain'
@@ -473,10 +486,12 @@ type HorizontalModeSettings = {
   fit: HorizontalFitMode
 }
 type VerticalFitMode = 'cover' | 'contain'
+type VerticalLayoutMode = 'stacked' | 'single'
 type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
 type VerticalModeSettings = {
   enabled: boolean
   output: { width: number; height: number }
+  layout: VerticalLayoutMode
   webcamCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
   bottomFit: VerticalFitMode
@@ -495,6 +510,8 @@ type EngagementWindow = {
   motionScore: number
   facePresence: number
   faceIntensity?: number
+  faceCenterX?: number
+  faceCenterY?: number
   textDensity: number
   textConfidence?: number
   sceneChangeRate: number
@@ -757,6 +774,7 @@ const ZOOM_HARD_MAX = 1.15
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
 const STITCH_FADE_SEC = 0.08
+const JUMPCUT_FADE_SEC = 0.012
 const MIN_RENDER_SEGMENT_SECONDS = 0.08
 const MERGE_ADJACENT_SEGMENT_GAP_SEC = 0.06
 const FILTER_TIME_DECIMALS = 3
@@ -1316,10 +1334,28 @@ const parseVerticalFitMode = (value?: any, fallback: VerticalFitMode = 'cover'):
   return fallback
 }
 
+const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'stacked'): VerticalLayoutMode => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'single' || raw === 'source' || raw === 'original') return 'single'
+  if (raw === 'stacked') return 'stacked'
+  return fallback
+}
+
 const parseVerticalClipCount = (value?: any) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   if (!Number.isFinite(parsed)) return 1
   return clamp(parsed, 1, MAX_VERTICAL_CLIPS)
+}
+
+const parseBooleanFlag = (value: any): boolean | null => {
+  if (value === true) return true
+  if (value === false) return false
+  if (value === null || value === undefined) return null
+  const raw = String(value).trim().toLowerCase()
+  if (!raw) return null
+  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false
+  return null
 }
 
 const parseWebcamCrop = (value?: any): WebcamCrop | null => {
@@ -1381,6 +1417,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
   return {
     enabled: (value as any).enabled !== false,
     output: parseVerticalOutput((value as any).output),
+    layout: parseVerticalLayoutMode((value as any).layout, 'stacked'),
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
     bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover')
@@ -1400,6 +1437,7 @@ const legacyWebcamCropToVerticalCrop = (value: WebcamCrop | null): VerticalWebca
 const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   enabled: true,
   output: { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT },
+  layout: 'stacked',
   webcamCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
   bottomFit: 'cover'
@@ -1509,6 +1547,16 @@ const getRetentionAggressionFromPayload = (payload?: any) => {
   return STRATEGY_TO_AGGRESSION[strategy] || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
 }
 
+const getOnlyCutsFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).onlyCuts) ??
+    parseBooleanFlag((payload as any).onlyHookAndCut) ??
+    parseBooleanFlag((payload as any).hookAndCutOnly) ??
+    null
+  )
+}
+
 const getRetentionAggressionFromJob = (job?: any) => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -1527,6 +1575,18 @@ const getRetentionAggressionFromJob = (job?: any) => {
     analysis?.retentionStrategy
   )
   return STRATEGY_TO_AGGRESSION[strategy] || DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
+}
+
+const getOnlyCutsFromJob = (job?: any): boolean | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.onlyCuts) ??
+    parseBooleanFlag(settings?.onlyHookAndCut) ??
+    parseBooleanFlag(analysis?.onlyCuts) ??
+    parseBooleanFlag(analysis?.onlyHookAndCut) ??
+    null
+  )
 }
 
 const getRetentionStrategyFromJob = (job?: any): RetentionStrategyProfile => {
@@ -1583,6 +1643,7 @@ const buildPersistedRenderSettings = (
   opts?: {
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
+    onlyCuts?: boolean | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -1591,6 +1652,7 @@ const buildPersistedRenderSettings = (
   const retentionStrategy = parseRetentionStrategyProfile(
     opts?.retentionStrategyProfile || strategyFromAggressionLevel(retentionLevel)
   )
+  const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
   return {
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
@@ -1599,19 +1661,29 @@ const buildPersistedRenderSettings = (
     retentionAggressionLevel: retentionLevel,
     retentionLevel,
     retentionStrategyProfile: retentionStrategy,
-    retentionStrategy: retentionStrategy
+    retentionStrategy: retentionStrategy,
+    ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts })
   }
 }
 
 const buildPersistedRenderAnalysis = ({
   existing,
   renderConfig,
-  outputPaths
+  outputPaths,
+  onlyCuts
 }: {
   existing?: any
   renderConfig: RenderConfig
   outputPaths?: string[] | null
+  onlyCuts?: boolean | null
 }) => {
+  const resolvedOnlyCuts = typeof onlyCuts === 'boolean'
+    ? onlyCuts
+    : (
+      parseBooleanFlag((existing as any)?.onlyCuts) ??
+      parseBooleanFlag((existing as any)?.onlyHookAndCut) ??
+      null
+    )
   const verticalCrop = renderConfig.verticalMode?.webcamCrop
     ? {
         x: renderConfig.verticalMode.webcamCrop.x,
@@ -1620,7 +1692,7 @@ const buildPersistedRenderAnalysis = ({
         height: renderConfig.verticalMode.webcamCrop.h
       }
     : null
-  return normalizeAnalysisPayload({
+  const payload: Record<string, any> = {
     ...(existing || {}),
     metadata_version: Number.isFinite(Number((existing as any)?.metadata_version))
       ? Number((existing as any).metadata_version)
@@ -1638,7 +1710,12 @@ const buildPersistedRenderAnalysis = ({
         }
       : null,
     verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
-  })
+  }
+  if (resolvedOnlyCuts !== null) {
+    payload.onlyCuts = resolvedOnlyCuts
+    payload.onlyHookAndCut = resolvedOnlyCuts
+  }
+  return normalizeAnalysisPayload(payload)
 }
 
 const normalizePipelineStepMap = (raw?: any): Record<RetentionPipelineStep, PipelineStepState> => {
@@ -3518,7 +3595,7 @@ const buildEngagementWindows = (
   durationSeconds: number,
   energySamples: { time: number; rms: number }[],
   sceneChanges: number[],
-  faceSamples: { time: number; presence: number; intensity?: number; faceCount?: number }[] = [],
+  faceSamples: FaceSample[] = [],
   textSamples: { time: number; density: number; confidence?: number }[] = [],
   emotionSamples: { time: number; intensity: number }[] = []
 ): EngagementWindow[] => {
@@ -3545,6 +3622,9 @@ const buildEngagementWindows = (
 
   const faceBySecond = new Array(totalSeconds).fill(0)
   const faceIntensityBySecond = new Array(totalSeconds).fill(0)
+  const faceCenterXSumBySecond = new Array(totalSeconds).fill(0)
+  const faceCenterYSumBySecond = new Array(totalSeconds).fill(0)
+  const faceCenterWeightBySecond = new Array(totalSeconds).fill(0)
   for (const sample of faceSamples) {
     if (sample.time < 0 || sample.time >= totalSeconds) continue
     const idx = Math.floor(sample.time)
@@ -3552,6 +3632,12 @@ const buildEngagementWindows = (
     faceBySecond[idx] = Math.max(faceBySecond[idx], value)
     const intensity = Number.isFinite(sample.intensity) ? clamp01(sample.intensity ?? 0) : value
     faceIntensityBySecond[idx] = Math.max(faceIntensityBySecond[idx], intensity)
+    if (Number.isFinite(sample.centerX) && Number.isFinite(sample.centerY)) {
+      const weight = Math.max(0.15, intensity || value || 0.15)
+      faceCenterWeightBySecond[idx] += weight
+      faceCenterXSumBySecond[idx] += clamp01(Number(sample.centerX)) * weight
+      faceCenterYSumBySecond[idx] += clamp01(Number(sample.centerY)) * weight
+    }
   }
 
   const textBySecond = new Array(totalSeconds).fill(0)
@@ -3589,6 +3675,13 @@ const buildEngagementWindows = (
     const motionScore = clamp01(0.64 * sceneChangeRate + 0.36 * actionSpike)
     const facePresence = faceBySecond[i] || 0
     const faceIntensity = Math.max(facePresence, faceIntensityBySecond[i] || 0)
+    const faceCenterWeight = faceCenterWeightBySecond[i] || 0
+    const faceCenterX = faceCenterWeight > 0
+      ? clamp01(faceCenterXSumBySecond[i] / faceCenterWeight)
+      : undefined
+    const faceCenterY = faceCenterWeight > 0
+      ? clamp01(faceCenterYSumBySecond[i] / faceCenterWeight)
+      : undefined
     const textDensity = textBySecond[i] || 0
     const textConfidence = textConfidenceBySecond[i] || 0
     const emotionalSpike = audioEnergy > meanEnergy + std * 1.5 ? 1 : 0
@@ -3633,6 +3726,8 @@ const buildEngagementWindows = (
       motionScore,
       facePresence,
       faceIntensity,
+      faceCenterX: faceCenterX === undefined ? undefined : Number(faceCenterX.toFixed(4)),
+      faceCenterY: faceCenterY === undefined ? undefined : Number(faceCenterY.toFixed(4)),
       textDensity,
       textConfidence,
       sceneChangeRate,
@@ -4565,8 +4660,12 @@ const hasFaceDetectFilter = () => {
 }
 
 const detectFacePresence = async (filePath: string, durationSeconds: number) => {
-  if (!hasFfmpeg()) return [] as { time: number; presence: number; intensity?: number; faceCount?: number }[]
-  if (!hasFaceDetectFilter()) return [] as { time: number; presence: number; intensity?: number; faceCount?: number }[]
+  if (!hasFfmpeg()) return [] as FaceSample[]
+  if (!hasFaceDetectFilter()) return [] as FaceSample[]
+  const sourceProbe = probeVideoStream(filePath)
+  const sourceWidth = Number(sourceProbe?.width)
+  const sourceHeight = Number(sourceProbe?.height)
+  const hasSourceDimensions = Number.isFinite(sourceWidth) && Number.isFinite(sourceHeight) && sourceWidth > 0 && sourceHeight > 0
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
   const args = [
     '-hide_banner',
@@ -4579,7 +4678,13 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
   ]
   const output = await runFfmpegCapture(args).catch(() => '')
   const lines = output.split(/\r?\n/)
-  const sampleMap = new Map<number, { count: number; maxArea: number }>()
+  const sampleMap = new Map<number, {
+    count: number
+    maxArea: number
+    centerWeight: number
+    centerXWeightedSum: number
+    centerYWeightedSum: number
+  }>()
   for (const line of lines) {
     if (!line.includes('lavfi.facedetect')) continue
     const timeMatch = line.match(/pts_time:([0-9.]+)/)
@@ -4592,10 +4697,37 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
     const area = Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0
       ? width * height
       : 0
-    const prev = sampleMap.get(bucket) || { count: 0, maxArea: 0 }
+    const x = Number.parseFloat((line.match(/lavfi\.facedetect\.x=([0-9.]+)/)?.[1] || '0'))
+    const y = Number.parseFloat((line.match(/lavfi\.facedetect\.y=([0-9.]+)/)?.[1] || '0'))
+    const centerX = hasSourceDimensions && Number.isFinite(x) && Number.isFinite(width)
+      ? clamp01((x + width / 2) / sourceWidth)
+      : null
+    const centerY = hasSourceDimensions && Number.isFinite(y) && Number.isFinite(height)
+      ? clamp01((y + height / 2) / sourceHeight)
+      : null
+    const weight = area > 0 ? area : 1
+    const prev = sampleMap.get(bucket) || {
+      count: 0,
+      maxArea: 0,
+      centerWeight: 0,
+      centerXWeightedSum: 0,
+      centerYWeightedSum: 0
+    }
+    const centerWeight = centerX === null || centerY === null
+      ? prev.centerWeight
+      : prev.centerWeight + weight
+    const centerXWeightedSum = centerX === null
+      ? prev.centerXWeightedSum
+      : prev.centerXWeightedSum + centerX * weight
+    const centerYWeightedSum = centerY === null
+      ? prev.centerYWeightedSum
+      : prev.centerYWeightedSum + centerY * weight
     sampleMap.set(bucket, {
       count: prev.count + 1,
-      maxArea: Math.max(prev.maxArea, area)
+      maxArea: Math.max(prev.maxArea, area),
+      centerWeight,
+      centerXWeightedSum,
+      centerYWeightedSum
     })
   }
   return Array.from(sampleMap.entries()).map(([time, stats]) => {
@@ -4608,7 +4740,13 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
       time,
       presence: Number(presence.toFixed(4)),
       intensity: Number(intensity.toFixed(4)),
-      faceCount: stats.count
+      faceCount: stats.count,
+      centerX: stats.centerWeight > 0
+        ? Number(clamp01(stats.centerXWeightedSum / stats.centerWeight).toFixed(4))
+        : undefined,
+      centerY: stats.centerWeight > 0
+        ? Number(clamp01(stats.centerYWeightedSum / stats.centerWeight).toFixed(4))
+        : undefined
     }
   })
 }
@@ -6377,6 +6515,34 @@ const applySegmentEffects = (
     const speechIntensity = avg('speechIntensity')
     const motionScore = avg('motionScore')
     const emotionalSpike = avg('emotionalSpike')
+    const faceFocus = relevant.reduce((acc, window) => {
+      const x = Number(window.faceCenterX)
+      const y = Number(window.faceCenterY)
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return acc
+      const faceWeight = clamp(
+        Number.isFinite(window.faceIntensity)
+          ? Number(window.faceIntensity)
+          : window.facePresence,
+        0.12,
+        1
+      )
+      if (faceWeight <= 0) return acc
+      return {
+        weight: acc.weight + faceWeight,
+        x: acc.x + clamp01(x) * faceWeight,
+        y: acc.y + clamp01(y) * faceWeight
+      }
+    }, {
+      weight: 0,
+      x: 0,
+      y: 0
+    })
+    const faceFocusX = faceFocus.weight > 0
+      ? clamp(faceFocus.x / faceFocus.weight, 0.08, 0.92)
+      : 0.5
+    const faceFocusY = faceFocus.weight > 0
+      ? clamp(faceFocus.y / faceFocus.weight, 0.08, 0.88)
+      : 0.42
     const isHook = hookRange ? seg.start < hookRange.end && seg.end > hookRange.start : false
     const emphasisScore = Math.min(
       1,
@@ -6397,6 +6563,8 @@ const applySegmentEffects = (
       emotionIntensity,
       vocalExcitement,
       emotionalSpike,
+      faceFocusX,
+      faceFocusY,
       isHook,
       score
     }
@@ -6446,8 +6614,34 @@ const applySegmentEffects = (
     if (!alreadyStrong && options.emotionalBoost && (hasSpike || speechPeak)) {
       brightness = Math.max(brightness, speechPeak ? 0.02 : 0.03)
     }
+    const jumpTrigger = (
+      (score?.motionScore ?? 0) >= (options.aggressiveMode ? 0.38 : 0.56) ||
+      (score?.speechIntensity ?? 0) >= Math.max(0.62, speechBaseline * 1.24) ||
+      Boolean(score?.isHook && options.aggressiveMode)
+    )
+    const transitionStyle: SegmentTransitionStyle = jumpTrigger ? 'jump' : 'smooth'
+    const soundFxLevel = Number(clamp(
+      (score?.isHook ? 0.2 : 0) +
+      (jumpTrigger ? 0.32 : 0) +
+      (speechPeak ? 0.2 : 0) +
+      (motionEmphasis ? 0.24 : 0) +
+      (options.aggressiveMode ? 0.1 : 0),
+      0,
+      0.9
+    ).toFixed(3))
+    const faceFocusX = Number(clamp(score?.faceFocusX ?? 0.5, 0.08, 0.92).toFixed(4))
+    const faceFocusY = Number(clamp(score?.faceFocusY ?? 0.42, 0.08, 0.88).toFixed(4))
     zoom = Math.min(maxZoomDelta || 0, zoom)
-    return { ...seg, zoom, brightness, emphasize: Boolean(hasSpike || speechPeak || motionEmphasis || score?.isHook) }
+    return {
+      ...seg,
+      zoom,
+      brightness,
+      faceFocusX,
+      faceFocusY,
+      transitionStyle,
+      soundFxLevel,
+      emphasize: Boolean(hasSpike || speechPeak || motionEmphasis || score?.isHook)
+    }
   })
 }
 
@@ -6849,6 +7043,15 @@ const normalizeStoredEngagementWindows = (raw: any): EngagementWindow[] => {
       speechIntensity: clamp01(Number(window?.speechIntensity ?? 0)),
       motionScore: clamp01(Number(window?.motionScore ?? 0)),
       facePresence: clamp01(Number(window?.facePresence ?? 0)),
+      faceIntensity: Number.isFinite(Number(window?.faceIntensity))
+        ? clamp01(Number(window.faceIntensity))
+        : undefined,
+      faceCenterX: Number.isFinite(Number(window?.faceCenterX))
+        ? clamp01(Number(window.faceCenterX))
+        : undefined,
+      faceCenterY: Number.isFinite(Number(window?.faceCenterY))
+        ? clamp01(Number(window.faceCenterY))
+        : undefined,
       textDensity: clamp01(Number(window?.textDensity ?? 0)),
       sceneChangeRate: clamp01(Number(window?.sceneChangeRate ?? 0)),
       emotionalSpike: Number(window?.emotionalSpike ? 1 : 0),
@@ -7074,7 +7277,36 @@ const buildVerticalClipRanges = (
       selected.push(range)
     }
   }
-  return selected.length ? selected.slice(0, clipCount) : fallbackRanges
+  if (selected.length < clipCount) {
+    // If spacing constraints are too strict for dense edits, fill remaining slots deterministically.
+    for (const range of fallbackRanges) {
+      if (selected.length >= clipCount) break
+      const exists = selected.some((existing) => (
+        Math.abs(existing.start - range.start) < 0.01 &&
+        Math.abs(existing.end - range.end) < 0.01
+      ))
+      if (exists) continue
+      selected.push(range)
+    }
+  }
+  if (selected.length < clipCount) {
+    const chunk = total / clipCount
+    for (let index = 0; index < clipCount && selected.length < clipCount; index += 1) {
+      const start = Number((index * chunk).toFixed(3))
+      const end = Number((index === clipCount - 1 ? total : (index + 1) * chunk).toFixed(3))
+      if (end - start <= 0.2) continue
+      const exists = selected.some((existing) => (
+        Math.abs(existing.start - start) < 0.01 &&
+        Math.abs(existing.end - end) < 0.01
+      ))
+      if (exists) continue
+      selected.push({ start, end })
+    }
+  }
+  if (!selected.length) return fallbackRanges
+  return selected
+    .slice(0, clipCount)
+    .sort((a, b) => a.start - b.start)
 }
 
 const buildFrameFitFilter = (fit: HorizontalFitMode, width: number, height: number) => {
@@ -7208,6 +7440,30 @@ const buildVerticalStackedFilterGraph = ({
   return filters.join(';')
 }
 
+const buildVerticalSingleFilterGraph = ({
+  start,
+  end,
+  outputWidth,
+  outputHeight,
+  fit,
+  withAudio
+}: {
+  start: number
+  end: number
+  outputWidth: number
+  outputHeight: number
+  fit: VerticalFitMode
+  withAudio: boolean
+}) => {
+  const filters = [
+    `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,${buildVerticalBottomFilter(fit, outputWidth, outputHeight)}[outv]`
+  ]
+  if (withAudio) {
+    filters.push('[0:a]atrim=start=' + start + ':end=' + end + ',asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]')
+  }
+  return filters.join(';')
+}
+
 const renderVerticalClip = async ({
   inputPath,
   outputPath,
@@ -7229,22 +7485,35 @@ const renderVerticalClip = async ({
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
-  const topHeight = computeVerticalTopHeightPx(verticalMode, outputHeight)
-  const sourceCrop = normalizeVerticalCropToSource({
-    crop: verticalMode.webcamCrop,
-    sourceWidth,
-    sourceHeight
-  })
-  const filterComplex = buildVerticalStackedFilterGraph({
-    start,
-    end,
-    crop: sourceCrop,
-    outputWidth,
-    outputHeight,
-    topHeight,
-    bottomFit: parseVerticalFitMode(verticalMode.bottomFit, 'cover'),
-    withAudio
-  })
+  const layout = parseVerticalLayoutMode(verticalMode.layout, 'stacked')
+  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
+  const filterComplex = layout === 'single'
+    ? buildVerticalSingleFilterGraph({
+        start,
+        end,
+        outputWidth,
+        outputHeight,
+        fit,
+        withAudio
+      })
+    : (() => {
+        const topHeight = computeVerticalTopHeightPx(verticalMode, outputHeight)
+        const sourceCrop = normalizeVerticalCropToSource({
+          crop: verticalMode.webcamCrop,
+          sourceWidth,
+          sourceHeight
+        })
+        return buildVerticalStackedFilterGraph({
+          start,
+          end,
+          crop: sourceCrop,
+          outputWidth,
+          outputHeight,
+          topHeight,
+          bottomFit: fit,
+          withAudio
+        })
+      })()
 
   const args = [
     '-y',
@@ -7754,6 +8023,7 @@ const getEditOptionsForUser = async (
   overrides?: {
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
+    onlyCuts?: boolean | null
   }
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
@@ -7764,7 +8034,9 @@ const getEditOptionsForUser = async (
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
   const subtitleStyle =
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
-  const onlyCuts = settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts
+  const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
+    ? overrides.onlyCuts
+    : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   const requestedStrategy = parseRetentionStrategyProfile(
     overrides?.retentionStrategyProfile ??
@@ -8121,7 +8393,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         editPlan,
         proxyPath: existingProxyPath
       },
-      renderConfig
+      renderConfig,
+      onlyCuts: options.onlyCuts
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -8135,7 +8408,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       inputDurationSeconds: duration ? Math.round(duration) : null,
       renderSettings: buildPersistedRenderSettings(renderConfig, {
         retentionAggressionLevel: aggressionLevel,
-        retentionStrategyProfile: strategyProfile
+        retentionStrategyProfile: strategyProfile,
+        onlyCuts: options.onlyCuts
       }),
       analysis: analysis
     })
@@ -8403,6 +8677,7 @@ const processJob = async (
             : ((job.analysis as any)?.output_upload_fallback ?? null)
         },
         renderConfig: finalRenderConfig,
+        onlyCuts: options.onlyCuts,
         outputPaths
       })
 
@@ -8427,7 +8702,8 @@ const processJob = async (
         optimizationNotes: null,
         renderSettings: buildPersistedRenderSettings(finalRenderConfig, {
           retentionAggressionLevel: aggressionLevel,
-          retentionStrategyProfile: strategyProfile
+          retentionStrategyProfile: strategyProfile,
+          onlyCuts: options.onlyCuts
         }),
         analysis: nextAnalysis
       })
@@ -9701,6 +9977,7 @@ const processJob = async (
         retention_content_format: selectedContentFormat
       },
       renderConfig,
+      onlyCuts: options.onlyCuts,
       outputPaths
     })
 
@@ -9720,7 +9997,8 @@ const processJob = async (
       optimizationNotes: optimizationNotes.length ? optimizationNotes : null,
       renderSettings: buildPersistedRenderSettings(renderConfig, {
         retentionAggressionLevel: aggressionLevel,
-        retentionStrategyProfile: strategyProfile
+        retentionStrategyProfile: strategyProfile,
+        onlyCuts: options.onlyCuts
       }),
       analysis: nextAnalysis
     })
@@ -9755,7 +10033,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       }
       const { options } = await getEditOptionsForUser(user.id, {
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
-        retentionStrategyProfile: getRetentionStrategyFromJob(existing)
+        retentionStrategyProfile: getRetentionStrategyFromJob(existing),
+        onlyCuts: getOnlyCutsFromJob(existing)
       })
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       await analyzeJob(jobId, options, requestId)
@@ -10092,6 +10371,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
     const renderConfig = parseRenderConfigFromRequest(req.body)
+    const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -10164,7 +10444,8 @@ const handleCreateJob = async (req: any, res: any) => {
         priorityLevel: plan.priority ? 1 : 2,
         renderSettings: buildPersistedRenderSettings(renderConfig, {
           retentionAggressionLevel,
-          retentionStrategyProfile
+          retentionStrategyProfile,
+          onlyCuts: onlyCutsOverride
         }),
         analysis: buildPersistedRenderAnalysis({
           existing: {
@@ -10172,9 +10453,11 @@ const handleCreateJob = async (req: any, res: any) => {
             retentionLevel: retentionAggressionLevel,
             retentionStrategyProfile,
             retentionStrategy: retentionStrategyProfile,
-            pipelineSteps: normalizePipelineStepMap({})
+            pipelineSteps: normalizePipelineStepMap({}),
+            ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride })
           },
           renderConfig,
+          onlyCuts: onlyCutsOverride,
           outputPaths: null
         })
       }
@@ -10482,6 +10765,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
     }
     const inputPath = req.body?.key || req.body?.inputPath || job.inputPath
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
+    const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
+    const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -10494,14 +10779,16 @@ const handleCompleteUpload = async (req: any, res: any) => {
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
       retentionStrategyProfile: requestedStrategyProfile,
-      retentionStrategy: requestedStrategyProfile
+      retentionStrategy: requestedStrategyProfile,
+      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
       retentionStrategyProfile: requestedStrategyProfile,
-      retentionStrategy: requestedStrategyProfile
+      retentionStrategy: requestedStrategyProfile,
+      ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
 
     const { plan, tier } = await getUserPlan(req.user.id)
@@ -10557,7 +10844,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     })
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy
+      retentionStrategyProfile: tuning.strategy,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     })
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
@@ -10595,7 +10883,8 @@ router.post('/:id/process', async (req: any, res) => {
     })
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy
+      retentionStrategyProfile: tuning.strategy,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     })
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
