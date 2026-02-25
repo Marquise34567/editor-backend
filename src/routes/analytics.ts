@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import prisma from '../prisma'
+import { recordAdminErrorLog } from '../services/adminTelemetry'
 
 const router = Router()
 
@@ -103,6 +104,32 @@ router.post('/track', async (req: any, res) => {
     return res.json({ ok: true, eventId: created.id })
   } catch (err) {
     console.error('analytics track failed', err)
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/client-error', async (req: any, res) => {
+  try {
+    const message = normalizeString(req.body?.message, 600)
+    if (!message) {
+      return res.status(400).json({ error: 'invalid_message' })
+    }
+    const stackSnippet = normalizeString(req.body?.stack, 2000)
+    const pagePath = normalizeString(req.body?.pagePath ?? req.body?.route, 180)
+    const jobId = normalizeString(req.body?.jobId, 120)
+    await recordAdminErrorLog({
+      severity: String(req.body?.severity || '').toLowerCase() === 'critical' ? 'critical' : 'medium',
+      message: `frontend_js_error: ${message}`,
+      stackSnippet: stackSnippet || null,
+      route: pagePath || '/frontend',
+      endpoint: 'frontend://browser',
+      userId: String(req.user?.id || ''),
+      jobId: jobId || null,
+      userAgent: typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    })
+    return res.json({ ok: true })
+  } catch (err) {
+    console.error('client-error track failed', err)
     return res.status(500).json({ error: 'server_error' })
   }
 })

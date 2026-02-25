@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
+import { getAllowedDevAdminEmails, resolveDevAdminAccess } from '../lib/devAccounts'
 
 declare global {
   namespace Express {
@@ -18,7 +19,6 @@ const getClientIp = (req: Request) => {
 }
 
 const safeLower = (value?: string | null) => String(value || '').trim().toLowerCase()
-const ONLY_DEV_PANEL_EMAIL = 'fyequise03@gmail.com'
 
 const getTokenFromRequest = (req: Request) => {
   const authHeader = req.headers.authorization
@@ -83,13 +83,16 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
     const normalizedEmail = safeLower(email)
     req.user = { id: userId, email: email ?? undefined }
 
-    if (normalizedEmail !== ONLY_DEV_PANEL_EMAIL) {
+    const access = await resolveDevAdminAccess(userId, normalizedEmail)
+    if (!access.allowed) {
       await auditAccessAttempt({
         req,
         allowed: false,
         email,
         userId,
-        reason: 'email_not_authorized'
+        reason: access.emailAuthorized
+          ? `admin_role_required; role=${access.role}; isDevAdmin=${access.isDevAdmin}`
+          : `email_not_authorized; allowed=${getAllowedDevAdminEmails().join('|')}`
       })
       return stealthNotFound(res)
     }

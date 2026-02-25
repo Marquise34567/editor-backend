@@ -13,6 +13,7 @@ export type AdminErrorLogEntry = {
   endpoint: string | null
   userId: string | null
   jobId: string | null
+  userAgent: string | null
   count: number
   createdAt: string
   lastSeen: string
@@ -109,10 +110,15 @@ export const ensureAdminTelemetryInfra = async () => {
         endpoint TEXT NULL,
         user_id TEXT NULL,
         job_id TEXT NULL,
+        user_agent TEXT NULL,
         count INTEGER NOT NULL DEFAULT 1,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
+    `)
+    await (prisma as any).$executeRawUnsafe(`
+      ALTER TABLE admin_error_logs
+      ADD COLUMN IF NOT EXISTS user_agent TEXT NULL
     `)
     await (prisma as any).$executeRawUnsafe(`
       CREATE TABLE IF NOT EXISTS stripe_webhook_events (
@@ -202,7 +208,8 @@ export const recordAdminErrorLog = async ({
   route,
   endpoint,
   userId,
-  jobId
+  jobId,
+  userAgent
 }: {
   severity?: string | null
   message: string
@@ -211,10 +218,12 @@ export const recordAdminErrorLog = async ({
   endpoint?: string | null
   userId?: string | null
   jobId?: string | null
+  userAgent?: string | null
 }) => {
   const safeMessage = String(message || 'internal_error').trim().slice(0, 600)
   if (!safeMessage) return null
   const safeSeverity = normalizeSeverity(severity)
+  const safeUserAgent = userAgent ? String(userAgent).trim().slice(0, 260) : null
   const fingerprint = buildErrorFingerprint(safeMessage, route, endpoint)
   const seenAt = nowIso()
   const existing = inMemoryErrorLogs.get(fingerprint)
@@ -227,6 +236,7 @@ export const recordAdminErrorLog = async ({
         route: route || existing.route,
         userId: userId || existing.userId,
         jobId: jobId || existing.jobId,
+        userAgent: safeUserAgent || existing.userAgent || null,
         count: existing.count + 1,
         lastSeen: seenAt
       }
@@ -239,6 +249,7 @@ export const recordAdminErrorLog = async ({
         endpoint: endpoint || null,
         userId: userId || null,
         jobId: jobId || null,
+        userAgent: safeUserAgent || null,
         count: 1,
         createdAt: seenAt,
         lastSeen: seenAt
@@ -252,9 +263,9 @@ export const recordAdminErrorLog = async ({
       await (prisma as any).$executeRawUnsafe(
         `
           INSERT INTO admin_error_logs
-            (fingerprint, severity, message, stack_snippet, route, endpoint, user_id, job_id, count, created_at, last_seen)
+            (fingerprint, severity, message, stack_snippet, route, endpoint, user_id, job_id, user_agent, count, created_at, last_seen)
           VALUES
-            ($1, $2, $3, $4, $5, $6, $7, $8, 1, $9, $9)
+            ($1, $2, $3, $4, $5, $6, $7, $8, $9, 1, $10, $10)
           ON CONFLICT (fingerprint) DO UPDATE
           SET severity = EXCLUDED.severity,
               stack_snippet = COALESCE(EXCLUDED.stack_snippet, admin_error_logs.stack_snippet),
@@ -262,6 +273,7 @@ export const recordAdminErrorLog = async ({
               endpoint = COALESCE(EXCLUDED.endpoint, admin_error_logs.endpoint),
               user_id = COALESCE(EXCLUDED.user_id, admin_error_logs.user_id),
               job_id = COALESCE(EXCLUDED.job_id, admin_error_logs.job_id),
+              user_agent = COALESCE(EXCLUDED.user_agent, admin_error_logs.user_agent),
               count = admin_error_logs.count + 1,
               last_seen = EXCLUDED.last_seen
         `,
@@ -273,6 +285,7 @@ export const recordAdminErrorLog = async ({
         endpoint || null,
         userId || null,
         jobId || null,
+        safeUserAgent,
         seenAt
       )
     } catch (err) {
@@ -305,6 +318,7 @@ export const getAdminErrorLogs = async ({
             endpoint,
             user_id AS "userId",
             job_id AS "jobId",
+            user_agent AS "userAgent",
             count,
             created_at AS "createdAt",
             last_seen AS "lastSeen"
@@ -327,6 +341,7 @@ export const getAdminErrorLogs = async ({
           endpoint: row.endpoint ? String(row.endpoint) : null,
           userId: row.userId ? String(row.userId) : null,
           jobId: row.jobId ? String(row.jobId) : null,
+          userAgent: row.userAgent ? String(row.userAgent) : null,
           count: Math.max(1, Number(row.count || 1)),
           createdAt: row.createdAt ? new Date(row.createdAt).toISOString() : nowIso(),
           lastSeen: row.lastSeen ? new Date(row.lastSeen).toISOString() : nowIso()
@@ -459,4 +474,3 @@ export const getStripeWebhookEvents = async ({ rangeMs }: { rangeMs: number }) =
     .filter((entry) => new Date(entry.createdAt).getTime() >= floor.getTime())
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
 }
-

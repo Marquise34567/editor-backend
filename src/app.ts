@@ -16,11 +16,13 @@ import publicRoutes from './routes/public'
 import adminRoutes from './routes/admin'
 import debugRoutes from './routes/debug'
 import analyticsRoutes from './routes/analytics'
+import algorithmDevRoutes from './dev/algorithm/routes/algorithm'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
 import { recordAdminErrorLog } from './services/adminTelemetry'
 import { blockBannedIp } from './middleware/blockBannedIp'
+import { recordRequestMetric } from './services/requestMetrics'
 
 loadEnv()
 const app = express()
@@ -190,6 +192,18 @@ app.use((req, res, next) => {
   const started = Date.now()
   res.on('finish', () => {
     const ms = Date.now() - started
+    const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim() || req.ip || null
+    const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null
+    recordRequestMetric({
+      t: new Date().toISOString(),
+      path: req.originalUrl || req.path || '/',
+      method: req.method || 'GET',
+      statusCode: Number(res.statusCode || 0),
+      latencyMs: ms,
+      userId: req?.user?.id || null,
+      ip,
+      userAgent
+    })
     console.log(`[${id}] ${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`)
   })
   next()
@@ -224,6 +238,7 @@ app.use('/api/uploads', requireAuth, uploadsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
 app.use('/api/analytics', requireAuth, analyticsRoutes)
+app.use('/api/dev/algorithm', algorithmDevRoutes)
 app.use('/api/admin', adminRoutes)
 
 app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
@@ -258,7 +273,8 @@ app.use((err: any, req: any, res: any, next: any) => {
     route: req?.path || req?.originalUrl || null,
     endpoint: req?.originalUrl || null,
     userId: req?.user?.id || null,
-    jobId: req?.params?.id || null
+    jobId: req?.params?.id || null,
+    userAgent: typeof req?.headers?.['user-agent'] === 'string' ? req.headers['user-agent'] : null
   })
   const message = err?.message || 'Internal error'
   res.status(err?.status || 500).json({ error: 'internal_error', message, path: req?.originalUrl, requestId })

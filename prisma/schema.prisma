@@ -63,6 +63,7 @@ model Job {
   id         String   @id @default(uuid())
   user       User     @relation(fields: [userId], references: [id])
   userId     String
+  configVersionId String? @map("config_version_id")
   status     JobStatus @default(queued)
   inputPath  String   @map("input_url")
   outputPath String?  @map("output_url")
@@ -80,8 +81,76 @@ model Job {
   optimizationNotes Json? @map("optimization_notes")
   createdAt  DateTime @default(now()) @map("created_at")
   updatedAt  DateTime @updatedAt @map("updated_at")
+  algorithmConfigVersion EditorConfigVersion? @relation("JobAlgorithmConfig", fields: [configVersionId], references: [id])
+  renderQualityMetrics RenderQualityMetric[]
 
   @@map("jobs")
+}
+
+model EditorConfigVersion {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  createdByUserId String?  @map("created_by_user_id")
+  presetName      String?  @map("preset_name")
+  params          Json
+  isActive        Boolean  @default(false) @map("is_active")
+  note            String?
+  jobs            Job[]    @relation("JobAlgorithmConfig")
+  metrics         RenderQualityMetric[]
+
+  @@index([createdAt], map: "idx_editor_config_versions_created_at")
+  @@index([isActive, createdAt], map: "idx_editor_config_versions_active_created_at")
+  @@map("editor_config_versions")
+}
+
+model RenderQualityMetric {
+  id              String   @id @default(uuid())
+  jobId           String   @map("job_id")
+  userId          String?  @map("user_id")
+  createdAt       DateTime @default(now()) @map("created_at")
+  configVersionId String   @map("config_version_id")
+  scoreTotal      Float    @map("score_total")
+  scoreHook       Float    @map("score_hook")
+  scorePacing     Float    @map("score_pacing")
+  scoreEmotion    Float    @map("score_emotion")
+  scoreVisual     Float    @map("score_visual")
+  scoreStory      Float    @map("score_story")
+  scoreJank       Float    @map("score_jank")
+  features        Json
+  flags           Json
+  job             Job      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  configVersion   EditorConfigVersion @relation(fields: [configVersionId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt], map: "idx_render_quality_metrics_created_at")
+  @@index([configVersionId], map: "idx_render_quality_metrics_config_version_id")
+  @@map("render_quality_metrics")
+}
+
+model AlgorithmExperiment {
+  id              String   @id @default(uuid())
+  createdAt       DateTime @default(now()) @map("created_at")
+  createdByUserId String?  @map("created_by_user_id")
+  name            String
+  status          String
+  arms            Json
+  allocation      Json
+  rewardMetric    String   @default("score_total") @map("reward_metric")
+  startAt         DateTime? @map("start_at")
+  endAt           DateTime? @map("end_at")
+
+  @@index([status, createdAt], map: "idx_algorithm_experiments_status_created_at")
+  @@map("algorithm_experiments")
+}
+
+model SecurityEvent {
+  id        String   @id @default(uuid())
+  createdAt DateTime @default(now()) @map("created_at")
+  type      String
+  meta      Json
+
+  @@index([createdAt], map: "idx_security_events_created_at")
+  @@index([type], map: "idx_security_events_type")
+  @@map("security_events")
 }
 
 model FounderInventory {

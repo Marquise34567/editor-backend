@@ -29,7 +29,7 @@ router.get('/', async (req: any, res) => {
   const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
   const rerenderUsageDaily = await getRerenderUsageForDay(id)
   const devAccess = await resolveDevAdminAccess(user.id, user.email)
-  const isDev = devAccess.allowed
+  const isDev = devAccess.emailAuthorized
   const rendersUsed = usage?.rendersUsed ?? 0
 
   res.json({
@@ -52,7 +52,7 @@ router.get('/', async (req: any, res) => {
     flags: {
       dev: isDev,
       role: devAccess.role,
-      isAdmin: devAccess.isDevAdmin
+      isAdmin: devAccess.allowed
     },
     usage: {
       month,

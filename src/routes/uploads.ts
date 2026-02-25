@@ -5,9 +5,11 @@ import crypto from 'crypto'
 import { enqueuePipeline, updateJob } from './jobs'
 import bodyParser from 'body-parser'
 import { supabaseAdmin } from '../supabaseClient'
+import { getFeatureLabControls } from '../services/featureLab'
 
 const router = express.Router()
 const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
+const MB = 1024 * 1024
 
 const logAwsError = (label: string, err: any) => {
   console.error(label, {
@@ -155,6 +157,17 @@ router.post('/create', async (req: any, res) => {
     const sizeBytes = Number(req.body?.sizeBytes ?? req.body?.fileSizeBytes ?? 0)
     if (!filename || !Number.isFinite(sizeBytes) || sizeBytes <= 0) {
       return res.status(400).json({ error: 'missing_params' })
+    }
+    const controls = await getFeatureLabControls().catch(() => null)
+    const maxUploadSizeMb = Math.max(50, Number(controls?.maxUploadSizeMb || 2048))
+    const maxUploadSizeBytes = Math.round(maxUploadSizeMb * MB)
+    if (sizeBytes > maxUploadSizeBytes) {
+      return res.status(413).json({
+        error: 'upload_too_large',
+        message: `Upload exceeds current max size of ${maxUploadSizeMb} MB`,
+        maxUploadSizeMb,
+        maxUploadSizeBytes
+      })
     }
     const job = await prisma.job.findUnique({ where: { id: resolvedJobId } })
     if (!job || job.userId !== userId) return res.status(404).json({ error: 'not_found' })

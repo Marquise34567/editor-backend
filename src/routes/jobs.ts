@@ -58,6 +58,7 @@ import {
   type TimelineFeatureSnapshot
 } from '../lib/multiStyleRetention'
 import { applyWatermarkOverride, getFeatureLabControls } from '../services/featureLab'
+import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
 
 const router = express.Router()
 
@@ -10324,6 +10325,21 @@ const processJob = async (
         analysis: nextAnalysis
       })
 
+      try {
+        await computeAndStoreRenderQualityMetric({
+          job: {
+            ...job,
+            id: jobId,
+            userId: user.id,
+            configVersionId: (job as any)?.configVersionId || (job as any)?.config_version_id || null,
+            analysis: nextAnalysis,
+            retentionScore: null
+          }
+        })
+      } catch (error) {
+        console.warn(`[${requestId || 'noid'}] render quality metric write failed`, error)
+      }
+
       const monthKey = getMonthKey()
       await incrementUsageForMonth(user.id, monthKey, 1, durationMinutes)
       await incrementRenderUsage(user.id, monthKey, 1)
@@ -11947,6 +11963,21 @@ const processJob = async (
       analysis: nextAnalysis
     })
 
+    try {
+      await computeAndStoreRenderQualityMetric({
+        job: {
+          ...job,
+          id: jobId,
+          userId: user.id,
+          configVersionId: (job as any)?.configVersionId || (job as any)?.config_version_id || null,
+          analysis: nextAnalysis,
+          retentionScore
+        }
+      })
+    } catch (error) {
+      console.warn(`[${requestId || 'noid'}] render quality metric write failed`, error)
+    }
+
     const monthKey = getMonthKey()
     await incrementUsageForMonth(user.id, monthKey, 1, durationMinutes)
     await incrementRenderUsage(user.id, monthKey, 1)
@@ -12392,23 +12423,30 @@ const handleCreateJob = async (req: any, res: any) => {
 
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
     const desiredQuality = getRequestedQuality(requestedQuality, settings?.exportQuality)
+    const configSelection = await chooseConfigForJobCreation()
 
     const job = await prisma.job.create({
       data: {
         id,
         userId,
+        configVersionId: configSelection.config_version_id,
         status: 'queued',
         inputPath,
         progress: 0,
         requestedQuality: desiredQuality,
         priorityLevel: plan.priority ? 1 : 2,
-        renderSettings: buildPersistedRenderSettings(renderConfig, {
-          retentionAggressionLevel,
-          retentionStrategyProfile,
-          retentionTargetPlatform,
-          platformProfile,
-          onlyCuts: onlyCutsOverride
-        }),
+        renderSettings: {
+          ...buildPersistedRenderSettings(renderConfig, {
+            retentionAggressionLevel,
+            retentionStrategyProfile,
+            retentionTargetPlatform,
+            platformProfile,
+            onlyCuts: onlyCutsOverride
+          }),
+          algorithm_config_version_id: configSelection.config_version_id,
+          algorithm_experiment_id: configSelection.experiment_id,
+          algorithm_config_source: configSelection.source
+        },
         analysis: buildPersistedRenderAnalysis({
           existing: {
             retentionAggressionLevel,
@@ -12423,6 +12461,9 @@ const handleCreateJob = async (req: any, res: any) => {
             platformProfile,
             platform_profile: platformProfile,
             style_archetype_blend_override: styleBlendOverride,
+            algorithm_config_version_id: configSelection.config_version_id,
+            algorithm_experiment_id: configSelection.experiment_id,
+            algorithm_config_source: configSelection.source,
             ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
             ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
             pipelineSteps: normalizePipelineStepMap({}),

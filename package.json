@@ -19,6 +19,7 @@
     "verify": "ts-node scripts/verify.ts",
     "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts",
     "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts",
+    "test:algorithm-control-room": "ts-node scripts/test-algorithm-control-room.ts",
     "tune:emotional-real-clips": "ts-node scripts/tune-emotional-real-clips.ts"
   },
   "dependencies": {
