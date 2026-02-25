@@ -40,6 +40,11 @@ import {
   parseSubtitleStyleConfig,
   type SubtitleFontId
 } from '../shared/subtitlePresets'
+import {
+  PLATFORM_EDIT_PROFILES,
+  parsePlatformProfile,
+  type PlatformProfileId
+} from '../shared/platformProfiles'
 
 const router = express.Router()
 
@@ -539,6 +544,7 @@ type RetentionAggressionLevel = 'low' | 'medium' | 'high' | 'viral'
 type RetentionStrategyProfile = 'safe' | 'balanced' | 'viral'
 type RetentionContentFormat = 'youtube_long' | 'tiktok_short' | 'podcast_clip'
 type RetentionTargetPlatform = 'auto' | 'tiktok' | 'instagram_reels' | 'youtube'
+type PlatformProfile = PlatformProfileId
 type PipelineStepStatus = 'pending' | 'running' | 'completed' | 'failed'
 type RetentionPipelineStep =
   | 'TRANSCRIBE'
@@ -851,8 +857,6 @@ const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MAX_VERTICAL_CLIPS = 3
-const MIN_VERTICAL_CLIP_SECONDS = 8
-const MAX_VERTICAL_CLIP_SECONDS = 55
 const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
 const LONG_FORM_MIN_EDIT_SECONDS = 20
@@ -961,6 +965,56 @@ const AGGRESSION_TO_STRATEGY: Record<RetentionAggressionLevel, RetentionStrategy
   medium: 'balanced',
   high: 'balanced',
   viral: 'viral'
+}
+type RetentionStyleReferencePreset = {
+  referenceAnchors: string[]
+  autoHookMove: boolean
+  removeBoring: boolean
+  smartZoom: boolean
+  jumpCuts: boolean
+  transitions: boolean
+  soundFx: boolean
+  emotionalBoost: boolean
+  aggressiveMode: boolean
+  musicDuck: boolean
+}
+const RETENTION_STYLE_REFERENCE_PRESETS: Record<RetentionStrategyProfile, RetentionStyleReferencePreset> = {
+  viral: {
+    referenceAnchors: ['MrBeast'],
+    autoHookMove: true,
+    removeBoring: true,
+    smartZoom: true,
+    jumpCuts: true,
+    transitions: true,
+    soundFx: true,
+    emotionalBoost: true,
+    aggressiveMode: true,
+    musicDuck: true
+  },
+  balanced: {
+    referenceAnchors: ['AsmonTV', 'kyahsarchive', 'DDG'],
+    autoHookMove: true,
+    removeBoring: true,
+    smartZoom: false,
+    jumpCuts: true,
+    transitions: false,
+    soundFx: false,
+    emotionalBoost: false,
+    aggressiveMode: false,
+    musicDuck: true
+  },
+  safe: {
+    referenceAnchors: ['regular context-first cuts'],
+    autoHookMove: true,
+    removeBoring: true,
+    smartZoom: false,
+    jumpCuts: false,
+    transitions: false,
+    soundFx: false,
+    emotionalBoost: false,
+    aggressiveMode: false,
+    musicDuck: true
+  }
 }
 const FORMAT_SCORE_WEIGHTS: Record<RetentionContentFormat, {
   hook: number
@@ -1239,6 +1293,38 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   retentionStrategyProfile: 'balanced'
 }
 
+const applyRetentionStyleReferencePreset = ({
+  options,
+  strategy,
+  allowAdvancedEffects
+}: {
+  options: EditOptions
+  strategy: RetentionStrategyProfile
+  allowAdvancedEffects: boolean
+}): EditOptions => {
+  const preset = RETENTION_STYLE_REFERENCE_PRESETS[strategy]
+  if (!preset || options.onlyCuts) {
+    return {
+      ...options,
+      retentionStrategyProfile: strategy,
+      aggressiveMode: options.onlyCuts ? false : options.aggressiveMode
+    }
+  }
+  return {
+    ...options,
+    retentionStrategyProfile: strategy,
+    autoHookMove: preset.autoHookMove,
+    removeBoring: preset.removeBoring,
+    smartZoom: preset.smartZoom,
+    jumpCuts: preset.jumpCuts,
+    transitions: preset.transitions,
+    soundFx: preset.soundFx,
+    musicDuck: preset.musicDuck,
+    emotionalBoost: allowAdvancedEffects ? preset.emotionalBoost : false,
+    aggressiveMode: allowAdvancedEffects ? preset.aggressiveMode : false
+  }
+}
+
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 type EmotionalTuningProfile = {
   thresholdOffset: number
@@ -1326,6 +1412,26 @@ const truncateErrorText = (value: unknown, max = 360) => {
   return text.length > max ? text.slice(0, max) : text
 }
 
+const getDefaultCrfForQuality = (quality: ExportQuality) => {
+  if (quality === '4k') return 18
+  if (quality === '1080p') return 20
+  return 22
+}
+
+const resolveAudioSampleRate = (value: unknown, fallback: number) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return fallback
+  const rounded = Math.round(parsed)
+  if (rounded < 8_000 || rounded > 192_000) return fallback
+  return rounded
+}
+
+const resolveAudioBitrateArg = (value: unknown, fallbackKbps: number) => {
+  const raw = String(value || '').trim()
+  if (!raw) return `${fallbackKbps}k`
+  return raw
+}
+
 const parseRetentionAggressionLevel = (value?: any): RetentionAggressionLevel => {
   const raw = String(value || '').trim().toLowerCase()
   if (raw === 'safe') return 'low'
@@ -1348,21 +1454,7 @@ const parseRetentionStrategyProfile = (value?: any): RetentionStrategyProfile =>
 }
 
 const parseRetentionTargetPlatform = (value?: any): RetentionTargetPlatform => {
-  const raw = String(value || '').trim().toLowerCase()
-  if (!raw || raw === 'auto' || raw === 'default') return 'auto'
-  if (raw === 'tiktok' || raw === 'tt' || raw.includes('tik')) return 'tiktok'
-  if (
-    raw === 'instagram_reels' ||
-    raw === 'instagram' ||
-    raw === 'ig' ||
-    raw === 'reels' ||
-    raw.includes('reel') ||
-    raw.includes('insta')
-  ) {
-    return 'instagram_reels'
-  }
-  if (raw === 'youtube' || raw === 'yt' || raw.includes('you')) return 'youtube'
-  return 'auto'
+  return parsePlatformProfile(value, 'auto') as RetentionTargetPlatform
 }
 
 const strategyFromAggressionLevel = (level: RetentionAggressionLevel): RetentionStrategyProfile => (
@@ -1676,6 +1768,28 @@ const getRetentionTargetPlatformFromPayload = (payload?: any): RetentionTargetPl
   return parseRetentionTargetPlatform(explicit)
 }
 
+const hasPlatformProfileOverride = (payload?: any) => Boolean(
+  payload &&
+  (
+    payload?.platformProfile !== undefined ||
+    payload?.platform_profile !== undefined ||
+    payload?.editProfile !== undefined
+  )
+)
+
+const getPlatformProfileFromPayload = (payload?: any, fallback: PlatformProfile = 'auto'): PlatformProfile => {
+  if (!payload || typeof payload !== 'object') return fallback
+  const explicit = (
+    (payload as any).platformProfile ??
+    (payload as any).platform_profile ??
+    (payload as any).editProfile
+  )
+  if (explicit !== undefined && explicit !== null && String(explicit).trim().length > 0) {
+    return parsePlatformProfile(explicit, fallback)
+  }
+  return parsePlatformProfile(getRetentionTargetPlatformFromPayload(payload), fallback)
+}
+
 const getRetentionAggressionFromJob = (job?: any) => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -1738,6 +1852,29 @@ const getRetentionTargetPlatformFromJob = (job?: any): RetentionTargetPlatform =
   return parseRetentionTargetPlatform(source)
 }
 
+const getPlatformProfileFromJob = (job?: any): PlatformProfile => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const retentionFallback = parsePlatformProfile(
+    settings?.retentionTargetPlatform ??
+    settings?.retention_target_platform ??
+    settings?.retentionPlatform ??
+    settings?.targetPlatform ??
+    analysis?.retentionTargetPlatform ??
+    analysis?.retention_target_platform ??
+    analysis?.retentionPlatform ??
+    analysis?.targetPlatform ??
+    analysis?.platform,
+    'auto'
+  )
+  const source =
+    settings?.platformProfile ??
+    settings?.platform_profile ??
+    analysis?.platformProfile ??
+    analysis?.platform_profile
+  return parsePlatformProfile(source, retentionFallback)
+}
+
 const buildRetentionPlatformFromPayload = ({
   payload,
   fallbackPlatform
@@ -1793,6 +1930,7 @@ const buildPersistedRenderSettings = (
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
     retentionTargetPlatform?: RetentionTargetPlatform | null
+    platformProfile?: PlatformProfile | null
     onlyCuts?: boolean | null
   }
 ) => {
@@ -1803,6 +1941,7 @@ const buildPersistedRenderSettings = (
     opts?.retentionStrategyProfile || strategyFromAggressionLevel(retentionLevel)
   )
   const retentionTargetPlatform = parseRetentionTargetPlatform(opts?.retentionTargetPlatform || 'auto')
+  const platformProfile = parsePlatformProfile(opts?.platformProfile || retentionTargetPlatform, 'auto')
   const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
   return {
     renderMode: renderConfig.mode,
@@ -1816,6 +1955,8 @@ const buildPersistedRenderSettings = (
     retentionTargetPlatform,
     retention_target_platform: retentionTargetPlatform,
     targetPlatform: retentionTargetPlatform,
+    platformProfile,
+    platform_profile: platformProfile,
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts })
   }
 }
@@ -1825,13 +1966,15 @@ const buildPersistedRenderAnalysis = ({
   renderConfig,
   outputPaths,
   onlyCuts,
-  retentionTargetPlatform
+  retentionTargetPlatform,
+  platformProfile
 }: {
   existing?: any
   renderConfig: RenderConfig
   outputPaths?: string[] | null
   onlyCuts?: boolean | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
+  platformProfile?: PlatformProfile | null
 }) => {
   const resolvedOnlyCuts = typeof onlyCuts === 'boolean'
     ? onlyCuts
@@ -1881,6 +2024,16 @@ const buildPersistedRenderAnalysis = ({
   payload.retentionPlatform = resolvedTargetPlatform
   payload.targetPlatform = resolvedTargetPlatform
   payload.platform = resolvedTargetPlatform
+  const resolvedPlatformProfile = platformProfile
+    ? parsePlatformProfile(platformProfile, parsePlatformProfile(resolvedTargetPlatform, 'auto'))
+    : parsePlatformProfile(
+        (existing as any)?.platformProfile ??
+        (existing as any)?.platform_profile ??
+        resolvedTargetPlatform,
+        'auto'
+      )
+  payload.platformProfile = resolvedPlatformProfile
+  payload.platform_profile = resolvedPlatformProfile
   if (resolvedOnlyCuts !== null) {
     payload.onlyCuts = resolvedOnlyCuts
     payload.onlyHookAndCut = resolvedOnlyCuts
@@ -7779,12 +7932,14 @@ const buildVerticalClipRanges = (
   opts?: {
     windows?: EngagementWindow[]
     hookCandidates?: HookCandidate[]
+    platformProfile?: PlatformProfile
   }
 ) => {
   const total = Math.max(0, durationSeconds || 0)
   if (total <= 0) return [{ start: 0, end: 0 }]
+  const platformProfile = PLATFORM_EDIT_PROFILES[parsePlatformProfile(opts?.platformProfile, 'auto')] || PLATFORM_EDIT_PROFILES.auto
   let clipCount = clamp(requestedCount || 1, 1, MAX_VERTICAL_CLIPS)
-  const maxFeasibleByLength = Math.max(1, Math.floor(total / MIN_VERTICAL_CLIP_SECONDS))
+  const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(1, platformProfile.verticalMinClipSeconds)))
   clipCount = Math.min(clipCount, maxFeasibleByLength)
   const windows = Array.isArray(opts?.windows) ? opts!.windows! : []
   const hookCandidates = Array.isArray(opts?.hookCandidates) ? opts!.hookCandidates! : []
@@ -7803,9 +7958,12 @@ const buildVerticalClipRanges = (
   if (!windows.length) return fallbackRanges
 
   const targetClipDuration = Number(clamp(
-    total / Math.max(1, clipCount * 3.2),
-    MIN_VERTICAL_CLIP_SECONDS,
-    MAX_VERTICAL_CLIP_SECONDS
+    total / Math.max(1, clipCount * platformProfile.verticalClipDurationDivisor),
+    Math.max(2, platformProfile.verticalMinClipSeconds),
+    Math.max(
+      Math.max(2, platformProfile.verticalMinClipSeconds),
+      platformProfile.verticalMaxClipSeconds
+    )
   ).toFixed(3))
   const step = total > 300 ? 2 : 1
   const candidates: Array<{ range: TimeRange; score: number }> = []
@@ -7839,7 +7997,7 @@ const buildVerticalClipRanges = (
     .slice()
     .sort((a, b) => b.score - a.score || a.range.start - b.range.start)
   const selected: TimeRange[] = []
-  const minSpacing = Math.max(2, targetClipDuration * 0.22)
+  const minSpacing = Math.max(2, targetClipDuration * clamp(platformProfile.verticalSpacingRatio, 0.1, 0.5))
   for (const entry of sorted) {
     if (selected.length >= clipCount) break
     const overlaps = selected.some((range) => (
@@ -8055,7 +8213,11 @@ const renderVerticalClip = async ({
   verticalMode,
   sourceWidth,
   sourceHeight,
-  withAudio
+  withAudio,
+  videoPreset,
+  videoCrf,
+  audioBitrate,
+  audioSampleRate
 }: {
   inputPath: string
   outputPath: string
@@ -8065,6 +8227,10 @@ const renderVerticalClip = async ({
   sourceWidth: number
   sourceHeight: number
   withAudio: boolean
+  videoPreset: string
+  videoCrf: string
+  audioBitrate: string
+  audioSampleRate: string
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
@@ -8113,9 +8279,9 @@ const renderVerticalClip = async ({
     '-c:v',
     'libx264',
     '-preset',
-    process.env.FFMPEG_PRESET || 'medium',
+    videoPreset,
     '-crf',
-    process.env.FFMPEG_CRF || '20',
+    videoCrf,
     '-threads',
     '0',
     '-pix_fmt',
@@ -8126,7 +8292,7 @@ const renderVerticalClip = async ({
     '[outv]'
   ]
   if (withAudio) {
-    args.push('-map', '[outa]', '-c:a', 'aac')
+    args.push('-map', '[outa]', '-c:a', 'aac', '-b:a', audioBitrate, '-ar', audioSampleRate, '-ac', '2')
   } else {
     args.push('-an')
   }
@@ -8271,6 +8437,10 @@ const resolveRuntimeRetentionProfile = ({
     if (isLongForm) {
       notes.push('Long-form runtime detected; applied long-form pacing safeguards.')
     }
+  }
+  const referencePreset = RETENTION_STYLE_REFERENCE_PRESETS[strategy]
+  if (referencePreset?.referenceAnchors?.length) {
+    notes.push(`Style anchors: ${referencePreset.referenceAnchors.join(', ')}.`)
   }
 
   return {
@@ -8735,24 +8905,30 @@ const getEditOptionsForUser = async (
     features.advancedEffects ? requestedAggression : (requestedAggression === 'low' ? 'low' : 'medium')
   const allowedStrategy = strategyFromAggressionLevel(allowedAggression)
   const aggressiveMode = onlyCuts ? false : isAggressiveRetentionLevel(allowedAggression)
+  const baseOptions: EditOptions = {
+    autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
+    removeBoring,
+    onlyCuts,
+    smartZoom: onlyCuts ? false : (settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
+    jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
+    transitions: onlyCuts ? false : (settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
+    soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
+    emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
+    aggressiveMode,
+    autoCaptions: onlyCuts ? false : (subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false),
+    musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
+    subtitleStyle,
+    autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
+    retentionAggressionLevel: allowedAggression,
+    retentionStrategyProfile: allowedStrategy
+  }
+  const options = applyRetentionStyleReferencePreset({
+    options: baseOptions,
+    strategy: allowedStrategy,
+    allowAdvancedEffects: Boolean(features.advancedEffects)
+  })
   return {
-    options: {
-      autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
-      removeBoring,
-      onlyCuts,
-      smartZoom: onlyCuts ? false : (settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
-      jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
-      transitions: onlyCuts ? false : (settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
-      soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
-      emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
-      aggressiveMode,
-      autoCaptions: onlyCuts ? false : (subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false),
-      musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
-      subtitleStyle,
-      autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
-      retentionAggressionLevel: allowedAggression,
-      retentionStrategyProfile: allowedStrategy
-    } as EditOptions,
+    options,
     plan,
     tier
   }
@@ -9033,6 +9209,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       analysis: existingAnalysis,
       renderSettings: latestRenderSettings
     })
+    const resolvedPlatformProfile = getPlatformProfileFromJob({
+      analysis: existingAnalysis,
+      renderSettings: latestRenderSettings
+    })
     const analyzeContentFormat = inferRetentionContentFormat({
       runtimeSeconds: duration,
       windows: editPlan?.engagementWindows ?? [],
@@ -9085,6 +9265,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         retentionPlatform: resolvedTargetPlatform,
         targetPlatform: resolvedTargetPlatform,
         platform: resolvedTargetPlatform,
+        platformProfile: resolvedPlatformProfile,
+        platform_profile: resolvedPlatformProfile,
         retentionContentFormat: analyzeContentFormat,
         retention_content_format: analyzeContentFormat,
         retention_runtime_profile: {
@@ -9114,6 +9296,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       },
       renderConfig,
       retentionTargetPlatform: resolvedTargetPlatform,
+      platformProfile: resolvedPlatformProfile,
       onlyCuts: options.onlyCuts
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
@@ -9130,6 +9313,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         retentionAggressionLevel: aggressionLevel,
         retentionStrategyProfile: strategyProfile,
         retentionTargetPlatform: resolvedTargetPlatform,
+        platformProfile: resolvedPlatformProfile,
         onlyCuts: options.onlyCuts
       }),
       analysis: analysis
@@ -9184,12 +9368,36 @@ const processJob = async (
     getRetentionAggressionFromJob(job)
   )
   const retentionTargetPlatform = getRetentionTargetPlatformFromJob(job)
+  const platformProfileId = getPlatformProfileFromJob(job)
+  const platformProfile = PLATFORM_EDIT_PROFILES[platformProfileId] || PLATFORM_EDIT_PROFILES.auto
   let strategyProfile = requestedStrategyProfile
   let aggressionLevel = requestedAggressionLevel
   const feedbackQualityGateOffset = computeFeedbackQualityGateOffset(job.analysis as any)
   const hookCalibration = await loadHookCalibrationProfile(job.userId)
-  const rawSubtitleStyle = options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
-  const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
+  const rawSubtitleStyle = String(options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET)
+  const normalizedRawSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
+  const hasExplicitSubtitleOverride = normalizedRawSubtitle !== DEFAULT_SUBTITLE_PRESET
+  let subtitleStyle = rawSubtitleStyle
+  let subtitleStyleSource: 'user' | 'platform' | 'default' = hasExplicitSubtitleOverride ? 'user' : 'default'
+  if (!hasExplicitSubtitleOverride) {
+    const preferredPlatformPreset = platformProfile.defaultSubtitlePreset
+    const canUsePlatformPreset = features.subtitles.enabled && isSubtitlePresetAllowed(preferredPlatformPreset, tier)
+    subtitleStyle = canUsePlatformPreset ? preferredPlatformPreset : DEFAULT_SUBTITLE_PRESET
+    subtitleStyleSource = canUsePlatformPreset ? 'platform' : 'default'
+  }
+  const normalizedSubtitle = normalizeSubtitlePreset(subtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
+  const baseCrf = getDefaultCrfForQuality(finalQuality)
+  const adjustedCrf = Math.round(clamp(baseCrf + platformProfile.crfDelta, 16, 30))
+  const ffPreset = options.fastMode
+    ? 'superfast'
+    : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
+  const ffCrf = options.fastMode
+    ? '28'
+    : (process.env.FFMPEG_CRF || String(adjustedCrf))
+  const ffAudioBitrate = resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
+  const ffAudioSampleRate = String(
+    resolveAudioSampleRate(process.env.FFMPEG_AUDIO_SAMPLE_RATE, platformProfile.audioSampleRate)
+  )
   if (renderConfig.mode === 'horizontal') {
     if (options.autoCaptions) {
       if (!features.subtitles.enabled) {
@@ -9211,7 +9419,6 @@ const processJob = async (
       throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
     }
   }
-  const subtitleStyle = rawSubtitleStyle
   const watermarkEnabled = renderConfig.mode === 'horizontal' ? features.watermark : false
 
   await updateJob(jobId, {
@@ -9310,7 +9517,8 @@ const processJob = async (
         : defaultVerticalModeSettings()
       const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount, {
         windows: verticalWindows,
-        hookCandidates: verticalHookCandidates
+        hookCandidates: verticalHookCandidates,
+        platformProfile: platformProfileId
       })
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
@@ -9337,7 +9545,11 @@ const processJob = async (
           verticalMode: resolvedVerticalMode,
           sourceWidth: sourceStream.width,
           sourceHeight: sourceStream.height,
-          withAudio: hasInputAudio
+          withAudio: hasInputAudio,
+          videoPreset: ffPreset,
+          videoCrf: ffCrf,
+          audioBitrate: ffAudioBitrate,
+          audioSampleRate: ffAudioSampleRate
         })
         const clipStats = fs.statSync(localClipPath)
         if (!clipStats.isFile() || clipStats.size <= 0) {
@@ -9399,6 +9611,8 @@ const processJob = async (
           retentionPlatform: retentionTargetPlatform,
           targetPlatform: retentionTargetPlatform,
           platform: retentionTargetPlatform,
+          platformProfile: platformProfileId,
+          platform_profile: platformProfileId,
           retentionContentFormat: verticalContentFormat,
           retention_content_format: verticalContentFormat,
           retention_runtime_profile: {
@@ -9426,6 +9640,7 @@ const processJob = async (
         },
         renderConfig: finalRenderConfig,
         retentionTargetPlatform: retentionTargetPlatform,
+        platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts,
         outputPaths
       })
@@ -9453,6 +9668,7 @@ const processJob = async (
           retentionAggressionLevel: aggressionLevel,
           retentionStrategyProfile: strategyProfile,
           retentionTargetPlatform: retentionTargetPlatform,
+          platformProfile: platformProfileId,
           onlyCuts: options.onlyCuts
         }),
         analysis: nextAnalysis
@@ -9472,6 +9688,11 @@ const processJob = async (
     let optimizationNotes: string[] = []
     if (runtimeRetentionNotes.length) {
       optimizationNotes.push(...runtimeRetentionNotes)
+    }
+    if (subtitleStyleSource === 'platform' && options.autoCaptions) {
+      optimizationNotes.push(
+        `Applied ${platformProfile.label} profile caption default (${normalizedSubtitle.replace(/_/g, ' ')}).`
+      )
     }
     let retentionAttempts: RetentionAttemptRecord[] = []
     let selectedJudge: RetentionJudgeReport | null = null
@@ -10391,13 +10612,6 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
-      const ffPreset = options.fastMode
-        ? 'superfast'
-        : (process.env.FFMPEG_PRESET || 'medium')
-      const defaultCrf = finalQuality === '4k' ? '18' : finalQuality === '1080p' ? '20' : '22'
-      const ffCrf = options.fastMode
-        ? '28'
-        : (process.env.FFMPEG_CRF || defaultCrf)
       const argsBase = [
         '-y',
         '-nostdin',
@@ -10421,7 +10635,9 @@ const processJob = async (
         '-pix_fmt',
         'yuv420p'
       ]
-      if (withAudio) argsBase.push('-c:a', 'aac')
+      if (withAudio) {
+        argsBase.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+      }
 
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
@@ -10601,7 +10817,9 @@ const processJob = async (
               '-pix_fmt',
               'yuv420p'
             ]
-            if (withAudio) concatEncodeArgs.push('-c:a', 'aac')
+            if (withAudio) {
+              concatEncodeArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            }
             concatEncodeArgs.push(tmpOut)
             await runFfmpeg(concatEncodeArgs)
           }
@@ -10860,6 +11078,8 @@ const processJob = async (
         retentionPlatform: retentionTargetPlatform,
         targetPlatform: retentionTargetPlatform,
         platform: retentionTargetPlatform,
+        platformProfile: platformProfileId,
+        platform_profile: platformProfileId,
         retentionContentFormat: selectedContentFormat,
         retention_content_format: selectedContentFormat,
         retention_runtime_profile: {
@@ -10872,6 +11092,7 @@ const processJob = async (
       },
       renderConfig,
       retentionTargetPlatform: retentionTargetPlatform,
+      platformProfile: platformProfileId,
       onlyCuts: options.onlyCuts,
       outputPaths
     })
@@ -10894,6 +11115,7 @@ const processJob = async (
         retentionAggressionLevel: aggressionLevel,
         retentionStrategyProfile: strategyProfile,
         retentionTargetPlatform: retentionTargetPlatform,
+        platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts
       }),
       analysis: nextAnalysis
@@ -11280,6 +11502,10 @@ const handleCreateJob = async (req: any, res: any) => {
     const retentionAggressionLevel = retentionTuning.aggression
     const retentionStrategyProfile = retentionTuning.strategy
     const retentionTargetPlatform = retentionPlatformTuning.targetPlatform
+    const platformProfile = getPlatformProfileFromPayload(
+      req.body,
+      parsePlatformProfile(retentionTargetPlatform, 'auto')
+    )
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -11347,6 +11573,7 @@ const handleCreateJob = async (req: any, res: any) => {
           retentionAggressionLevel,
           retentionStrategyProfile,
           retentionTargetPlatform,
+          platformProfile,
           onlyCuts: onlyCutsOverride
         }),
         analysis: buildPersistedRenderAnalysis({
@@ -11360,11 +11587,14 @@ const handleCreateJob = async (req: any, res: any) => {
             retentionPlatform: retentionTargetPlatform,
             targetPlatform: retentionTargetPlatform,
             platform: retentionTargetPlatform,
+            platformProfile,
+            platform_profile: platformProfile,
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride })
           },
           renderConfig,
           retentionTargetPlatform,
+          platformProfile,
           onlyCuts: onlyCutsOverride,
           outputPaths: null
         })
@@ -11690,6 +11920,9 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedAggressionLevel = tuning.aggression
     const requestedStrategyProfile = tuning.strategy
     const requestedTargetPlatform = platformTuning.targetPlatform
+    const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
+      ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
+      : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
@@ -11699,6 +11932,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
     const nextAnalysis = {
@@ -11712,6 +11947,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       retentionPlatform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
       platform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
 
@@ -11766,10 +12003,51 @@ router.post('/:id/analyze', async (req: any, res) => {
       fallbackAggression: getRetentionAggressionFromJob(job),
       fallbackStrategy: getRetentionStrategyFromJob(job)
     })
+    const platformTuning = buildRetentionPlatformFromPayload({
+      payload: req.body,
+      fallbackPlatform: getRetentionTargetPlatformFromJob(job)
+    })
+    const requestedTargetPlatform = platformTuning.targetPlatform
+    const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
+      ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
+      : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+    const nextRenderSettings = {
+      ...((job as any)?.renderSettings || {}),
+      retentionAggressionLevel: tuning.aggression,
+      retentionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy,
+      retentionStrategy: tuning.strategy,
+      retentionTargetPlatform: requestedTargetPlatform,
+      retention_target_platform: requestedTargetPlatform,
+      targetPlatform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+    }
+    const nextAnalysis = {
+      ...((job.analysis as any) || {}),
+      retentionAggressionLevel: tuning.aggression,
+      retentionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy,
+      retentionStrategy: tuning.strategy,
+      retentionTargetPlatform: requestedTargetPlatform,
+      retention_target_platform: requestedTargetPlatform,
+      retentionPlatform: requestedTargetPlatform,
+      targetPlatform: requestedTargetPlatform,
+      platform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+    }
+    await updateJob(id, {
+      renderSettings: nextRenderSettings,
+      analysis: nextAnalysis
+    })
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
-      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+      onlyCuts: requestedOnlyCuts
     })
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
@@ -11805,10 +12083,51 @@ router.post('/:id/process', async (req: any, res) => {
       fallbackAggression: getRetentionAggressionFromJob(job),
       fallbackStrategy: getRetentionStrategyFromJob(job)
     })
+    const platformTuning = buildRetentionPlatformFromPayload({
+      payload: req.body,
+      fallbackPlatform: getRetentionTargetPlatformFromJob(job)
+    })
+    const requestedTargetPlatform = platformTuning.targetPlatform
+    const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
+      ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
+      : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+    const nextRenderSettings = {
+      ...((job as any)?.renderSettings || {}),
+      retentionAggressionLevel: tuning.aggression,
+      retentionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy,
+      retentionStrategy: tuning.strategy,
+      retentionTargetPlatform: requestedTargetPlatform,
+      retention_target_platform: requestedTargetPlatform,
+      targetPlatform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+    }
+    const nextAnalysis = {
+      ...((job.analysis as any) || {}),
+      retentionAggressionLevel: tuning.aggression,
+      retentionLevel: tuning.aggression,
+      retentionStrategyProfile: tuning.strategy,
+      retentionStrategy: tuning.strategy,
+      retentionTargetPlatform: requestedTargetPlatform,
+      retention_target_platform: requestedTargetPlatform,
+      retentionPlatform: requestedTargetPlatform,
+      targetPlatform: requestedTargetPlatform,
+      platform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
+    }
+    await updateJob(id, {
+      renderSettings: nextRenderSettings,
+      analysis: nextAnalysis
+    })
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
-      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+      onlyCuts: requestedOnlyCuts
     })
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -11992,6 +12311,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedAggressionLevel = tuning.aggression
     const requestedStrategyProfile = tuning.strategy
     const requestedTargetPlatform = platformTuning.targetPlatform
+    const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
+      ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
+      : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -12016,7 +12338,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       retentionStrategy: requestedStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
-      targetPlatform: requestedTargetPlatform
+      targetPlatform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -12029,6 +12353,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       retentionPlatform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
       platform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      platform_profile: requestedPlatformProfile,
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }
