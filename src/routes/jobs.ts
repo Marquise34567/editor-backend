@@ -467,6 +467,19 @@ const toMinutes = (seconds?: number | null) => {
   return Math.ceil(seconds / 60)
 }
 
+const formatHookTimestamp = (seconds: number) => {
+  const safe = Math.max(0, Number(seconds) || 0)
+  const minutes = Math.floor(safe / 60)
+  const secondsRemainder = safe - minutes * 60
+  return `${String(minutes).padStart(2, '0')}:${secondsRemainder.toFixed(3).padStart(6, '0')}`
+}
+
+const formatHookRange = (start: number, end: number) => {
+  const safeStart = Math.max(0, Number(start) || 0)
+  const safeEnd = Math.max(safeStart, Number(end) || safeStart)
+  return `${formatHookTimestamp(safeStart)}-${formatHookTimestamp(safeEnd)}`
+}
+
 const getTargetDimensions = (quality?: ExportQuality | null) => {
   if (quality === '4k') return { width: 3840, height: 2160 }
   if (quality === '1080p') return { width: 1920, height: 1080 }
@@ -976,7 +989,7 @@ const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, Content
   commentary: 'vlog',
   vlog: 'vlog',
   gaming: 'gaming',
-  sports: 'reaction',
+  sports: 'gaming',
   education: 'tutorial'
 }
 const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingNiche> = {
@@ -1622,7 +1635,9 @@ const applyDurationBandSpeedTuning = ({
     if (energyEditorMode === 'education' || energyEditorMode === 'commentary') {
       target = Math.min(target, band.maxSpeed - 0.05)
     }
-    if (energyEditorMode === 'reaction' || energyEditorMode === 'gaming' || energyEditorMode === 'sports') {
+    if (energyEditorMode === 'sports') {
+      target += 0.05
+    } else if (energyEditorMode === 'reaction' || energyEditorMode === 'gaming') {
       target += 0.03
     }
     target = clamp(target, band.minSpeed, band.maxSpeed)
@@ -1654,7 +1669,8 @@ const resolveClipCandidateTarget = ({
   else if (minutes >= 60) target = 38
   else if (minutes >= 40) target = 32
   else if (minutes >= 20) target = 24
-  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') target += 4
+  if (editorMode === 'sports') target += 5
+  else if (editorMode === 'reaction' || editorMode === 'gaming') target += 4
   if (nicheProfile?.niche === 'high_energy') target += 4
   if (editorMode === 'education' || nicheProfile?.niche === 'education') target -= 2
   return clamp(Math.round(target), CLIP_CANDIDATE_POOL_MIN, CLIP_CANDIDATE_POOL_MAX)
@@ -1674,7 +1690,8 @@ const resolveAutoExportClipTarget = ({
   else if (minutes >= 90) target = 18
   else if (minutes >= 60) target = 15
   else if (minutes >= 40) target = 12
-  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') target += 2
+  if (editorMode === 'sports') target += 3
+  else if (editorMode === 'reaction' || editorMode === 'gaming') target += 2
   if (nicheProfile?.niche === 'high_energy') target += 2
   return clamp(Math.round(target), CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX)
 }
@@ -1699,8 +1716,14 @@ const resolveInterruptIntervalRange = ({
     minSec = 3
     maxSec = 4
   }
-  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') {
+  if (editorMode === 'sports') {
     minSec = 2
+    maxSec = 3.6
+  } else if (editorMode === 'gaming') {
+    minSec = 2.1
+    maxSec = 3.8
+  } else if (editorMode === 'reaction') {
+    minSec = 2.2
     maxSec = 4
   } else if (editorMode === 'education' || editorMode === 'commentary') {
     minSec = 3
@@ -1769,7 +1792,13 @@ const computeNicheFitScore = ({
   ))
   const curiosity = averageWindowMetric(windows, start, end, (window) => window.curiosityTrigger ?? 0)
   const mode = editorMode && editorMode !== 'auto' ? editorMode : null
-  if (mode === 'reaction' || mode === 'gaming' || mode === 'sports') {
+  if (mode === 'sports') {
+    return clamp01(0.54 * action + 0.3 * emotion + 0.16 * curiosity)
+  }
+  if (mode === 'gaming') {
+    return clamp01(0.5 * action + 0.28 * emotion + 0.22 * curiosity)
+  }
+  if (mode === 'reaction') {
     return clamp01(0.46 * action + 0.32 * emotion + 0.22 * curiosity)
   }
   if (mode === 'education' || mode === 'commentary') {
@@ -7558,8 +7587,9 @@ const buildRetentionMetadataSummary = ({
         : hookSelectionSource === 'fallback'
           ? 'Fallback hook was used to keep the opening attention-grabbing.'
           : 'Best-performing hook candidate was moved to the opening.'
+    const hookRangeLabel = formatHookRange(hook.start, hook.start + hook.duration)
     improvements.push(
-      `${hookSourceLabel} Hook window ${hook.start.toFixed(1)}s-${(hook.start + hook.duration).toFixed(1)}s.`
+      `${hookSourceLabel} Hook window ${hookRangeLabel}.`
     )
   }
   if (removedSeconds >= 1.2) {
@@ -9539,6 +9569,22 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
   return candidates.length ? candidates[0].fullPath : null
 }
 
+const prependPathEntry = (existingPath: string | undefined, entry: string) => {
+  const normalizedEntry = String(entry || '').trim()
+  if (!normalizedEntry) return String(existingPath || '')
+  const parts = String(existingPath || '')
+    .split(path.delimiter)
+    .map((part) => part.trim())
+    .filter(Boolean)
+  const hasEntry = parts.some((part) =>
+    process.platform === 'win32'
+      ? part.toLowerCase() === normalizedEntry.toLowerCase()
+      : part === normalizedEntry
+  )
+  if (hasEntry) return parts.join(path.delimiter)
+  return [normalizedEntry, ...parts].join(path.delimiter)
+}
+
 const runWhisperTranscribe = async ({
   command,
   args,
@@ -9552,8 +9598,18 @@ const runWhisperTranscribe = async ({
   workingDir: string
   label: string
 }) => {
+  const ffmpegDir = path.dirname(FFMPEG_PATH)
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+    PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+  }
+  if (ffmpegDir && ffmpegDir !== '.' && ffmpegDir !== FFMPEG_PATH) {
+    env.PATH = prependPathEntry(process.env.PATH, ffmpegDir)
+  }
+
   return new Promise<string | null>((resolve) => {
-    const proc = spawn(command, args)
+    const proc = spawn(command, args, { env, windowsHide: true })
     proc.on('error', () => resolve(null))
     proc.on('close', (code) => {
       if (code !== 0) {
@@ -10043,12 +10099,36 @@ const buildVerticalClipRanges = (
   buildVerticalClipSelection(durationSeconds, requestedCount, opts).clipRanges
 )
 
-const getVerticalInterruptTargetIntervalSeconds = (platformProfile?: PlatformProfile): number => {
+const getVerticalInterruptTargetIntervalSeconds = ({
+  platformProfile,
+  strategyProfile,
+  editorMode,
+  styleProfile
+}: {
+  platformProfile?: PlatformProfile
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+}): number => {
   const normalized = parsePlatformProfile(platformProfile, 'auto')
-  if (normalized === 'tiktok') return 3.2
-  if (normalized === 'instagram_reels') return 3.6
-  if (normalized === 'youtube') return 4.6
-  return 4
+  let platformBaseline = 4
+  if (normalized === 'tiktok') platformBaseline = 3.2
+  else if (normalized === 'instagram_reels') platformBaseline = 3.6
+  else if (normalized === 'youtube') platformBaseline = 4.6
+
+  const styleAlignedTarget = resolveInterruptTargetSeconds({
+    strategyProfile: strategyProfile ?? 'viral',
+    editorMode: editorMode ?? null,
+    styleProfile: styleProfile ?? null
+  })
+  let combined = 0.62 * platformBaseline + 0.38 * styleAlignedTarget
+  if (editorMode === 'sports') combined -= 0.35
+  else if (editorMode === 'gaming') combined -= 0.24
+  else if (editorMode === 'reaction') combined -= 0.18
+  else if (editorMode === 'education') combined += 0.28
+  else if (editorMode === 'commentary') combined += 0.18
+  else if (editorMode === 'vlog') combined += 0.08
+  return Number(clamp(combined, 2.2, 5.4).toFixed(2))
 }
 
 const getVerticalCandidateTargetCount = (durationSeconds: number) => {
@@ -10060,6 +10140,36 @@ const getVerticalCandidateTargetCount = (durationSeconds: number) => {
     CLIP_CANDIDATE_POOL_MIN,
     CLIP_CANDIDATE_POOL_MAX
   ))
+}
+
+type VerticalModeScoreBias = {
+  hook: number
+  interrupt: number
+  ending: number
+  energy: number
+  caption: number
+}
+
+const getVerticalModeScoreBias = (editorMode?: EditorModeSelection | null): VerticalModeScoreBias => {
+  if (editorMode === 'sports') {
+    return { hook: 0.02, interrupt: 0.08, ending: 0.03, energy: 0.05, caption: -0.02 }
+  }
+  if (editorMode === 'gaming') {
+    return { hook: 0.02, interrupt: 0.06, ending: 0.01, energy: 0.04, caption: -0.01 }
+  }
+  if (editorMode === 'reaction') {
+    return { hook: 0.03, interrupt: 0.05, ending: 0.01, energy: 0.03, caption: -0.01 }
+  }
+  if (editorMode === 'education') {
+    return { hook: 0, interrupt: -0.06, ending: 0.06, energy: -0.03, caption: 0.06 }
+  }
+  if (editorMode === 'commentary') {
+    return { hook: 0, interrupt: -0.03, ending: 0.03, energy: -0.01, caption: 0.03 }
+  }
+  if (editorMode === 'vlog') {
+    return { hook: 0.01, interrupt: -0.01, ending: 0.03, energy: 0.01, caption: 0.02 }
+  }
+  return { hook: 0, interrupt: 0, ending: 0, energy: 0, caption: 0 }
 }
 
 const collectInterruptMarkersForRange = ({
@@ -10302,11 +10412,17 @@ const buildVerticalRetentionReason = ({
 const scoreVerticalRetentionCandidate = ({
   range,
   windows,
-  platformProfile
+  platformProfile,
+  strategyProfile,
+  editorMode,
+  styleProfile
 }: {
   range: TimeRange
   windows: EngagementWindow[]
   platformProfile?: PlatformProfile
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
 }): { candidate: VerticalRetentionCandidate | null; rejectReason: string | null } => {
   const start = Number(range.start.toFixed(3))
   const end = Number(range.end.toFixed(3))
@@ -10344,7 +10460,12 @@ const scoreVerticalRetentionCandidate = ({
   }
 
   const interruptMarks = collectInterruptMarkersForRange({ windows, start, end })
-  const targetInterval = getVerticalInterruptTargetIntervalSeconds(platformProfile)
+  const targetInterval = getVerticalInterruptTargetIntervalSeconds({
+    platformProfile,
+    strategyProfile,
+    editorMode,
+    styleProfile
+  })
   const targetCount = Math.max(1, Math.ceil(duration / targetInterval))
   const interruptCoverage = clamp01(interruptMarks.length / targetCount)
   const maxInterruptGap = computeInterruptGapMaxSeconds({ marks: interruptMarks, start, end })
@@ -10370,12 +10491,18 @@ const scoreVerticalRetentionCandidate = ({
     windows,
     framingQuality
   })
+  const modeBias = getVerticalModeScoreBias(editorMode)
+  const biasedHookStrength = clamp01(hookStrength + modeBias.hook)
+  const biasedInterruptDensityQuality = clamp01(interruptDensityQuality + modeBias.interrupt)
+  const biasedEndingLoopPotential = clamp01(endingLoopPotential + modeBias.ending)
+  const biasedEnergyCurveQuality = clamp01(energyCurveQuality + modeBias.energy)
+  const biasedCaptionSilentViability = clamp01(captionSilentViability + modeBias.caption)
   const predictedCompletion = Number((100 * clamp01(
-    RETENTION_2026_WEIGHTS.introHold * hookStrength +
-    RETENTION_2026_WEIGHTS.interruptDensity * interruptDensityQuality +
-    RETENTION_2026_WEIGHTS.endingReplayPotential * endingLoopPotential +
-    RETENTION_2026_WEIGHTS.energyCurve * energyCurveQuality +
-    RETENTION_2026_WEIGHTS.silentCaptionViability * captionSilentViability
+    RETENTION_2026_WEIGHTS.introHold * biasedHookStrength +
+    RETENTION_2026_WEIGHTS.interruptDensity * biasedInterruptDensityQuality +
+    RETENTION_2026_WEIGHTS.endingReplayPotential * biasedEndingLoopPotential +
+    RETENTION_2026_WEIGHTS.energyCurve * biasedEnergyCurveQuality +
+    RETENTION_2026_WEIGHTS.silentCaptionViability * biasedCaptionSilentViability
   )).toFixed(2))
 
   if (duration > 35 && predictedCompletion < LONG_CLIP_PREDICTION_FLOOR) {
@@ -10392,18 +10519,18 @@ const scoreVerticalRetentionCandidate = ({
     range: { start, end },
     predictedCompletion,
     predictorBreakdown: {
-      hookStrength: Number(hookStrength.toFixed(4)),
-      interruptDensityQuality: Number(interruptDensityQuality.toFixed(4)),
-      endingLoopPotential: Number(endingLoopPotential.toFixed(4)),
-      energyCurveQuality: Number(energyCurveQuality.toFixed(4)),
-      captionSilentViability: Number(captionSilentViability.toFixed(4)),
+      hookStrength: Number(biasedHookStrength.toFixed(4)),
+      interruptDensityQuality: Number(biasedInterruptDensityQuality.toFixed(4)),
+      endingLoopPotential: Number(biasedEndingLoopPotential.toFixed(4)),
+      energyCurveQuality: Number(biasedEnergyCurveQuality.toFixed(4)),
+      captionSilentViability: Number(biasedCaptionSilentViability.toFixed(4)),
       introRetentionProxy: Number(introRetentionProxy.toFixed(4)),
       verticalFramingQuality: Number(framingQuality.toFixed(4))
     },
     reason: buildVerticalRetentionReason({
       predictedCompletion,
       interruptIntervalSeconds: observedInterruptInterval,
-      endingLoopPotential
+      endingLoopPotential: biasedEndingLoopPotential
     })
   }
   return { candidate, rejectReason: null }
@@ -10425,30 +10552,54 @@ const buildVerticalRetentionCandidates = ({
   durationSeconds,
   requestedCount,
   windows,
-  platformProfile
+  platformProfile,
+  strategyProfile,
+  editorMode,
+  styleProfile,
+  nicheProfile
 }: {
   durationSeconds: number
   requestedCount: number
   windows: EngagementWindow[]
   platformProfile?: PlatformProfile
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
 }): VerticalRetentionSelectionResult => {
   const total = Math.max(0, durationSeconds || 0)
+  const modeAwareAutoExportTarget = resolveAutoExportClipTarget({
+    durationSeconds: total,
+    editorMode: editorMode ?? null,
+    nicheProfile: nicheProfile ?? null
+  })
   const outputTarget = Math.round(clamp(
-    Math.max(CLIP_EXPORT_TARGET_MIN, requestedCount * 4),
+    requestedCount > 0
+      ? Math.max(CLIP_EXPORT_TARGET_MIN, requestedCount * 4)
+      : modeAwareAutoExportTarget,
     CLIP_EXPORT_TARGET_MIN,
     CLIP_EXPORT_TARGET_MAX
   ))
+  const modeAwareCandidateTarget = resolveClipCandidateTarget({
+    durationSeconds: total,
+    editorMode: editorMode ?? null,
+    nicheProfile: nicheProfile ?? null
+  })
   if (total <= 0 || !windows.length) {
     return {
       accepted: [],
       rejectedCount: 1,
       rejectionReasonsSummary: ['insufficient_signal_windows:1'],
-      candidateTarget: getVerticalCandidateTargetCount(total),
+      candidateTarget: modeAwareCandidateTarget,
       outputTarget,
       evaluatedCount: 0
     }
   }
-  const candidateTarget = getVerticalCandidateTargetCount(total)
+  const candidateTarget = Math.round(clamp(
+    Math.max(getVerticalCandidateTargetCount(total), modeAwareCandidateTarget),
+    CLIP_CANDIDATE_POOL_MIN,
+    CLIP_CANDIDATE_POOL_MAX
+  ))
   const minDuration = 15
   const clipDurations = [
     15,
@@ -10470,6 +10621,7 @@ const buildVerticalRetentionCandidates = ({
           ? 2
           : 1
   const preScored: Array<{ range: TimeRange; score: number }> = []
+  const modeBias = getVerticalModeScoreBias(editorMode)
   for (let start = 0; start + minDuration <= total; start += stepSeconds) {
     const startTime = Number(start.toFixed(3))
     for (const duration of clipDurations) {
@@ -10492,7 +10644,16 @@ const buildVerticalRetentionCandidates = ({
         0.25 * (window.keywordIntensity ?? 0) +
         0.25 * window.emotionIntensity
       ))
-      const score = clamp01(0.5 * intro + 0.32 * core + 0.18 * tail)
+      const score = clamp01(
+        0.5 * intro +
+        0.32 * core +
+        0.18 * tail +
+        0.05 * modeBias.hook +
+        0.05 * modeBias.interrupt +
+        0.04 * modeBias.ending +
+        0.03 * modeBias.energy +
+        0.03 * modeBias.caption
+      )
       if (duration > 35 && score < 0.76) continue
       preScored.push({ range: { start: startTime, end: endTime }, score })
     }
@@ -10518,7 +10679,10 @@ const buildVerticalRetentionCandidates = ({
     const scored = scoreVerticalRetentionCandidate({
       range: item.range,
       windows,
-      platformProfile
+      platformProfile,
+      strategyProfile,
+      editorMode,
+      styleProfile
     })
     if (scored.candidate) {
       evaluated.push(scored.candidate)
@@ -10544,7 +10708,12 @@ const buildVerticalRetentionCandidates = ({
       a.range.start - b.range.start
     ))
   const selected: VerticalRetentionCandidate[] = []
-  const minSpacing = Math.max(2, getVerticalInterruptTargetIntervalSeconds(platformProfile) * 2)
+  const minSpacing = Math.max(2, getVerticalInterruptTargetIntervalSeconds({
+    platformProfile,
+    strategyProfile,
+    editorMode,
+    styleProfile
+  }) * 2)
   for (const candidate of sortedAccepted) {
     if (selected.length >= outputTarget) break
     const overlaps = selected.some((entry) => (
@@ -12316,7 +12485,11 @@ const processJob = async (
         durationSeconds: durationSeconds || 0,
         requestedCount: renderConfig.verticalClipCount,
         windows: verticalWindows,
-        platformProfile: platformProfileId
+        platformProfile: platformProfileId,
+        strategyProfile,
+        editorMode: editorModeForRender,
+        styleProfile: verticalStyleProfile,
+        nicheProfile: verticalNicheProfile
       })
       const requestedVerticalClipCount = Math.round(clamp(
         Number(renderConfig.verticalClipCount || 0),
@@ -12880,7 +13053,10 @@ const processJob = async (
         if (waitedPreferredHook) {
           preferredHookCandidate = waitedPreferredHook
           optimizationNotes.push(
-            `User-selected hook applied during hook stage (${waitedPreferredHook.start.toFixed(1)}s-${(waitedPreferredHook.start + waitedPreferredHook.duration).toFixed(1)}s).`
+            `User-selected hook applied during hook stage (${formatHookRange(
+              waitedPreferredHook.start,
+              waitedPreferredHook.start + waitedPreferredHook.duration
+            )}).`
           )
         }
         await updateJob(jobId, { status: 'story', progress: 55 })
@@ -12898,7 +13074,10 @@ const processJob = async (
         (options.autoHookMove || selectedHookSelectionSource === 'user_selected')
       if (preferredHookCandidate) {
         optimizationNotes.push(
-          `User-selected hook pinned to opening (${preferredHookCandidate.start.toFixed(1)}s-${(preferredHookCandidate.start + preferredHookCandidate.duration).toFixed(1)}s).`
+          `User-selected hook pinned to opening (${formatHookRange(
+            preferredHookCandidate.start,
+            preferredHookCandidate.start + preferredHookCandidate.duration
+          )}).`
         )
       }
       const orderedHookCandidates = [
