@@ -10654,7 +10654,7 @@ const handleCreateJob = async (req: any, res: any) => {
   try {
     const userId = req.user?.id
     if (!userId) return res.status(401).json({ error: 'unauthorized', message: 'Login required' })
-    const { filename, inputPath: providedPath, requestedQuality } = req.body
+    const { filename, inputPath: providedPath, requestedQuality, contentType } = req.body
     if (!filename && !providedPath) return res.status(400).json({ error: 'filename required' })
     const id = crypto.randomUUID()
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
@@ -10758,7 +10758,10 @@ const handleCreateJob = async (req: any, res: any) => {
 
     try {
       // Generate an R2 presigned PUT URL for direct upload
-      const uploadUrl = await r2.generateUploadUrl(inputPath, 'video/mp4')
+      const uploadContentType = typeof contentType === 'string' && contentType.trim().length
+        ? contentType.trim()
+        : 'video/mp4'
+      const uploadUrl = await r2.generateUploadUrl(inputPath, uploadContentType)
       return res.json({ job, uploadUrl, inputPath, bucket: r2.bucket })
     } catch (e) {
       console.warn('generateUploadUrl failed, returning job only', e)

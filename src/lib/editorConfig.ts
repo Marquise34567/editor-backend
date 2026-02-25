@@ -140,7 +140,7 @@ export const EDITOR_RETENTION_CONFIG = {
   hookSelectionMatchDurationToleranceSec: parseNumberEnv('HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC', 0.8, { min: 0.05, max: 2 }),
   hookSelectionWaitMs: parseNumberEnv('HOOK_SELECTION_WAIT_MS', 12_000, { min: 0, max: 60_000, integer: true }),
   hookSelectionPollMs: parseNumberEnv('HOOK_SELECTION_POLL_MS', 500, { min: 120, max: 2_000, integer: true }),
-  hookSelectionMaxCandidates: parseNumberEnv('HOOK_SELECTION_MAX_CANDIDATES', 5, { min: 3, max: 12, integer: true }),
+  hookSelectionMaxCandidates: parseNumberEnv('HOOK_SELECTION_MAX_CANDIDATES', 3, { min: 3, max: 12, integer: true }),
   emotionalBeatThreshold: parseNumberEnv('EDITOR_EMOTIONAL_BEAT_THRESHOLD', 0.62, { min: 0.35, max: 0.95 }),
   emotionalBeatSpacingSec: parseNumberEnv('EDITOR_EMOTIONAL_BEAT_SPACING_SEC', 1.05, { min: 0.35, max: 3.5 }),
   emotionalLeadTrimSec: parseNumberEnv('EDITOR_EMOTIONAL_LEAD_TRIM_SEC', 1.8, { min: 0.5, max: 4 }),
