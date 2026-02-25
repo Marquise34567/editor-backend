@@ -1443,10 +1443,27 @@ const resolveAudioSampleRate = (value: unknown, fallback: number) => {
   return rounded
 }
 
+const parseAudioBitrateKbps = (value: unknown): number | null => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw) return null
+  if (raw === 'auto' || raw === 'default') return null
+  const match = raw.match(/^(\d+(?:\.\d+)?)([km]?)$/i)
+  if (!match) return null
+  let numeric = Number(match[1])
+  if (!Number.isFinite(numeric) || numeric <= 0) return null
+  const unit = match[2]
+  if (unit === 'm') numeric *= 1000
+  if (unit !== 'k' && numeric > 1000) numeric /= 1000
+  if (!Number.isFinite(numeric) || numeric <= 0) return null
+  return Math.round(numeric)
+}
+
 const resolveAudioBitrateArg = (value: unknown, fallbackKbps: number) => {
-  const raw = String(value || '').trim()
-  if (!raw) return `${fallbackKbps}k`
-  return raw
+  const parsed = parseAudioBitrateKbps(value)
+  const fallback = Number.isFinite(fallbackKbps) && fallbackKbps > 0 ? Math.round(fallbackKbps) : 192
+  const selected = parsed !== null && Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+  const clamped = Math.round(clamp(selected, 160, 320))
+  return `${clamped}k`
 }
 
 const parseRetentionAggressionLevel = (value?: any): RetentionAggressionLevel => {
@@ -8612,7 +8629,8 @@ const renderVerticalClip = async ({
   videoPreset,
   videoCrf,
   audioBitrate,
-  audioSampleRate
+  audioSampleRate,
+  audioFilters
 }: {
   inputPath: string
   outputPath: string
@@ -8626,12 +8644,13 @@ const renderVerticalClip = async ({
   videoCrf: string
   audioBitrate: string
   audioSampleRate: string
+  audioFilters: string[]
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
   const layout = parseVerticalLayoutMode(verticalMode.layout, 'stacked')
   const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
-  const filterComplex = layout === 'single'
+  const baseFilterComplex = layout === 'single'
     ? buildVerticalSingleFilterGraph({
         start,
         end,
@@ -8654,10 +8673,14 @@ const renderVerticalClip = async ({
           outputWidth,
           outputHeight,
           topHeight,
-          bottomFit: fit,
-          withAudio
-        })
+            bottomFit: fit,
+            withAudio
+          })
       })()
+  const shouldPolishAudio = withAudio && audioFilters.length > 0
+  const filterComplex = shouldPolishAudio
+    ? `${baseFilterComplex};[outa]${audioFilters.join(',')}[aout]`
+    : baseFilterComplex
 
   const args = [
     '-y',
@@ -8687,7 +8710,18 @@ const renderVerticalClip = async ({
     '[outv]'
   ]
   if (withAudio) {
-    args.push('-map', '[outa]', '-c:a', 'aac', '-b:a', audioBitrate, '-ar', audioSampleRate, '-ac', '2')
+    args.push(
+      '-map',
+      shouldPolishAudio ? '[aout]' : '[outa]',
+      '-c:a',
+      'aac',
+      '-b:a',
+      audioBitrate,
+      '-ar',
+      audioSampleRate,
+      '-ac',
+      '2'
+    )
   } else {
     args.push('-an')
   }
@@ -8753,16 +8787,22 @@ const buildAudioFilters = ({
   const compressionRatio = styleProfile?.style === 'tutorial' ? 2.8 : 3.2
   const attackMs = styleProfile?.style === 'tutorial' ? 18 : 12
   const releaseMs = styleProfile?.style === 'tutorial' ? 240 : 170
-  const denoiseFloor = aggressionLevel === 'viral' ? -21 : aggressionLevel === 'high' ? -22 : -23
+  const denoiseFloor = aggressionLevel === 'viral' ? -20 : aggressionLevel === 'high' ? -21.5 : -22.5
+  const presenceBoost = styleProfile?.style === 'tutorial' ? 2.5 : 2.2
+  const airBoost = styleProfile?.style === 'tutorial' ? 1.8 : 1.4
   const filters: string[] = [
-    'highpass=f=78',
-    'lowpass=f=17200',
-    `afftdn=nf=${toFilterNumber(denoiseFloor)}`,
+    'highpass=f=72',
+    'lowpass=f=17800',
     // Mild tonal shaping for clearer dialog without harshness.
-    'equalizer=f=180:t=q:w=0.9:g=-1.2',
-    'equalizer=f=3200:t=q:w=1.3:g=2.1',
-    'equalizer=f=7800:t=q:w=1.0:g=1.2'
+    'equalizer=f=170:t=q:w=0.9:g=-1.4',
+    'equalizer=f=280:t=q:w=1.0:g=-1.1',
+    `equalizer=f=3300:t=q:w=1.2:g=${toFilterNumber(presenceBoost)}`,
+    `equalizer=f=7200:t=q:w=1.1:g=${toFilterNumber(airBoost)}`,
+    'equalizer=f=11200:t=q:w=0.8:g=0.8'
   ]
+  if (hasFfmpegFilter('afftdn')) {
+    filters.splice(2, 0, `afftdn=nf=${toFilterNumber(denoiseFloor)}:tn=1`)
+  }
   if (hasFfmpegFilter('deesser')) {
     filters.push('deesser')
   }
@@ -8771,16 +8811,19 @@ const buildAudioFilters = ({
       // Haas stereoization gives mono footage a subtle spatial spread.
       filters.push('haas')
     } else if (hasFfmpegFilter('extrastereo')) {
-      filters.push('extrastereo=m=1.6:c=0.0')
+      filters.push('extrastereo=m=1.45:c=0.0')
     }
   }
   if (hasFfmpegFilter('dynaudnorm')) {
-    filters.push('dynaudnorm=f=75:g=13:p=0.9:m=8')
+    filters.push('dynaudnorm=f=85:g=11:p=0.88:m=9')
   }
   filters.push(
     `acompressor=threshold=-17dB:ratio=${toFilterNumber(compressionRatio)}:attack=${toFilterNumber(attackMs)}:release=${toFilterNumber(releaseMs)}:makeup=2`,
-    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.5:LRA=10`
+    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.2:LRA=9`
   )
+  if (hasFfmpegFilter('alimiter')) {
+    filters.push('alimiter=limit=0.97:level=true')
+  }
   return filters
 }
 
@@ -9929,6 +9972,14 @@ const processJob = async (
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
       const hasInputAudio = hasAudioStream(tmpIn)
+      const verticalAudioProfile = hasInputAudio ? probeAudioStream(tmpIn) : null
+      const verticalAudioFilters = hasInputAudio
+        ? buildAudioFilters({
+            aggressionLevel,
+            styleProfile: null,
+            audioProfile: verticalAudioProfile
+          })
+        : []
       const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
       fs.mkdirSync(localOutDir, { recursive: true })
 
@@ -9955,7 +10006,8 @@ const processJob = async (
           videoPreset: ffPreset,
           videoCrf: ffCrf,
           audioBitrate: ffAudioBitrate,
-          audioSampleRate: ffAudioSampleRate
+          audioSampleRate: ffAudioSampleRate,
+          audioFilters: verticalAudioFilters
         })
         const clipStats = fs.statSync(localClipPath)
         if (!clipStats.isFile() || clipStats.size <= 0) {
@@ -11320,8 +11372,10 @@ const processJob = async (
             await runFfmpeg(concatEncodeArgs)
           }
 
-          if (subtitleFilter && subtitlePath) {
-            const burnArgs = [
+          const shouldPostProcessSubtitle = Boolean(subtitleFilter && subtitlePath)
+          const shouldPostProcessAudio = withAudio && audioFilters.length > 0
+          if (shouldPostProcessSubtitle || shouldPostProcessAudio) {
+            const postProcessArgs = [
               '-y',
               '-nostdin',
               '-hide_banner',
@@ -11330,41 +11384,55 @@ const processJob = async (
               '-i',
               tmpOut,
               '-movflags',
-              '+faststart',
-              '-c:v',
-              'libx264',
-              '-preset',
-              ffPreset,
-              '-crf',
-              ffCrf,
-              '-threads',
-              '0',
-              '-pix_fmt',
-              'yuv420p',
-              '-vf',
-              subtitleIsAss
-                ? `subtitles=${escapeFilterPath(subtitlePath)}`
-                : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+              '+faststart'
             ]
-            if (withAudio) {
-              burnArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            if (shouldPostProcessSubtitle && subtitlePath) {
+              postProcessArgs.push(
+                '-c:v',
+                'libx264',
+                '-preset',
+                ffPreset,
+                '-crf',
+                ffCrf,
+                '-threads',
+                '0',
+                '-pix_fmt',
+                'yuv420p',
+                '-vf',
+                subtitleIsAss
+                  ? `subtitles=${escapeFilterPath(subtitlePath)}`
+                  : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+              )
             } else {
-              burnArgs.push('-an')
+              postProcessArgs.push('-c:v', 'copy')
             }
-            const captionedFallbackPath = path.join(
+            if (withAudio) {
+              if (shouldPostProcessAudio) {
+                postProcessArgs.push('-af', audioFilters.join(','))
+              }
+              postProcessArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            } else {
+              postProcessArgs.push('-an')
+            }
+            const postProcessPath = path.join(
               workDir,
-              `segment-fallback-captioned-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+              `segment-fallback-post-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
             )
-            burnArgs.push(captionedFallbackPath)
+            postProcessArgs.push(postProcessPath)
             try {
-              await runFfmpeg(burnArgs)
+              await runFfmpeg(postProcessArgs)
               safeUnlink(tmpOut)
-              fs.renameSync(captionedFallbackPath, tmpOut)
-            } catch (burnErr) {
-              logFfmpegFailure('segment-subtitle-burn', burnArgs, burnErr)
-              safeUnlink(captionedFallbackPath)
-              const reason = summarizeFfmpegError(burnErr)
-              optimizationNotes.push(`Render fallback: subtitles could not be burned (${reason}).`)
+              fs.renameSync(postProcessPath, tmpOut)
+            } catch (postProcessErr) {
+              logFfmpegFailure('segment-postprocess', postProcessArgs, postProcessErr)
+              safeUnlink(postProcessPath)
+              const reason = summarizeFfmpegError(postProcessErr)
+              if (shouldPostProcessSubtitle) {
+                optimizationNotes.push(`Render fallback: subtitles could not be burned (${reason}).`)
+              }
+              if (shouldPostProcessAudio) {
+                optimizationNotes.push(`Render fallback: audio polish could not be applied (${reason}).`)
+              }
             }
           }
         } finally {

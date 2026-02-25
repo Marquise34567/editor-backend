@@ -33,7 +33,7 @@ export const PLATFORM_EDIT_PROFILES: Record<PlatformProfileId, PlatformEditProfi
     verticalSpacingRatio: 0.22,
     videoPreset: 'medium',
     crfDelta: 0,
-    audioBitrateKbps: 128,
+    audioBitrateKbps: 192,
     audioSampleRate: 48000
   },
   tiktok: {
@@ -47,7 +47,7 @@ export const PLATFORM_EDIT_PROFILES: Record<PlatformProfileId, PlatformEditProfi
     verticalSpacingRatio: 0.28,
     videoPreset: 'fast',
     crfDelta: 1,
-    audioBitrateKbps: 128,
+    audioBitrateKbps: 192,
     audioSampleRate: 48000
   },
   instagram_reels: {
@@ -61,7 +61,7 @@ export const PLATFORM_EDIT_PROFILES: Record<PlatformProfileId, PlatformEditProfi
     verticalSpacingRatio: 0.24,
     videoPreset: 'fast',
     crfDelta: 1,
-    audioBitrateKbps: 128,
+    audioBitrateKbps: 192,
     audioSampleRate: 48000
   },
   youtube: {
@@ -75,7 +75,7 @@ export const PLATFORM_EDIT_PROFILES: Record<PlatformProfileId, PlatformEditProfi
     verticalSpacingRatio: 0.18,
     videoPreset: 'medium',
     crfDelta: -1,
-    audioBitrateKbps: 160,
+    audioBitrateKbps: 224,
     audioSampleRate: 48000
   }
 }
