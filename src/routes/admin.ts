@@ -357,7 +357,16 @@ router.get('/subscriptions', async (req, res) => {
     const end = asMs(sub?.currentPeriodEnd)
     return isActiveSubscriptionStatus(String(sub?.status || '').toLowerCase()) && end > Date.now() && end <= Date.now() + RANGE_MS['30d']
   }).map((sub) => ({ userId: sub?.userId || null, planTier: sub?.planTier || 'free', currentPeriodEnd: sub?.currentPeriodEnd || null }))
-  res.json({ distribution, activeSubscriptions: active.length, churnCount, upcomingRenewals, updatedAt: new Date().toISOString() })
+  const bucketMs = rangeMs <= RANGE_MS['7d'] ? 24 * 60 * 60 * 1000 : 3 * 24 * 60 * 60 * 1000
+  const start = Date.now() - rangeMs
+  const trendBuckets: number[] = []
+  for (let t = Math.floor(start / bucketMs) * bucketMs; t <= Date.now(); t += bucketMs) trendBuckets.push(t)
+  const trend = trendBuckets.map((bucket) => {
+    const bucketEnd = bucket + bucketMs
+    const value = active.filter((sub) => asMs(sub?.updatedAt || sub?.currentPeriodEnd || Date.now()) <= bucketEnd).length
+    return { t: new Date(bucket).toISOString(), v: value }
+  })
+  res.json({ distribution, activeSubscriptions: active.length, churnCount, upcomingRenewals, trend, updatedAt: new Date().toISOString() })
 })
 
 router.get('/editor-insights', async (req, res) => {
