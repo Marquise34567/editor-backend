@@ -5,6 +5,7 @@ import { coercePlanTier, isActiveSubscriptionStatus } from '../services/plans'
 import { getStripeConfig } from '../lib/stripeConfig'
 import { resolvePlanFromPriceId } from '../lib/stripePlans'
 import { incrementFounderPurchase } from '../services/founder'
+import { storeStripeWebhookEvent } from '../services/adminTelemetry'
 
 const router = express.Router()
 
@@ -24,6 +25,7 @@ router.post('/', async (req: any, res) => {
   }
 
   try {
+    await storeStripeWebhookEvent(event).catch(() => null)
     switch (event.type) {
       case 'checkout.session.completed': {
         const session = event.data.object as any
@@ -155,7 +157,8 @@ router.post('/', async (req: any, res) => {
         })
         break
       }
-      case 'invoice.payment_succeeded': {
+      case 'invoice.payment_succeeded':
+      case 'invoice.paid': {
         const invoice = event.data.object as any
         const subId = invoice.subscription
         if (subId) {
@@ -171,6 +174,10 @@ router.post('/', async (req: any, res) => {
           await prisma.user.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { planStatus: 'past_due' } })
           await prisma.subscription.updateMany({ where: { stripeSubscriptionId: String(subId) }, data: { status: 'past_due', planTier: 'free' } })
         }
+        break
+      }
+      case 'charge.refunded': {
+        // Event is stored in telemetry store for admin dashboard reporting.
         break
       }
       default:

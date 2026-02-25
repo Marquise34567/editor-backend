@@ -1,9 +1,18 @@
-const DEV_ACCOUNT_EMAILS = (process.env.DEV_ACCOUNT_EMAILS || process.env.DEV_ACCOUNT_EMAIL || '')
+const DEV_ACCOUNT_EMAILS = (
+  process.env.DEV_ADMIN_EMAILS ||
+  process.env.DEV_ACCOUNT_EMAILS ||
+  process.env.DEV_ACCOUNT_EMAIL ||
+  ''
+)
   .split(',')
   .map((value) => value.trim().toLowerCase())
   .filter(Boolean)
 
-const DEV_ACCOUNT_USER_IDS = (process.env.DEV_ACCOUNT_USER_IDS || '')
+const DEV_ACCOUNT_USER_IDS = (
+  process.env.DEV_ADMIN_USER_IDS ||
+  process.env.DEV_ACCOUNT_USER_IDS ||
+  ''
+)
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean)
