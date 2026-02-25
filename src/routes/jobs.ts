@@ -738,6 +738,35 @@ type HookCalibrationProfile = {
   reasons: string[]
   updatedAt: string
 }
+type OutcomeMenuProfile = {
+  enabled: boolean
+  source: 'real_distribution_analytics'
+  sampleSize: number
+  baselineOutcome: number | null
+  confidence: number
+  expectedOutcome: number | null
+  expectedLift: number
+  qualityGateOffset: number
+  hookThresholdOffset: number
+  recommendedStrategyProfile: RetentionStrategyProfile
+  recommendedTargetPlatform: RetentionTargetPlatform
+  recommendedEditorMode: EditorModeSelection | null
+  reasons: string[]
+  generatedAt: string
+}
+type OutcomeMenuContext = {
+  requestedStrategy: RetentionStrategyProfile
+  requestedTargetPlatform: RetentionTargetPlatform
+  requestedEditorMode: EditorModeSelection | null
+}
+type OutcomeMenuApplyResult = {
+  strategyApplied: boolean
+  targetPlatformApplied: boolean
+  editorModeApplied: boolean
+  strategy: RetentionStrategyProfile
+  targetPlatform: RetentionTargetPlatform
+  editorMode: EditorModeSelection | null
+}
 type CreatorFeedbackCategory = 'bad_hook' | 'too_fast' | 'too_generic' | 'great_edit'
 type RetentionFeedbackPayload = {
   watchPercent: number | null
@@ -1006,6 +1035,11 @@ const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
   return Number.isFinite(envValue) && envValue > 2 ? Math.round(envValue) : 24
 })()
 const HOOK_CALIBRATION_MIN_SAMPLES = 3
+const OUTCOME_AUTOMATION_LOOKBACK_JOBS = (() => {
+  const envValue = Number(process.env.OUTCOME_AUTOMATION_LOOKBACK_JOBS || 90)
+  return Number.isFinite(envValue) && envValue > 8 ? Math.round(envValue) : 90
+})()
+const OUTCOME_AUTOMATION_MIN_SAMPLES = 6
 const DEFAULT_HOOK_FACEOFF_WEIGHTS: HookCalibrationWeights = {
   candidateScore: 0.4,
   auditScore: 0.24,
@@ -2955,6 +2989,330 @@ const computeFeedbackOutcomeSignal = (entry: {
   }
 }
 
+type OutcomeMenuBucket = {
+  strategy: RetentionStrategyProfile
+  targetPlatform: RetentionTargetPlatform
+  editorMode: EditorModeSelection | null
+  count: number
+  outcomeTotal: number
+  platformFeedbackCount: number
+}
+
+const normalizeOutcomeEditorMode = (value: EditorModeSelection | null | undefined) => {
+  const parsed = parseEditorModeSelection(value)
+  if (!parsed || parsed === 'auto') return null
+  return parsed
+}
+
+const normalizeOutcomeMenuContext = (context: OutcomeMenuContext): OutcomeMenuContext => ({
+  requestedStrategy: parseRetentionStrategyProfile(context?.requestedStrategy),
+  requestedTargetPlatform: parseRetentionTargetPlatform(context?.requestedTargetPlatform),
+  requestedEditorMode: normalizeOutcomeEditorMode(context?.requestedEditorMode)
+})
+
+const buildOutcomeMenuKey = ({
+  strategy,
+  targetPlatform,
+  editorMode
+}: {
+  strategy: RetentionStrategyProfile
+  targetPlatform: RetentionTargetPlatform
+  editorMode: EditorModeSelection | null
+}) => `${strategy}|${targetPlatform}|${editorMode || 'none'}`
+
+const readOutcomeMenuContextFromEntry = (entry: { analysis?: any; renderSettings?: any }) => {
+  const jobLike = {
+    analysis: entry.analysis ?? null,
+    renderSettings: entry.renderSettings ?? null
+  }
+  return {
+    strategy: parseRetentionStrategyProfile(getRetentionStrategyFromJob(jobLike)),
+    targetPlatform: parseRetentionTargetPlatform(getRetentionTargetPlatformFromJob(jobLike)),
+    editorMode: normalizeOutcomeEditorMode(getEditorModeFromJob(jobLike))
+  }
+}
+
+const buildDefaultOutcomeMenuProfile = (
+  reason: string,
+  context: OutcomeMenuContext,
+  sampleSize = 0
+): OutcomeMenuProfile => {
+  const normalizedContext = normalizeOutcomeMenuContext(context)
+  return {
+    enabled: false,
+    source: 'real_distribution_analytics',
+    sampleSize,
+    baselineOutcome: null,
+    confidence: 0,
+    expectedOutcome: null,
+    expectedLift: 0,
+    qualityGateOffset: 0,
+    hookThresholdOffset: 0,
+    recommendedStrategyProfile: normalizedContext.requestedStrategy,
+    recommendedTargetPlatform: normalizedContext.requestedTargetPlatform,
+    recommendedEditorMode: normalizedContext.requestedEditorMode,
+    reasons: [reason],
+    generatedAt: toIsoNow()
+  }
+}
+
+const resolveOutcomeQualityGateOffset = (outcome: number) => {
+  if (!Number.isFinite(outcome)) return 0
+  if (outcome < 0.44) return 3
+  if (outcome < 0.52) return 2
+  if (outcome < 0.6) return 1
+  if (outcome > 0.84) return -2
+  if (outcome > 0.76) return -1
+  return 0
+}
+
+const resolveOutcomeHookThresholdOffset = (outcome: number) => {
+  if (!Number.isFinite(outcome)) return 0
+  if (outcome < 0.46) return 2
+  if (outcome < 0.56) return 1
+  if (outcome > 0.82) return -2
+  if (outcome > 0.74) return -1
+  return 0
+}
+
+const computeOutcomeMenuProfileFromHistory = (
+  entries: Array<{ analysis?: any; retentionScore?: number | null; renderSettings?: any }>,
+  context: OutcomeMenuContext
+): OutcomeMenuProfile => {
+  const normalizedContext = normalizeOutcomeMenuContext(context)
+  if (!entries.length) {
+    return buildDefaultOutcomeMenuProfile('No completed jobs found for outcome-driven automation.', normalizedContext, 0)
+  }
+
+  const priorWeight = 3
+  const buckets = new Map<string, OutcomeMenuBucket>()
+  let sampleSize = 0
+  let totalOutcome = 0
+  let platformFeedbackCount = 0
+
+  for (const entry of entries) {
+    const signal = computeFeedbackOutcomeSignal(entry)
+    if (signal.outcome === null) continue
+    const outcome = Number(signal.outcome)
+    const optionContext = readOutcomeMenuContextFromEntry(entry)
+    const key = buildOutcomeMenuKey(optionContext)
+    const current = buckets.get(key) || {
+      strategy: optionContext.strategy,
+      targetPlatform: optionContext.targetPlatform,
+      editorMode: optionContext.editorMode,
+      count: 0,
+      outcomeTotal: 0,
+      platformFeedbackCount: 0
+    }
+    current.count += 1
+    current.outcomeTotal += outcome
+    if (signal.isPlatform) current.platformFeedbackCount += 1
+    buckets.set(key, current)
+    sampleSize += 1
+    totalOutcome += outcome
+    if (signal.isPlatform) platformFeedbackCount += 1
+  }
+
+  if (sampleSize < OUTCOME_AUTOMATION_MIN_SAMPLES || buckets.size === 0) {
+    return buildDefaultOutcomeMenuProfile(
+      `Need at least ${OUTCOME_AUTOMATION_MIN_SAMPLES} completed jobs with watch-time feedback before automation can learn menu preferences.`,
+      normalizedContext,
+      sampleSize
+    )
+  }
+
+  const baselineOutcome = clamp01(totalOutcome / Math.max(1, sampleSize))
+  const toSmoothed = (bucket: OutcomeMenuBucket) => (
+    ((bucket.outcomeTotal / Math.max(1, bucket.count)) * bucket.count + baselineOutcome * priorWeight) /
+    (bucket.count + priorWeight)
+  )
+  const requestedKey = buildOutcomeMenuKey({
+    strategy: normalizedContext.requestedStrategy,
+    targetPlatform: normalizedContext.requestedTargetPlatform,
+    editorMode: normalizedContext.requestedEditorMode
+  })
+  const requestedBucket = buckets.get(requestedKey)
+  const requestedSmoothed = requestedBucket ? toSmoothed(requestedBucket) : baselineOutcome
+  const requestedOutcome = Number(clamp01(requestedSmoothed).toFixed(4))
+
+  const candidateBuckets = Array.from(buckets.values())
+  const platformScoped =
+    normalizedContext.requestedTargetPlatform !== 'auto'
+      ? candidateBuckets.filter((bucket) => bucket.targetPlatform === normalizedContext.requestedTargetPlatform)
+      : candidateBuckets
+  const effectiveCandidates = platformScoped.length ? platformScoped : candidateBuckets
+
+  const top = effectiveCandidates
+    .map((bucket) => {
+      const smoothed = clamp01(toSmoothed(bucket))
+      const platformMatch = bucket.targetPlatform === normalizedContext.requestedTargetPlatform ? 1 : 0
+      const editorMatch = (
+        normalizedContext.requestedEditorMode !== null &&
+        bucket.editorMode === normalizedContext.requestedEditorMode
+      ) ? 1 : 0
+      const score = smoothed + platformMatch * 0.015 + editorMatch * 0.008
+      return { bucket, smoothed, score }
+    })
+    .sort((a, b) => (
+      b.score - a.score ||
+      b.smoothed - a.smoothed ||
+      b.bucket.count - a.bucket.count
+    ))[0]
+
+  if (!top) {
+    return buildDefaultOutcomeMenuProfile(
+      'Outcome automation could not resolve a stable menu recommendation from distribution analytics.',
+      normalizedContext,
+      sampleSize
+    )
+  }
+
+  const expectedOutcome = Number(clamp01(top.smoothed).toFixed(4))
+  const expectedLift = Number((expectedOutcome - requestedOutcome).toFixed(4))
+  const platformFeedbackShare = platformFeedbackCount / Math.max(1, sampleSize)
+  const confidence = Number(
+    clamp(
+      (sampleSize / Math.max(OUTCOME_AUTOMATION_MIN_SAMPLES, OUTCOME_AUTOMATION_LOOKBACK_JOBS)) * 0.72 +
+      platformFeedbackShare * 0.28,
+      0,
+      1
+    ).toFixed(4)
+  )
+
+  const recommendedTargetPlatform = normalizedContext.requestedTargetPlatform === 'auto'
+    ? top.bucket.targetPlatform
+    : normalizedContext.requestedTargetPlatform
+  let recommendedEditorMode = top.bucket.editorMode
+  if (normalizedContext.requestedEditorMode && confidence < 0.8) {
+    recommendedEditorMode = normalizedContext.requestedEditorMode
+  }
+
+  const reasons: string[] = []
+  reasons.push(
+    `Learned from ${sampleSize} completed jobs with real watch-time outcomes (${Math.round(platformFeedbackShare * 100)}% platform-sourced feedback).`
+  )
+  if (expectedLift >= 0.015) {
+    reasons.push(
+      `Recommended menu profile projects +${(expectedLift * 100).toFixed(1)} outcome points over current selection.`
+    )
+  } else {
+    reasons.push('Current menu profile is close to historical best; keeping conservative automation adjustments.')
+  }
+
+  return {
+    enabled: true,
+    source: 'real_distribution_analytics',
+    sampleSize,
+    baselineOutcome: Number(baselineOutcome.toFixed(4)),
+    confidence,
+    expectedOutcome,
+    expectedLift,
+    qualityGateOffset: resolveOutcomeQualityGateOffset(expectedOutcome),
+    hookThresholdOffset: resolveOutcomeHookThresholdOffset(expectedOutcome),
+    recommendedStrategyProfile: top.bucket.strategy,
+    recommendedTargetPlatform,
+    recommendedEditorMode,
+    reasons,
+    generatedAt: toIsoNow()
+  }
+}
+
+const loadOutcomeMenuProfile = async (
+  userId: string,
+  context: OutcomeMenuContext
+): Promise<OutcomeMenuProfile> => {
+  const normalizedContext = normalizeOutcomeMenuContext(context)
+  if (!userId) {
+    return buildDefaultOutcomeMenuProfile('Missing user context for outcome automation.', normalizedContext, 0)
+  }
+  try {
+    const jobs = await prisma.job.findMany({
+      where: { userId, status: 'completed' },
+      orderBy: { updatedAt: 'desc' },
+      take: OUTCOME_AUTOMATION_LOOKBACK_JOBS,
+      select: {
+        analysis: true,
+        renderSettings: true,
+        retentionScore: true
+      }
+    })
+    return computeOutcomeMenuProfileFromHistory(
+      jobs.map((job) => ({
+        analysis: job.analysis,
+        renderSettings: job.renderSettings,
+        retentionScore: job.retentionScore
+      })),
+      normalizedContext
+    )
+  } catch (error) {
+    console.warn('outcome menu profile load failed', error)
+    return buildDefaultOutcomeMenuProfile(
+      'Failed to load outcome history for menu automation; using requested settings.',
+      normalizedContext,
+      0
+    )
+  }
+}
+
+const applyOutcomeMenuProfile = ({
+  profile,
+  requestedStrategy,
+  requestedTargetPlatform,
+  requestedEditorMode
+}: {
+  profile: OutcomeMenuProfile
+  requestedStrategy: RetentionStrategyProfile
+  requestedTargetPlatform: RetentionTargetPlatform
+  requestedEditorMode: EditorModeSelection | null
+}): OutcomeMenuApplyResult => {
+  const normalizedRequestedEditorMode = normalizeOutcomeEditorMode(requestedEditorMode)
+  let strategy = parseRetentionStrategyProfile(requestedStrategy)
+  let targetPlatform = parseRetentionTargetPlatform(requestedTargetPlatform)
+  let editorMode = normalizedRequestedEditorMode
+  let strategyApplied = false
+  let targetPlatformApplied = false
+  let editorModeApplied = false
+
+  if (!profile.enabled) {
+    return {
+      strategyApplied,
+      targetPlatformApplied,
+      editorModeApplied,
+      strategy,
+      targetPlatform,
+      editorMode
+    }
+  }
+
+  const confidentStrategySwitch = profile.confidence >= 0.58 && profile.expectedLift >= 0.02
+  if (confidentStrategySwitch && profile.recommendedStrategyProfile !== strategy) {
+    strategy = profile.recommendedStrategyProfile
+    strategyApplied = true
+  }
+
+  if (targetPlatform === 'auto' && profile.recommendedTargetPlatform !== targetPlatform) {
+    targetPlatform = profile.recommendedTargetPlatform
+    targetPlatformApplied = true
+  }
+
+  const autoEditorMode = editorMode === null
+  const confidentEditorSwitch = profile.confidence >= 0.62 && profile.expectedLift >= 0.03
+  const recommendedEditorMode = normalizeOutcomeEditorMode(profile.recommendedEditorMode)
+  if ((autoEditorMode || confidentEditorSwitch) && recommendedEditorMode && recommendedEditorMode !== editorMode) {
+    editorMode = recommendedEditorMode
+    editorModeApplied = true
+  }
+
+  return {
+    strategyApplied,
+    targetPlatformApplied,
+    editorModeApplied,
+    strategy,
+    targetPlatform,
+    editorMode
+  }
+}
+
 const computeStrategyBiasFromHistory = (
   strategyOutcomes: Partial<Record<RetentionRetryStrategy, { total: number; count: number }>>,
   averageOutcome: number
@@ -4080,17 +4438,20 @@ const alignSegmentsToRhythm = ({
 const resolveHookScoreThreshold = ({
   aggressionLevel,
   hasTranscript,
-  signalStrength
+  signalStrength,
+  thresholdOffset = 0
 }: {
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
+  thresholdOffset?: number
 }) => {
   let threshold = LEVEL_HOOK_THRESHOLD_BASE[aggressionLevel]
   if (!hasTranscript) threshold -= 0.11
   if (signalStrength < 0.42) threshold -= 0.08
   else if (signalStrength < 0.52) threshold -= 0.05
   else if (signalStrength > 0.76) threshold += 0.02
+  threshold -= clamp(Number(thresholdOffset || 0), -3, 3) * 0.03
   const floor = LEVEL_HOOK_THRESHOLD_FLOOR[aggressionLevel]
   return Number(clamp(threshold, floor, 0.9).toFixed(3))
 }
@@ -4210,12 +4571,14 @@ const selectRenderableHookCandidate = ({
   candidates,
   aggressionLevel,
   hasTranscript,
-  signalStrength
+  signalStrength,
+  thresholdOffset = 0
 }: {
   candidates: HookCandidate[]
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
+  thresholdOffset?: number
 }): HookSelectionDecision | null => {
   const deduped = candidates.filter((candidate, index) => (
     candidate &&
@@ -4232,7 +4595,12 @@ const selectRenderableHookCandidate = ({
   const ranked = deduped
     .map((candidate) => ({ candidate, confidence: getHookCandidateConfidence(candidate) }))
     .sort((a, b) => b.confidence - a.confidence || b.candidate.score - a.candidate.score)
-  const threshold = resolveHookScoreThreshold({ aggressionLevel, hasTranscript, signalStrength })
+  const threshold = resolveHookScoreThreshold({
+    aggressionLevel,
+    hasTranscript,
+    signalStrength,
+    thresholdOffset
+  })
   const strict = ranked.find((entry) => entry.candidate.auditPassed && entry.confidence >= threshold)
   if (strict) {
     return {
@@ -6602,7 +6970,9 @@ const buildRetentionMetadataSummary = ({
   hookSelectionSource,
   contentFormat,
   targetPlatform,
-  strategyProfile
+  strategyProfile,
+  outcomeMenuProfile,
+  outcomeMenuApply
 }: {
   durationSeconds: number
   segments: Segment[]
@@ -6629,6 +6999,8 @@ const buildRetentionMetadataSummary = ({
   contentFormat?: RetentionContentFormat | null
   targetPlatform?: RetentionTargetPlatform | null
   strategyProfile?: RetentionStrategyProfile | null
+  outcomeMenuProfile?: OutcomeMenuProfile | null
+  outcomeMenuApply?: OutcomeMenuApplyResult | null
 }) => {
   const segmentStats = buildSegmentStatsSummary(segments)
   const hookRangeEnd = hook ? hook.start + hook.duration : null
@@ -6694,6 +7066,18 @@ const buildRetentionMetadataSummary = ({
         ? 'TikTok'
         : 'YouTube'
     improvements.push(`Tuned pacing and quality gate targets for ${platformLabel}.`)
+  }
+  if (outcomeMenuProfile?.enabled) {
+    improvements.push(
+      `Outcome automation calibrated from ${outcomeMenuProfile.sampleSize} watch-time outcome samples (confidence ${Math.round(outcomeMenuProfile.confidence * 100)}%).`
+    )
+  }
+  if (outcomeMenuApply?.strategyApplied || outcomeMenuApply?.targetPlatformApplied || outcomeMenuApply?.editorModeApplied) {
+    const applied: string[] = []
+    if (outcomeMenuApply.strategyApplied) applied.push('strategy')
+    if (outcomeMenuApply.targetPlatformApplied) applied.push('platform')
+    if (outcomeMenuApply.editorModeApplied) applied.push('editor mode')
+    improvements.push(`Applied outcome-driven menu automation to ${applied.join(', ')}.`)
   }
   if (qualityGateOverride?.applied && qualityGateOverride.reason) {
     improvements.push(`Quality gate override: ${qualityGateOverride.reason}`)
@@ -6797,6 +7181,24 @@ const buildRetentionMetadataSummary = ({
       styleTimelineFeatures: styleFeatureSnapshot ?? null,
       whyKeepWatching: Array.isArray(judge?.why_keep_watching) ? judge!.why_keep_watching.slice(0, 3) : [],
       genericFlags: Array.isArray(judge?.what_is_generic) ? judge!.what_is_generic.slice(0, 3) : [],
+      automation: outcomeMenuProfile
+        ? {
+            enabled: Boolean(outcomeMenuProfile.enabled),
+            source: outcomeMenuProfile.source,
+            sampleSize: Number(outcomeMenuProfile.sampleSize || 0),
+            confidence: Number(outcomeMenuProfile.confidence || 0),
+            expectedOutcome: outcomeMenuProfile.expectedOutcome,
+            expectedLift: Number(outcomeMenuProfile.expectedLift || 0),
+            qualityGateOffset: Number(outcomeMenuProfile.qualityGateOffset || 0),
+            hookThresholdOffset: Number(outcomeMenuProfile.hookThresholdOffset || 0),
+            applied: {
+              strategy: Boolean(outcomeMenuApply?.strategyApplied),
+              targetPlatform: Boolean(outcomeMenuApply?.targetPlatformApplied),
+              editorMode: Boolean(outcomeMenuApply?.editorModeApplied)
+            },
+            reasons: Array.isArray(outcomeMenuProfile.reasons) ? outcomeMenuProfile.reasons.slice(0, 3) : []
+          }
+        : null,
       improvements: improvements.slice(0, 12)
     },
     qualityGate: judge
@@ -10345,20 +10747,79 @@ const processJob = async (
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
   }
   const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
-  const requestedStrategyProfile = parseRetentionStrategyProfile(
+  let requestedStrategyProfile = parseRetentionStrategyProfile(
     options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
   )
-  const requestedAggressionLevel = parseRetentionAggressionLevel(
+  let requestedAggressionLevel = parseRetentionAggressionLevel(
     options.retentionAggressionLevel ??
     STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ??
     getRetentionAggressionFromJob(job)
   )
-  const retentionTargetPlatform = getRetentionTargetPlatformFromJob(job)
-  const platformProfileId = getPlatformProfileFromJob(job)
-  const platformProfile = PLATFORM_EDIT_PROFILES[platformProfileId] || PLATFORM_EDIT_PROFILES.auto
+  const requestedTargetPlatform = getRetentionTargetPlatformFromJob(job)
+  const requestedPlatformProfileId = getPlatformProfileFromJob(job)
+  let retentionTargetPlatform = requestedTargetPlatform
+  let platformProfileId = requestedPlatformProfileId
+  const requestedEditorModeRaw = parseEditorModeSelection(options.editorMode ?? getEditorModeFromJob(job) ?? 'auto')
+  let requestedEditorMode: EditorModeSelection | null = requestedEditorModeRaw
+  const outcomeMenuProfile = await loadOutcomeMenuProfile(user.id, {
+    requestedStrategy: requestedStrategyProfile,
+    requestedTargetPlatform: retentionTargetPlatform,
+    requestedEditorMode
+  })
+  const outcomeMenuApply = applyOutcomeMenuProfile({
+    profile: outcomeMenuProfile,
+    requestedStrategy: requestedStrategyProfile,
+    requestedTargetPlatform: retentionTargetPlatform,
+    requestedEditorMode
+  })
+  const outcomeAutomationNotes: string[] = []
+  if (outcomeMenuProfile.enabled) {
+    outcomeAutomationNotes.push(
+      `Outcome automation profile learned from ${outcomeMenuProfile.sampleSize} completed jobs (confidence ${Math.round(outcomeMenuProfile.confidence * 100)}%).`
+    )
+    if (Number(outcomeMenuProfile.expectedLift || 0) >= 0.015) {
+      outcomeAutomationNotes.push(
+        `Expected watch-time outcome lift: +${(Number(outcomeMenuProfile.expectedLift || 0) * 100).toFixed(1)} points.`
+      )
+    }
+  }
+  requestedStrategyProfile = outcomeMenuApply.strategy
+  retentionTargetPlatform = outcomeMenuApply.targetPlatform
+  requestedEditorMode = outcomeMenuApply.editorMode
+  if (
+    outcomeMenuApply.targetPlatformApplied &&
+    (
+      requestedPlatformProfileId === 'auto' ||
+      requestedPlatformProfileId === parsePlatformProfile(requestedTargetPlatform, 'auto')
+    )
+  ) {
+    platformProfileId = parsePlatformProfile(retentionTargetPlatform, 'auto')
+  }
+  if (outcomeMenuApply.strategyApplied || outcomeMenuApply.targetPlatformApplied || outcomeMenuApply.editorModeApplied) {
+    const adjusted: string[] = []
+    if (outcomeMenuApply.strategyApplied) adjusted.push(`strategy ${requestedStrategyProfile}`)
+    if (outcomeMenuApply.targetPlatformApplied) adjusted.push(`platform ${retentionTargetPlatform}`)
+    if (outcomeMenuApply.editorModeApplied && requestedEditorMode) adjusted.push(`editor mode ${requestedEditorMode}`)
+    if (adjusted.length) {
+      outcomeAutomationNotes.push(`Applied outcome-driven automation to ${adjusted.join(', ')}.`)
+    }
+  }
+  let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
+  requestedAggressionLevel = parseRetentionAggressionLevel(
+    STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel
+  )
+  let platformProfile = PLATFORM_EDIT_PROFILES[platformProfileId] || PLATFORM_EDIT_PROFILES.auto
   let strategyProfile = requestedStrategyProfile
   let aggressionLevel = requestedAggressionLevel
   const feedbackQualityGateOffset = computeFeedbackQualityGateOffset(job.analysis as any)
+  const combinedQualityGateOffset = Math.round(
+    clamp(
+      feedbackQualityGateOffset + (outcomeMenuProfile.enabled ? outcomeMenuProfile.qualityGateOffset : 0),
+      -4,
+      4
+    )
+  )
+  const hookThresholdOffset = outcomeMenuProfile.enabled ? outcomeMenuProfile.hookThresholdOffset : 0
   const hookCalibration = await loadHookCalibrationProfile(job.userId)
   const rawSubtitleStyle = String(options.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET)
   const normalizedRawSubtitle = normalizeSubtitlePreset(rawSubtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
@@ -10652,7 +11113,16 @@ const processJob = async (
             aggression: aggressionLevel,
             isLongForm: runtimeRetentionProfile.isLongForm,
             isVerticalShortForm: runtimeRetentionProfile.isVerticalShortForm,
-            notes: runtimeRetentionNotes
+            notes: [...runtimeRetentionNotes, ...outcomeAutomationNotes]
+          },
+          outcome_menu_profile: outcomeMenuProfile,
+          outcome_menu_applied: outcomeMenuApply,
+          outcome_menu_effective: {
+            strategyProfile,
+            targetPlatform: retentionTargetPlatform,
+            editorMode: editorModeForRender,
+            qualityGateOffset: combinedQualityGateOffset,
+            hookThresholdOffset
           },
           vertical_clip_ranges: clipRanges.map((range, index) => ({
             clip: index + 1,
@@ -10675,7 +11145,7 @@ const processJob = async (
         platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
-        editorMode: options.editorMode,
+        editorMode: editorModeForRender,
         outputPaths
       })
 
@@ -10705,7 +11175,7 @@ const processJob = async (
           platformProfile: platformProfileId,
           onlyCuts: options.onlyCuts,
           maxCuts: options.maxCutsRequested,
-          editorMode: options.editorMode
+          editorMode: editorModeForRender
         }),
         analysis: nextAnalysis
       })
@@ -10739,6 +11209,9 @@ const processJob = async (
     let optimizationNotes: string[] = []
     if (runtimeRetentionNotes.length) {
       optimizationNotes.push(...runtimeRetentionNotes)
+    }
+    if (outcomeAutomationNotes.length) {
+      optimizationNotes.push(...outcomeAutomationNotes)
     }
     if (subtitleStyleSource === 'platform' && options.autoCaptions) {
       optimizationNotes.push(
@@ -10812,6 +11285,7 @@ const processJob = async (
             ...options,
             retentionAggressionLevel: aggressionLevel,
             retentionStrategyProfile: strategyProfile,
+            editorMode: editorModeForRender,
             aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
           }, undefined, {
             aggressionLevel,
@@ -10819,7 +11293,12 @@ const processJob = async (
           })
         } catch (err) {
           console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process, using deterministic fallback`, err)
-          editPlan = buildDeterministicFallbackEditPlan(durationSeconds, options)
+          editPlan = buildDeterministicFallbackEditPlan(durationSeconds, {
+            ...options,
+            retentionAggressionLevel: aggressionLevel,
+            retentionStrategyProfile: strategyProfile,
+            editorMode: editorModeForRender
+          })
           optimizationNotes.push('AI edit plan fallback: deterministic rescue plan used.')
         }
       }
@@ -10898,7 +11377,7 @@ const processJob = async (
         signalStrength: contentSignalStrength,
         contentFormat: selectedContentFormat,
         targetPlatform: retentionTargetPlatform,
-        feedbackOffset: feedbackQualityGateOffset
+        feedbackOffset: combinedQualityGateOffset
       })
       qualityGateOverride = null
       const latestJobHookSnapshot = await prisma.job.findUnique({
@@ -10925,7 +11404,8 @@ const processJob = async (
         candidates: hookCandidates,
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
-        signalStrength: contentSignalStrength
+        signalStrength: contentSignalStrength,
+        thresholdOffset: hookThresholdOffset
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
       if (!resolvedHookDecision) {
@@ -10956,7 +11436,8 @@ const processJob = async (
           threshold: resolveHookScoreThreshold({
             aggressionLevel,
             hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength
+            signalStrength: contentSignalStrength,
+            thresholdOffset: hookThresholdOffset
           }),
           usedFallback: true,
           reason: fallbackHook.reason
@@ -11241,7 +11722,7 @@ const processJob = async (
           segments: autoEscalationResult.segments,
           windows: editPlan?.engagementWindows ?? [],
           durationSeconds,
-          editorMode: options.editorMode
+          editorMode: editorModeForRender
         })
         const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
         const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(runtimeBandAdjustedSegments))
@@ -11581,6 +12062,8 @@ const processJob = async (
           selectedJudge,
           attempts: retentionAttempts,
           thresholds: qualityGateThresholds,
+          qualityGateOffset: combinedQualityGateOffset,
+          hookThresholdOffset,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
           contentFormat: selectedContentFormat,
@@ -11597,6 +12080,8 @@ const processJob = async (
           judge: selectedJudge,
           attempts: retentionAttempts,
           thresholds: qualityGateThresholds,
+          qualityGateOffset: combinedQualityGateOffset,
+          hookThresholdOffset,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
           contentFormat: selectedContentFormat,
@@ -12253,7 +12738,9 @@ const processJob = async (
       hookSelectionSource: selectedHookSelectionSource,
       contentFormat: selectedContentFormat,
       targetPlatform: retentionTargetPlatform,
-      strategyProfile
+      strategyProfile,
+      outcomeMenuProfile,
+      outcomeMenuApply
     })
 
     const nextAnalysis = buildPersistedRenderAnalysis({
@@ -12332,7 +12819,16 @@ const processJob = async (
           aggression: aggressionLevel,
           isLongForm: runtimeRetentionProfile.isLongForm,
           isVerticalShortForm: runtimeRetentionProfile.isVerticalShortForm,
-          notes: runtimeRetentionNotes
+          notes: [...runtimeRetentionNotes, ...outcomeAutomationNotes]
+        },
+        outcome_menu_profile: outcomeMenuProfile,
+        outcome_menu_applied: outcomeMenuApply,
+        outcome_menu_effective: {
+          strategyProfile,
+          targetPlatform: retentionTargetPlatform,
+          editorMode: editorModeForRender,
+          qualityGateOffset: combinedQualityGateOffset,
+          hookThresholdOffset
         }
       },
       renderConfig,
@@ -12340,7 +12836,7 @@ const processJob = async (
       platformProfile: platformProfileId,
       onlyCuts: options.onlyCuts,
       maxCuts: options.maxCutsRequested,
-      editorMode: options.editorMode,
+      editorMode: editorModeForRender,
       outputPaths
     })
 
@@ -12365,7 +12861,7 @@ const processJob = async (
         platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
-        editorMode: options.editorMode
+        editorMode: editorModeForRender
       }),
       analysis: nextAnalysis
     })
@@ -13062,6 +13558,47 @@ router.get('/', async (req: any, res) => {
     res.json({ jobs: payload })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.get('/automation-profile', async (req: any, res) => {
+  try {
+    const requestedStrategy = parseRetentionStrategyProfile(
+      req.query?.strategyProfile ??
+      req.query?.retentionStrategyProfile ??
+      req.query?.strategy ??
+      req.query?.retentionStrategy
+    )
+    const requestedTargetPlatform = parseRetentionTargetPlatform(
+      req.query?.targetPlatform ??
+      req.query?.retentionTargetPlatform ??
+      req.query?.platform
+    )
+    const requestedEditorMode = normalizeOutcomeEditorMode(
+      parseEditorModeSelection(
+        req.query?.editorMode ??
+        req.query?.editor_mode ??
+        req.query?.contentMode ??
+        req.query?.content_mode
+      )
+    )
+    const profile = await loadOutcomeMenuProfile(req.user.id, {
+      requestedStrategy,
+      requestedTargetPlatform,
+      requestedEditorMode
+    })
+    const preview = applyOutcomeMenuProfile({
+      profile,
+      requestedStrategy,
+      requestedTargetPlatform,
+      requestedEditorMode
+    })
+    return res.json({
+      profile,
+      preview
+    })
+  } catch (err) {
+    return res.status(500).json({ error: 'server_error' })
   }
 })
 

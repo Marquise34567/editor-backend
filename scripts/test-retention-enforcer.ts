@@ -349,6 +349,7 @@ const run = () => {
       interruptDensityRaw: 0.25,
       runtimeSeconds: 16,
       contentFormat: 'tiktok_short' as const,
+      targetPlatform: 'tiktok' as const,
       pacingTargetSeconds: 6
     }
   }
@@ -384,6 +385,7 @@ const run = () => {
       interruptDensityRaw: 0.01,
       runtimeSeconds: 12,
       contentFormat: 'tiktok_short' as const,
+      targetPlatform: 'tiktok' as const,
       pacingTargetSeconds: 6
     }
   }
