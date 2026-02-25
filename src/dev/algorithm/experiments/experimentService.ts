@@ -349,8 +349,8 @@ const queryResultsForExperiment = async (experiment: AlgorithmExperiment): Promi
         COALESCE(STDDEV_POP(score_total), 0)::float AS std_dev,
         COUNT(*)::int AS sample_size
       FROM render_quality_metrics
-      WHERE created_at >= $1
-        AND created_at <= $2
+      WHERE created_at >= $1::timestamptz
+        AND created_at <= $2::timestamptz
         AND config_version_id = ANY($3::text[])
       GROUP BY config_version_id
     `,

@@ -290,15 +290,16 @@ export const listMetricsByRange = async ({
   }
 
   await ensureInfra()
+  const fromDate = new Date(fromMs)
   const rows = await (prisma as any).$queryRawUnsafe(
     `
       SELECT id, job_id, user_id, created_at, config_version_id, score_total, score_hook, score_pacing, score_emotion, score_visual, score_story, score_jank, features, flags
       FROM render_quality_metrics
-      WHERE created_at >= $1
+      WHERE created_at >= $1::timestamptz
       ORDER BY created_at DESC
       LIMIT $2
     `,
-    new Date(fromMs).toISOString(),
+    fromDate,
     safeLimit
   )
 

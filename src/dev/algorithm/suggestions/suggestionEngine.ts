@@ -101,7 +101,7 @@ export const fetchMetricsWithConfig = async ({
   }
 
   const hasRange = Boolean(range)
-  const rangeStartIso = hasRange ? new Date(Date.now() - parseRangeToMs(range || '7d')).toISOString() : null
+  const rangeStartAt = hasRange ? new Date(Date.now() - parseRangeToMs(range || '7d')) : null
   const rows = hasRange
     ? await (prisma as any).$queryRawUnsafe(
         `
@@ -125,11 +125,11 @@ export const fetchMetricsWithConfig = async ({
             c.created_at AS config_created_at
           FROM render_quality_metrics m
           INNER JOIN editor_config_versions c ON c.id = m.config_version_id
-          WHERE m.created_at >= $1
+          WHERE m.created_at >= $1::timestamptz
           ORDER BY m.created_at DESC
           LIMIT $2
         `,
-        rangeStartIso,
+        rangeStartAt,
         safeLimit
       )
     : await (prisma as any).$queryRawUnsafe(
