@@ -987,6 +987,44 @@ const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingN
   sports: 'high_energy',
   education: 'education'
 }
+const resolveLowRetentionRecoveryEditorMode = ({
+  contentFormat,
+  targetPlatform,
+  styleProfile,
+  nicheProfile
+}: {
+  contentFormat?: RetentionContentFormat | null
+  targetPlatform?: RetentionTargetPlatform | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+}): { mode: Exclude<EditorModeSelection, 'auto'>; reason: string } => {
+  const normalizedPlatform = parseRetentionTargetPlatform(targetPlatform || 'auto')
+  if (styleProfile?.style === 'gaming') {
+    return { mode: 'gaming', reason: 'Detected gaming visual rhythm.' }
+  }
+  if (styleProfile?.style === 'reaction') {
+    return { mode: 'reaction', reason: 'Detected reaction-style pacing opportunities.' }
+  }
+  if (styleProfile?.style === 'tutorial' || nicheProfile?.niche === 'education' || contentFormat === 'podcast_clip') {
+    return { mode: 'education', reason: 'Detected education/talking-head signals that benefit from clarity-first pacing.' }
+  }
+  if (nicheProfile?.niche === 'high_energy') {
+    if (normalizedPlatform === 'youtube') {
+      return { mode: 'sports', reason: 'High-energy signal on long-form platform; applying fast highlight pacing.' }
+    }
+    return { mode: 'reaction', reason: 'High-energy signal detected; applying aggressive short-form pacing.' }
+  }
+  if (nicheProfile?.niche === 'talking_head') {
+    return { mode: 'commentary', reason: 'Talking-head signal detected; tightening speech-first pacing.' }
+  }
+  if (styleProfile?.style === 'vlog' || styleProfile?.style === 'story') {
+    return { mode: 'vlog', reason: 'Narrative/vlog pattern detected; applying conversational pacing profile.' }
+  }
+  if (contentFormat === 'tiktok_short' || normalizedPlatform === 'tiktok' || normalizedPlatform === 'instagram_reels') {
+    return { mode: 'reaction', reason: 'Short-form target detected; prioritizing stronger hook pressure.' }
+  }
+  return { mode: 'commentary', reason: 'Default low-retention recovery profile for horizontal long-form footage.' }
+}
 const DURATION_SPEED_BANDS = {
   short_1_10: {
     minMinutes: 1,
@@ -13280,7 +13318,26 @@ const processJob = async (
           strategyProfile
         })
       }
-      if (!selectedJudge.passed) {
+      const judgePassedBeforeRecovery = selectedJudge.passed
+      const initialPredictedRetention = Number(selectedJudge.retention_score ?? 0)
+      const lowRetentionRecoveryRequested = initialPredictedRetention < MIN_PREDICTED_COMPLETION_PERCENT
+      if (
+        lowRetentionRecoveryRequested &&
+        requestedEditorModeRaw === 'auto' &&
+        editorModeForRender === 'auto'
+      ) {
+        const lowRetentionEditorMode = resolveLowRetentionRecoveryEditorMode({
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          styleProfile: styleProfileForAnalysis,
+          nicheProfile: nicheProfileForAnalysis
+        })
+        editorModeForRender = lowRetentionEditorMode.mode
+        optimizationNotes.push(
+          `Low-retention recovery auto-mode activated: ${lowRetentionEditorMode.mode} (${lowRetentionEditorMode.reason})`
+        )
+      }
+      if (!selectedJudge.passed || lowRetentionRecoveryRequested) {
         let overrideReason = maybeAllowQualityGateOverride({
           judge: selectedJudge,
           thresholds: qualityGateThresholds,
@@ -13383,7 +13440,10 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
-          if (Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT) {
+          if (
+            !judgePassedBeforeRecovery &&
+            Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT
+          ) {
             const reason = `Predicted completion ${Number(selectedJudge?.retention_score ?? 0).toFixed(1)}% below ${MIN_PREDICTED_COMPLETION_PERCENT}% minimum.`
             await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
               status: 'failed',
@@ -13424,7 +13484,9 @@ const processJob = async (
               strategyProfile
             })
           }
-          const forcedReason = 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
+          const forcedReason = lowRetentionRecoveryRequested
+            ? 'Low-retention recovery ran but remained below target; using best available rescue output.'
+            : 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
         }
