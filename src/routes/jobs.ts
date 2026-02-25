@@ -5107,13 +5107,34 @@ const pickTopHookCandidates = ({
   const rankedEvaluated = evaluated
     .slice()
     .sort((a, b) => b.score - a.score || a.start - b.start)
-  const uniqueTop: HookCandidate[] = []
-  for (const candidate of rankedEvaluated) {
-    const tooClose = uniqueTop.some((entry) => Math.abs(entry.start - candidate.start) < 1.3)
-    if (tooClose) continue
-    uniqueTop.push(candidate)
-    if (uniqueTop.length >= Math.max(HOOK_SELECTION_MAX_CANDIDATES * 3, 12)) break
+  const dedupeByStartSpacing = (
+    candidates: HookCandidate[],
+    spacingSeconds: number,
+    maxCount: number
+  ) => {
+    const deduped: HookCandidate[] = []
+    for (const candidate of candidates) {
+      const tooClose = deduped.some((entry) => Math.abs(entry.start - candidate.start) < spacingSeconds)
+      if (tooClose) continue
+      deduped.push(candidate)
+      if (deduped.length >= maxCount) break
+    }
+    return deduped
   }
+  const faceoffScoreCache = new Map<string, number>()
+  const getFaceoffScore = (candidate: HookCandidate) => {
+    const key = `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
+    const cached = faceoffScoreCache.get(key)
+    if (cached !== undefined) return cached
+    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration })
+    faceoffScoreCache.set(key, score)
+    return score
+  }
+  const uniqueTop = dedupeByStartSpacing(
+    rankedEvaluated,
+    1.3,
+    Math.max(HOOK_SELECTION_MAX_CANDIDATES * 5, 20)
+  )
   if (!uniqueTop.length) {
     const synthetic = buildSyntheticHookCandidate({ durationSeconds, segments, windows, transcriptCues })
     if (synthetic) {
@@ -5141,17 +5162,21 @@ const pickTopHookCandidates = ({
   const partitionWinners: HookCandidate[] = []
   for (let index = 0; index < partitions.length; index += 1) {
     const partition = partitions[index]
-    const partitionPool = uniqueTop.filter((candidate) => {
-      const center = candidate.start + candidate.duration / 2
-      return center >= partition.start && center < partition.end
-    })
+    const partitionPool = dedupeByStartSpacing(
+      rankedEvaluated.filter((candidate) => {
+        const center = candidate.start + candidate.duration / 2
+        return center >= partition.start && center < partition.end
+      }),
+      0.8,
+      Math.max(HOOK_SELECTION_MAX_CANDIDATES * 3, 10)
+    )
     if (!partitionPool.length) continue
     const nearEightPool = partitionPool.filter((candidate) => candidate.duration >= 7.4)
     const pool = nearEightPool.length ? nearEightPool : partitionPool
     const best = pool
       .slice()
       .sort((a, b) => (
-        scoreHookFaceoffCandidate({ candidate: b, windows, hookCalibration }) - scoreHookFaceoffCandidate({ candidate: a, windows, hookCalibration }) ||
+        getFaceoffScore(b) - getFaceoffScore(a) ||
         b.score - a.score ||
         a.start - b.start
       ))[0]
@@ -5160,11 +5185,13 @@ const pickTopHookCandidates = ({
       reason: `${best.reason} Chosen as top 8s candidate for section ${index + 1}/${partitions.length}.`
     })
   }
-  const faceoffPool = partitionWinners.length ? partitionWinners : uniqueTop.slice(0, Math.max(4, HOOK_SELECTION_MAX_CANDIDATES))
+  const faceoffPool = partitionWinners.length
+    ? partitionWinners
+    : uniqueTop.slice(0, Math.max(4, HOOK_SELECTION_MAX_CANDIDATES))
   const faceoffRanked = faceoffPool
     .map((candidate) => ({
       candidate,
-      faceoffScore: scoreHookFaceoffCandidate({ candidate, windows, hookCalibration })
+      faceoffScore: getFaceoffScore(candidate)
     }))
     .sort((a, b) => (
       b.faceoffScore - a.faceoffScore ||
@@ -5189,8 +5216,23 @@ const pickTopHookCandidates = ({
       if (synthetic) uniqueTop.push(synthetic)
     }
   }
+  const timelineCoverageCandidates = dedupeByStartSpacing(
+    [
+      ...partitionWinners
+        .slice()
+        .sort((a, b) => (
+          getFaceoffScore(b) - getFaceoffScore(a) ||
+          b.score - a.score ||
+          a.start - b.start
+        )),
+      ...uniqueTop
+    ],
+    1.05,
+    Math.max(HOOK_SELECTION_MAX_CANDIDATES * 4, 14)
+  )
   const finalRanked = [
     selected,
+    ...timelineCoverageCandidates,
     ...faceoffRanked.map((entry) => entry.candidate),
     ...uniqueTop
   ]
