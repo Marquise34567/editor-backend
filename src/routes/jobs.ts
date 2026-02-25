@@ -144,6 +144,13 @@ const getSignedOutputUrl = async ({ key, expiresIn }: { key: string; expiresIn: 
   return data.signedUrl
 }
 
+const getSignedInputUrl = async ({ key, expiresIn }: { key: string; expiresIn: number }) => {
+  if (r2.isConfigured) return r2.getPresignedGetUrl({ Key: key, expiresIn })
+  const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).createSignedUrl(key, expiresIn)
+  if (error || !data?.signedUrl) throw error || new Error('signed_url_failed')
+  return data.signedUrl
+}
+
 const deleteOutputObject = async (key: string) => {
   if (r2.isConfigured) {
     await r2.deleteObject({ Key: key })
@@ -10442,6 +10449,22 @@ router.post('/:id/proxy-url', async (req: any, res) => {
     await ensureBucket(OUTPUT_BUCKET, false)
     const expires = 60 * 10
     const url = await getSignedOutputUrl({ key: proxyPath, expiresIn: expires })
+    return res.json({ url })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+// Return signed URL for source input preview
+router.post('/:id/input-url', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (!job.inputPath) return res.status(404).json({ error: 'input_not_available' })
+    await ensureBucket(INPUT_BUCKET, true)
+    const expires = 60 * 10
+    const url = await getSignedInputUrl({ key: job.inputPath, expiresIn: expires })
     return res.json({ url })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
