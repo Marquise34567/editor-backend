@@ -9238,11 +9238,11 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
-      const ffPreset = (options as any)?.fastMode
+      const ffPreset = options.fastMode
         ? 'superfast'
         : (process.env.FFMPEG_PRESET || 'medium')
       const defaultCrf = finalQuality === '4k' ? '18' : finalQuality === '1080p' ? '20' : '22'
-      const ffCrf = (options as any)?.fastMode
+      const ffCrf = options.fastMode
         ? '28'
         : (process.env.FFMPEG_CRF || defaultCrf)
       const argsBase = [
@@ -10539,6 +10539,9 @@ router.post('/:id/analyze', async (req: any, res) => {
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
+    if (req.body?.fastMode) {
+      options.fastMode = true
+    }
     const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
   } catch (err) {
@@ -10593,7 +10596,7 @@ router.post('/:id/process', async (req: any, res) => {
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     // Allow client to request a fast-mode re-render (overrides user settings for this run)
     if (req.body?.fastMode) {
-      ;(options as any).fastMode = true
+      options.fastMode = true
     }
     await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
