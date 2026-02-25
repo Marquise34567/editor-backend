@@ -1779,6 +1779,33 @@ const getOnlyCutsFromPayload = (payload?: any): boolean | null => {
   )
 }
 
+const getAutoCaptionsFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const nested = (payload as any).subtitles
+  return (
+    parseBooleanFlag((payload as any).autoCaptions) ??
+    parseBooleanFlag((payload as any).auto_captions) ??
+    parseBooleanFlag(nested?.enabled) ??
+    null
+  )
+}
+
+const getSubtitleStyleFromPayload = (payload?: any): string | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const nested = (payload as any).subtitles
+  const candidate =
+    (payload as any).subtitleStyle ??
+    (payload as any).subtitle_style ??
+    nested?.style ??
+    nested?.subtitleStyle ??
+    nested?.subtitle_style ??
+    nested?.preset
+  if (candidate === undefined || candidate === null) return null
+  const text = String(candidate).trim()
+  if (!text) return null
+  return text.slice(0, 320)
+}
+
 const STYLE_ARCHETYPE_KEYS: Array<keyof StyleArchetypeBlend> = [
   'high_stakes_challenge',
   'longform_reaction_commentary',
@@ -9313,16 +9340,19 @@ const getEditOptionsForUser = async (
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
     onlyCuts?: boolean | null
+    autoCaptions?: boolean | null
+    subtitleStyle?: string | null
   }
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
   const { tier, plan } = await getUserPlan(userId)
   const features = getPlanFeatures(tier)
   const subtitlesEnabled = features.subtitles.enabled
-  const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
+  const rawSubtitle = String(overrides?.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET)
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
   const subtitleStyle =
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+  const autoCaptionsOverride = typeof overrides?.autoCaptions === 'boolean' ? overrides.autoCaptions : null
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
     : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
@@ -9353,7 +9383,11 @@ const getEditOptionsForUser = async (
     soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
     emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
     aggressiveMode,
-    autoCaptions: onlyCuts ? false : (subtitlesEnabled ? (settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions) : false),
+    autoCaptions: onlyCuts ? false : (
+      subtitlesEnabled
+        ? (autoCaptionsOverride ?? settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions)
+        : false
+    ),
     musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
     subtitleStyle,
     autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
@@ -11786,7 +11820,9 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       const { options } = await getEditOptionsForUser(user.id, {
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
-        onlyCuts: getOnlyCutsFromJob(existing)
+        onlyCuts: getOnlyCutsFromJob(existing),
+        autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
+        subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       })
       const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
       if (styleBlendOverride) options.styleArchetypeBlend = styleBlendOverride
@@ -12143,6 +12179,8 @@ const handleCreateJob = async (req: any, res: any) => {
       parsePlatformProfile(retentionTargetPlatform, 'auto')
     )
     const styleBlendOverride = parseStyleArchetypeBlendFromPayload(req.body)
+    const autoCaptionsOverride = getAutoCaptionsFromPayload(req.body)
+    const subtitleStyleOverride = getSubtitleStyleFromPayload(req.body)
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -12227,6 +12265,8 @@ const handleCreateJob = async (req: any, res: any) => {
             platformProfile,
             platform_profile: platformProfile,
             style_archetype_blend_override: styleBlendOverride,
+            ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+            ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride })
           },
@@ -12564,6 +12604,14 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const styleBlendOverride =
       parseStyleArchetypeBlendFromPayload(req.body) ??
       parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
+    const autoCaptionsOverride = (
+      getAutoCaptionsFromPayload(req.body) ??
+      getAutoCaptionsFromPayload((job.analysis as any) || {})
+    )
+    const subtitleStyleOverride = (
+      getSubtitleStyleFromPayload(req.body) ??
+      getSubtitleStyleFromPayload((job.analysis as any) || {})
+    )
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
@@ -12591,6 +12639,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
       style_archetype_blend_override: styleBlendOverride,
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
 
@@ -12656,6 +12706,14 @@ router.post('/:id/analyze', async (req: any, res) => {
     const styleBlendOverride =
       parseStyleArchetypeBlendFromPayload(req.body) ??
       parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
+    const autoCaptionsOverride = (
+      getAutoCaptionsFromPayload(req.body) ??
+      getAutoCaptionsFromPayload((job.analysis as any) || {})
+    )
+    const subtitleStyleOverride = (
+      getSubtitleStyleFromPayload(req.body) ??
+      getSubtitleStyleFromPayload((job.analysis as any) || {})
+    )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -12684,6 +12742,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
       style_archetype_blend_override: styleBlendOverride,
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
     }
     await updateJob(id, {
@@ -12693,7 +12753,9 @@ router.post('/:id/analyze', async (req: any, res) => {
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
-      onlyCuts: requestedOnlyCuts
+      onlyCuts: requestedOnlyCuts,
+      autoCaptions: autoCaptionsOverride,
+      subtitleStyle: subtitleStyleOverride
     })
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
@@ -12741,6 +12803,14 @@ router.post('/:id/process', async (req: any, res) => {
     const styleBlendOverride =
       parseStyleArchetypeBlendFromPayload(req.body) ??
       parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
+    const autoCaptionsOverride = (
+      getAutoCaptionsFromPayload(req.body) ??
+      getAutoCaptionsFromPayload((job.analysis as any) || {})
+    )
+    const subtitleStyleOverride = (
+      getSubtitleStyleFromPayload(req.body) ??
+      getSubtitleStyleFromPayload((job.analysis as any) || {})
+    )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -12769,6 +12839,8 @@ router.post('/:id/process', async (req: any, res) => {
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
       style_archetype_blend_override: styleBlendOverride,
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
     }
     await updateJob(id, {
@@ -12778,7 +12850,9 @@ router.post('/:id/process', async (req: any, res) => {
     const { options } = await getEditOptionsForUser(req.user.id, {
       retentionAggressionLevel: tuning.aggression,
       retentionStrategyProfile: tuning.strategy,
-      onlyCuts: requestedOnlyCuts
+      onlyCuts: requestedOnlyCuts,
+      autoCaptions: autoCaptionsOverride,
+      subtitleStyle: subtitleStyleOverride
     })
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -12969,6 +13043,14 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const styleBlendOverride =
       parseStyleArchetypeBlendFromPayload(req.body) ??
       parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
+    const autoCaptionsOverride = (
+      getAutoCaptionsFromPayload(req.body) ??
+      getAutoCaptionsFromPayload((job.analysis as any) || {})
+    )
+    const subtitleStyleOverride = (
+      getSubtitleStyleFromPayload(req.body) ??
+      getSubtitleStyleFromPayload((job.analysis as any) || {})
+    )
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -12995,7 +13077,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
-      platform_profile: requestedPlatformProfile
+      platform_profile: requestedPlatformProfile,
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {})
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -13011,6 +13095,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
       style_archetype_blend_override: styleBlendOverride,
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }
