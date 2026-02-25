@@ -8370,7 +8370,6 @@ const buildVerticalClipRanges = (
   requestedCount: number,
   opts?: {
     windows?: EngagementWindow[]
-    hookCandidates?: HookCandidate[]
     platformProfile?: PlatformProfile
   }
 ) => {
@@ -8381,7 +8380,6 @@ const buildVerticalClipRanges = (
   const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(1, platformProfile.verticalMinClipSeconds)))
   clipCount = Math.min(clipCount, maxFeasibleByLength)
   const windows = Array.isArray(opts?.windows) ? opts!.windows! : []
-  const hookCandidates = Array.isArray(opts?.hookCandidates) ? opts!.hookCandidates! : []
 
   const fallbackRanges = (() => {
     const chunk = total / clipCount
@@ -8406,25 +8404,29 @@ const buildVerticalClipRanges = (
   ).toFixed(3))
   const step = total > 300 ? 2 : 1
   const candidates: Array<{ range: TimeRange; score: number }> = []
-  const hookCenters = hookCandidates.map((candidate) => candidate.start + candidate.duration / 2)
 
   for (let start = 0; start + targetClipDuration <= total; start += step) {
     const end = Number((start + targetClipDuration).toFixed(3))
     const startRounded = Number(start.toFixed(3))
     const coreScore = averageWindowMetric(windows, startRounded, end, (window) => (
-      0.34 * (window.hookScore ?? window.score) +
-      0.18 * window.emotionIntensity +
-      0.14 * window.vocalExcitement +
-      0.12 * (window.curiosityTrigger ?? 0) +
-      0.1 * window.sceneChangeRate +
-      0.06 * window.speechIntensity +
-      0.06 * (window.actionSpike ?? 0)
+      0.3 * window.score +
+      0.2 * window.emotionIntensity +
+      0.16 * window.vocalExcitement +
+      0.13 * (window.actionSpike ?? 0) +
+      0.1 * window.motionScore +
+      0.07 * window.sceneChangeRate +
+      0.04 * window.speechIntensity
     ))
-    const center = startRounded + targetClipDuration / 2
-    const hookBoost = hookCenters.length
-      ? clamp01(1 - Math.min(...hookCenters.map((point) => Math.abs(point - center))) / Math.max(1, targetClipDuration * 1.8))
-      : 0
-    const score = Number((coreScore + hookBoost * 0.12).toFixed(5))
+    const spikeScore = averageWindowMetric(windows, startRounded, end, (window) => (
+      Math.max(
+        window.emotionIntensity,
+        window.vocalExcitement,
+        window.motionScore,
+        window.sceneChangeRate,
+        window.actionSpike ?? 0
+      )
+    ))
+    const score = Number((coreScore * 0.78 + spikeScore * 0.22).toFixed(5))
     candidates.push({
       range: { start: startRounded, end },
       score
@@ -8526,6 +8528,12 @@ const normalizeVerticalCropToSource = ({
 }) => {
   const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
   const defaultY = Math.round(clamp(sourceHeight * 0.05, 0, Math.max(0, sourceHeight - defaultHeight)))
+  const fallbackCrop = {
+    x: 0,
+    y: defaultY,
+    w: sourceWidth,
+    h: defaultHeight
+  }
   let x = 0
   let y = defaultY
   let w = sourceWidth
@@ -8534,7 +8542,7 @@ const normalizeVerticalCropToSource = ({
   if (crop) {
     const rawValues = [crop.x, crop.y, crop.w, crop.h]
     if (rawValues.some((value) => !Number.isFinite(value))) {
-      throw new Error('invalid_webcam_crop_values')
+      return fallbackCrop
     }
     const isNormalized = crop.w <= 1.0001 && crop.h <= 1.0001 && crop.x >= -0.0001 && crop.y >= -0.0001
     if (isNormalized) {
@@ -8555,7 +8563,7 @@ const normalizeVerticalCropToSource = ({
   w = clamp(w, 2, sourceWidth - x)
   h = clamp(h, 2, sourceHeight - y)
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(w) || !Number.isFinite(h) || w <= 1 || h <= 1) {
-    throw new Error('invalid_webcam_crop_values')
+    return fallbackCrop
   }
   return {
     x: Math.round(x),
@@ -8657,7 +8665,10 @@ const renderVerticalClip = async ({
   videoCrf,
   audioBitrate,
   audioSampleRate,
-  audioFilters
+  audioFilters,
+  subtitlePath,
+  subtitleIsAss,
+  subtitleStyle
 }: {
   inputPath: string
   outputPath: string
@@ -8672,6 +8683,9 @@ const renderVerticalClip = async ({
   audioBitrate: string
   audioSampleRate: string
   audioFilters: string[]
+  subtitlePath?: string | null
+  subtitleIsAss?: boolean
+  subtitleStyle?: string | null
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
@@ -8704,10 +8718,20 @@ const renderVerticalClip = async ({
             withAudio
           })
       })()
+  const subtitleFilter = subtitlePath
+    ? (
+      subtitleIsAss
+        ? `subtitles=${escapeFilterPath(subtitlePath)}`
+        : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+    )
+    : ''
+  const filterWithSubtitles = subtitleFilter
+    ? `${baseFilterComplex};[outv]${subtitleFilter}[vsub]`
+    : baseFilterComplex
   const shouldPolishAudio = withAudio && audioFilters.length > 0
   const filterComplex = shouldPolishAudio
-    ? `${baseFilterComplex};[outa]${audioFilters.join(',')}[aout]`
-    : baseFilterComplex
+    ? `${filterWithSubtitles};[outa]${audioFilters.join(',')}[aout]`
+    : filterWithSubtitles
 
   const args = [
     '-y',
@@ -8734,7 +8758,7 @@ const renderVerticalClip = async ({
     '-filter_complex',
     filterComplex,
     '-map',
-    '[outv]'
+    subtitleFilter ? '[vsub]' : '[outv]'
   ]
   if (withAudio) {
     args.push(
@@ -9383,11 +9407,9 @@ const getEditOptionsForUser = async (
     soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
     emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
     aggressiveMode,
-    autoCaptions: onlyCuts ? false : (
-      subtitlesEnabled
-        ? (autoCaptionsOverride ?? settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions)
-        : false
-    ),
+    autoCaptions: subtitlesEnabled
+      ? (autoCaptionsOverride ?? settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions)
+      : false,
     musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
     subtitleStyle,
     autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
@@ -9982,12 +10004,7 @@ const processJob = async (
         verticalAnalysis?.engagement_windows ||
         verticalAnalysis?.engagementWindows
       )
-      const verticalHookCandidates = normalizeStoredHookCandidates(
-        verticalAnalysis?.hook_variants ||
-        verticalAnalysis?.editPlan?.hookVariants ||
-        verticalAnalysis?.editPlan?.hookCandidates ||
-        verticalAnalysis?.hook_candidates
-      )
+      const verticalHookCandidates: HookCandidate[] = []
       const resolvedVerticalMode = renderConfig.verticalMode
         ? {
             ...defaultVerticalModeSettings(),
@@ -10000,7 +10017,6 @@ const processJob = async (
         : defaultVerticalModeSettings()
       const clipRanges = buildVerticalClipRanges(durationSeconds || 0, renderConfig.verticalClipCount, {
         windows: verticalWindows,
-        hookCandidates: verticalHookCandidates,
         platformProfile: platformProfileId
       })
       const renderedClipPaths: string[] = []
@@ -10016,6 +10032,14 @@ const processJob = async (
         : []
       const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
       fs.mkdirSync(localOutDir, { recursive: true })
+      let verticalSourceCues: TranscriptCue[] = []
+      if (options.autoCaptions) {
+        await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
+        const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
+        if (generatedVerticalSubtitlePath) {
+          verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
+        }
+      }
 
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
         status: 'running',
@@ -10028,6 +10052,34 @@ const processJob = async (
       for (let idx = 0; idx < clipRanges.length; idx += 1) {
         const range = clipRanges[idx]
         const localClipPath = path.join(localOutDir, `vertical-clip-${idx + 1}.mp4`)
+        let clipSubtitlePath: string | null = null
+        let clipSubtitleIsAss = false
+        if (options.autoCaptions && verticalSourceCues.length) {
+          const clipSegment: Segment = {
+            start: Number(range.start.toFixed(3)),
+            end: Number(range.end.toFixed(3)),
+            speed: 1
+          }
+          const remappedClipCues = remapTranscriptCuesToEditedTimeline(verticalSourceCues, [clipSegment])
+          if (remappedClipCues.length) {
+            const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
+            const writtenClipSrt = writeTranscriptCuesToSrt(remappedClipCues, clipSrtPath)
+            if (writtenClipSrt) {
+              clipSubtitlePath = writtenClipSrt
+              if (normalizedSubtitle === 'mrbeast_animated') {
+                const clipAssPath = buildMrBeastAnimatedAss({
+                  srtPath: clipSubtitlePath,
+                  workingDir: workDir,
+                  style: subtitleStyle
+                })
+                if (clipAssPath) {
+                  clipSubtitlePath = clipAssPath
+                  clipSubtitleIsAss = true
+                }
+              }
+            }
+          }
+        }
         await renderVerticalClip({
           inputPath: tmpIn,
           outputPath: localClipPath,
@@ -10041,7 +10093,10 @@ const processJob = async (
           videoCrf: ffCrf,
           audioBitrate: ffAudioBitrate,
           audioSampleRate: ffAudioSampleRate,
-          audioFilters: verticalAudioFilters
+          audioFilters: verticalAudioFilters,
+          subtitlePath: clipSubtitlePath,
+          subtitleIsAss: clipSubtitleIsAss,
+          subtitleStyle
         })
         const clipStats = fs.statSync(localClipPath)
         if (!clipStats.isFile() || clipStats.size <= 0) {
