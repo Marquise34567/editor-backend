@@ -45,6 +45,17 @@ import {
   parsePlatformProfile,
   type PlatformProfileId
 } from '../shared/platformProfiles'
+import {
+  applyAutoEscalationGuarantee,
+  buildEditDecisionTimeline,
+  extractTimelineFeatures,
+  resolveRuntimeStyleProfile,
+  type AutoEscalationEvent,
+  type EditDecisionTimeline,
+  type RetentionBehaviorStyleProfile,
+  type StyleArchetypeBlend,
+  type TimelineFeatureSnapshot
+} from '../lib/multiStyleRetention'
 
 const router = express.Router()
 
@@ -713,6 +724,11 @@ type EditPlan = {
   emotionalTuning?: EmotionalTuningProfile
   hookVariants?: HookCandidate[]
   hookCalibration?: HookCalibrationProfile | null
+  styleArchetypeBlend?: StyleArchetypeBlend | null
+  behaviorStyleProfile?: RetentionBehaviorStyleProfile | null
+  autoEscalationEvents?: AutoEscalationEvent[]
+  editDecisionTimeline?: EditDecisionTimeline | null
+  styleFeatureSnapshot?: TimelineFeatureSnapshot | null
 }
 type EditOptions = {
   autoHookMove: boolean
@@ -731,6 +747,7 @@ type EditOptions = {
   retentionAggressionLevel: RetentionAggressionLevel
   retentionStrategyProfile: RetentionStrategyProfile
   preferredHookCandidate?: HookCandidate | null
+  styleArchetypeBlend?: Partial<StyleArchetypeBlend> | null
   fastMode?: boolean
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
@@ -980,7 +997,7 @@ type RetentionStyleReferencePreset = {
 }
 const RETENTION_STYLE_REFERENCE_PRESETS: Record<RetentionStrategyProfile, RetentionStyleReferencePreset> = {
   viral: {
-    referenceAnchors: ['MrBeast'],
+    referenceAnchors: ['high_stakes_challenge', 'energetic_vlog'],
     autoHookMove: true,
     removeBoring: true,
     smartZoom: true,
@@ -992,7 +1009,7 @@ const RETENTION_STYLE_REFERENCE_PRESETS: Record<RetentionStrategyProfile, Retent
     musicDuck: true
   },
   balanced: {
-    referenceAnchors: ['AsmonTV', 'kyahsarchive', 'DDG'],
+    referenceAnchors: ['longform_reaction_commentary', 'cinematic_lifestyle_archive', 'energetic_vlog'],
     autoHookMove: true,
     removeBoring: true,
     smartZoom: false,
@@ -1004,7 +1021,7 @@ const RETENTION_STYLE_REFERENCE_PRESETS: Record<RetentionStrategyProfile, Retent
     musicDuck: true
   },
   safe: {
-    referenceAnchors: ['regular context-first cuts'],
+    referenceAnchors: ['longform_reaction_commentary', 'cinematic_lifestyle_archive'],
     autoHookMove: true,
     removeBoring: true,
     smartZoom: false,
@@ -1743,6 +1760,33 @@ const getOnlyCutsFromPayload = (payload?: any): boolean | null => {
     parseBooleanFlag((payload as any).hookAndCutOnly) ??
     null
   )
+}
+
+const STYLE_ARCHETYPE_KEYS: Array<keyof StyleArchetypeBlend> = [
+  'high_stakes_challenge',
+  'longform_reaction_commentary',
+  'cinematic_lifestyle_archive',
+  'energetic_vlog'
+]
+
+const parseStyleArchetypeBlendFromPayload = (payload?: any): Partial<StyleArchetypeBlend> | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const rawBlend =
+    (payload as any).styleArchetypeBlendOverride ??
+    (payload as any).style_archetype_blend_override ??
+    (payload as any).styleArchetypeBlend ??
+    (payload as any).styleMix ??
+    (payload as any).style_mix
+  if (!rawBlend || typeof rawBlend !== 'object') return null
+  const blend: Partial<StyleArchetypeBlend> = {}
+  let hasValue = false
+  for (const key of STYLE_ARCHETYPE_KEYS) {
+    const value = Number((rawBlend as any)[key])
+    if (!Number.isFinite(value) || value <= 0) continue
+    blend[key] = Number(value.toFixed(6))
+    hasValue = true
+  }
+  return hasValue ? blend : null
 }
 
 const hasRetentionTargetPlatformOverride = (payload?: any) => Boolean(
@@ -3201,6 +3245,51 @@ const applyStyleToPacingProfile = (
     jitter: Number(adjustedJitter.toFixed(3)),
     speedCap: Number(adjustedSpeedCap.toFixed(3))
   }
+}
+
+const applyBehaviorStyleProfileToPacingProfile = (
+  profile: PacingProfile,
+  behaviorStyleProfile?: RetentionBehaviorStyleProfile | null
+) => {
+  if (!behaviorStyleProfile) return profile
+  const targetInterval = clamp(behaviorStyleProfile.avgCutInterval, CUT_MIN, CUT_MAX)
+  const maxCutIntervalShift = 1.1
+  const centerShift = clamp(targetInterval - profile.middleTarget, -maxCutIntervalShift, maxCutIntervalShift)
+  const adjustedMin = clamp(profile.minLen + centerShift * 0.55, CUT_MIN, CUT_MAX - 0.3)
+  const adjustedMax = clamp(profile.maxLen + centerShift * 0.65, adjustedMin + 0.4, CUT_MAX)
+  const interruptBias = clamp(0.9 - behaviorStyleProfile.patternInterruptInterval / 10, -0.2, 0.32)
+  const jitter = clamp(profile.jitter + interruptBias * 0.14, 0.12, 0.56)
+  const speedCapShift = behaviorStyleProfile.energyEscalationCurve === 'aggressive'
+    ? 0.08
+    : behaviorStyleProfile.energyEscalationCurve === 'steady'
+      ? 0.03
+      : -0.02
+  const speedCap = clamp(profile.speedCap + speedCapShift, 1.15, 1.62)
+  return {
+    ...profile,
+    minLen: Number(adjustedMin.toFixed(2)),
+    maxLen: Number(adjustedMax.toFixed(2)),
+    earlyTarget: Number(clamp(profile.earlyTarget + centerShift, adjustedMin, adjustedMax).toFixed(2)),
+    middleTarget: Number(clamp(profile.middleTarget + centerShift, adjustedMin, adjustedMax).toFixed(2)),
+    lateTarget: Number(clamp(profile.lateTarget + centerShift * 0.85, adjustedMin, adjustedMax).toFixed(2)),
+    jitter: Number(jitter.toFixed(3)),
+    speedCap: Number(speedCap.toFixed(3))
+  }
+}
+
+const buildEnergySamplesFromWindows = (windows: EngagementWindow[]) => {
+  return windows
+    .map((window) => ({
+      t: Number((window.time + 0.5).toFixed(3)),
+      value: Number(clamp01(
+        0.52 * window.score +
+        0.2 * window.emotionIntensity +
+        0.14 * window.speechIntensity +
+        0.08 * window.vocalExcitement +
+        0.06 * (window.curiosityTrigger ?? 0)
+      ).toFixed(4))
+    }))
+    .filter((sample) => Number.isFinite(sample.t) && Number.isFinite(sample.value))
 }
 
 const detectRhythmAnchors = ({
@@ -4997,19 +5086,32 @@ const applyBoredomModelToSegments = ({
 const injectPatternInterrupts = ({
   segments,
   durationSeconds,
-  aggressionLevel
+  aggressionLevel,
+  targetIntervalSeconds
 }: {
   segments: Segment[]
   durationSeconds: number
   aggressionLevel: RetentionAggressionLevel
+  targetIntervalSeconds?: number | null
 }) => {
   const preset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
   if (!segments.length || durationSeconds <= 0) return { segments, count: 0, density: 0 }
   const out = segments.map((segment) => ({ ...segment }))
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(out))
-  const requiredInterval = runtimeSeconds <= 90 ? 4 : 6
+  const preferredInterval = Number.isFinite(Number(targetIntervalSeconds))
+    ? clamp(Number(targetIntervalSeconds), 3, 12)
+    : runtimeSeconds <= 90
+      ? 4
+      : 6
+  const requiredInterval = preferredInterval
   const minimumInterruptCount = Math.max(1, Math.ceil(runtimeSeconds / requiredInterval))
-  let cursor = preset.patternIntervalMin
+  const minInterval = Number.isFinite(Number(targetIntervalSeconds))
+    ? clamp(Number(targetIntervalSeconds) * 0.8, 2.6, 11)
+    : preset.patternIntervalMin
+  const maxInterval = Number.isFinite(Number(targetIntervalSeconds))
+    ? clamp(Number(targetIntervalSeconds) * 1.18, minInterval + 0.2, 13.5)
+    : preset.patternIntervalMax
+  let cursor = minInterval
   let count = 0
   while (cursor < durationSeconds) {
     const segment = out.find((item) => item.start <= cursor && item.end >= cursor)
@@ -5019,7 +5121,7 @@ const injectPatternInterrupts = ({
       ;(segment as any).emphasize = true
       count += 1
     }
-    const interval = count % 2 === 0 ? preset.patternIntervalMax : preset.patternIntervalMin
+    const interval = count % 2 === 0 ? maxInterval : minInterval
     cursor += interval
   }
   if (count < minimumInterruptCount) {
@@ -5944,7 +6046,12 @@ const buildRetentionMetadataSummary = ({
   segments,
   windows,
   hook,
+  styleProfile,
   nicheProfile,
+  styleArchetypeBlend,
+  behaviorStyleProfile,
+  styleFeatureSnapshot,
+  autoEscalationEvents,
   judge,
   strategy,
   retentionScore,
@@ -5965,7 +6072,12 @@ const buildRetentionMetadataSummary = ({
   segments: Segment[]
   windows: EngagementWindow[]
   hook?: HookCandidate | null
+  styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
+  styleArchetypeBlend?: StyleArchetypeBlend | null
+  behaviorStyleProfile?: RetentionBehaviorStyleProfile | null
+  styleFeatureSnapshot?: TimelineFeatureSnapshot | null
+  autoEscalationEvents?: AutoEscalationEvent[] | null
   judge?: RetentionJudgeReport | null
   strategy?: RetentionRetryStrategy | null
   retentionScore?: number | null
@@ -5992,10 +6104,22 @@ const buildRetentionMetadataSummary = ({
   const compressionRatio = safeDuration > 0
     ? clamp01((safeDuration - segmentStats.editedRuntimeSeconds) / safeDuration)
     : 0
+  const resolvedArchetypeBlend = styleArchetypeBlend || behaviorStyleProfile?.archetypeBlend || null
+  const autoEscalationCount = Array.isArray(autoEscalationEvents) ? autoEscalationEvents.length : 0
   const improvements: string[] = []
+  if (styleProfile?.style) {
+    improvements.push(
+      `Detected ${styleProfile.style} style signals (confidence ${(styleProfile.confidence * 100).toFixed(0)}%) and adapted pacing profile.`
+    )
+  }
   if (nicheProfile?.niche) {
     improvements.push(
       `Detected ${nicheProfile.niche.replace('_', ' ')} niche (confidence ${(nicheProfile.confidence * 100).toFixed(0)}%) and tuned pacing accordingly.`
+    )
+  }
+  if (behaviorStyleProfile) {
+    improvements.push(
+      `Applied adaptive behavior profile (${behaviorStyleProfile.styleName}) with ~${behaviorStyleProfile.avgCutInterval.toFixed(1)}s average cut interval.`
     )
   }
   if (hook) {
@@ -6020,6 +6144,9 @@ const buildRetentionMetadataSummary = ({
   }
   if (Number(patternInterruptCount ?? 0) > 0) {
     improvements.push(`Inserted ${Number(patternInterruptCount)} pattern interrupt${Number(patternInterruptCount) === 1 ? '' : 's'} for retention resets.`)
+  }
+  if (autoEscalationCount > 0) {
+    improvements.push(`Auto-escalation guarantee fired ${autoEscalationCount} time${autoEscalationCount === 1 ? '' : 's'} to prevent flat pacing.`)
   }
   if (strategy && strategy !== 'BASELINE') {
     improvements.push(`Used ${strategy.replace('_', ' ').toLowerCase()} retry strategy to improve retention quality.`)
@@ -6091,11 +6218,33 @@ const buildRetentionMetadataSummary = ({
           rationale: nicheProfile.rationale.slice(0, 3)
         }
       : null,
+    style: {
+      contentStyle: styleProfile
+        ? {
+            name: styleProfile.style,
+            confidence: Number(styleProfile.confidence.toFixed(4)),
+            rationale: styleProfile.rationale.slice(0, 3)
+          }
+        : null,
+      archetypeBlend: resolvedArchetypeBlend,
+      behaviorProfile: behaviorStyleProfile
+        ? {
+            styleName: behaviorStyleProfile.styleName,
+            avgCutInterval: Number(behaviorStyleProfile.avgCutInterval.toFixed(3)),
+            patternInterruptInterval: Number(behaviorStyleProfile.patternInterruptInterval.toFixed(3)),
+            zoomFrequencyPer10Seconds: Number(behaviorStyleProfile.zoomFrequencyPer10Seconds.toFixed(4)),
+            captionEmphasisRatePer10Seconds: Number(behaviorStyleProfile.captionEmphasisRatePer10Seconds.toFixed(4)),
+            energyEscalationCurve: behaviorStyleProfile.energyEscalationCurve,
+            autoEscalationWindowSec: Number(behaviorStyleProfile.autoEscalationWindowSec.toFixed(3))
+          }
+        : null
+    },
     timeline: {
       sourceDurationSeconds: Number(safeDuration.toFixed(3)),
       removedSeconds: Number(removedSeconds.toFixed(3)),
       compressionRatio: Number(compressionRatio.toFixed(4)),
-      boredomRemovedRatio: Number(clamp01(Number(boredomRemovedRatio ?? 0)).toFixed(4))
+      boredomRemovedRatio: Number(clamp01(Number(boredomRemovedRatio ?? 0)).toFixed(4)),
+      autoEscalationCount
     },
     retention: {
       score: resolvedAfterScore,
@@ -6109,6 +6258,7 @@ const buildRetentionMetadataSummary = ({
       hookSelectionSource: hookSelectionSource ?? 'auto',
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
+      styleTimelineFeatures: styleFeatureSnapshot ?? null,
       whyKeepWatching: Array.isArray(judge?.why_keep_watching) ? judge!.why_keep_watching.slice(0, 3) : [],
       genericFlags: Array.isArray(judge?.what_is_generic) ? judge!.what_is_generic.slice(0, 3) : [],
       improvements: improvements.slice(0, 12)
@@ -6247,6 +6397,14 @@ const buildGuaranteedFallbackSegments = (durationSeconds: number, options: EditO
 const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: EditOptions): EditPlan => {
   const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
   const segments = buildGuaranteedFallbackSegments(total, options)
+  const runtimeStyleResolution = resolveRuntimeStyleProfile({
+    mode: options.retentionStrategyProfile,
+    contentStyle: 'story',
+    niche: 'story',
+    contentStyleConfidence: 0.45,
+    nicheConfidence: 0.45,
+    explicitBlend: options.styleArchetypeBlend || null
+  })
   const baseRange = [{ start: 0, end: total, speed: 1 }]
   const keepRanges = segments.map((segment) => ({ start: segment.start, end: segment.end, speed: 1 }))
   const removedSegments = total > 0 ? subtractRanges(baseRange, keepRanges) : []
@@ -6282,6 +6440,16 @@ const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: Ed
       durationSeconds: Number(total.toFixed(3))
     }
   }
+  const fallbackDecisionTimeline = buildEditDecisionTimeline({
+    styleName: runtimeStyleResolution.profile.styleName,
+    hook: { start: fallbackHook.start },
+    segments,
+    patternInterruptCount: 0
+  })
+  const fallbackStyleFeatureSnapshot = extractTimelineFeatures({
+    timeline: fallbackDecisionTimeline,
+    durationSeconds: total
+  })
   return {
     hook: fallbackHook,
     segments,
@@ -6299,7 +6467,12 @@ const buildDeterministicFallbackEditPlan = (durationSeconds: number, options: Ed
       orderedIndex
     })),
     hookFailureReason: fallbackHook.auditPassed ? null : fallbackHook.reason,
-    nicheProfile: fallbackNicheProfile
+    nicheProfile: fallbackNicheProfile,
+    styleArchetypeBlend: runtimeStyleResolution.blend,
+    behaviorStyleProfile: runtimeStyleResolution.profile,
+    autoEscalationEvents: [],
+    editDecisionTimeline: fallbackDecisionTimeline,
+    styleFeatureSnapshot: fallbackStyleFeatureSnapshot
   }
 }
 
@@ -6808,7 +6981,7 @@ const buildEditPlan = async (
     durationSeconds
   })
   const styleAdjustedAggressionLevel = getStyleAdjustedAggressionLevel(aggressionLevel, styleProfile)
-  const pacingProfile = applyStyleToPacingProfile(
+  const basePacingProfile = applyStyleToPacingProfile(
     inferPacingProfile(windows, durationSeconds, options.aggressiveMode),
     styleProfile,
     options.aggressiveMode
@@ -6817,9 +6990,20 @@ const buildEditPlan = async (
     windows,
     transcriptCues,
     durationSeconds,
-    pacingProfile,
+    pacingProfile: basePacingProfile,
     styleProfile
   })
+  const runtimeStyleResolution = resolveRuntimeStyleProfile({
+    mode: options.retentionStrategyProfile,
+    contentStyle: styleProfile.style,
+    niche: nicheProfile.niche,
+    contentStyleConfidence: styleProfile.confidence,
+    nicheConfidence: nicheProfile.confidence,
+    explicitBlend: options.styleArchetypeBlend || null
+  })
+  const styleArchetypeBlend = runtimeStyleResolution.blend
+  const behaviorStyleProfile = runtimeStyleResolution.profile
+  const pacingProfile = applyBehaviorStyleProfileToPacingProfile(basePacingProfile, behaviorStyleProfile)
   const emotionalTuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
@@ -6949,7 +7133,8 @@ const buildEditPlan = async (
   const interruptInjected = injectPatternInterrupts({
     segments: emotionalBeatAdjusted.segments,
     durationSeconds,
-    aggressionLevel: styleAdjustedAggressionLevel
+    aggressionLevel: styleAdjustedAggressionLevel,
+    targetIntervalSeconds: behaviorStyleProfile.patternInterruptInterval
   })
   const endingSpikeSegments = enforceEndingSpike({
     segments: interruptInjected.segments,
@@ -6979,10 +7164,48 @@ const buildEditPlan = async (
     anchors: mergedBeatAnchors,
     styleProfile
   })
+  const lowEnergyThreshold = behaviorStyleProfile.energyEscalationCurve === 'aggressive'
+    ? 0.52
+    : behaviorStyleProfile.energyEscalationCurve === 'steady'
+      ? 0.54
+      : 0.57
+  const energySamplesForTimeline = buildEnergySamplesFromWindows(windows)
+  const autoEscalationResult = options.onlyCuts
+    ? { segments: rhythmAlignedSegments, events: [] as AutoEscalationEvent[], count: 0 }
+    : applyAutoEscalationGuarantee({
+        segments: rhythmAlignedSegments,
+        energySamples: energySamplesForTimeline,
+        flatWindowSeconds: clamp(behaviorStyleProfile.autoEscalationWindowSec, 5.2, 9.2),
+        lowEnergyThreshold,
+        maxSpeed: clamp(pacingProfile.speedCap + 0.04, 1.18, 1.34)
+      })
+  const finalTimelineSegments = autoEscalationResult.segments
+  const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
+  const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
+  const totalPatternInterruptDensity = Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
+  const decisionTimeline = buildEditDecisionTimeline({
+    styleName: behaviorStyleProfile.styleName,
+    hook: hook ? { start: hook.start } : null,
+    segments: finalTimelineSegments,
+    cues: transcriptCues.map((cue) => ({
+      start: cue.start,
+      text: cue.text,
+      keywordIntensity: cue.keywordIntensity,
+      curiosityTrigger: cue.curiosityTrigger
+    })),
+    patternInterruptCount: totalPatternInterruptCount,
+    autoEscalationEvents: autoEscalationResult.events,
+    includeBrollMarkers: styleArchetypeBlend.cinematic_lifestyle_archive >= 0.24
+  })
+  const styleFeatureSnapshot = extractTimelineFeatures({
+    timeline: decisionTimeline,
+    durationSeconds,
+    energySamples: energySamplesForTimeline
+  })
 
   return {
     hook,
-    segments: rhythmAlignedSegments,
+    segments: finalTimelineSegments,
     silences,
     removedSegments: mergeRanges([...removedSegments, ...boredomApplied.removedRanges]),
     compressedSegments,
@@ -6994,10 +7217,10 @@ const buildEditPlan = async (
       })),
     hookCandidates: hookVariants,
     boredomRanges: boredomApplied.removedRanges,
-    patternInterruptCount: interruptInjected.count,
-    patternInterruptDensity: interruptInjected.density,
+    patternInterruptCount: totalPatternInterruptCount,
+    patternInterruptDensity: totalPatternInterruptDensity,
     boredomRemovedRatio: Number(clamp01(getRangesDurationSeconds(boredomApplied.removedRanges) / Math.max(0.1, durationSeconds)).toFixed(4)),
-    storyReorderMap: rhythmAlignedSegments.map((segment, orderedIndex) => ({
+    storyReorderMap: finalTimelineSegments.map((segment, orderedIndex) => ({
       sourceStart: Number(segment.start.toFixed(3)),
       sourceEnd: Number(segment.end.toFixed(3)),
       orderedIndex
@@ -7015,7 +7238,12 @@ const buildEditPlan = async (
     emotionalLeadTrimmedSeconds: emotionalBeatAdjusted.trimmedSeconds,
     emotionalTuning,
     hookVariants,
-    hookCalibration: context?.hookCalibration ?? null
+    hookCalibration: context?.hookCalibration ?? null,
+    styleArchetypeBlend,
+    behaviorStyleProfile,
+    autoEscalationEvents: autoEscalationResult.events,
+    editDecisionTimeline: decisionTimeline,
+    styleFeatureSnapshot
   }
 }
 
@@ -9225,7 +9453,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       segments: editPlan?.segments ?? [],
       windows: editPlan?.engagementWindows ?? [],
       hook: editPlan?.hook ?? null,
+      styleProfile: editPlan?.styleProfile ?? null,
       nicheProfile: editPlan?.nicheProfile ?? null,
+      styleArchetypeBlend: editPlan?.styleArchetypeBlend ?? null,
+      behaviorStyleProfile: editPlan?.behaviorStyleProfile ?? null,
+      styleFeatureSnapshot: editPlan?.styleFeatureSnapshot ?? null,
+      autoEscalationEvents: editPlan?.autoEscalationEvents ?? [],
       patternInterruptCount: editPlan?.patternInterruptCount ?? 0,
       patternInterruptDensity: editPlan?.patternInterruptDensity ?? 0,
       boredomRemovedRatio: editPlan?.boredomRemovedRatio ?? 0,
@@ -9283,6 +9516,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         emotional_beat_cut_count: editPlan?.emotionalBeatCutCount ?? 0,
         emotional_lead_trimmed_seconds: editPlan?.emotionalLeadTrimmedSeconds ?? 0,
         emotional_tuning_profile: editPlan?.emotionalTuning ?? null,
+        style_archetype_blend: editPlan?.styleArchetypeBlend ?? null,
+        behavior_style_profile: editPlan?.behaviorStyleProfile ?? null,
+        edit_decision_timeline: editPlan?.editDecisionTimeline ?? null,
+        style_timeline_features: editPlan?.styleFeatureSnapshot ?? null,
+        auto_escalation_events: editPlan?.autoEscalationEvents ?? [],
+        auto_escalation_count: Number(editPlan?.autoEscalationEvents?.length ?? 0),
         transcript_signals: editPlan?.transcriptSignals ?? {
           cueCount: transcriptCues.length,
           hasTranscript: transcriptCues.length > 0
@@ -9710,6 +9949,13 @@ const processJob = async (
     let finalSegmentsForAnalysis: Segment[] = []
     let styleProfileForAnalysis: ContentStyleProfile | null = ((job.analysis as any)?.style_profile as ContentStyleProfile) || null
     let nicheProfileForAnalysis: VideoNicheProfile | null = ((job.analysis as any)?.niche_profile as VideoNicheProfile) || null
+    let styleArchetypeBlendForAnalysis: StyleArchetypeBlend | null = ((job.analysis as any)?.style_archetype_blend as StyleArchetypeBlend) || null
+    let behaviorStyleProfileForAnalysis: RetentionBehaviorStyleProfile | null = ((job.analysis as any)?.behavior_style_profile as RetentionBehaviorStyleProfile) || null
+    let autoEscalationEventsForAnalysis: AutoEscalationEvent[] = Array.isArray((job.analysis as any)?.auto_escalation_events)
+      ? (((job.analysis as any)?.auto_escalation_events as AutoEscalationEvent[]) || [])
+      : []
+    let editDecisionTimelineForAnalysis: EditDecisionTimeline | null = ((job.analysis as any)?.edit_decision_timeline as EditDecisionTimeline) || null
+    let styleFeatureSnapshotForAnalysis: TimelineFeatureSnapshot | null = ((job.analysis as any)?.style_timeline_features as TimelineFeatureSnapshot) || null
     let selectedContentFormat: RetentionContentFormat = inferRetentionContentFormat({
       runtimeSeconds: durationSeconds,
       windows: [],
@@ -9732,6 +9978,7 @@ const processJob = async (
     let emotionalTuningForAnalysis = ((job.analysis as any)?.emotional_tuning_profile as EmotionalTuningProfile) || null
     let hookVariantsForAnalysis: HookCandidate[] = getHookCandidatesFromAnalysis(job.analysis as any)
     let hookCalibrationForAnalysis: HookCalibrationProfile | null = ((job.analysis as any)?.hook_calibration as HookCalibrationProfile) || hookCalibration
+    let selectedAutoEscalationEvents: AutoEscalationEvent[] = autoEscalationEventsForAnalysis
     let audioProfileForAnalysis: AudioStreamProfile | null = null
     let audioFiltersForAnalysis: string[] = []
     if (hasFfmpeg()) {
@@ -9795,6 +10042,12 @@ const processJob = async (
         hookVariantsForAnalysis = editPlan.hookCandidates
       }
       if (editPlan?.hookCalibration) hookCalibrationForAnalysis = editPlan.hookCalibration
+      if (editPlan?.styleArchetypeBlend) styleArchetypeBlendForAnalysis = editPlan.styleArchetypeBlend
+      if (editPlan?.behaviorStyleProfile) behaviorStyleProfileForAnalysis = editPlan.behaviorStyleProfile
+      if (Array.isArray(editPlan?.autoEscalationEvents)) autoEscalationEventsForAnalysis = editPlan.autoEscalationEvents
+      if (editPlan?.editDecisionTimeline) editDecisionTimelineForAnalysis = editPlan.editDecisionTimeline
+      if (editPlan?.styleFeatureSnapshot) styleFeatureSnapshotForAnalysis = editPlan.styleFeatureSnapshot
+      const energySamplesForEscalation = buildEnergySamplesFromWindows(editPlan?.engagementWindows ?? [])
 
       await updateJob(jobId, { status: 'story', progress: 55 })
 
@@ -10131,7 +10384,8 @@ const processJob = async (
         const interruptInjected = injectPatternInterrupts({
           segments: effected,
           durationSeconds,
-          aggressionLevel: styleAdjustedInterruptAggression
+          aggressionLevel: styleAdjustedInterruptAggression,
+          targetIntervalSeconds: behaviorStyleProfileForAnalysis?.patternInterruptInterval
         })
         const withZoom = editPlan && !options.onlyCuts
           ? applyZoomEasing(interruptInjected.segments)
@@ -10142,12 +10396,37 @@ const processJob = async (
           renderMode: renderConfig.mode,
           targetPlatform: retentionTargetPlatform
         })
+        const escalationLowEnergyThreshold = behaviorStyleProfileForAnalysis?.energyEscalationCurve === 'aggressive'
+          ? 0.52
+          : behaviorStyleProfileForAnalysis?.energyEscalationCurve === 'steady'
+            ? 0.54
+            : 0.57
+        const autoEscalationResult = options.onlyCuts
+          ? { segments: withCutDensityLimit, events: [] as AutoEscalationEvent[], count: 0 }
+          : applyAutoEscalationGuarantee({
+              segments: withCutDensityLimit,
+              energySamples: energySamplesForEscalation,
+              flatWindowSeconds: clamp(
+                Number(behaviorStyleProfileForAnalysis?.autoEscalationWindowSec ?? 6),
+                5.2,
+                9.2
+              ),
+              lowEnergyThreshold: escalationLowEnergyThreshold,
+              maxSpeed: clamp(
+                behaviorStyleProfileForAnalysis?.energyEscalationCurve === 'aggressive' ? 1.32 : 1.26,
+                1.18,
+                1.34
+              )
+            })
+        const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
+        const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(autoEscalationResult.segments))
         return {
           hook: effectiveHookCandidate,
           hookRange,
-          segments: withCutDensityLimit,
-          patternInterruptCount: interruptInjected.count,
-          patternInterruptDensity: interruptInjected.density
+          segments: autoEscalationResult.segments,
+          autoEscalationEvents: autoEscalationResult.events,
+          patternInterruptCount: totalPatternInterruptCount,
+          patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
         }
       }
 
@@ -10163,6 +10442,7 @@ const processJob = async (
         variantScore: number
         patternInterruptCount: number
         patternInterruptDensity: number
+        autoEscalationEvents: AutoEscalationEvent[]
       }> = []
       for (let attemptIndex = 0; attemptIndex < attemptStrategies.length; attemptIndex += 1) {
         const strategy = attemptStrategies[attemptIndex]
@@ -10242,7 +10522,8 @@ const processJob = async (
           predictedRetention,
           variantScore,
           patternInterruptCount: attempt.patternInterruptCount,
-          patternInterruptDensity: attempt.patternInterruptDensity
+          patternInterruptDensity: attempt.patternInterruptDensity,
+          autoEscalationEvents: attempt.autoEscalationEvents
         })
       }
       if (attemptEvaluations.length) {
@@ -10263,6 +10544,7 @@ const processJob = async (
           selectedPatternInterruptCount = winner.patternInterruptCount
           selectedPatternInterruptDensity = winner.patternInterruptDensity
           selectedBoredomRemovalRatio = winner.retention.details.boredomRemovalRatio
+          selectedAutoEscalationEvents = winner.autoEscalationEvents
           selectedStrategy = winner.strategy
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
@@ -10397,6 +10679,7 @@ const processJob = async (
           selectedPatternInterruptCount = rescueAttempt.patternInterruptCount
           selectedPatternInterruptDensity = rescueAttempt.patternInterruptDensity
           selectedBoredomRemovalRatio = rescueRetention.details.boredomRemovalRatio
+          selectedAutoEscalationEvents = rescueAttempt.autoEscalationEvents
           selectedStrategy = 'RESCUE_MODE'
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
@@ -10542,9 +10825,9 @@ const processJob = async (
           if (assPath) {
             subtitlePath = assPath
             subtitleIsAss = true
-            optimizationNotes.push('Applied MrBeast animated caption style.')
+            optimizationNotes.push('Applied high-energy animated caption style.')
           } else {
-            optimizationNotes.push('MrBeast animation fallback applied: using static caption styling.')
+            optimizationNotes.push('Animated caption fallback applied: using static caption styling.')
           }
         }
       }
@@ -10602,6 +10885,30 @@ const processJob = async (
         throw new Error('no_renderable_segments')
       }
       finalSegmentsForAnalysis = finalSegments.map((segment) => ({ ...segment }))
+      if (selectedHook && finalSegmentsForAnalysis.length) {
+        const styleName = behaviorStyleProfileForAnalysis?.styleName || `${strategyProfile}_adaptive_v1`
+        const resolvedBlendForDecision = styleArchetypeBlendForAnalysis || behaviorStyleProfileForAnalysis?.archetypeBlend || null
+        editDecisionTimelineForAnalysis = buildEditDecisionTimeline({
+          styleName,
+          hook: { start: selectedHook.start },
+          segments: finalSegmentsForAnalysis,
+          patternInterruptCount: selectedPatternInterruptCount,
+          autoEscalationEvents: selectedAutoEscalationEvents,
+          includeBrollMarkers: Boolean(
+            resolvedBlendForDecision &&
+            Number(resolvedBlendForDecision.cinematic_lifestyle_archive) >= 0.24
+          )
+        })
+        styleFeatureSnapshotForAnalysis = extractTimelineFeatures({
+          timeline: editDecisionTimelineForAnalysis,
+          durationSeconds,
+          energySamples: energySamplesForEscalation
+        })
+      }
+      autoEscalationEventsForAnalysis = selectedAutoEscalationEvents
+      if (behaviorStyleProfileForAnalysis && !styleArchetypeBlendForAnalysis) {
+        styleArchetypeBlendForAnalysis = behaviorStyleProfileForAnalysis.archetypeBlend
+      }
 
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
         status: 'running',
@@ -10999,7 +11306,12 @@ const processJob = async (
           })),
       windows: engagementWindowsForAnalysis,
       hook: selectedHook,
+      styleProfile: styleProfileForAnalysis,
       nicheProfile: nicheProfileForAnalysis,
+      styleArchetypeBlend: styleArchetypeBlendForAnalysis,
+      behaviorStyleProfile: behaviorStyleProfileForAnalysis,
+      styleFeatureSnapshot: styleFeatureSnapshotForAnalysis,
+      autoEscalationEvents: autoEscalationEventsForAnalysis,
       judge: selectedJudge,
       strategy: selectedStrategy,
       retentionScore,
@@ -11043,6 +11355,12 @@ const processJob = async (
         story_reorder_map: selectedStoryReorderMap,
         style_profile: styleProfileForAnalysis,
         niche_profile: nicheProfileForAnalysis,
+        style_archetype_blend: styleArchetypeBlendForAnalysis,
+        behavior_style_profile: behaviorStyleProfileForAnalysis,
+        edit_decision_timeline: editDecisionTimelineForAnalysis,
+        style_timeline_features: styleFeatureSnapshotForAnalysis,
+        auto_escalation_events: autoEscalationEventsForAnalysis,
+        auto_escalation_count: Number(autoEscalationEventsForAnalysis.length || 0),
         beat_anchors: beatAnchorsForAnalysis,
         emotional_beat_anchors: emotionalBeatAnchorsForAnalysis,
         emotional_beat_cut_count: emotionalBeatCutCountForAnalysis,
@@ -11154,6 +11472,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
         onlyCuts: getOnlyCutsFromJob(existing)
       })
+      const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
+      if (styleBlendOverride) options.styleArchetypeBlend = styleBlendOverride
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       await analyzeJob(jobId, options, requestId)
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
@@ -11506,6 +11826,7 @@ const handleCreateJob = async (req: any, res: any) => {
       req.body,
       parsePlatformProfile(retentionTargetPlatform, 'auto')
     )
+    const styleBlendOverride = parseStyleArchetypeBlendFromPayload(req.body)
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -11589,6 +11910,7 @@ const handleCreateJob = async (req: any, res: any) => {
             platform: retentionTargetPlatform,
             platformProfile,
             platform_profile: platformProfile,
+            style_archetype_blend_override: styleBlendOverride,
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride })
           },
@@ -11923,6 +12245,9 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const styleBlendOverride =
+      parseStyleArchetypeBlendFromPayload(req.body) ??
+      parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
@@ -11949,6 +12274,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      style_archetype_blend_override: styleBlendOverride,
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts })
     }
 
@@ -12011,6 +12337,9 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const styleBlendOverride =
+      parseStyleArchetypeBlendFromPayload(req.body) ??
+      parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -12038,6 +12367,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      style_archetype_blend_override: styleBlendOverride,
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
     }
     await updateJob(id, {
@@ -12052,6 +12382,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
+    options.styleArchetypeBlend = styleBlendOverride
     if (req.body?.fastMode) {
       options.fastMode = true
     }
@@ -12091,6 +12422,9 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const styleBlendOverride =
+      parseStyleArchetypeBlendFromPayload(req.body) ??
+      parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -12118,6 +12452,7 @@ router.post('/:id/process', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      style_archetype_blend_override: styleBlendOverride,
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts })
     }
     await updateJob(id, {
@@ -12149,6 +12484,7 @@ router.post('/:id/process', async (req: any, res) => {
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
+    options.styleArchetypeBlend = styleBlendOverride
     // Allow client to request a fast-mode re-render (overrides user settings for this run)
     if (req.body?.fastMode) {
       options.fastMode = true
@@ -12314,6 +12650,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const styleBlendOverride =
+      parseStyleArchetypeBlendFromPayload(req.body) ??
+      parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -12355,6 +12694,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      style_archetype_blend_override: styleBlendOverride,
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }

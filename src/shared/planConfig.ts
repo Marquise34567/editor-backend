@@ -105,7 +105,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
       'No watermark',
       'Subtitles: 4 presets',
       'Auto zoom max 1.12',
-      'MrBeast animated captions'
+      'High-energy animated captions'
     ]
   },
   creator: {

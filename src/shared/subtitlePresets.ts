@@ -24,7 +24,7 @@ export type SubtitlePresetDefinition = {
 export const SUBTITLE_PRESET_REGISTRY: SubtitlePresetDefinition[] = [
   { id: 'basic_clean', label: 'Minimal White', description: 'Clean white captions with subtle outline.' },
   { id: 'bold_pop', label: 'Bold Influencer', description: 'High-contrast styling that pops on mobile.' },
-  { id: 'mrbeast_animated', label: 'MrBeast Animated', description: 'High-energy animated captions with punchy styling.' },
+  { id: 'mrbeast_animated', label: 'High-Energy Animated', description: 'High-energy animated captions with punchy styling.' },
   { id: 'outline_heavy', label: 'Cinematic Serif', description: 'Film-style serif captions with strong outline.' },
   { id: 'caption_box', label: 'Black Box', description: 'Boxed captions for maximum readability.' },
   { id: 'neon_glow', label: 'Neon Glow', description: 'Bright glow treatment for stylized edits.' },
