@@ -3456,6 +3456,138 @@ const averageWindowMetric = (
   return relevant.reduce((sum, window) => sum + metric(window), 0) / relevant.length
 }
 
+const tightenHookRangeForRetention = ({
+  range,
+  windows,
+  silences,
+  durationSeconds
+}: {
+  range: TimeRange
+  windows: EngagementWindow[]
+  silences: TimeRange[]
+  durationSeconds: number
+}) => {
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end) || range.end - range.start <= 0.2) {
+    return {
+      start: Number(clamp(range.start || 0, 0, Math.max(0, durationSeconds - HOOK_MIN)).toFixed(3)),
+      end: Number(clamp((range.start || 0) + HOOK_MIN, HOOK_MIN, durationSeconds).toFixed(3))
+    }
+  }
+  let start = clamp(range.start, 0, Math.max(0, durationSeconds - 0.2))
+  let end = clamp(range.end, start + 0.2, durationSeconds)
+  const minHookSeconds = clamp(HOOK_MIN - 1.4, 3.2, HOOK_MIN)
+  const probeSeconds = 0.62
+  const stepSeconds = 0.22
+  const maxHeadTrim = 1.7
+  const maxTailTrim = 1.3
+  let headTrimmed = 0
+  let tailTrimmed = 0
+
+  while (headTrimmed + stepSeconds <= maxHeadTrim && end - (start + stepSeconds) >= minHookSeconds) {
+    const probeRange: TimeRange = { start, end: Math.min(end, start + probeSeconds) }
+    const hookSignal = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.hookScore ?? window.score)
+    const speech = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.speechIntensity)
+    const energy = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.audioEnergy)
+    const silenceRatio = getSilenceCoverageRatio(probeRange, silences)
+    const weakLead = silenceRatio >= 0.28 || (hookSignal < 0.44 && speech < 0.5 && energy < 0.46)
+    if (!weakLead) break
+    start += stepSeconds
+    headTrimmed += stepSeconds
+  }
+
+  while (tailTrimmed + stepSeconds <= maxTailTrim && (end - stepSeconds) - start >= minHookSeconds) {
+    const probeRange: TimeRange = { start: Math.max(start, end - probeSeconds), end }
+    const hookSignal = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.hookScore ?? window.score)
+    const speech = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.speechIntensity)
+    const energy = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.audioEnergy)
+    const silenceRatio = getSilenceCoverageRatio(probeRange, silences)
+    const weakTail = silenceRatio >= 0.32 || (hookSignal < 0.42 && speech < 0.46 && energy < 0.43)
+    if (!weakTail) break
+    end -= stepSeconds
+    tailTrimmed += stepSeconds
+  }
+
+  if (end - start < minHookSeconds) {
+    const needed = minHookSeconds - (end - start)
+    const extendTail = Math.min(needed, Math.max(0, durationSeconds - end))
+    end += extendTail
+    const remaining = needed - extendTail
+    if (remaining > 0) start = Math.max(0, start - remaining)
+  }
+
+  end = Math.min(durationSeconds, start + Math.min(HOOK_MAX, Math.max(minHookSeconds, end - start)))
+  start = Math.max(0, Math.min(start, end - minHookSeconds))
+  return {
+    start: Number(start.toFixed(3)),
+    end: Number(end.toFixed(3))
+  }
+}
+
+const buildFallbackHookCandidateFromStorySegments = ({
+  segments,
+  windows,
+  silences,
+  durationSeconds
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  silences: TimeRange[]
+  durationSeconds: number
+}) => {
+  const scored = segments
+    .map((segment) => {
+      const start = clamp(segment.start, 0, Math.max(0, durationSeconds - 0.5))
+      const maxEnd = Math.min(durationSeconds, segment.end)
+      const end = Math.min(maxEnd, start + HOOK_MAX)
+      const duration = end - start
+      if (duration < Math.max(3.2, HOOK_MIN - 1.4)) return null
+      const hookSignal = averageWindowMetric(windows, start, end, (window) => window.hookScore ?? window.score)
+      const speech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
+      const emotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
+      const vocal = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
+      const scene = averageWindowMetric(windows, start, end, (window) => window.sceneChangeRate)
+      const silenceRatio = getSilenceCoverageRatio({ start, end }, silences)
+      const earlyBias = 1 - clamp01(start / Math.max(45, durationSeconds * 0.4))
+      const score = clamp01(
+        0.42 * hookSignal +
+        0.2 * speech +
+        0.14 * emotion +
+        0.08 * vocal +
+        0.08 * scene +
+        0.08 * earlyBias -
+        0.28 * silenceRatio
+      )
+      return {
+        start,
+        end,
+        score
+      }
+    })
+    .filter((entry): entry is { start: number; end: number; score: number } => Boolean(entry))
+    .sort((a, b) => b.score - a.score || a.start - b.start)
+
+  const best = scored[0]
+  if (!best) return null
+  const tightened = tightenHookRangeForRetention({
+    range: { start: best.start, end: best.end },
+    windows,
+    silences,
+    durationSeconds
+  })
+  const duration = Math.max(0.2, tightened.end - tightened.start)
+  const confidence = clamp01(Math.max(best.score, 0.44))
+  return {
+    start: Number(tightened.start.toFixed(3)),
+    duration: Number(duration.toFixed(3)),
+    score: Number(confidence.toFixed(4)),
+    auditScore: Number(clamp01(confidence - 0.02).toFixed(4)),
+    auditPassed: false,
+    text: '',
+    reason: 'Fallback hook selected from the strongest low-silence segment after weak candidate pool.',
+    synthetic: true
+  } as HookCandidate
+}
+
 const pickRetentionSplitPoint = (
   start: number,
   end: number,
@@ -3904,6 +4036,16 @@ const enrichWindowsWithCognitiveScores = ({
 }
 
 const overlapsRange = (a: TimeRange, b: TimeRange) => a.start < b.end && a.end > b.start
+const getRangeOverlapSeconds = (a: TimeRange, b: TimeRange) => {
+  const start = Math.max(a.start, b.start)
+  const end = Math.min(a.end, b.end)
+  return Math.max(0, end - start)
+}
+const getSilenceCoverageRatio = (range: TimeRange, silences: TimeRange[]) => {
+  const duration = Math.max(0.001, range.end - range.start)
+  const overlap = silences.reduce((sum, silence) => sum + getRangeOverlapSeconds(range, silence), 0)
+  return clamp01(overlap / duration)
+}
 
 const evaluateHookContextDependency = (start: number, end: number, transcriptCues: TranscriptCue[]) => {
   const relevant = transcriptCues.filter((cue) => cue.end > start && cue.start < end)
@@ -5470,6 +5612,8 @@ const buildRetentionMetadataSummary = ({
   judge,
   strategy,
   retentionScore,
+  retentionScoreBefore,
+  retentionScoreAfter,
   attempts,
   patternInterruptCount,
   patternInterruptDensity,
@@ -5488,6 +5632,8 @@ const buildRetentionMetadataSummary = ({
   judge?: RetentionJudgeReport | null
   strategy?: RetentionRetryStrategy | null
   retentionScore?: number | null
+  retentionScoreBefore?: number | null
+  retentionScoreAfter?: number | null
   attempts?: RetentionAttemptRecord[]
   patternInterruptCount?: number
   patternInterruptDensity?: number
@@ -5552,6 +5698,24 @@ const buildRetentionMetadataSummary = ({
   for (const note of normalizedNotes) {
     if (!improvements.includes(note)) improvements.push(note)
   }
+  const resolvedAfterScore = Number.isFinite(Number(retentionScoreAfter))
+    ? Number(retentionScoreAfter)
+    : Number.isFinite(Number(retentionScore))
+      ? Number(retentionScore)
+      : Number.isFinite(Number(judge?.retention_score))
+        ? Number(judge?.retention_score)
+        : null
+  const resolvedBeforeScore = Number.isFinite(Number(retentionScoreBefore))
+    ? Number(retentionScoreBefore)
+    : null
+  const retentionDelta = resolvedBeforeScore !== null && resolvedAfterScore !== null
+    ? Number((resolvedAfterScore - resolvedBeforeScore).toFixed(1))
+    : null
+  if (retentionDelta !== null && retentionDelta >= 0.5) {
+    improvements.unshift(`Projected retention improved by +${retentionDelta.toFixed(1)} points vs source baseline.`)
+  } else if (retentionDelta !== null && retentionDelta <= -0.5) {
+    improvements.unshift(`Projected retention is ${Math.abs(retentionDelta).toFixed(1)} points below source baseline.`)
+  }
   return {
     metadataVersion: 2,
     generatedAt: toIsoNow(),
@@ -5588,7 +5752,10 @@ const buildRetentionMetadataSummary = ({
       boredomRemovedRatio: Number(clamp01(Number(boredomRemovedRatio ?? 0)).toFixed(4))
     },
     retention: {
-      score: retentionScore ?? judge?.retention_score ?? null,
+      score: resolvedAfterScore,
+      beforeScore: resolvedBeforeScore,
+      afterScore: resolvedAfterScore,
+      delta: retentionDelta,
       strategy: strategy ?? null,
       strategyProfile: strategyProfile ?? judge?.strategy_profile ?? null,
       contentFormat: contentFormat ?? judge?.content_format ?? null,
@@ -5806,9 +5973,9 @@ const buildRangesFromFlags = (flags: boolean[], minDurationSeconds = 1) => {
 
 const buildSilenceTrimCuts = (silences: TimeRange[], durationSeconds: number, aggressiveMode = false) => {
   if (!silences.length || durationSeconds <= 0) return [] as TimeRange[]
-  const keepPadding = aggressiveMode ? 0.14 : SILENCE_KEEP_PADDING_SEC
-  const minTrim = aggressiveMode ? 0.32 : 0.45
-  const edgePadding = aggressiveMode ? 0.4 : 0.55
+  const keepPadding = aggressiveMode ? 0.08 : 0.12
+  const minTrim = aggressiveMode ? 0.22 : 0.28
+  const edgePadding = aggressiveMode ? 0.14 : 0.18
   const trims: TimeRange[] = []
   for (const silence of silences) {
     const rawStart = clamp(silence.start, 0, durationSeconds)
@@ -6324,12 +6491,18 @@ const buildEditPlan = async (
   const fallbackRemovedSegments = options.removeBoring && !detectedRemovedSegments.length
     ? buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode)
     : []
+  let contentRemovedCandidates = mergeRanges(
+    detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments
+  )
   let candidateRemovedSegments = mergeRanges([
-    ...(detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments),
+    ...contentRemovedCandidates,
     ...silenceTrimCuts
   ])
   let removedSegments = options.removeBoring
-    ? applyContinuityGuardsToCuts(candidateRemovedSegments, windows, options.aggressiveMode)
+    ? mergeRanges([
+        ...applyContinuityGuardsToCuts(contentRemovedCandidates, windows, options.aggressiveMode),
+        ...silenceTrimCuts
+      ])
     : []
   if (options.removeBoring) {
     const minimumRemovedSeconds = getMinimumRemovedSeconds(durationSeconds, options.aggressiveMode)
@@ -6343,12 +6516,16 @@ const buildEditPlan = async (
         removedSegments.length ? removedSegments : candidateRemovedSegments
       )
       if (rescueCuts.length) {
-        candidateRemovedSegments = mergeRanges([...candidateRemovedSegments, ...rescueCuts])
-        const guarded = applyContinuityGuardsToCuts(candidateRemovedSegments, windows, true)
-        const guardedRemovedSeconds = getRangesDurationSeconds(guarded)
-        removedSegments = guardedRemovedSeconds >= removedSeconds + 0.5
-          ? guarded
-          : candidateRemovedSegments
+        contentRemovedCandidates = mergeRanges([...contentRemovedCandidates, ...rescueCuts])
+        candidateRemovedSegments = mergeRanges([...contentRemovedCandidates, ...silenceTrimCuts])
+        const guardedWithSilence = mergeRanges([
+          ...applyContinuityGuardsToCuts(contentRemovedCandidates, windows, true),
+          ...silenceTrimCuts
+        ])
+        const guardedRemovedSeconds = getRangesDurationSeconds(guardedWithSilence)
+        if (guardedRemovedSeconds >= removedSeconds + 0.15) {
+          removedSegments = guardedWithSilence
+        }
       }
     }
   }
@@ -8764,6 +8941,8 @@ const processJob = async (
 
     let processed = false
     let retentionScore: number | null = null
+    let retentionScoreBeforeEdit: number | null = null
+    let retentionScoreAfterEdit: number | null = null
     let optimizationNotes: string[] = []
     let retentionAttempts: RetentionAttemptRecord[] = []
     let selectedJudge: RetentionJudgeReport | null = null
@@ -8922,19 +9101,22 @@ const processJob = async (
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
       if (!resolvedHookDecision) {
-        const fallbackStart = Number((storySegments[0]?.start ?? 0).toFixed(3))
-        const fallbackDuration = Number(
-          clamp(
-            storySegments[0] ? (storySegments[0].end - storySegments[0].start) : 6,
-            HOOK_MIN,
-            HOOK_MAX
-          ).toFixed(3)
-        )
-        const fallbackHook: HookCandidate = {
-          start: fallbackStart,
-          duration: fallbackDuration,
-          score: 0.48,
-          auditScore: 0.46,
+        const fallbackHook = buildFallbackHookCandidateFromStorySegments({
+          segments: storySegments,
+          windows: editPlan?.engagementWindows ?? [],
+          silences: editPlan?.silences ?? [],
+          durationSeconds
+        }) || {
+          start: Number((storySegments[0]?.start ?? 0).toFixed(3)),
+          duration: Number(
+            clamp(
+              storySegments[0] ? (storySegments[0].end - storySegments[0].start) : 6,
+              HOOK_MIN,
+              HOOK_MAX
+            ).toFixed(3)
+          ),
+          score: 0.46,
+          auditScore: 0.44,
           auditPassed: false,
           text: '',
           reason: 'Fallback hook generated from earliest stable segment due weak candidate pool.',
@@ -8951,7 +9133,7 @@ const processJob = async (
           usedFallback: true,
           reason: fallbackHook.reason
         }
-        optimizationNotes.push('Hook fallback applied: no strong candidate passed; used earliest stable highlight.')
+        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected strongest low-silence highlight.')
       }
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
@@ -9076,9 +9258,22 @@ const processJob = async (
       }
 
       const buildAttemptSegments = (strategy: RetentionRetryStrategy, hookCandidate: HookCandidate) => {
-        const hookRange: TimeRange = {
+        const baseHookRange: TimeRange = {
           start: hookCandidate.start,
           end: Number((hookCandidate.start + hookCandidate.duration).toFixed(3))
+        }
+        const hookRange = editPlan
+          ? tightenHookRangeForRetention({
+              range: baseHookRange,
+              windows: editPlan.engagementWindows,
+              silences: editPlan.silences || [],
+              durationSeconds
+            })
+          : baseHookRange
+        const effectiveHookCandidate: HookCandidate = {
+          ...hookCandidate,
+          start: hookRange.start,
+          duration: Number(Math.max(0.2, hookRange.end - hookRange.start).toFixed(3))
         }
         const hookSegment: Segment = { ...hookRange, speed: 1, emphasize: true }
         let story = storySegments.map((segment) => ({ ...segment }))
@@ -9166,7 +9361,7 @@ const processJob = async (
           ? applyZoomEasing(interruptInjected.segments)
           : interruptInjected.segments
         return {
-          hook: hookCandidate,
+          hook: effectiveHookCandidate,
           hookRange,
           segments: withZoom,
           patternInterruptCount: interruptInjected.count,
@@ -9201,10 +9396,11 @@ const processJob = async (
                   : initialHook
         )
         const attempt = buildAttemptSegments(strategy, hookCandidate)
+        const effectiveHookCandidate = attempt.hook
         const retention = computeRetentionScore(
           attempt.segments,
           editPlan?.engagementWindows ?? [],
-          hookCandidate.score,
+          effectiveHookCandidate.score,
           options.autoCaptions,
           {
             removedRanges: editPlan?.removedSegments ?? [],
@@ -9219,7 +9415,7 @@ const processJob = async (
             : 0.2
         const judge = buildRetentionJudgeReport({
           retentionScore: retention,
-          hook: hookCandidate,
+          hook: effectiveHookCandidate,
           windows: editPlan?.engagementWindows ?? [],
           clarityPenalty,
           captionsEnabled: options.autoCaptions,
@@ -9233,7 +9429,7 @@ const processJob = async (
         const predictedRetention = predictVariantRetention({
           strategy,
           judge,
-          hook: hookCandidate,
+          hook: effectiveHookCandidate,
           hookCalibration: hookCalibrationForAnalysis,
           styleProfile: styleProfileForAnalysis
         })
@@ -9246,7 +9442,7 @@ const processJob = async (
           attempt: attemptIndex + 1,
           strategy,
           judge,
-          hook: hookCandidate,
+          hook: effectiveHookCandidate,
           patternInterruptCount: attempt.patternInterruptCount,
           patternInterruptDensity: attempt.patternInterruptDensity,
           boredomRemovalRatio: retention.details.boredomRemovalRatio,
@@ -9255,7 +9451,7 @@ const processJob = async (
         })
         attemptEvaluations.push({
           strategy,
-          hookCandidate,
+          hookCandidate: effectiveHookCandidate,
           segments: attempt.segments,
           judge,
           retention,
@@ -9435,6 +9631,47 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
         }
+      }
+
+      const baselineWindows = editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+      if (baselineWindows.length && durationSeconds > 0) {
+        const openingHookScore = averageWindowMetric(
+          baselineWindows,
+          0,
+          Math.min(durationSeconds, HOOK_MAX),
+          (window) => window.hookScore ?? window.score
+        )
+        const baselineHookScore = clamp01(
+          Number.isFinite(openingHookScore) && openingHookScore > 0
+            ? openingHookScore
+            : Number(selectedHook?.score ?? initialHook?.score ?? 0.5)
+        )
+        const sourceBaselineRetention = computeRetentionScore(
+          [{ start: 0, end: durationSeconds, speed: 1 }],
+          baselineWindows,
+          baselineHookScore,
+          options.autoCaptions,
+          {
+            removedRanges: [],
+            patternInterruptCount: 0,
+            contentFormat: selectedContentFormat
+          }
+        )
+        retentionScoreBeforeEdit = sourceBaselineRetention.score
+      }
+      retentionScoreAfterEdit = Number.isFinite(Number(retentionScore))
+        ? Number(retentionScore)
+        : Number.isFinite(Number(selectedJudge?.retention_score))
+          ? Number(selectedJudge?.retention_score)
+          : null
+      if (
+        Number.isFinite(Number(retentionScoreBeforeEdit)) &&
+        Number.isFinite(Number(retentionScoreAfterEdit)) &&
+        Number(retentionScoreAfterEdit) < Number(retentionScoreBeforeEdit)
+      ) {
+        optimizationNotes.push(
+          `Retention model warning: edit scored ${Number(retentionScoreAfterEdit)} vs source baseline ${Number(retentionScoreBeforeEdit)}.`
+        )
       }
 
       await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
@@ -9956,6 +10193,8 @@ const processJob = async (
       judge: selectedJudge,
       strategy: selectedStrategy,
       retentionScore,
+      retentionScoreBefore: retentionScoreBeforeEdit,
+      retentionScoreAfter: retentionScoreAfterEdit,
       attempts: retentionAttempts,
       patternInterruptCount: selectedPatternInterruptCount,
       patternInterruptDensity: selectedPatternInterruptDensity,
@@ -9985,6 +10224,8 @@ const processJob = async (
         retention_judge: selectedJudge,
         quality_gate_thresholds: selectedJudge?.applied_thresholds ?? null,
         quality_gate_override: qualityGateOverride,
+        retention_score_before: retentionScoreBeforeEdit,
+        retention_score_after: retentionScoreAfterEdit,
         pattern_interrupt_count: selectedPatternInterruptCount || (job.analysis as any)?.pattern_interrupt_count || 0,
         pattern_interrupt_density: selectedPatternInterruptDensity || (job.analysis as any)?.pattern_interrupt_density || 0,
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
