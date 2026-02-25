@@ -18,7 +18,8 @@
     "setup": "ts-node scripts/setup.ts",
     "verify": "ts-node scripts/verify.ts",
     "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts",
-    "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts"
+    "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts",
+    "tune:emotional-real-clips": "ts-node scripts/tune-emotional-real-clips.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",

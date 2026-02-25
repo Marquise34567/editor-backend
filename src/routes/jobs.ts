@@ -18,6 +18,14 @@ import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { isDevAccount } from '../lib/devAccounts'
 import {
+  EDITOR_RETENTION_CONFIG,
+  EMOTIONAL_NICHE_TUNING,
+  EMOTIONAL_STYLE_TUNING,
+  isJobStatusTransitionAllowed,
+  normalizeJobStatus
+} from '../lib/editorConfig'
+import { normalizeAnalysisPayload } from '../lib/analysisNormalizer'
+import {
   getPlanFeatures,
   getRequiredPlanForAdvancedEffects,
   getRequiredPlanForAutoZoom,
@@ -325,8 +333,65 @@ const safeUnlink = (filePath?: string | null) => {
   }
 }
 
-export const updateJob = async (jobId: string, data: any) => {
-  const updated = await prisma.job.update({ where: { id: jobId }, data })
+export const updateJob = async (
+  jobId: string,
+  data: any,
+  opts?: {
+    expectedUpdatedAt?: Date | string | null
+  }
+) => {
+  const nextData = data && typeof data === 'object' ? { ...data } : {}
+  const hasStatusPatch = Object.prototype.hasOwnProperty.call(nextData, 'status')
+  const hasAnalysisPatch = Object.prototype.hasOwnProperty.call(nextData, 'analysis')
+  let expectedUpdatedAt: Date | null = null
+
+  if (opts?.expectedUpdatedAt) {
+    const parsedExpected = new Date(opts.expectedUpdatedAt)
+    if (Number.isFinite(parsedExpected.getTime())) expectedUpdatedAt = parsedExpected
+  }
+
+  if (hasStatusPatch) {
+    const normalizedStatus = normalizeJobStatus(nextData.status)
+    if (!normalizedStatus) {
+      throw new Error(`invalid_job_status:${String(nextData.status || '')}`)
+    }
+    const existing = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { status: true }
+    })
+    if (!existing) throw new Error('job_not_found')
+    const currentStatus = normalizeJobStatus(existing.status)
+    if (
+      currentStatus &&
+      EDITOR_RETENTION_CONFIG.enforceStatusTransitions &&
+      !isJobStatusTransitionAllowed(currentStatus, normalizedStatus)
+    ) {
+      throw new Error(`invalid_status_transition:${currentStatus}->${normalizedStatus}`)
+    }
+    nextData.status = normalizedStatus
+  }
+
+  if (hasAnalysisPatch && nextData.analysis !== null && nextData.analysis !== undefined) {
+    nextData.analysis = normalizeAnalysisPayload(nextData.analysis)
+  }
+
+  let updated: any
+  if (expectedUpdatedAt) {
+    const result = await prisma.job.updateMany({
+      where: { id: jobId, updatedAt: expectedUpdatedAt },
+      data: nextData
+    })
+    if (result.count === 0) {
+      const conflict: any = new Error('job_update_conflict')
+      conflict.code = 'job_update_conflict'
+      throw conflict
+    }
+    updated = await prisma.job.findUnique({ where: { id: jobId } })
+    if (!updated) throw new Error('job_not_found')
+  } else {
+    updated = await prisma.job.update({ where: { id: jobId }, data: nextData })
+  }
+
   broadcastJobUpdate(updated.userId, { job: updated })
   return updated
 }
@@ -605,6 +670,10 @@ type EditPlan = {
   styleProfile?: ContentStyleProfile
   nicheProfile?: VideoNicheProfile | null
   beatAnchors?: number[]
+  emotionalBeatAnchors?: number[]
+  emotionalBeatCutCount?: number
+  emotionalLeadTrimmedSeconds?: number
+  emotionalTuning?: EmotionalTuningProfile
   hookVariants?: HookCandidate[]
   hookCalibration?: HookCalibrationProfile | null
 }
@@ -622,6 +691,7 @@ type EditOptions = {
   retentionAggressionLevel: RetentionAggressionLevel
   retentionStrategyProfile: RetentionStrategyProfile
   preferredHookCandidate?: HookCandidate | null
+  fastMode?: boolean
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type ContentStyleProfile = {
@@ -658,27 +728,18 @@ type VideoNicheProfile = {
   }
 }
 
-const HOOK_MIN = 5
-const HOOK_MAX = 8
+const HOOK_MIN = EDITOR_RETENTION_CONFIG.hookMin
+const HOOK_MAX = EDITOR_RETENTION_CONFIG.hookMax
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
-const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = 0.4
-const HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC = 0.8
-const HOOK_SELECTION_WAIT_MS = (() => {
-  const envValue = Number(process.env.HOOK_SELECTION_WAIT_MS || 12_000)
-  if (!Number.isFinite(envValue)) return 12_000
-  return Math.max(0, Math.round(envValue))
-})()
-const HOOK_SELECTION_POLL_MS = (() => {
-  const envValue = Number(process.env.HOOK_SELECTION_POLL_MS || 500)
-  if (!Number.isFinite(envValue)) return 500
-  const rounded = Math.round(envValue)
-  return Math.max(120, Math.min(2_000, rounded))
-})()
-const CUT_MIN = 5
-const CUT_MAX = 8
-const PACE_MIN = 5
-const PACE_MAX = 8
+const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
+const HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchDurationToleranceSec
+const HOOK_SELECTION_WAIT_MS = EDITOR_RETENTION_CONFIG.hookSelectionWaitMs
+const HOOK_SELECTION_POLL_MS = EDITOR_RETENTION_CONFIG.hookSelectionPollMs
+const CUT_MIN = EDITOR_RETENTION_CONFIG.cutMin
+const CUT_MAX = EDITOR_RETENTION_CONFIG.cutMax
+const PACE_MIN = EDITOR_RETENTION_CONFIG.cutMin
+const PACE_MAX = EDITOR_RETENTION_CONFIG.cutMax
 const CUT_GUARD_SEC = 0.35
 const CUT_LEN_PATTERN = [5.2, 6.1, 5.8, 7.1]
 const CUT_GAP_PATTERN = [1.3, 1.8, 1.5, 1.2]
@@ -703,7 +764,36 @@ const FILTER_COMPLEX_SCRIPT_THRESHOLD = (() => {
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const SILENCE_KEEP_PADDING_SEC = 0.2
-const HOOK_ANALYZE_MAX = 1800
+const HOOK_ANALYZE_MAX = (() => {
+  const envValue = Number(process.env.HOOK_ANALYZE_MAX_SECONDS || 1800)
+  return Number.isFinite(envValue) && envValue >= 45 ? Math.round(envValue) : 1800
+})()
+const ANALYSIS_SKIP_PROXY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_SKIP_PROXY || '').trim())
+const ANALYSIS_PROXY_WIDTH = (() => {
+  const envValue = Number(process.env.ANALYSIS_PROXY_WIDTH || 960)
+  return Number.isFinite(envValue) && envValue >= 320 ? Math.round(envValue) : 960
+})()
+const ANALYSIS_PROXY_HEIGHT = (() => {
+  const envValue = Number(process.env.ANALYSIS_PROXY_HEIGHT || 540)
+  return Number.isFinite(envValue) && envValue >= 180 ? Math.round(envValue) : 540
+})()
+const ANALYSIS_FRAME_FPS = (() => {
+  const envValue = Number(process.env.ANALYSIS_FRAME_FPS || 2)
+  return Number.isFinite(envValue) && envValue >= 0.25 && envValue <= 8
+    ? Number(envValue.toFixed(2))
+    : 2
+})()
+const ANALYSIS_FRAME_SCALE_WIDTH = (() => {
+  const envValue = Number(process.env.ANALYSIS_FRAME_SCALE_WIDTH || 360)
+  return Number.isFinite(envValue) && envValue >= 160 ? Math.round(envValue) : 360
+})()
+const ANALYSIS_DISABLE_FACE_DETECTION = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_FACE_DETECTION || '').trim())
+const ANALYSIS_DISABLE_TEXT_DENSITY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_TEXT_DENSITY || '').trim())
+const ANALYSIS_DISABLE_EMOTION_MODEL = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_EMOTION_MODEL || '').trim())
+const RENDER_FILTER_THREADS = (() => {
+  const envValue = Number(process.env.FFMPEG_FILTER_THREADS || 1)
+  return Number.isFinite(envValue) && envValue >= 1 ? Math.round(envValue) : 1
+})()
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
@@ -721,7 +811,7 @@ const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
 const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
 const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.4
-const HOOK_SELECTION_MAX_CANDIDATES = 5
+const HOOK_SELECTION_MAX_CANDIDATES = EDITOR_RETENTION_CONFIG.hookSelectionMaxCandidates
 const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
   const envValue = Number(process.env.HOOK_CALIBRATION_LOOKBACK_JOBS || 24)
   return Number.isFinite(envValue) && envValue > 2 ? Math.round(envValue) : 24
@@ -1047,6 +1137,80 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
 }
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+type EmotionalTuningProfile = {
+  thresholdOffset: number
+  spacingMultiplier: number
+  leadTrimMultiplier: number
+  splitLenBias: number
+  openLoopBoost: number
+  curiosityBoost: number
+  contextPenaltyMultiplier: number
+}
+
+const resolveEmotionalTuningProfile = ({
+  styleProfile,
+  nicheProfile,
+  aggressionLevel
+}: {
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  aggressionLevel?: RetentionAggressionLevel
+}): EmotionalTuningProfile => {
+  const nicheKey = nicheProfile?.niche || 'story'
+  const styleKey = styleProfile?.style || 'story'
+  const base = EMOTIONAL_NICHE_TUNING[nicheKey] || EMOTIONAL_NICHE_TUNING.story
+  const style = EMOTIONAL_STYLE_TUNING[styleKey] || EMOTIONAL_STYLE_TUNING.story
+  const styleConfidence = clamp(Number(styleProfile?.confidence ?? 0.55), 0, 1)
+  const nicheConfidence = clamp(Number(nicheProfile?.confidence ?? 0.55), 0, 1)
+  const styleWeight = 0.34 + styleConfidence * 0.46
+  const nicheWeight = 0.4 + nicheConfidence * 0.5
+  let thresholdShiftByAggression = 0
+  if (aggressionLevel === 'low') thresholdShiftByAggression = 0.04
+  else if (aggressionLevel === 'medium') thresholdShiftByAggression = 0
+  else if (aggressionLevel === 'high') thresholdShiftByAggression = -0.02
+  else if (aggressionLevel === 'viral') thresholdShiftByAggression = -0.05
+
+  return {
+    thresholdOffset: Number(clamp(
+      base.thresholdOffset * nicheWeight +
+      style.thresholdOffset * styleWeight +
+      thresholdShiftByAggression,
+      -0.22,
+      0.22
+    ).toFixed(4)),
+    spacingMultiplier: Number(clamp(
+      base.spacingMultiplier * (1 + (style.spacingMultiplier - 1) * styleWeight),
+      0.7,
+      1.45
+    ).toFixed(4)),
+    leadTrimMultiplier: Number(clamp(
+      base.leadTrimMultiplier * (1 + (style.leadTrimMultiplier - 1) * styleWeight),
+      0.58,
+      1.48
+    ).toFixed(4)),
+    splitLenBias: Number(clamp(
+      base.splitLenBias * (1 + (style.splitLenBias - 1) * styleWeight),
+      0.72,
+      1.55
+    ).toFixed(4)),
+    openLoopBoost: Number(clamp(
+      base.openLoopBoost * (1 + (style.openLoopBoost - 1) * styleWeight),
+      0.75,
+      1.45
+    ).toFixed(4)),
+    curiosityBoost: Number(clamp(
+      base.curiosityBoost * (1 + (style.curiosityBoost - 1) * styleWeight),
+      0.8,
+      1.5
+    ).toFixed(4)),
+    contextPenaltyMultiplier: Number(clamp(
+      base.contextPenaltyMultiplier * (1 + (style.contextPenaltyMultiplier - 1) * styleWeight),
+      0.8,
+      1.35
+    ).toFixed(4))
+  }
+}
+
 const roundForFilter = (value: number, decimals: number = FILTER_TIME_DECIMALS) => {
   if (!Number.isFinite(value)) return 0
   return Number(value.toFixed(decimals))
@@ -1449,7 +1613,7 @@ const buildPersistedRenderAnalysis = ({
         height: renderConfig.verticalMode.webcamCrop.h
       }
     : null
-  return {
+  return normalizeAnalysisPayload({
     ...(existing || {}),
     metadata_version: Number.isFinite(Number((existing as any)?.metadata_version))
       ? Number((existing as any).metadata_version)
@@ -1467,7 +1631,7 @@ const buildPersistedRenderAnalysis = ({
         }
       : null,
     verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
-  }
+  })
 }
 
 const normalizePipelineStepMap = (raw?: any): Record<RetentionPipelineStep, PipelineStepState> => {
@@ -2456,6 +2620,7 @@ const extractFramesEveryHalfSecond = async (filePath: string, outDir: string, du
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
   fs.mkdirSync(outDir, { recursive: true })
   const framePattern = path.join(outDir, 'frame-%06d.jpg')
+  const frameFilter = `fps=${ANALYSIS_FRAME_FPS},scale=${ANALYSIS_FRAME_SCALE_WIDTH}:-1:flags=lanczos`
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -2465,7 +2630,7 @@ const extractFramesEveryHalfSecond = async (filePath: string, outDir: string, du
     '-t',
     String(analyzeSeconds),
     '-vf',
-    'fps=2,scale=360:-1:flags=lanczos',
+    frameFilter,
     '-q:v',
     '7',
     framePattern
@@ -2642,10 +2807,13 @@ const detectRhythmAnchors = ({
 }) => {
   if (!windows.length) return [] as number[]
   const pulse = windows.map((window) => (
-    0.42 * window.audioEnergy +
-    0.28 * (window.audioVariance ?? 0) +
-    0.18 * window.vocalExcitement +
-    0.12 * window.sceneChangeRate
+    0.3 * window.audioEnergy +
+    0.2 * (window.audioVariance ?? 0) +
+    0.17 * window.vocalExcitement +
+    0.11 * window.sceneChangeRate +
+    0.12 * window.emotionIntensity +
+    0.06 * (window.curiosityTrigger ?? 0) +
+    0.04 * (window.actionSpike ?? 0)
   ))
   const meanPulse = pulse.reduce((sum, value) => sum + value, 0) / pulse.length
   const variance = pulse.reduce((sum, value) => sum + (value - meanPulse) ** 2, 0) / pulse.length
@@ -2669,6 +2837,288 @@ const detectRhythmAnchors = ({
     anchors.push(Number(clamp(durationSeconds * 0.8, 0, durationSeconds).toFixed(3)))
   }
   return anchors
+}
+
+const detectEmotionalBeatAnchors = ({
+  windows,
+  durationSeconds,
+  styleProfile,
+  nicheProfile,
+  aggressionLevel
+}: {
+  windows: EngagementWindow[]
+  durationSeconds: number
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  aggressionLevel?: RetentionAggressionLevel
+}) => {
+  if (!windows.length) return [] as number[]
+  const tuning = resolveEmotionalTuningProfile({
+    styleProfile,
+    nicheProfile,
+    aggressionLevel
+  })
+  const beatStrength = (window: EngagementWindow) => clamp01(
+    0.34 * window.emotionIntensity +
+    0.2 * window.vocalExcitement +
+    0.18 * (window.hookScore ?? window.score) +
+    0.12 * (window.curiosityTrigger ?? 0) +
+    0.1 * (window.actionSpike ?? 0) +
+    0.06 * window.sceneChangeRate
+  )
+  const spacingByStyle = styleProfile?.style === 'tutorial'
+    ? 1.22
+    : styleProfile?.style === 'vlog'
+      ? 1.04
+      : 0.88
+  const minSpacing = Math.max(
+    spacingByStyle * tuning.spacingMultiplier,
+    EDITOR_RETENTION_CONFIG.emotionalBeatSpacingSec * tuning.spacingMultiplier
+  )
+  const baseThreshold = clamp(
+    EDITOR_RETENTION_CONFIG.emotionalBeatThreshold + tuning.thresholdOffset,
+    0.45,
+    0.94
+  )
+  const candidates: Array<{ time: number; score: number }> = []
+  for (let index = 1; index < windows.length - 1; index += 1) {
+    const prev = beatStrength(windows[index - 1])
+    const curr = beatStrength(windows[index])
+    const next = beatStrength(windows[index + 1])
+    if (curr < baseThreshold || curr < prev || curr < next) continue
+    candidates.push({
+      time: Number(clamp(windows[index].time + 0.45, 0, Math.max(0, durationSeconds)).toFixed(3)),
+      score: curr
+    })
+  }
+  if (!candidates.length) return []
+  const selected: number[] = []
+  for (const candidate of candidates.sort((a, b) => b.score - a.score || a.time - b.time)) {
+    const tooClose = selected.some((time) => Math.abs(time - candidate.time) < minSpacing)
+    if (tooClose) continue
+    selected.push(candidate.time)
+    if (selected.length >= 20) break
+  }
+  return selected.slice().sort((a, b) => a - b)
+}
+
+const mergeBeatAnchorSets = ({
+  rhythmAnchors,
+  emotionalAnchors,
+  durationSeconds
+}: {
+  rhythmAnchors: number[]
+  emotionalAnchors: number[]
+  durationSeconds: number
+}) => {
+  const raw = [...rhythmAnchors, ...emotionalAnchors]
+    .filter((value) => Number.isFinite(value))
+    .map((value) => Number(clamp(value, 0, Math.max(0, durationSeconds)).toFixed(3)))
+    .sort((a, b) => a - b)
+  if (!raw.length) return [] as number[]
+  const minSpacing = clamp(EDITOR_RETENTION_CONFIG.emotionalBeatSpacingSec * 0.45, 0.24, 0.8)
+  const merged: number[] = []
+  for (const anchor of raw) {
+    const prev = merged[merged.length - 1]
+    if (!Number.isFinite(prev)) {
+      merged.push(anchor)
+      continue
+    }
+    if (Math.abs(anchor - prev) < minSpacing) {
+      merged[merged.length - 1] = Number(((prev + anchor) / 2).toFixed(3))
+      continue
+    }
+    merged.push(anchor)
+  }
+  return merged
+}
+
+const applyEmotionalBeatCuts = ({
+  segments,
+  windows,
+  aggressionLevel,
+  hookRange,
+  styleProfile,
+  nicheProfile
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  aggressionLevel: RetentionAggressionLevel
+  hookRange: TimeRange | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+}) => {
+  if (!segments.length || !windows.length) {
+    return {
+      segments: segments.map((segment) => ({ ...segment })),
+      anchors: [] as number[],
+      cutCount: 0,
+      trimmedSeconds: 0
+    }
+  }
+  const tuning = resolveEmotionalTuningProfile({
+    styleProfile,
+    nicheProfile,
+    aggressionLevel
+  })
+  const beatStrength = (window: EngagementWindow) => clamp01(
+    0.34 * window.emotionIntensity +
+    0.2 * window.vocalExcitement +
+    0.18 * (window.hookScore ?? window.score) +
+    0.12 * (window.curiosityTrigger ?? 0) +
+    0.1 * (window.actionSpike ?? 0) +
+    0.06 * window.sceneChangeRate
+  )
+  const thresholdOffsetByAggression: Record<RetentionAggressionLevel, number> = {
+    low: 0.05,
+    medium: 0.02,
+    high: -0.01,
+    viral: -0.04
+  }
+  const beatThreshold = clamp(
+    EDITOR_RETENTION_CONFIG.emotionalBeatThreshold + thresholdOffsetByAggression[aggressionLevel] + tuning.thresholdOffset,
+    0.44,
+    0.95
+  )
+  const targetLeadByStyle =
+    styleProfile?.style === 'tutorial'
+      ? 0.92
+      : styleProfile?.style === 'vlog'
+        ? 0.72
+      : aggressionLevel === 'high' || aggressionLevel === 'viral'
+          ? 0.46
+          : 0.58
+  const targetLeadSeconds = clamp(targetLeadByStyle / Math.max(0.68, tuning.leadTrimMultiplier), 0.28, 1.25)
+  const maxLeadTrim = clamp(
+    (
+      EDITOR_RETENTION_CONFIG.emotionalLeadTrimSec * tuning.leadTrimMultiplier +
+      (aggressionLevel === 'viral' ? 0.35 : aggressionLevel === 'high' ? 0.2 : 0)
+    ),
+    0.5,
+    4
+  )
+  const output: Segment[] = []
+  const anchors: number[] = []
+  let cutCount = 0
+  let trimmedSeconds = 0
+
+  for (const sourceSegment of segments) {
+    if (sourceSegment.end - sourceSegment.start <= 0.3) continue
+    if (hookRange && overlapsRange(sourceSegment, hookRange)) {
+      output.push({ ...sourceSegment })
+      continue
+    }
+    const relevant = windows.filter((window) => window.time >= sourceSegment.start && window.time < sourceSegment.end)
+    if (relevant.length < 3) {
+      output.push({ ...sourceSegment })
+      continue
+    }
+
+    const scored = relevant.map((window, index) => ({
+      window,
+      index,
+      score: beatStrength(window)
+    }))
+    const localPeaks = scored.filter((entry) => {
+      const prev = scored[Math.max(0, entry.index - 1)]?.score ?? entry.score
+      const next = scored[Math.min(scored.length - 1, entry.index + 1)]?.score ?? entry.score
+      return entry.score >= beatThreshold && entry.score >= prev && entry.score >= next
+    })
+    const strongestPeak = (localPeaks.length ? localPeaks : scored)
+      .slice()
+      .sort((a, b) => b.score - a.score || a.window.time - b.window.time)[0]
+
+    let adjusted = { ...sourceSegment }
+    if (strongestPeak) {
+      const leadIn = strongestPeak.window.time - adjusted.start
+      if (leadIn > targetLeadSeconds + 0.3 && adjusted.end - adjusted.start > 2.1) {
+        const preScore = averageWindowMetric(
+          windows,
+          adjusted.start,
+          Math.min(adjusted.end, strongestPeak.window.time),
+          (window) => window.score
+        )
+        const beatScore = averageWindowMetric(
+          windows,
+          strongestPeak.window.time,
+          Math.min(adjusted.end, strongestPeak.window.time + 1.2),
+          (window) => (
+            0.5 * (window.hookScore ?? window.score) +
+            0.28 * window.emotionIntensity +
+            0.22 * window.vocalExcitement
+          )
+        )
+        const trimGateMultiplier = clamp(0.86 + tuning.contextPenaltyMultiplier * 0.08, 0.8, 1)
+        if (preScore < beatScore * trimGateMultiplier && preScore < 0.6) {
+          const trimAmount = clamp(
+            leadIn - targetLeadSeconds,
+            0.22,
+            Math.min(maxLeadTrim, Math.max(0.22, adjusted.end - adjusted.start - 1.05))
+          )
+          adjusted.start = Number((adjusted.start + trimAmount).toFixed(3))
+          trimmedSeconds += trimAmount
+          cutCount += 1
+        }
+      }
+    }
+
+    const adjustedDuration = adjusted.end - adjusted.start
+    const fallbackSplitPool = (
+      !localPeaks.length && strongestPeak && strongestPeak.score >= Math.max(0.48, beatThreshold * 0.82)
+    )
+      ? [strongestPeak]
+      : []
+    const splitCandidate = [...localPeaks, ...fallbackSplitPool]
+      .filter((entry) => (
+        entry.window.time > adjusted.start + 0.82 &&
+        entry.window.time < adjusted.end - 0.82
+      ))
+      .sort((a, b) => b.score - a.score || a.window.time - b.window.time)[0]
+
+    const splitDurationThreshold = CUT_MAX + 0.55 * tuning.splitLenBias
+    if (adjustedDuration > splitDurationThreshold && splitCandidate) {
+      const splitAt = Number(clamp(splitCandidate.window.time + 0.12, adjusted.start + 0.75, adjusted.end - 0.75).toFixed(3))
+      const first = { ...adjusted, end: splitAt }
+      const second = { ...adjusted, start: splitAt }
+      if (first.end - first.start > 0.24 && second.end - second.start > 0.24) {
+        output.push(first)
+        output.push(second)
+        anchors.push(splitAt)
+        cutCount += 1
+        continue
+      }
+    }
+
+    if (adjusted.end - adjusted.start > 0.2) output.push(adjusted)
+  }
+
+  const normalized: Segment[] = []
+  for (const segment of output.slice().sort((a, b) => a.start - b.start)) {
+    const prev = normalized[normalized.length - 1]
+    let start = segment.start
+    const end = segment.end
+    if (prev && start < prev.end - 0.02) {
+      start = Number(prev.end.toFixed(3))
+    }
+    if (end - start <= 0.18) continue
+    normalized.push({
+      ...segment,
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3))
+    })
+  }
+
+  const dedupedAnchors = anchors
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b)
+    .filter((value, index, list) => index === 0 || Math.abs(value - list[index - 1]) >= 0.2)
+
+  return {
+    segments: normalized.length ? normalized : segments.map((segment) => ({ ...segment })),
+    anchors: dedupedAnchors,
+    cutCount,
+    trimmedSeconds: Number(trimmedSeconds.toFixed(3))
+  }
 }
 
 const alignSegmentsToRhythm = ({
@@ -3416,6 +3866,18 @@ const extractHookText = (start: number, end: number, transcriptCues: TranscriptC
     .trim()
 }
 
+const scoreHookOpenLoopSignal = (text: string) => {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) return 0
+  let score = 0
+  if (/\?/.test(normalized)) score += 0.18
+  if (/\b(wait|watch|see|before|after|until|why|how|what happens|you won't)\b/.test(normalized)) score += 0.22
+  if (/\b(reveal|result|truth|mistake|secret|warning|proof|finally)\b/.test(normalized)) score += 0.2
+  if (/\b(but|then|and then|so)\b/.test(normalized)) score += 0.08
+  if (/\b(i|you|we)\b/.test(normalized)) score += 0.05
+  return clamp01(score)
+}
+
 const runHookAudit = ({
   start,
   end,
@@ -3663,14 +4125,25 @@ const pickTopHookCandidates = ({
   segments,
   windows,
   transcriptCues,
-  hookCalibration
+  hookCalibration,
+  styleProfile,
+  nicheProfile,
+  aggressionLevel
 }: {
   durationSeconds: number
   segments: TimeRange[]
   windows: EngagementWindow[]
   transcriptCues: TranscriptCue[]
   hookCalibration?: HookCalibrationProfile | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  aggressionLevel?: RetentionAggressionLevel
 }) => {
+  const emotionalTuning = resolveEmotionalTuningProfile({
+    styleProfile,
+    nicheProfile,
+    aggressionLevel
+  })
   const starts = new Set<number>()
   segments.forEach((segment) => starts.add(Number(segment.start.toFixed(2))))
   windows
@@ -3719,6 +4192,14 @@ const pickTopHookCandidates = ({
       const durationSecondsActual = aligned.end - aligned.start
       const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 8) / 3))
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
+      const hookText = extractHookText(aligned.start, aligned.end, transcriptCues)
+      const openLoopSignal = clamp01(scoreHookOpenLoopSignal(hookText) * emotionalTuning.openLoopBoost)
+      const curiosityAcceleration = clamp01(
+        averageWindowMetric(windows, aligned.start, aligned.start + durationSecondsActual * 0.45, (window) => (window.curiosityTrigger ?? 0)) * 0.55 +
+        averageWindowMetric(windows, aligned.start + durationSecondsActual * 0.55, aligned.end, (window) => (window.hookScore ?? window.score)) * 0.45
+      )
+      const boostedCuriosityAcceleration = clamp01(curiosityAcceleration * emotionalTuning.curiosityBoost)
+      const tunedContextPenalty = clamp01(contextPenalty * emotionalTuning.contextPenaltyMultiplier)
       const audit = runHookAudit({
         start: aligned.start,
         end: aligned.end,
@@ -3726,15 +4207,17 @@ const pickTopHookCandidates = ({
         windows
       })
       const totalScore = clamp01(
-        0.22 * baseHookScore +
+        0.2 * baseHookScore +
         0.16 * speechImpact +
-        0.15 * transcriptImpact +
+        0.13 * transcriptImpact +
         0.11 * visualImpact +
-        0.16 * emotionImpact +
+        0.14 * emotionImpact +
         0.14 * emotionalHookPull +
+        0.06 * boostedCuriosityAcceleration +
+        0.06 * openLoopSignal +
         0.06 * durationAlignment +
         0.16 * audit.auditScore -
-        0.2 * contextPenalty
+        0.18 * tunedContextPenalty
       )
       evaluated.push({
         start: aligned.start,
@@ -3742,7 +4225,7 @@ const pickTopHookCandidates = ({
         score: Number(totalScore.toFixed(4)),
         auditScore: audit.auditScore,
         auditPassed: audit.passed,
-        text: extractHookText(aligned.start, aligned.end, transcriptCues),
+        text: hookText,
         reason: audit.passed ? 'Best-moment candidate passed hook audit.' : audit.reasons.join('; ')
       })
     }
@@ -5630,18 +6113,22 @@ const buildEditPlan = async (
   const aggressionPreset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
   if (onStage) await onStage('cutting')
   // Run independent analysis tasks in parallel to save wall-clock time.
+  const fastMode = Boolean(options.fastMode)
+  const skipFacePresence = fastMode || options.smartZoom === false || ANALYSIS_DISABLE_FACE_DETECTION
+  const skipTextDensity = fastMode || ANALYSIS_DISABLE_TEXT_DENSITY
+  const skipEmotionModel = fastMode || ANALYSIS_DISABLE_EMOTION_MODEL
   const tasks: Array<Promise<any>> = []
   tasks.push(detectSilences(filePath, durationSeconds).catch(() => []))
   tasks.push(detectAudioEnergy(filePath, durationSeconds).catch(() => []))
   tasks.push(detectSceneChanges(filePath, durationSeconds).catch(() => []))
-  // Face detection is optional if smartZoom is disabled (saves time)
-  if (options.smartZoom !== false) {
+  // Face detection can be skipped in fast mode to cut analysis latency.
+  if (!skipFacePresence) {
     tasks.push(detectFacePresence(filePath, durationSeconds).catch(() => []))
   } else {
     tasks.push(Promise.resolve([]))
   }
-  tasks.push(detectTextDensity(filePath, durationSeconds).catch(() => []))
-  tasks.push(detectEmotionModelSignals(filePath, durationSeconds).catch(() => []))
+  tasks.push(skipTextDensity ? Promise.resolve([]) : detectTextDensity(filePath, durationSeconds).catch(() => []))
+  tasks.push(skipEmotionModel ? Promise.resolve([]) : detectEmotionModelSignals(filePath, durationSeconds).catch(() => []))
   const [silences, energySamples, sceneChanges, faceSamples, textSamples, emotionSamples] = await Promise.all(tasks)
   const transcriptCues = Array.isArray(context?.transcriptCues) ? context!.transcriptCues! : []
   const windows = enrichWindowsWithCognitiveScores({
@@ -5667,6 +6154,11 @@ const buildEditPlan = async (
     durationSeconds,
     pacingProfile,
     styleProfile
+  })
+  const emotionalTuning = resolveEmotionalTuningProfile({
+    styleProfile,
+    nicheProfile,
+    aggressionLevel: styleAdjustedAggressionLevel
   })
   const silenceTrimCuts = options.removeBoring
     ? buildSilenceTrimCuts(silences, durationSeconds, options.aggressiveMode)
@@ -5735,7 +6227,10 @@ const buildEditPlan = async (
     transcriptCues,
     hookCalibration: context?.hookCalibration && context.hookCalibration.enabled
       ? context.hookCalibration
-      : null
+      : null,
+    styleProfile,
+    nicheProfile,
+    aggressionLevel: styleAdjustedAggressionLevel
   })
   const hookVariants = [
     topHookCandidates.selected,
@@ -5768,8 +6263,16 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel,
     hookRange
   })
-  const interruptInjected = injectPatternInterrupts({
+  const emotionalBeatAdjusted = applyEmotionalBeatCuts({
     segments: boredomApplied.segments,
+    windows,
+    aggressionLevel: styleAdjustedAggressionLevel,
+    hookRange,
+    styleProfile,
+    nicheProfile
+  })
+  const interruptInjected = injectPatternInterrupts({
+    segments: emotionalBeatAdjusted.segments,
     durationSeconds,
     aggressionLevel: styleAdjustedAggressionLevel
   })
@@ -5783,10 +6286,22 @@ const buildEditPlan = async (
     durationSeconds,
     styleProfile
   })
+  const emotionalBeatAnchors = detectEmotionalBeatAnchors({
+    windows,
+    durationSeconds,
+    styleProfile,
+    nicheProfile,
+    aggressionLevel: styleAdjustedAggressionLevel
+  })
+  const mergedBeatAnchors = mergeBeatAnchorSets({
+    rhythmAnchors: beatAnchors,
+    emotionalAnchors: [...emotionalBeatAnchors, ...emotionalBeatAdjusted.anchors],
+    durationSeconds
+  })
   const rhythmAlignedSegments = alignSegmentsToRhythm({
     segments: endingSpikeSegments,
     durationSeconds,
-    anchors: beatAnchors,
+    anchors: mergedBeatAnchors,
     styleProfile
   })
 
@@ -5819,7 +6334,11 @@ const buildEditPlan = async (
     },
     styleProfile,
     nicheProfile,
-    beatAnchors,
+    beatAnchors: mergedBeatAnchors,
+    emotionalBeatAnchors,
+    emotionalBeatCutCount: emotionalBeatAdjusted.cutCount,
+    emotionalLeadTrimmedSeconds: emotionalBeatAdjusted.trimmedSeconds,
+    emotionalTuning,
     hookVariants,
     hookCalibration: context?.hookCalibration ?? null
   }
@@ -6307,8 +6826,8 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
 }
 
 const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
-  const width = opts?.width ?? 960
-  const height = opts?.height ?? 540
+  const width = opts?.width ?? ANALYSIS_PROXY_WIDTH
+  const height = opts?.height ?? ANALYSIS_PROXY_HEIGHT
   const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
   const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'copy', outPath]
   await runFfmpeg(args)
@@ -6726,6 +7245,8 @@ const renderVerticalClip = async ({
     '-hide_banner',
     '-loglevel',
     'error',
+    '-filter_threads',
+    String(RENDER_FILTER_THREADS),
     '-i',
     inputPath,
     '-movflags',
@@ -7317,24 +7838,28 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
     // Generate a low-res proxy and analyze the proxy to save CPU/time.
     const tmpProxy = path.join(os.tmpdir(), `${jobId}-proxy.mp4`)
-    try {
-      await generateProxy(tmpIn, tmpProxy)
-      // upload proxy for client preview
-      const proxyBucketPath = `${job.userId}/${jobId}/proxy.mp4`
+    if (!ANALYSIS_SKIP_PROXY) {
       try {
-        const proxyBuf = fs.readFileSync(tmpProxy)
+        await generateProxy(tmpIn, tmpProxy)
+        // upload proxy for client preview
+        const proxyBucketPath = `${job.userId}/${jobId}/proxy.mp4`
         try {
-          await uploadBufferToOutput({ key: proxyBucketPath, body: proxyBuf, contentType: 'video/mp4' })
-          await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
+          const proxyBuf = fs.readFileSync(tmpProxy)
+          try {
+            await uploadBufferToOutput({ key: proxyBucketPath, body: proxyBuf, contentType: 'video/mp4' })
+            await updateJob(jobId, { analysis: { ...(job.analysis as any || {}), proxyPath: proxyBucketPath }, progress: 20 })
+          } catch (e) {
+            console.warn('proxy upload failed', e)
+          }
         } catch (e) {
+          // non-fatal: continue analysis even if upload fails
           console.warn('proxy upload failed', e)
         }
       } catch (e) {
-        // non-fatal: continue analysis even if upload fails
-        console.warn('proxy upload failed', e)
+        console.warn('proxy generation failed, falling back to original for analysis', e)
       }
-    } catch (e) {
-      console.warn('proxy generation failed, falling back to original for analysis', e)
+    } else {
+      console.log(`[${requestId || 'noid'}] proxy generation skipped for analysis`)
     }
 
     const strategyProfile = parseRetentionStrategyProfile(
@@ -7574,6 +8099,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         style_profile: editPlan?.styleProfile ?? null,
         niche_profile: editPlan?.nicheProfile ?? null,
         beat_anchors: editPlan?.beatAnchors ?? [],
+        emotional_beat_anchors: editPlan?.emotionalBeatAnchors ?? [],
+        emotional_beat_cut_count: editPlan?.emotionalBeatCutCount ?? 0,
+        emotional_lead_trimmed_seconds: editPlan?.emotionalLeadTrimmedSeconds ?? 0,
+        emotional_tuning_profile: editPlan?.emotionalTuning ?? null,
         transcript_signals: editPlan?.transcriptSignals ?? {
           cueCount: transcriptCues.length,
           hasTranscript: transcriptCues.length > 0
@@ -7931,6 +8460,16 @@ const processJob = async (
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
+    let emotionalBeatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.emotional_beat_anchors)
+      ? ((job.analysis as any).emotional_beat_anchors as number[])
+      : []
+    let emotionalBeatCutCountForAnalysis = Number.isFinite(Number((job.analysis as any)?.emotional_beat_cut_count))
+      ? Number((job.analysis as any).emotional_beat_cut_count)
+      : 0
+    let emotionalLeadTrimmedSecondsForAnalysis = Number.isFinite(Number((job.analysis as any)?.emotional_lead_trimmed_seconds))
+      ? Number((job.analysis as any).emotional_lead_trimmed_seconds)
+      : 0
+    let emotionalTuningForAnalysis = ((job.analysis as any)?.emotional_tuning_profile as EmotionalTuningProfile) || null
     let hookVariantsForAnalysis: HookCandidate[] = getHookCandidatesFromAnalysis(job.analysis as any)
     let hookCalibrationForAnalysis: HookCalibrationProfile | null = ((job.analysis as any)?.hook_calibration as HookCalibrationProfile) || hookCalibration
     let audioProfileForAnalysis: AudioStreamProfile | null = null
@@ -7962,8 +8501,29 @@ const processJob = async (
       }
       if (editPlan?.styleProfile) styleProfileForAnalysis = editPlan.styleProfile
       if (editPlan?.nicheProfile) nicheProfileForAnalysis = editPlan.nicheProfile
+      if (Number(editPlan?.emotionalBeatCutCount || 0) > 0) {
+        optimizationNotes.push(
+          `Emotion-aware pacing inserted ${Number(editPlan?.emotionalBeatCutCount)} additional cut${Number(editPlan?.emotionalBeatCutCount) === 1 ? '' : 's'}.`
+        )
+      }
+      if (Number(editPlan?.emotionalLeadTrimmedSeconds || 0) > 0.2) {
+        optimizationNotes.push(
+          `Trimmed ${Number(editPlan?.emotionalLeadTrimmedSeconds || 0).toFixed(1)}s of low-signal lead-ins before emotional peaks.`
+        )
+      }
+      if (editPlan?.emotionalTuning) {
+        optimizationNotes.push(
+          `Emotional tuning profile: threshold ${Number(editPlan.emotionalTuning.thresholdOffset).toFixed(2)}, spacing x${Number(editPlan.emotionalTuning.spacingMultiplier).toFixed(2)}, lead-trim x${Number(editPlan.emotionalTuning.leadTrimMultiplier).toFixed(2)}.`
+        )
+      }
       engagementWindowsForAnalysis = editPlan?.engagementWindows ?? []
       if (Array.isArray(editPlan?.beatAnchors)) beatAnchorsForAnalysis = editPlan.beatAnchors
+      if (Array.isArray(editPlan?.emotionalBeatAnchors)) emotionalBeatAnchorsForAnalysis = editPlan.emotionalBeatAnchors
+      if (Number.isFinite(Number(editPlan?.emotionalBeatCutCount))) emotionalBeatCutCountForAnalysis = Number(editPlan?.emotionalBeatCutCount)
+      if (Number.isFinite(Number(editPlan?.emotionalLeadTrimmedSeconds))) {
+        emotionalLeadTrimmedSecondsForAnalysis = Number(editPlan?.emotionalLeadTrimmedSeconds)
+      }
+      if (editPlan?.emotionalTuning) emotionalTuningForAnalysis = editPlan.emotionalTuning
       if (Array.isArray(editPlan?.hookVariants) && editPlan.hookVariants.length) {
         hookVariantsForAnalysis = editPlan.hookVariants
       } else if (Array.isArray(editPlan?.hookCandidates) && editPlan.hookCandidates.length) {
@@ -8692,7 +9252,7 @@ const processJob = async (
         '-loglevel',
         'error',
         '-filter_threads',
-        '1',
+        String(RENDER_FILTER_THREADS),
         '-i',
         tmpIn,
         '-movflags',
@@ -9101,6 +9661,10 @@ const processJob = async (
         style_profile: styleProfileForAnalysis,
         niche_profile: nicheProfileForAnalysis,
         beat_anchors: beatAnchorsForAnalysis,
+        emotional_beat_anchors: emotionalBeatAnchorsForAnalysis,
+        emotional_beat_cut_count: emotionalBeatCutCountForAnalysis,
+        emotional_lead_trimmed_seconds: emotionalLeadTrimmedSecondsForAnalysis,
+        emotional_tuning_profile: emotionalTuningForAnalysis,
         hook_variants: hookVariantsForAnalysis,
         hook_calibration: hookCalibrationForAnalysis,
         audio_profile: audioProfileForAnalysis
@@ -10144,7 +10708,7 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
       pipelineUpdatedAt: nowIso
     }
 
-    await updateJob(id, { analysis: nextAnalysis })
+    await updateJob(id, { analysis: nextAnalysis }, { expectedUpdatedAt: job.updatedAt })
     return res.json({
       ok: true,
       preferredHook: {
@@ -10153,7 +10717,13 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
       },
       appliedAt: nowIso
     })
-  } catch (err) {
+  } catch (err: any) {
+    if (String(err?.code || '').toLowerCase() === 'job_update_conflict' || String(err?.message || '').includes('job_update_conflict')) {
+      return res.status(409).json({
+        error: 'hook_update_conflict',
+        message: 'Hook selection changed in another request. Refresh and retry.'
+      })
+    }
     console.error('preferred-hook update error', err)
     return res.status(500).json({ error: 'server_error' })
   }
@@ -10454,6 +11024,38 @@ router.get('/:id/local-output', async (req: any, res) => {
   }
 })
 
+const buildEditPlanForTest = async ({
+  filePath,
+  aggressionLevel,
+  strategyProfile
+}: {
+  filePath: string
+  aggressionLevel?: RetentionAggressionLevel | string
+  strategyProfile?: RetentionStrategyProfile | string
+}) => {
+  const absolutePath = path.resolve(String(filePath || ''))
+  if (!absolutePath || !fs.existsSync(absolutePath)) {
+    throw new Error(`test_input_missing:${absolutePath}`)
+  }
+  const durationSeconds = getDurationSeconds(absolutePath)
+  if (!durationSeconds || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    throw new Error(`test_input_duration_unavailable:${absolutePath}`)
+  }
+  const normalizedAggression = parseRetentionAggressionLevel(aggressionLevel)
+  const normalizedStrategy = parseRetentionStrategyProfile(
+    strategyProfile || strategyFromAggressionLevel(normalizedAggression)
+  )
+  const options: EditOptions = {
+    ...DEFAULT_EDIT_OPTIONS,
+    retentionAggressionLevel: normalizedAggression,
+    retentionStrategyProfile: normalizedStrategy,
+    aggressiveMode: isAggressiveRetentionLevel(normalizedAggression)
+  }
+  return buildEditPlan(absolutePath, durationSeconds, options, undefined, {
+    aggressionLevel: normalizedAggression
+  })
+}
+
 export const __retentionTestUtils = {
   pickTopHookCandidates,
   computeRetentionScore,
@@ -10469,13 +11071,16 @@ export const __retentionTestUtils = {
   getStyleAdjustedAggressionLevel,
   applyStyleToPacingProfile,
   detectRhythmAnchors,
+  detectEmotionalBeatAnchors,
+  applyEmotionalBeatCuts,
   alignSegmentsToRhythm,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
-  buildPersistedRenderAnalysis
+  buildPersistedRenderAnalysis,
+  buildEditPlanForTest
 }
 
 export default router

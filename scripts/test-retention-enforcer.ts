@@ -1,5 +1,7 @@
 import assert from 'assert'
 import { __retentionTestUtils } from '../src/routes/jobs'
+import { normalizeAnalysisPayload } from '../src/lib/analysisNormalizer'
+import { isJobStatusTransitionAllowed } from '../src/lib/editorConfig'
 
 const {
   pickTopHookCandidates,
@@ -14,6 +16,8 @@ const {
   inferContentStyleProfile,
   getStyleAdjustedAggressionLevel,
   applyStyleToPacingProfile,
+  detectEmotionalBeatAnchors,
+  applyEmotionalBeatCuts,
   alignSegmentsToRhythm,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
@@ -343,7 +347,9 @@ const run = () => {
       boredomRemovalRatio: 0.22,
       interruptDensity: 1,
       interruptDensityRaw: 0.25,
-      runtimeSeconds: 16
+      runtimeSeconds: 16,
+      contentFormat: 'tiktok_short' as const,
+      pacingTargetSeconds: 6
     }
   }
   const strongWindows = windows.map((window) => ({
@@ -376,7 +382,9 @@ const run = () => {
       boredomRemovalRatio: 0.01,
       interruptDensity: 0.1,
       interruptDensityRaw: 0.01,
-      runtimeSeconds: 12
+      runtimeSeconds: 12,
+      contentFormat: 'tiktok_short' as const,
+      pacingTargetSeconds: 6
     }
   }
   const weakWindows = windows.map((window) => ({
@@ -492,7 +500,7 @@ const run = () => {
   assert.strictEqual(attemptsSecondPass.length, 2, 'must stop immediately once passing')
 
   // 4) Metadata persistence through analysis builder
-  const persisted = buildPersistedRenderAnalysis({
+  const persisted: any = buildPersistedRenderAnalysis({
     existing: {
       hook_start_time: 12.1,
       hook_end_time: 18.1,
@@ -529,6 +537,78 @@ const run = () => {
   assert.strictEqual(persisted.style_profile?.style, 'reaction', 'style profile should persist')
   assert.strictEqual(Array.isArray(persisted.beat_anchors), true, 'beat anchors should persist')
   assert.strictEqual(Boolean(persisted.output_upload_fallback?.used), true, 'upload fallback metadata should persist')
+
+  // 5) Emotional beat detection/cuts should create anchor-aware pacing boundaries.
+  const emotionalWindows = new Array(26).fill(null).map((_, idx) =>
+    makeWindow(idx, {
+      score: idx >= 8 && idx <= 16 ? 0.72 : 0.28,
+      hookScore: idx >= 8 && idx <= 16 ? 0.8 : 0.24,
+      emotionIntensity: idx === 10 || idx === 15 ? 0.92 : idx >= 8 && idx <= 16 ? 0.72 : 0.24,
+      vocalExcitement: idx === 10 || idx === 15 ? 0.88 : idx >= 8 && idx <= 16 ? 0.66 : 0.2,
+      curiosityTrigger: idx === 10 || idx === 15 ? 0.84 : 0.2,
+      actionSpike: idx === 10 || idx === 15 ? 0.75 : 0.08,
+      sceneChangeRate: idx >= 8 && idx <= 16 ? 0.45 : 0.18
+    })
+  )
+  const emotionalAnchors = detectEmotionalBeatAnchors({
+    windows: emotionalWindows,
+    durationSeconds: 26,
+    styleProfile: {
+      style: 'reaction',
+      confidence: 0.82,
+      rationale: ['test'],
+      tempoBias: -0.4,
+      interruptBias: 0.22,
+      hookBias: 0.1
+    }
+  })
+  assert.ok(emotionalAnchors.length >= 2, 'emotional beat detection should find high-energy anchors')
+  const emotionalCutPass = applyEmotionalBeatCuts({
+    segments: [{ start: 0, end: 26, speed: 1 }],
+    windows: emotionalWindows,
+    aggressionLevel: 'high',
+    hookRange: null,
+    styleProfile: {
+      style: 'reaction',
+      confidence: 0.82,
+      rationale: ['test'],
+      tempoBias: -0.4,
+      interruptBias: 0.22,
+      hookBias: 0.1
+    }
+  })
+  assert.ok(emotionalCutPass.cutCount >= 1, 'emotional cut pass should add at least one cut for long low-lead segments')
+  assert.ok(emotionalCutPass.segments.length >= 2, 'emotional cut pass should split long segments around emotional peaks')
+
+  // 6) Analysis normalization should clamp invalid hook metadata and stamp editor versions.
+  const normalizedAnalysis = normalizeAnalysisPayload({
+    hook_start_time: '4.5',
+    hook_end_time: 2,
+    hook_score: 1.6,
+    hook_variants: [
+      { start: 7.11111, duration: 6.444, score: 0.9, auditScore: 0.88, auditPassed: true, text: 'Test', reason: 'good' },
+      { start: 7.11111, duration: 6.444, score: 0.9 }
+    ],
+    preferred_hook: { start: 9.2, duration: 6.1, score: 0.81, auditScore: 0.8, auditPassed: true },
+    retention_attempts: new Array(40).fill({ passed: false })
+  }) as any
+  assert.strictEqual(normalizedAnalysis.hook_start_time, 4.5, 'analysis normalization should parse finite hook start values')
+  assert.ok(
+    normalizedAnalysis.hook_end_time >= normalizedAnalysis.hook_start_time,
+    'analysis normalization should repair invalid hook end times'
+  )
+  assert.ok(normalizedAnalysis.hook_score <= 1 && normalizedAnalysis.hook_score >= 0, 'analysis normalization should clamp hook scores to 0-1')
+  assert.ok(Array.isArray(normalizedAnalysis.hook_variants), 'analysis normalization should keep hook variants as array')
+  assert.ok(normalizedAnalysis.hook_variants.length === 1, 'analysis normalization should dedupe duplicate hook variants')
+  assert.ok(Array.isArray(normalizedAnalysis.retention_attempts), 'analysis normalization should keep attempts array')
+  assert.ok(normalizedAnalysis.retention_attempts.length <= 20, 'analysis normalization should cap retention attempts payload size')
+  assert.ok(typeof normalizedAnalysis.editor_engine_version === 'string', 'analysis normalization should stamp editor engine version')
+  assert.ok(typeof normalizedAnalysis.editor_config_version === 'string', 'analysis normalization should stamp editor config version')
+
+  // 7) Status transition guard should reject illegal terminal regressions.
+  assert.ok(isJobStatusTransitionAllowed('rendering', 'completed'), 'rendering should transition to completed')
+  assert.ok(isJobStatusTransitionAllowed('failed', 'queued'), 'failed jobs should be re-queueable')
+  assert.ok(!isJobStatusTransitionAllowed('completed', 'rendering'), 'completed jobs should not jump directly back to rendering')
 
   console.log('PASS retention enforcer tests')
 }
