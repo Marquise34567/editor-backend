@@ -206,6 +206,121 @@ const applySubtitleModeChange = ({
   })
 }
 
+const applyPromptPresetIntent = ({
+  preset,
+  next,
+  changes
+}: {
+  preset: 'balanced' | 'aggressive' | 'ultra'
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+}) => {
+  if (preset === 'balanced') {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'cut_aggression',
+      delta: 2,
+      source: 'prompt_intent',
+      reason: 'Balanced preset intent'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'jank_guard',
+      delta: 4,
+      source: 'prompt_intent',
+      reason: 'Balanced preset intent'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'story_coherence_guard',
+      delta: 3,
+      source: 'prompt_intent',
+      reason: 'Balanced preset intent'
+    })
+    return
+  }
+
+  if (preset === 'aggressive') {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'cut_aggression',
+      delta: 9,
+      source: 'prompt_intent',
+      reason: 'Aggressive preset intent'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'pacing_multiplier',
+      delta: 0.14,
+      source: 'prompt_intent',
+      reason: 'Aggressive preset intent'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'pattern_interrupt_every_sec',
+      delta: -1.8,
+      source: 'prompt_intent',
+      reason: 'Aggressive preset intent'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'silence_min_ms',
+      delta: -120,
+      source: 'prompt_intent',
+      reason: 'Aggressive preset intent'
+    })
+    return
+  }
+
+  applyNumericDelta({
+    next,
+    changes,
+    key: 'cut_aggression',
+    delta: 14,
+    source: 'prompt_intent',
+    reason: 'Ultra preset intent'
+  })
+  applyNumericDelta({
+    next,
+    changes,
+    key: 'pacing_multiplier',
+    delta: 0.22,
+    source: 'prompt_intent',
+    reason: 'Ultra preset intent'
+  })
+  applyNumericDelta({
+    next,
+    changes,
+    key: 'pattern_interrupt_every_sec',
+    delta: -2.6,
+    source: 'prompt_intent',
+    reason: 'Ultra preset intent'
+  })
+  applyNumericDelta({
+    next,
+    changes,
+    key: 'silence_min_ms',
+    delta: -180,
+    source: 'prompt_intent',
+    reason: 'Ultra preset intent'
+  })
+  applyNumericDelta({
+    next,
+    changes,
+    key: 'jank_guard',
+    delta: -5,
+    source: 'prompt_intent',
+    reason: 'Ultra preset intent prioritizes speed over polish'
+  })
+}
+
 const parsePromptIntoParams = async ({
   prompt,
   base,
@@ -291,6 +406,87 @@ const parsePromptIntoParams = async ({
     })
   }
 
+  if (/\bultra\b/.test(lower)) {
+    applyPromptPresetIntent({ preset: 'ultra', next, changes })
+  } else if (/\baggressive\b/.test(lower)) {
+    applyPromptPresetIntent({ preset: 'aggressive', next, changes })
+  } else if (/\bbalanced\b/.test(lower)) {
+    applyPromptPresetIntent({ preset: 'balanced', next, changes })
+  }
+
+  if (/(long[\s-]?form|podcast|episode|interview|60\s*min|1\s*hour|2\s*hour)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'story_coherence_guard',
+      delta: 8,
+      source: 'prompt_intent',
+      reason: 'Prompt targets long-form context preservation'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'max_clip_len_ms',
+      delta: 1_200,
+      source: 'prompt_intent',
+      reason: 'Prompt targets longer long-form moments'
+    })
+  }
+
+  const maxSilenceMatch = normalizedPrompt.match(/max\s+silence\s*[:=]?\s*(\d+(?:\.\d+)?)\s*s/i)
+  if (maxSilenceMatch?.[1]) {
+    const maxSilenceMs = Number(maxSilenceMatch[1]) * 1000
+    if (Number.isFinite(maxSilenceMs)) {
+      applyNumericChange({
+        next,
+        changes,
+        key: 'silence_min_ms',
+        targetRaw: maxSilenceMs,
+        source: 'prompt_directive',
+        reason: 'Direct max silence threshold in prompt'
+      })
+    }
+  }
+
+  const cutsPerMinuteMatch = normalizedPrompt.match(
+    /(\d+(?:\.\d+)?)\s*(?:-|to)\s*(\d+(?:\.\d+)?)\s*(?:cuts?|edits?)\s*(?:\/|per)?\s*(?:min|minute)/i
+  )
+  if (cutsPerMinuteMatch?.[1] && cutsPerMinuteMatch?.[2]) {
+    const low = Number(cutsPerMinuteMatch[1])
+    const high = Number(cutsPerMinuteMatch[2])
+    const avgCuts = Number.isFinite(low) && Number.isFinite(high) ? (low + high) / 2 : NaN
+    if (Number.isFinite(avgCuts) && avgCuts > 0) {
+      const interruptSeconds = clamp(60 / avgCuts, 2, 20)
+      applyNumericChange({
+        next,
+        changes,
+        key: 'pattern_interrupt_every_sec',
+        targetRaw: interruptSeconds,
+        source: 'prompt_directive',
+        reason: 'Direct cuts-per-minute target in prompt'
+      })
+    }
+  }
+
+  if (/(tangent killer|remove tangents|kill tangents|repeated points)/i.test(lower)) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'redundancy_weight',
+      delta: 0.24,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger tangent/redundancy suppression'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'filler_word_weight',
+      delta: 0.18,
+      source: 'prompt_intent',
+      reason: 'Prompt requests stronger tangent/filler suppression'
+    })
+  }
+
   if (/(hook|opening|first\s*(3|5|8)\s*s|intro)/i.test(lower)) {
     applyNumericDelta({
       next,
@@ -310,7 +506,7 @@ const parsePromptIntoParams = async ({
     })
   }
 
-  if (/(faster|fast[-\s]?paced|snappy|snappier|aggressive|viral|more cuts|punchy)/i.test(lower)) {
+  if (/(faster|fast[-\s]?paced|snappy|snappier|viral|more cuts|punchy)/i.test(lower)) {
     applyNumericDelta({
       next,
       changes,
@@ -473,6 +669,37 @@ const parsePromptIntoParams = async ({
       }
     } else {
       warnings.push('No deterministic prompt mapping or fallback suggestion was available.')
+    }
+  }
+
+  if (!changes.length) {
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'hook_priority_weight',
+      delta: 0.08,
+      source: 'suggestion_fallback',
+      reason: 'Deterministic baseline fallback tune'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'cut_aggression',
+      delta: 3,
+      source: 'suggestion_fallback',
+      reason: 'Deterministic baseline fallback tune'
+    })
+    applyNumericDelta({
+      next,
+      changes,
+      key: 'jank_guard',
+      delta: 4,
+      source: 'suggestion_fallback',
+      reason: 'Deterministic baseline fallback tune'
+    })
+    if (changes.length) {
+      strategy = 'suggestion_fallback'
+      warnings.push('Prompt mapped to baseline deterministic tuning due limited direct signal match.')
     }
   }
 

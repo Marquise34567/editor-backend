@@ -199,7 +199,7 @@ export const sampleFootageTestRequestSchema = z
 
 export const promptTuneRequestSchema = z
   .object({
-    prompt: z.string().trim().min(4).max(2_000),
+    prompt: z.string().trim().min(4).max(12_000),
     fallback_limit: z.number().int().min(50).max(5_000).optional(),
     fallback_range: z.string().trim().min(2).max(12).optional()
   })
