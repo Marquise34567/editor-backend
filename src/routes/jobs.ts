@@ -16878,29 +16878,47 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
       })
     }
 
+    const hasPreferredHookPayload =
+      req.body?.preferredHook !== undefined ||
+      req.body?.selectedHook !== undefined
     const preferredHookPayload = parsePreferredHookCandidateFromPayload(
       req.body?.preferredHook ?? req.body?.selectedHook
     )
-    if (!preferredHookPayload) {
+    if (hasPreferredHookPayload && !preferredHookPayload) {
       return res.status(400).json({ error: 'invalid_preferred_hook' })
     }
+
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body)
+    const hookSelectionMode = requestedHookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'manual'
 
     const analysis = ((job.analysis as any) || {}) as Record<string, any>
     const availableHookCandidates = getHookCandidatesFromAnalysis(analysis)
-    if (!availableHookCandidates.length) {
-      return res.status(409).json({
-        error: 'hook_candidates_not_ready',
-        message: 'Hook options are still being generated.'
+    let preferredHookCandidate: HookCandidate | null = null
+    if (hookSelectionMode === 'manual' && hasPreferredHookPayload) {
+      if (!availableHookCandidates.length) {
+        return res.status(409).json({
+          error: 'hook_candidates_not_ready',
+          message: 'Hook options are still being generated.'
+        })
+      }
+      preferredHookCandidate = matchPreferredHookCandidate({
+        preferred: preferredHookPayload,
+        candidates: availableHookCandidates
       })
+      if (!preferredHookCandidate) {
+        return res.status(400).json({ error: 'invalid_preferred_hook' })
+      }
     }
-
-    const preferredHookCandidate = matchPreferredHookCandidate({
-      preferred: preferredHookPayload,
-      candidates: availableHookCandidates
-    })
-    if (!preferredHookCandidate) {
-      return res.status(400).json({ error: 'invalid_preferred_hook' })
-    }
+    const existingPreferredHook = parsePreferredHookCandidateFromPayload(analysis.preferred_hook)
+    const resolvedPreferredHook = hookSelectionMode === 'auto'
+      ? null
+      : (
+          preferredHookCandidate ??
+          (hasPreferredHookPayload ? null : existingPreferredHook)
+        )
+    const resolvedHookSelectionSource: 'auto' | 'user_selected' | 'fallback' = hookSelectionMode === 'auto'
+      ? 'auto'
+      : (resolvedPreferredHook ? 'user_selected' : 'auto')
 
     const nowIso = toIsoNow()
     const existingSteps = normalizePipelineStepMap(analysis.pipelineSteps)
@@ -16913,32 +16931,47 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
       ...existingSteps.HOOK_SELECT_AND_AUDIT,
       meta: {
         ...hookStepMeta,
-        selectedHook: preferredHookCandidate,
-        hookSelectionSource: 'user_selected',
+        ...(resolvedPreferredHook ? { selectedHook: resolvedPreferredHook } : {}),
+        hookSelectionMode: hookSelectionMode,
+        hookSelectionSource: resolvedHookSelectionSource,
         preferredHookUpdatedAt: nowIso
       }
     }
 
     const nextAnalysis = {
       ...analysis,
-      preferred_hook: preferredHookCandidate,
+      hookSelectionMode: hookSelectionMode,
+      hook_selection_mode: hookSelectionMode,
+      preferred_hook: resolvedPreferredHook ?? null,
       preferred_hook_updated_at: nowIso,
-      hook_start_time: preferredHookCandidate.start,
-      hook_end_time: Number((preferredHookCandidate.start + preferredHookCandidate.duration).toFixed(3)),
-      hook_text: preferredHookCandidate.text || analysis.hook_text || null,
-      hook_reason: preferredHookCandidate.reason || analysis.hook_reason || null,
-      hook_selection_source: 'user_selected',
+      ...(resolvedPreferredHook
+        ? {
+            hook_start_time: resolvedPreferredHook.start,
+            hook_end_time: Number((resolvedPreferredHook.start + resolvedPreferredHook.duration).toFixed(3)),
+            hook_text: resolvedPreferredHook.text || analysis.hook_text || null,
+            hook_reason: resolvedPreferredHook.reason || analysis.hook_reason || null
+          }
+        : {}),
+      hook_selection_source: resolvedHookSelectionSource,
       pipelineSteps: existingSteps,
       pipelineUpdatedAt: nowIso
     }
 
-    await updateJob(id, { analysis: nextAnalysis }, { expectedUpdatedAt: job.updatedAt })
+    const nextRenderSettings = {
+      ...(((job as any)?.renderSettings || {}) as Record<string, any>),
+      hookSelectionMode: hookSelectionMode,
+      hook_selection_mode: hookSelectionMode
+    }
+    await updateJob(id, { analysis: nextAnalysis, renderSettings: nextRenderSettings }, { expectedUpdatedAt: job.updatedAt })
     return res.json({
       ok: true,
-      preferredHook: {
-        start: preferredHookCandidate.start,
-        duration: preferredHookCandidate.duration
-      },
+      hookSelectionMode,
+      preferredHook: resolvedPreferredHook
+        ? {
+            start: resolvedPreferredHook.start,
+            duration: resolvedPreferredHook.duration
+          }
+        : null,
       appliedAt: nowIso
     })
   } catch (err: any) {
