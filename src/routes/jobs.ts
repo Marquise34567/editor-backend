@@ -3930,6 +3930,18 @@ const getSoundFxFromJob = (job?: any): boolean | null => {
   )
 }
 
+const getFastModeFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.fastMode) ??
+    parseBooleanFlag(settings?.fast_mode) ??
+    parseBooleanFlag(analysis?.fastMode) ??
+    parseBooleanFlag(analysis?.fast_mode) ??
+    false
+  )
+}
+
 const getMaxCutsFromJob = (job?: any): number | null => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -15291,6 +15303,7 @@ const getEditOptionsForUser = async (
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
     manualTimestampConfig?: ManualTimestampConfig | null
+    fastMode?: boolean | null
   },
   userEmail?: string | null
 ) => {
@@ -15309,6 +15322,7 @@ const getEditOptionsForUser = async (
   const smartZoomOverride = typeof overrides?.smartZoom === 'boolean' ? overrides.smartZoom : null
   const transitionsOverride = typeof overrides?.transitions === 'boolean' ? overrides.transitions : null
   const soundFxOverride = typeof overrides?.soundFx === 'boolean' ? overrides.soundFx : null
+  const fastModeOverride = typeof overrides?.fastMode === 'boolean' ? overrides.fastMode : null
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
     : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
@@ -15405,7 +15419,8 @@ const getEditOptionsForUser = async (
     longFormAggression,
     longFormClarityVsSpeed,
     tangentKiller,
-    manualTimestampConfig
+    manualTimestampConfig,
+    fastMode: fastModeOverride ?? false
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
@@ -17927,6 +17942,73 @@ const processJob = async (
         return combined.length > 200 ? combined.slice(0, 200) : combined
       }
 
+      const isSigkillRenderError = (err: any) => {
+        const message = String(err?.message || '').toLowerCase()
+        const signal = String(err?.exitSignal || err?.signal || '').toUpperCase()
+        return signal === 'SIGKILL' || message.includes('ffmpeg_failed_signal_sigkill') || message.includes('signal_sigkill')
+      }
+
+      const argsEqual = (a: string[], b: string[]) =>
+        a.length === b.length && a.every((value, idx) => value === b[idx])
+
+      const buildLowMemoryRetryArgs = (inputArgs: string[]) => {
+        const args = [...inputArgs]
+        const setOption = (flag: string, value: string) => {
+          const flagIdx = args.indexOf(flag)
+          if (flagIdx >= 0 && flagIdx + 1 < args.length) {
+            args[flagIdx + 1] = value
+          }
+        }
+        setOption('-threads', '1')
+        setOption('-filter_threads', '1')
+        const presetIdx = args.indexOf('-preset')
+        if (presetIdx >= 0 && presetIdx + 1 < args.length) {
+          const currentPreset = String(args[presetIdx + 1] || '').toLowerCase()
+          if (currentPreset !== 'ultrafast' && currentPreset !== 'superfast') {
+            args[presetIdx + 1] = 'superfast'
+          }
+        }
+        const crfIdx = args.indexOf('-crf')
+        if (crfIdx >= 0 && crfIdx + 1 < args.length) {
+          const parsedCrf = Number(args[crfIdx + 1])
+          if (Number.isFinite(parsedCrf)) {
+            args[crfIdx + 1] = String(Math.round(clamp(parsedCrf + 3, 20, 38)))
+          }
+        }
+        return args
+      }
+
+      let lowMemoryRetryApplied = false
+      const runRenderFfmpeg = async (args: string[], label: string) => {
+        try {
+          await runFfmpeg(args)
+        } catch (err) {
+          if (!isSigkillRenderError(err)) {
+            logFfmpegFailure(label, args, err)
+            throw err
+          }
+          const retryArgs = buildLowMemoryRetryArgs(args)
+          if (argsEqual(retryArgs, args)) {
+            logFfmpegFailure(label, args, err)
+            throw err
+          }
+          console.warn(`[${requestId || 'noid'}] ffmpeg ${label} received SIGKILL, retrying with low-memory settings`, {
+            cmd: formatFfmpegCommand(args),
+            retryCmd: formatFfmpegCommand(retryArgs),
+          })
+          try {
+            await runFfmpeg(retryArgs)
+            if (!lowMemoryRetryApplied) {
+              optimizationNotes.push('Render fallback: low-memory ffmpeg retry used after SIGKILL.')
+              lowMemoryRetryApplied = true
+            }
+          } catch (retryErr) {
+            logFfmpegFailure(`${label}-retry`, retryArgs, retryErr)
+            throw retryErr
+          }
+        }
+      }
+
       const runFfmpegWithFilter = async (
         argsPrefix: string[],
         filter: string,
@@ -17945,10 +18027,7 @@ const processJob = async (
         }
         args.push(...mapArgs, outputPath)
         try {
-          await runFfmpeg(args)
-        } catch (err) {
-          logFfmpegFailure(label, args, err)
-          throw err
+          await runRenderFfmpeg(args, label)
         } finally {
           safeUnlink(filterScriptPath)
         }
@@ -18059,7 +18138,7 @@ const processJob = async (
               concatEncodeArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
             }
             concatEncodeArgs.push(tmpOut)
-            await runFfmpeg(concatEncodeArgs)
+            await runRenderFfmpeg(concatEncodeArgs, 'segment-concat-encode')
           }
 
           const shouldPostProcessSubtitle = Boolean(subtitleFilter && subtitlePath)
@@ -18110,7 +18189,7 @@ const processJob = async (
             )
             postProcessArgs.push(postProcessPath)
             try {
-              await runFfmpeg(postProcessArgs)
+              await runRenderFfmpeg(postProcessArgs, 'segment-postprocess')
               safeUnlink(tmpOut)
               fs.renameSync(postProcessPath, tmpOut)
             } catch (postProcessErr) {
@@ -18220,7 +18299,7 @@ const processJob = async (
             tmpOut
           ]
           try {
-            await runFfmpeg(fallbackArgs)
+            await runRenderFfmpeg(fallbackArgs, 'single')
           } catch (err) {
             logFfmpegFailure('single', fallbackArgs, err)
             throw err
@@ -18561,6 +18640,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         longFormClarityVsSpeed: getLongFormClarityVsSpeedFromJob(existing),
         tangentKiller: getTangentKillerFromJob(existing),
         manualTimestampConfig: getManualTimestampConfigFromJob(existing),
+        fastMode: getFastModeFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       }, user.email)
@@ -19794,6 +19874,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -19857,6 +19939,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -20009,6 +20092,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -20382,6 +20466,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null

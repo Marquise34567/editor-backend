@@ -2,6 +2,8 @@ import express from 'express'
 import fetch from 'node-fetch'
 import os from 'os'
 import crypto from 'crypto'
+import fs from 'fs/promises'
+import path from 'path'
 import { ListObjectsV2Command } from '@aws-sdk/client-s3'
 import { checkDb, isStubDb, prisma } from '../db/prisma'
 import { rateLimit } from '../middleware/rateLimit'
@@ -117,6 +119,11 @@ const SYSTEM_LATENCY_SPIKE_MS = 1500
 const BANK_TAKEOUT_MAX_USD = 1000
 const BANK_TAKEOUT_COOLDOWN_MS = 10 * 60 * 1000
 const BANK_TAKEOUT_CURRENCY = 'usd'
+const ADMIN_PROMPT_MAX_CHARS = 24_000
+const ADMIN_PROMPT_TITLE_MAX_CHARS = 140
+const ADMIN_PROMPT_RECENT_LIMIT = 80
+const PROJECT_ROOT_DIR = path.resolve(__dirname, '../../..')
+const ADMIN_PROMPT_INBOX_DIR = path.join(PROJECT_ROOT_DIR, 'output', 'vscode-prompts')
 const geoCache = new Map<string, { expiresAt: number; payload: GeoLookup }>()
 const bankTakeoutCooldownByActor = new Map<string, { nextAllowedAt: number; lastPayoutId: string | null; lastAmountUsd: number; lastTakeoutAt: string }>()
 let cpuSample: { usage: NodeJS.CpuUsage; hrtime: bigint } | null = null
@@ -443,6 +450,82 @@ const parseUsdAmount = (value: unknown) => {
   const rounded = Math.round(parsed * 100) / 100
   if (rounded <= 0) return null
   return rounded
+}
+
+const slugifyToken = (value: string, fallback = 'prompt') => {
+  const normalized = String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return normalized || fallback
+}
+
+const sanitizePromptTitle = (value: unknown) => {
+  const raw = String(value || '').trim()
+  if (!raw) return 'Untitled Prompt'
+  return raw.slice(0, ADMIN_PROMPT_TITLE_MAX_CHARS)
+}
+
+const sanitizePromptBody = (value: unknown) =>
+  String(value || '')
+    .replace(/\r\n?/g, '\n')
+    .trim()
+    .slice(0, ADMIN_PROMPT_MAX_CHARS)
+
+const ensurePromptInboxDir = async () => {
+  await fs.mkdir(ADMIN_PROMPT_INBOX_DIR, { recursive: true })
+}
+
+const toProjectRelativePath = (absolutePath: string) =>
+  path.relative(PROJECT_ROOT_DIR, absolutePath).replace(/\\/g, '/')
+
+const resolveSafeProjectFile = (value: unknown) => {
+  const raw = String(value || '').trim().replace(/\\/g, '/')
+  if (!raw) return null
+  if (raw.startsWith('/') || /^[a-z]:/i.test(raw)) return null
+  const resolved = path.resolve(PROJECT_ROOT_DIR, raw)
+  const rootWithSep = `${path.resolve(PROJECT_ROOT_DIR)}${path.sep}`
+  if (!resolved.startsWith(rootWithSep)) return null
+  return resolved
+}
+
+const loadRecentPromptInboxEntries = async () => {
+  await ensurePromptInboxDir()
+  const fileNames = await fs.readdir(ADMIN_PROMPT_INBOX_DIR)
+  const jsonFiles = fileNames.filter((name) => name.endsWith('.json'))
+  const parsed = await Promise.all(
+    jsonFiles.map(async (name) => {
+      const absolutePath = path.join(ADMIN_PROMPT_INBOX_DIR, name)
+      try {
+        const raw = await fs.readFile(absolutePath, 'utf8')
+        const payload = JSON.parse(raw) as any
+        const createdAt = new Date(payload?.createdAt || payload?.updatedAt || Date.now()).toISOString()
+        return {
+          id: String(payload?.id || name.replace(/\.json$/i, '')),
+          title: sanitizePromptTitle(payload?.title),
+          promptPreview: sanitizePromptBody(payload?.prompt).slice(0, 320),
+          targetPath: payload?.targetPath ? String(payload.targetPath) : null,
+          inboxPath: toProjectRelativePath(absolutePath),
+          createdAt,
+          createdBy: payload?.createdBy ? String(payload.createdBy) : null
+        }
+      } catch {
+        return null
+      }
+    })
+  )
+  return parsed
+    .filter((entry): entry is {
+      id: string
+      title: string
+      promptPreview: string
+      targetPath: string | null
+      inboxPath: string
+      createdAt: string
+      createdBy: string | null
+    } => Boolean(entry))
+    .sort((a, b) => asMs(b.createdAt) - asMs(a.createdAt))
+    .slice(0, ADMIN_PROMPT_RECENT_LIMIT)
 }
 
 const parseTakeoutAmountFromAuditReason = (reason: unknown) => {
@@ -2983,6 +3066,144 @@ router.delete('/ip-bans/:ip', async (req: any, res) => {
     reason: sanitizeReason(req.body?.reason) || null
   })
   return res.json({ ok: true, ip: normalized })
+})
+
+router.get('/automation/prompts', async (_req, res) => {
+  const items = await loadRecentPromptInboxEntries()
+  return res.json({
+    items,
+    updatedAt: new Date().toISOString()
+  })
+})
+
+router.post('/automation/prompts', async (req: any, res) => {
+  const title = sanitizePromptTitle(req.body?.title)
+  const prompt = sanitizePromptBody(req.body?.prompt)
+  const targetPathRaw = String(req.body?.targetPath || '').trim()
+  const createTargetFile = parseBool(req.body?.createTargetFile, true)
+  const overwriteTargetFile = parseBool(req.body?.overwriteTargetFile, false)
+  if (!prompt) {
+    return res.status(400).json({
+      error: 'invalid_prompt',
+      message: 'Prompt text is required.'
+    })
+  }
+
+  const id = `prompt_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`
+  const createdAt = new Date().toISOString()
+  const slug = slugifyToken(title, 'vscode-prompt')
+  const inboxFileName = `${Date.now()}-${slug}-${id.slice(-6)}.json`
+  const inboxFilePath = path.join(ADMIN_PROMPT_INBOX_DIR, inboxFileName)
+
+  await ensurePromptInboxDir()
+  let targetPath: string | null = null
+  if (targetPathRaw) {
+    const resolved = resolveSafeProjectFile(targetPathRaw)
+    if (!resolved) {
+      return res.status(400).json({
+        error: 'invalid_target_path',
+        message: 'Target path must be project-relative.'
+      })
+    }
+    targetPath = resolved
+  }
+
+  let createdTargetPath: string | null = null
+  if (targetPath && createTargetFile) {
+    try {
+      await fs.access(targetPath)
+      if (!overwriteTargetFile) {
+        return res.status(409).json({
+          error: 'target_exists',
+          message: 'Target file already exists. Enable overwrite to replace it.',
+          targetPath: toProjectRelativePath(targetPath)
+        })
+      }
+    } catch {
+      // target file does not exist yet.
+    }
+    await fs.mkdir(path.dirname(targetPath), { recursive: true })
+    const generatedBody = [
+      `/*`,
+      ` Auto-generated from Admin Prompt Inbox`,
+      ` Title: ${title}`,
+      ` Created: ${createdAt}`,
+      ` Actor: ${String(req.user?.email || req.user?.id || 'unknown')}`,
+      `*/`,
+      ``,
+      `/**`,
+      ` * Prompt`,
+      ` */`,
+      `${JSON.stringify(prompt, null, 2)}`,
+      ``
+    ].join('\n')
+    await fs.writeFile(targetPath, generatedBody, 'utf8')
+    createdTargetPath = toProjectRelativePath(targetPath)
+  }
+
+  const payload = {
+    id,
+    title,
+    prompt,
+    targetPath: createdTargetPath || (targetPath ? toProjectRelativePath(targetPath) : null),
+    createdBy: String(req.user?.email || req.user?.id || '').trim() || null,
+    createdAt,
+    updatedAt: createdAt
+  }
+  await fs.writeFile(inboxFilePath, JSON.stringify(payload, null, 2), 'utf8')
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_automation_prompt_create',
+    targetEmail: req.user?.email || null,
+    planKey: payload.targetPath || null,
+    reason: sanitizeReason(req.body?.reason) || title
+  })
+  return res.json({
+    ok: true,
+    item: {
+      id: payload.id,
+      title: payload.title,
+      promptPreview: payload.prompt.slice(0, 320),
+      targetPath: payload.targetPath,
+      inboxPath: toProjectRelativePath(inboxFilePath),
+      createdAt: payload.createdAt,
+      createdBy: payload.createdBy
+    },
+    createdTargetPath
+  })
+})
+
+router.post('/server/restart', async (req: any, res) => {
+  const reason = sanitizeReason(req.body?.reason) || 'admin_restart_requested'
+  const allowRestart = parseBool(process.env.ALLOW_ADMIN_SERVER_RESTART, false)
+  const requestedAt = new Date().toISOString()
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_server_restart_request',
+    targetEmail: req.user?.email || null,
+    reason
+  })
+  if (!allowRestart) {
+    return res.status(202).json({
+      ok: true,
+      requested: true,
+      executed: false,
+      requestedAt,
+      message: 'Restart request recorded. Set ALLOW_ADMIN_SERVER_RESTART=true to enable automatic process restart.'
+    })
+  }
+
+  setTimeout(() => {
+    process.exit(0)
+  }, 1250).unref()
+
+  return res.json({
+    ok: true,
+    requested: true,
+    executed: true,
+    requestedAt,
+    message: 'Restart signal issued. Process will exit shortly.'
+  })
 })
 
 router.get('/health-status', async (_req, res) => {
