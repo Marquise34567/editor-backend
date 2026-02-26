@@ -882,6 +882,34 @@ type HookCandidate = {
   reason: string
   synthetic?: boolean
 }
+type ManualTimestampMarkerType = 'keep' | 'remove' | 'hook'
+type ManualTimestampMarkerSource = 'user' | 'ai'
+type ManualTimestampMarker = {
+  id: string
+  type: ManualTimestampMarkerType
+  start: number
+  end: number
+  source: ManualTimestampMarkerSource
+  rationale?: string
+}
+type ManualTimestampSuggestionType = 'hook' | 'remove' | 'cut'
+type ManualTimestampSuggestion = {
+  id: string
+  type: ManualTimestampSuggestionType
+  start: number
+  end: number
+  rationale: string
+  source: 'ai'
+}
+type ManualTimestampConfig = {
+  enabled: boolean
+  autoAssist: boolean
+  markers: ManualTimestampMarker[]
+  suggestions: ManualTimestampSuggestion[]
+  requested: boolean
+  retentionDeltaEstimate: number | null
+  updatedAt?: string | null
+}
 type Retention2026Metrics = {
   introHold: number
   interruptDensity: number
@@ -1216,9 +1244,10 @@ type EditOptions = {
   longFormAggression: number
   longFormClarityVsSpeed: number
   tangentKiller: boolean
+  manualTimestampConfig?: ManualTimestampConfig | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
-type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
+type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type HookSelectionMode = 'manual' | 'auto'
 type LongFormPreset = 'auto' | 'balanced' | 'aggressive' | 'ultra'
 type EffectPreviewType = 'transitions' | 'swoosh' | 'zooms' | 'all' | 'auto'
@@ -1285,12 +1314,15 @@ const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
 const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
 const EFFECT_PREVIEW_PROXY_WIDTH = 854
 const EFFECT_PREVIEW_PROXY_HEIGHT = 480
-const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education', 'podcast']
+const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'education', 'podcast']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
+const MANUAL_TIMESTAMP_MARKER_TYPES: ManualTimestampMarkerType[] = ['keep', 'remove', 'hook']
+const MANUAL_TIMESTAMP_SUGGESTION_TYPES: ManualTimestampSuggestionType[] = ['hook', 'remove', 'cut']
 const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['auto', 'balanced', 'aggressive', 'ultra']
 const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, ContentStyle> = {
   reaction: 'reaction',
   commentary: 'story',
+  'savage-roast': 'reaction',
   vlog: 'vlog',
   gaming: 'gaming',
   sports: 'reaction',
@@ -1300,6 +1332,7 @@ const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, Content
 const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingNiche> = {
   reaction: 'high_energy',
   commentary: 'talking_head',
+  'savage-roast': 'high_energy',
   vlog: 'story',
   gaming: 'high_energy',
   sports: 'high_energy',
@@ -1983,6 +2016,7 @@ const resolveClipCandidateTarget = ({
   else if (minutes >= 40) target = 32
   else if (minutes >= 20) target = 24
   if (editorMode === 'sports') target += 5
+  else if (editorMode === 'savage-roast') target += 5
   else if (editorMode === 'reaction') target += 4
   else if (editorMode === 'gaming') target += 3
   else if (editorMode === 'podcast') target -= 3
@@ -2007,6 +2041,7 @@ const resolveAutoExportClipTarget = ({
   else if (minutes >= 60) target = 15
   else if (minutes >= 40) target = 12
   if (editorMode === 'sports') target += 3
+  else if (editorMode === 'savage-roast') target += 3
   else if (editorMode === 'reaction') target += 2
   else if (editorMode === 'gaming') target += 1
   else if (editorMode === 'podcast') target -= 2
@@ -2037,6 +2072,9 @@ const resolveInterruptIntervalRange = ({
   if (editorMode === 'sports') {
     minSec = 2
     maxSec = 3.6
+  } else if (editorMode === 'savage-roast') {
+    minSec = 2
+    maxSec = 3.4
   } else if (editorMode === 'gaming') {
     minSec = 2.1
     maxSec = 3.8
@@ -2118,6 +2156,9 @@ const computeNicheFitScore = ({
   const mode = editorMode && editorMode !== 'auto' ? editorMode : null
   if (mode === 'sports') {
     return clamp01(0.54 * action + 0.3 * emotion + 0.16 * curiosity)
+  }
+  if (mode === 'savage-roast') {
+    return clamp01(0.52 * action + 0.32 * emotion + 0.16 * curiosity)
   }
   if (mode === 'gaming') {
     return clamp01(0.5 * action + 0.28 * emotion + 0.22 * curiosity)
@@ -2892,15 +2933,14 @@ const parseHookSelectionMode = (
   value: any,
   fallback: HookSelectionMode | null = null
 ): HookSelectionMode | null => {
-  const normalizeResolved = (mode: HookSelectionMode | null) => (mode === 'manual' ? 'auto' : mode)
-  if (value === null || value === undefined) return normalizeResolved(fallback)
+  if (value === null || value === undefined) return fallback
   const normalized = String(value).trim().toLowerCase()
-  if (!normalized) return normalizeResolved(fallback)
+  if (!normalized) return fallback
   if (normalized === 'auto' || normalized === 'automatic' || normalized === 'editor') return 'auto'
-  if (normalized === 'manual' || normalized === 'user' || normalized === 'user_selected') return 'auto'
+  if (normalized === 'manual' || normalized === 'user' || normalized === 'user_selected') return 'manual'
   return (HOOK_SELECTION_MODE_VALUES as string[]).includes(normalized)
-    ? normalizeResolved(normalized as HookSelectionMode)
-    : normalizeResolved(fallback)
+    ? (normalized as HookSelectionMode)
+    : fallback
 }
 
 const parseBooleanFlag = (value: any): boolean | null => {
@@ -3171,7 +3211,7 @@ const getHookSelectionModeFromPayload = (payload?: any): HookSelectionMode | nul
     parseBooleanFlag((payload as any).manualHookSelection) ??
     parseBooleanFlag((payload as any).manual_hook_selection)
   )
-  if (manualFlag === true) return 'auto'
+  if (manualFlag === true) return 'manual'
   if (manualFlag === false) return 'auto'
   return (
     parseHookSelectionMode((payload as any).hookSelectionMode) ??
@@ -3181,6 +3221,219 @@ const getHookSelectionModeFromPayload = (payload?: any): HookSelectionMode | nul
     parseHookSelectionMode((payload as any).mode) ??
     null
   )
+}
+
+const parseManualTimestampMarkerType = (value: any): ManualTimestampMarkerType | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if ((MANUAL_TIMESTAMP_MARKER_TYPES as string[]).includes(normalized)) {
+    return normalized as ManualTimestampMarkerType
+  }
+  return null
+}
+
+const parseManualTimestampSuggestionType = (value: any): ManualTimestampSuggestionType | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if ((MANUAL_TIMESTAMP_SUGGESTION_TYPES as string[]).includes(normalized)) {
+    return normalized as ManualTimestampSuggestionType
+  }
+  if (normalized === 'keep') return 'cut'
+  return null
+}
+
+const parseManualRetentionDeltaEstimate = (value: any): number | null => {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Number(clamp(parsed, -100, 100).toFixed(2))
+}
+
+const parseManualTimestampMarker = (value: any, index: number): ManualTimestampMarker | null => {
+  if (!value || typeof value !== 'object') return null
+  const type = parseManualTimestampMarkerType(
+    (value as any).type ?? (value as any).markerType ?? (value as any).kind
+  )
+  if (!type) return null
+  const startRaw = Number((value as any).start ?? (value as any).from ?? (value as any).t0)
+  const endRaw = Number((value as any).end ?? (value as any).to ?? (value as any).t1)
+  if (!Number.isFinite(startRaw) || !Number.isFinite(endRaw)) return null
+  const start = Number(Math.max(0, startRaw).toFixed(3))
+  const end = Number(Math.max(start + 0.05, endRaw).toFixed(3))
+  const sourceRaw = String((value as any).source ?? '').trim().toLowerCase()
+  const source: ManualTimestampMarkerSource = sourceRaw === 'ai' ? 'ai' : 'user'
+  const rationale = typeof (value as any).rationale === 'string'
+    ? (value as any).rationale.trim().slice(0, 280)
+    : ''
+  const idSource = typeof (value as any).id === 'string' ? (value as any).id.trim() : ''
+  const id = idSource || `${type}_${index}_${Math.round(start * 1000)}_${Math.round(end * 1000)}`
+  return {
+    id,
+    type,
+    start,
+    end,
+    source,
+    ...(rationale ? { rationale } : {})
+  }
+}
+
+const parseManualTimestampSuggestion = (value: any, index: number): ManualTimestampSuggestion | null => {
+  if (!value || typeof value !== 'object') return null
+  const type = parseManualTimestampSuggestionType(
+    (value as any).type ?? (value as any).suggestionType ?? (value as any).kind
+  )
+  if (!type) return null
+  const startRaw = Number((value as any).start ?? (value as any).from ?? (value as any).t0)
+  const endRaw = Number((value as any).end ?? (value as any).to ?? (value as any).t1)
+  if (!Number.isFinite(startRaw) || !Number.isFinite(endRaw)) return null
+  const start = Number(Math.max(0, startRaw).toFixed(3))
+  const end = Number(Math.max(start + 0.05, endRaw).toFixed(3))
+  const rationaleRaw = typeof (value as any).rationale === 'string'
+    ? (value as any).rationale.trim()
+    : ''
+  const rationale = rationaleRaw || 'AI suggestion'
+  const idSource = typeof (value as any).id === 'string' ? (value as any).id.trim() : ''
+  const id = idSource || `suggest_${type}_${index}_${Math.round(start * 1000)}_${Math.round(end * 1000)}`
+  return {
+    id,
+    type,
+    start,
+    end,
+    rationale: rationale.slice(0, 280),
+    source: 'ai'
+  }
+}
+
+const parseManualTimestampConfig = (value: any): ManualTimestampConfig | null => {
+  if (!value || typeof value !== 'object') return null
+  const markersRaw = Array.isArray((value as any).markers)
+    ? (value as any).markers
+    : Array.isArray((value as any).manualMarkers)
+      ? (value as any).manualMarkers
+      : Array.isArray((value as any).manual_markers)
+        ? (value as any).manual_markers
+        : []
+  const suggestionsRaw = Array.isArray((value as any).suggestions)
+    ? (value as any).suggestions
+    : Array.isArray((value as any).manualSuggestions)
+      ? (value as any).manualSuggestions
+      : Array.isArray((value as any).manual_suggestions)
+        ? (value as any).manual_suggestions
+        : []
+  const markers = markersRaw
+    .map((entry: any, index: number) => parseManualTimestampMarker(entry, index))
+    .filter((entry: ManualTimestampMarker | null): entry is ManualTimestampMarker => Boolean(entry))
+    .slice(0, 160)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  const suggestions = suggestionsRaw
+    .map((entry: any, index: number) => parseManualTimestampSuggestion(entry, index))
+    .filter((entry: ManualTimestampSuggestion | null): entry is ManualTimestampSuggestion => Boolean(entry))
+    .slice(0, 60)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  const enabled = parseBooleanFlag(
+    (value as any).enabled ??
+    (value as any).manualMode ??
+    (value as any).manual_mode ??
+    (value as any).manualTimestampEditor ??
+    (value as any).manual_timestamp_editor ??
+    (value as any).manualTimestampEnabled ??
+    (value as any).manual_timestamp_enabled
+  )
+  const autoAssist = parseBooleanFlag(
+    (value as any).autoAssist ??
+    (value as any).auto_assist ??
+    (value as any).manualAutoAssist ??
+    (value as any).manual_auto_assist ??
+    (value as any).aiAssist ??
+    (value as any).ai_assist
+  ) ?? false
+  const requested = parseBooleanFlag(
+    (value as any).requested ??
+    (value as any).aiSuggestRequested ??
+    (value as any).ai_suggest_requested
+  ) ?? false
+  const retentionDeltaEstimate = parseManualRetentionDeltaEstimate(
+    (value as any).retentionDeltaEstimate ??
+    (value as any).manualRetentionDeltaEstimate ??
+    (value as any).manual_retention_delta_estimate ??
+    (value as any).retentionImpact
+  )
+  const updatedAtRaw = typeof (value as any).updatedAt === 'string'
+    ? (value as any).updatedAt.trim()
+    : typeof (value as any).manualUpdatedAt === 'string'
+      ? (value as any).manualUpdatedAt.trim()
+      : typeof (value as any).manual_updated_at === 'string'
+        ? (value as any).manual_updated_at.trim()
+        : ''
+  const hasSignal = (
+    enabled !== null ||
+    markers.length > 0 ||
+    suggestions.length > 0 ||
+    (value as any).manualTimestamp !== undefined ||
+    (value as any).manual_timestamp !== undefined
+  )
+  if (!hasSignal) return null
+  return {
+    enabled: enabled ?? markers.length > 0,
+    autoAssist,
+    markers,
+    suggestions,
+    requested: requested || suggestions.length > 0,
+    retentionDeltaEstimate,
+    updatedAt: updatedAtRaw || null
+  }
+}
+
+const buildManualTimestampPersistenceFields = (config?: ManualTimestampConfig | null) => {
+  const parsed = parseManualTimestampConfig(config)
+  if (!parsed) return {}
+  const updatedAt = parsed.updatedAt && parsed.updatedAt.trim().length > 0
+    ? parsed.updatedAt.trim()
+    : toIsoNow()
+  const payload = {
+    ...parsed,
+    updatedAt
+  }
+  return {
+    manualTimestamp: payload,
+    manual_timestamp: payload,
+    manualTimestampEditor: payload.enabled,
+    manual_timestamp_editor: payload.enabled,
+    manualTimestampEnabled: payload.enabled,
+    manual_timestamp_enabled: payload.enabled,
+    manualAutoAssist: payload.autoAssist,
+    manual_auto_assist: payload.autoAssist,
+    manualMarkers: payload.markers,
+    manual_markers: payload.markers,
+    manualSuggestions: payload.suggestions,
+    manual_suggestions: payload.suggestions,
+    manualRetentionDeltaEstimate: payload.retentionDeltaEstimate,
+    manual_retention_delta_estimate: payload.retentionDeltaEstimate,
+    manualUpdatedAt: updatedAt,
+    manual_updated_at: updatedAt
+  }
+}
+
+const getManualTimestampConfigFromPayload = (payload?: any): ManualTimestampConfig | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const nested = (payload as any).manualTimestamp ?? (payload as any).manual_timestamp
+  if (nested && typeof nested === 'object') {
+    return parseManualTimestampConfig(nested)
+  }
+  const hasInlineSignal = (
+    (payload as any).manualTimestampEditor !== undefined ||
+    (payload as any).manual_timestamp_editor !== undefined ||
+    (payload as any).manualTimestampEnabled !== undefined ||
+    (payload as any).manual_timestamp_enabled !== undefined ||
+    (payload as any).manualMarkers !== undefined ||
+    (payload as any).manual_markers !== undefined ||
+    (payload as any).manualSuggestions !== undefined ||
+    (payload as any).manual_suggestions !== undefined ||
+    (payload as any).manualAutoAssist !== undefined ||
+    (payload as any).manual_auto_assist !== undefined
+  )
+  if (!hasInlineSignal) return null
+  return parseManualTimestampConfig(payload)
 }
 
 const getLongFormPresetFromPayload = (payload?: any): LongFormPreset | null => {
@@ -3698,6 +3951,57 @@ const getHookSelectionModeFromJob = (job?: any): HookSelectionMode | null => {
   )
 }
 
+const getManualTimestampConfigFromJob = (job?: any): ManualTimestampConfig | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const nested = (
+    settings?.manualTimestamp ??
+    settings?.manual_timestamp ??
+    analysis?.manualTimestamp ??
+    analysis?.manual_timestamp
+  )
+  const parsedNested = parseManualTimestampConfig(nested)
+  if (parsedNested) return parsedNested
+  const composite = {
+    manualTimestampEditor:
+      settings?.manualTimestampEditor ??
+      settings?.manual_timestamp_editor ??
+      analysis?.manualTimestampEditor ??
+      analysis?.manual_timestamp_editor,
+    manualTimestampEnabled:
+      settings?.manualTimestampEnabled ??
+      settings?.manual_timestamp_enabled ??
+      analysis?.manualTimestampEnabled ??
+      analysis?.manual_timestamp_enabled,
+    manualAutoAssist:
+      settings?.manualAutoAssist ??
+      settings?.manual_auto_assist ??
+      analysis?.manualAutoAssist ??
+      analysis?.manual_auto_assist,
+    manualMarkers:
+      settings?.manualMarkers ??
+      settings?.manual_markers ??
+      analysis?.manualMarkers ??
+      analysis?.manual_markers,
+    manualSuggestions:
+      settings?.manualSuggestions ??
+      settings?.manual_suggestions ??
+      analysis?.manualSuggestions ??
+      analysis?.manual_suggestions,
+    manualRetentionDeltaEstimate:
+      settings?.manualRetentionDeltaEstimate ??
+      settings?.manual_retention_delta_estimate ??
+      analysis?.manualRetentionDeltaEstimate ??
+      analysis?.manual_retention_delta_estimate,
+    manualUpdatedAt:
+      settings?.manualUpdatedAt ??
+      settings?.manual_updated_at ??
+      analysis?.manualUpdatedAt ??
+      analysis?.manual_updated_at
+  }
+  return parseManualTimestampConfig(composite)
+}
+
 const getLongFormAggressionFromJob = (job?: any): number => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -3877,6 +4181,7 @@ const buildPersistedRenderSettings = (
     longFormAggression?: number | null
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
+    manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
   }
 ) => {
@@ -3899,6 +4204,7 @@ const buildPersistedRenderSettings = (
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
   const tangentKiller = typeof opts?.tangentKiller === 'boolean' ? opts.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
     ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
     : null
@@ -3935,6 +4241,7 @@ const buildPersistedRenderSettings = (
     ...(soundFx === null ? {} : { soundFx }),
     ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts }),
     ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode }),
+    ...(manualTimestampConfig ? buildManualTimestampPersistenceFields(manualTimestampConfig) : {}),
     ...(verticalCaptionConfig ? buildVerticalCaptionPersistenceFields(verticalCaptionConfig) : {})
   }
 }
@@ -3954,6 +4261,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression,
   longFormClarityVsSpeed,
   tangentKiller,
+  manualTimestampConfig,
   verticalCaptionConfig,
   retentionTargetPlatform,
   platformProfile
@@ -3972,6 +4280,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression?: number | null
   longFormClarityVsSpeed?: number | null
   tangentKiller?: boolean | null
+  manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
   platformProfile?: PlatformProfile | null
@@ -4056,6 +4365,11 @@ const buildPersistedRenderAnalysis = ({
         parseBooleanFlag((existing as any)?.removeTangents)
       )
   ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
+  const resolvedManualTimestampConfig = (
+    parseManualTimestampConfig(manualTimestampConfig) ??
+    parseManualTimestampConfig((existing as any)?.manualTimestamp ?? (existing as any)?.manual_timestamp) ??
+    parseManualTimestampConfig(existing)
+  )
   const verticalCrop = renderConfig.verticalMode?.webcamCrop
     ? {
         x: renderConfig.verticalMode.webcamCrop.x,
@@ -4156,6 +4470,9 @@ const buildPersistedRenderAnalysis = ({
   payload.long_form_clarity_vs_speed = resolvedLongFormClarityVsSpeed
   payload.tangentKiller = resolvedTangentKiller
   payload.tangent_killer = resolvedTangentKiller
+  if (resolvedManualTimestampConfig) {
+    Object.assign(payload, buildManualTimestampPersistenceFields(resolvedManualTimestampConfig))
+  }
   return normalizeAnalysisPayload(payload)
 }
 
@@ -7239,7 +7556,7 @@ const inferHighEnergyVerticalClip = ({
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
 }) => {
-  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') return true
+  if (editorMode === 'reaction' || editorMode === 'savage-roast' || editorMode === 'gaming' || editorMode === 'sports') return true
   if (styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') return true
   if (nicheProfile?.niche === 'high_energy') return true
   const energy = averageWindowMetric(
@@ -7272,6 +7589,9 @@ const buildAutoVerticalCaptionPool = ({
   }
   if (editorMode === 'podcast') {
     return ['Key point here 🎙️', 'Listen to this part 👂', 'Worth replaying 🔁']
+  }
+  if (editorMode === 'savage-roast') {
+    return ['BRO WHAT?! 😂', 'THAT IS COLD-BLOODED 💀', 'WHAT THE F*** JUST HAPPENED?! 🔥', 'CHAT IS LOSING IT 😭']
   }
   if (editorMode === 'gaming' || editorMode === 'sports' || styleProfile?.style === 'gaming') {
     return ['NO WAY 🤯', 'CLUTCH MOMENT 🎯', 'RUN IT BACK 🔁', 'THIS IS WILD 😤']
@@ -12639,6 +12959,7 @@ const buildVerticalClipSelection = (
 
   const highEnergyMode = (
     opts?.editorMode === 'reaction' ||
+    opts?.editorMode === 'savage-roast' ||
     opts?.editorMode === 'gaming' ||
     opts?.editorMode === 'sports' ||
     opts?.nicheProfile?.niche === 'high_energy' ||
@@ -12856,6 +13177,7 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   })
   let combined = 0.62 * platformBaseline + 0.38 * styleAlignedTarget
   if (editorMode === 'sports') combined -= 0.35
+  else if (editorMode === 'savage-roast') combined -= 0.32
   else if (editorMode === 'gaming') combined -= 0.24
   else if (editorMode === 'reaction') combined -= 0.18
   else if (editorMode === 'education') combined += 0.28
@@ -12887,6 +13209,9 @@ type VerticalModeScoreBias = {
 const getVerticalModeScoreBias = (editorMode?: EditorModeSelection | null): VerticalModeScoreBias => {
   if (editorMode === 'sports') {
     return { hook: 0.02, interrupt: 0.08, ending: 0.03, energy: 0.05, caption: -0.02 }
+  }
+  if (editorMode === 'savage-roast') {
+    return { hook: 0.04, interrupt: 0.08, ending: 0.02, energy: 0.06, caption: -0.02 }
   }
   if (editorMode === 'gaming') {
     return { hook: 0.02, interrupt: 0.06, ending: 0.01, energy: 0.04, caption: -0.01 }
@@ -14656,6 +14981,140 @@ const buildTimelineWithHookAtStartForTest = (segments: Segment[], hook: HookCand
   return [{ ...hookRange, speed: 1 }, ...withoutHook]
 }
 
+type ManualTimelineRenderPlan = {
+  active: boolean
+  keepRanges: TimeRange[]
+  removeRanges: TimeRange[]
+  hookRange: TimeRange | null
+  hookSource: 'user-set' | 'ai-suggested' | 'none'
+  segments: Segment[]
+  retentionImpact: number | null
+  warnings: string[]
+  microHookSuggestions: TimeRange[]
+  structuredOutput: {
+    manualMode: 'ON'
+    hook: string
+    userCuts: string[]
+    removals: string[]
+    retentionImpact: string
+    aiSuggestions: string[]
+  }
+}
+
+const normalizeManualRangeForDuration = (range: TimeRange, durationSeconds: number): TimeRange | null => {
+  const start = Number(clamp(Number(range.start || 0), 0, Math.max(0, durationSeconds - 0.05)).toFixed(3))
+  const end = Number(clamp(Number(range.end || 0), start + 0.05, Math.max(start + 0.05, durationSeconds)).toFixed(3))
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 0.05) return null
+  return { start, end }
+}
+
+const buildManualTimelineRenderPlan = ({
+  config,
+  durationSeconds
+}: {
+  config?: ManualTimestampConfig | null
+  durationSeconds: number
+}): ManualTimelineRenderPlan | null => {
+  if (!config?.enabled || !Number.isFinite(durationSeconds) || durationSeconds <= 0.1) return null
+  const keepRanges = mergeRanges(
+    config.markers
+      .filter((marker) => marker.type === 'keep')
+      .map((marker) => normalizeManualRangeForDuration({ start: marker.start, end: marker.end }, durationSeconds))
+      .filter((range: TimeRange | null): range is TimeRange => Boolean(range))
+  )
+  const removeRanges = mergeRanges(
+    config.markers
+      .filter((marker) => marker.type === 'remove')
+      .map((marker) => normalizeManualRangeForDuration({ start: marker.start, end: marker.end }, durationSeconds))
+      .filter((range: TimeRange | null): range is TimeRange => Boolean(range))
+  )
+  const baseKeepRanges = keepRanges.length
+    ? keepRanges
+    : [{ start: 0, end: Number(durationSeconds.toFixed(3)) }]
+  let effectiveKeepSegments = baseKeepRanges.map((range) => ({ start: range.start, end: range.end, speed: 1 }))
+  if (removeRanges.length) {
+    effectiveKeepSegments = subtractRanges(effectiveKeepSegments, removeRanges)
+  }
+  if (!effectiveKeepSegments.length) {
+    const fallbackEnd = Number(clamp(durationSeconds * 0.35, 0.6, durationSeconds).toFixed(3))
+    effectiveKeepSegments = [{ start: 0, end: fallbackEnd, speed: 1 }]
+  }
+  const hookMarker = config.markers.find((marker) => marker.type === 'hook' && marker.source === 'user')
+    || config.markers.find((marker) => marker.type === 'hook')
+    || null
+  const hookRange = hookMarker
+    ? normalizeManualRangeForDuration({ start: hookMarker.start, end: hookMarker.end }, durationSeconds)
+    : null
+  const hookSource: 'user-set' | 'ai-suggested' | 'none' = !hookMarker
+    ? 'none'
+    : (hookMarker.source === 'ai' ? 'ai-suggested' : 'user-set')
+  const segments = hookRange
+    ? [{ start: hookRange.start, end: hookRange.end, speed: 1, emphasize: true }, ...subtractRange(
+        effectiveKeepSegments.map((segment) => ({ ...segment })),
+        hookRange
+      )]
+    : effectiveKeepSegments.map((segment) => ({ ...segment }))
+  const keepDuration = segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start), 0)
+  const removedSeconds = Math.max(0, durationSeconds - keepDuration)
+  const removedRatio = clamp01(removedSeconds / Math.max(0.1, durationSeconds))
+  const longestSegment = segments.reduce((max, segment) => Math.max(max, segment.end - segment.start), 0)
+  let retentionImpact = 0
+  if (hookRange && hookRange.start <= 0.35) retentionImpact += 8
+  else if (hookRange) retentionImpact += 4
+  else retentionImpact -= 2
+  retentionImpact += Math.min(6, segments.length * 0.8)
+  if (removedRatio > 0.4) {
+    retentionImpact -= Math.min(15, 4 + (removedRatio - 0.4) * 42)
+  }
+  if (longestSegment > 45) {
+    retentionImpact -= Math.min(10, (longestSegment - 45) / 9)
+  }
+  const warnings: string[] = []
+  if (removedRatio > 0.4) {
+    warnings.push('Warning: removing >40% may hurt retention.')
+  }
+  const microHookSuggestions: TimeRange[] = []
+  if (durationSeconds >= 180) {
+    for (let anchor = 150; anchor < durationSeconds - 20 && microHookSuggestions.length < 12; anchor += 150) {
+      const start = Number(anchor.toFixed(3))
+      const end = Number(Math.min(durationSeconds, anchor + 3).toFixed(3))
+      if (end > start + 0.2) {
+        microHookSuggestions.push({ start, end })
+      }
+    }
+    if (microHookSuggestions.length) {
+      warnings.push('Suggestion: add micro-hooks every 2-3 minutes for long-form retention.')
+    }
+  }
+  const aiSuggestions = (config.suggestions || []).map((suggestion) => (
+    `${suggestion.type.toUpperCase()} ${formatHookRange(suggestion.start, suggestion.end)} :: ${suggestion.rationale}`
+  ))
+  return {
+    active: true,
+    keepRanges: baseKeepRanges,
+    removeRanges,
+    hookRange,
+    hookSource,
+    segments,
+    retentionImpact: Number(clamp(retentionImpact, -25, 25).toFixed(2)),
+    warnings,
+    microHookSuggestions,
+    structuredOutput: {
+      manualMode: 'ON',
+      hook: hookRange
+        ? `${hookSource} (${formatHookRange(hookRange.start, hookRange.end)})`
+        : (config.autoAssist ? 'AI-suggested (not pinned)' : 'none'),
+      userCuts: [
+        ...baseKeepRanges.map((range) => `KEEP ${formatHookRange(range.start, range.end)}`),
+        ...removeRanges.map((range) => `REMOVE ${formatHookRange(range.start, range.end)}`)
+      ],
+      removals: removeRanges.map((range) => formatHookRange(range.start, range.end)),
+      retentionImpact: `${Number(clamp(retentionImpact, -25, 25).toFixed(2)) >= 0 ? '+' : ''}${Number(clamp(retentionImpact, -25, 25).toFixed(2))} pts`,
+      aiSuggestions
+    }
+  }
+}
+
 const boostSegmentsForRetention = (
   segments: Segment[],
   windows: EngagementWindow[],
@@ -14780,6 +15239,7 @@ const getEditOptionsForUser = async (
     longFormAggression?: number | null
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
+    manualTimestampConfig?: ManualTimestampConfig | null
   }
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
@@ -14844,6 +15304,10 @@ const getEditOptionsForUser = async (
         parseBooleanFlag((settings as any)?.removeTangents)
       )
   ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
+  const manualTimestampConfig = (
+    parseManualTimestampConfig(overrides?.manualTimestampConfig) ??
+    parseManualTimestampConfig((settings as any)?.manualTimestamp ?? (settings as any)?.manual_timestamp)
+  )
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   const requestedStrategy = parseRetentionStrategyProfile(
     overrides?.retentionStrategyProfile ??
@@ -14885,7 +15349,8 @@ const getEditOptionsForUser = async (
     longFormPreset,
     longFormAggression,
     longFormClarityVsSpeed,
-    tangentKiller
+    tangentKiller,
+    manualTimestampConfig
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
@@ -15381,10 +15846,17 @@ const processJob = async (
   let platformProfileId = requestedPlatformProfileId
   const requestedEditorModeRaw = parseEditorModeSelection(options.editorMode ?? getEditorModeFromJob(job) ?? 'auto')
   let requestedEditorMode: EditorModeSelection | null = requestedEditorModeRaw
-  const requestedHookSelectionMode = parseHookSelectionMode(
+  let requestedHookSelectionMode = parseHookSelectionMode(
     options.hookSelectionMode ?? getHookSelectionModeFromJob(job),
     'auto'
   ) || 'auto'
+  const requestedManualTimestampConfig = (
+    parseManualTimestampConfig(options.manualTimestampConfig) ??
+    getManualTimestampConfigFromJob(job)
+  )
+  if (requestedManualTimestampConfig?.enabled) {
+    requestedHookSelectionMode = 'manual'
+  }
   const outcomeMenuProfile = await loadOutcomeMenuProfile(user.id, {
     requestedStrategy: requestedStrategyProfile,
     requestedTargetPlatform: retentionTargetPlatform,
@@ -15431,6 +15903,7 @@ const processJob = async (
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
   const hookSelectionModeForRender: HookSelectionMode = requestedHookSelectionMode
   options.hookSelectionMode = hookSelectionModeForRender
+  options.manualTimestampConfig = requestedManualTimestampConfig
   requestedAggressionLevel = parseRetentionAggressionLevel(
     STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel
   )
@@ -15927,7 +16400,11 @@ const processJob = async (
                 mode: 'local',
                 updatedAt: toIsoNow()
               }
-            : ((job.analysis as any)?.output_upload_fallback ?? null)
+            : ((job.analysis as any)?.output_upload_fallback ?? null),
+          ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
+          manual_override_plan: null,
+          manual_micro_hook_suggestions: [],
+          manual_warnings: []
         },
         renderConfig: finalRenderConfig,
         retentionTargetPlatform: retentionTargetPlatform,
@@ -15935,6 +16412,7 @@ const processJob = async (
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
         editorMode: editorModeForRender,
+        manualTimestampConfig: requestedManualTimestampConfig,
         longFormPreset: options.longFormPreset,
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
@@ -16001,6 +16479,7 @@ const processJob = async (
           longFormAggression: options.longFormAggression,
           longFormClarityVsSpeed: options.longFormClarityVsSpeed,
           tangentKiller: options.tangentKiller,
+          manualTimestampConfig: requestedManualTimestampConfig,
           verticalCaptionConfig
         }),
         analysis: nextAnalysis
@@ -16092,6 +16571,7 @@ const processJob = async (
     let selectedAutoEscalationEvents: AutoEscalationEvent[] = autoEscalationEventsForAnalysis
     let audioProfileForAnalysis: AudioStreamProfile | null = null
     let audioFiltersForAnalysis: string[] = []
+    let manualTimelinePlanForAnalysis: ManualTimelineRenderPlan | null = null
     if (hasFfmpeg()) {
       const qualityTarget = getTargetDimensions(finalQuality)
       const sourceProbe = probeVideoStream(tmpIn)
@@ -16914,6 +17394,141 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
         }
+      }
+
+      const manualTimelinePlan = buildManualTimelineRenderPlan({
+        config: requestedManualTimestampConfig,
+        durationSeconds
+      })
+      if (manualTimelinePlan?.active) {
+        manualTimelinePlanForAnalysis = manualTimelinePlan
+        finalSegments = manualTimelinePlan.segments.map((segment) => ({ ...segment }))
+        const manualHookCandidate = manualTimelinePlan.hookRange
+          ? {
+              start: manualTimelinePlan.hookRange.start,
+              duration: Number(Math.max(0.2, manualTimelinePlan.hookRange.end - manualTimelinePlan.hookRange.start).toFixed(3)),
+              score: 0.82,
+              auditScore: 0.82,
+              auditPassed: true,
+              text: '',
+              reason: manualTimelinePlan.hookSource === 'ai-suggested'
+                ? 'AI-suggested hook accepted in Manual Timestamp Editor.'
+                : 'User-set hook from Manual Timestamp Editor.',
+              synthetic: false
+            } as HookCandidate
+          : null
+        if (manualHookCandidate) {
+          selectedHook = manualHookCandidate
+          selectedHookSelectionSource = manualTimelinePlan.hookSource === 'ai-suggested' ? 'auto' : 'user_selected'
+          hookVariantsForAnalysis = [
+            manualHookCandidate,
+            ...hookVariantsForAnalysis.filter((candidate) => (
+              Math.abs(candidate.start - manualHookCandidate.start) > 0.01 ||
+              Math.abs(candidate.duration - manualHookCandidate.duration) > 0.01
+            ))
+          ]
+        } else if (!requestedManualTimestampConfig?.autoAssist) {
+          const fallbackSegment = finalSegments[0]
+          if (fallbackSegment) {
+            selectedHook = {
+              start: fallbackSegment.start,
+              duration: Number(clamp(fallbackSegment.end - fallbackSegment.start, HOOK_MIN, HOOK_MAX).toFixed(3)),
+              score: 0.58,
+              auditScore: 0.58,
+              auditPassed: true,
+              text: '',
+              reason: 'Manual mode with no explicit hook; first kept segment used as opening context.',
+              synthetic: true
+            }
+            selectedHookSelectionSource = 'fallback'
+          }
+        }
+        const manualHookForJudge = selectedHook || initialHook
+        selectedHook = manualHookForJudge
+        selectedPatternInterruptCount = 0
+        selectedPatternInterruptDensity = 0
+        selectedBoredomRemovalRatio = clamp01(
+          (durationSeconds - getRangesDurationSeconds(manualTimelinePlan.keepRanges)) / Math.max(0.1, durationSeconds)
+        )
+        selectedStrategy = 'BASELINE'
+        selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+          sourceStart: Number(segment.start.toFixed(3)),
+          sourceEnd: Number(segment.end.toFixed(3)),
+          orderedIndex
+        }))
+        const manualRetention = computeRetentionScore(
+          finalSegments,
+          editPlan?.engagementWindows ?? [],
+          clamp01(Number(manualHookForJudge?.score ?? 0.6)),
+          options.autoCaptions,
+          {
+            removedRanges: manualTimelinePlan.removeRanges,
+            patternInterruptCount: selectedPatternInterruptCount,
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            editorMode: editorModeForRender,
+            styleProfile: styleProfileForAnalysis,
+            nicheProfile: nicheProfileForAnalysis
+          }
+        )
+        const manualJudgeRaw = buildRetentionJudgeReport({
+          retentionScore: manualRetention,
+          hook: manualHookForJudge,
+          windows: editPlan?.engagementWindows ?? [],
+          clarityPenalty: 0.06,
+          captionsEnabled: options.autoCaptions,
+          patternInterruptCount: selectedPatternInterruptCount,
+          removedRanges: manualTimelinePlan.removeRanges,
+          segments: finalSegments,
+          thresholds: qualityGateThresholds,
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          strategyProfile
+        })
+        selectedJudge = {
+          ...manualJudgeRaw,
+          passed: true,
+          gate_mode: 'adaptive',
+          why_keep_watching: [
+            ...manualJudgeRaw.why_keep_watching.slice(0, 2),
+            'Manual timestamp overrides are prioritized over automatic pacing decisions.'
+          ].slice(0, 3)
+        }
+        retentionScore = selectedJudge.retention_score
+        retentionAttempts = [
+          {
+            attempt: 1,
+            strategy: 'BASELINE',
+            judge: selectedJudge,
+            hook: manualHookForJudge,
+            patternInterruptCount: selectedPatternInterruptCount,
+            patternInterruptDensity: selectedPatternInterruptDensity,
+            boredomRemovalRatio: selectedBoredomRemovalRatio
+          }
+        ]
+        qualityGateOverride = {
+          applied: true,
+          reason: 'Manual Timestamp Editor override applied: user markers prioritized over auto decisions.'
+        }
+        optimizationNotes.push(
+          `Manual Timestamp Editor active: ${manualTimelinePlan.structuredOutput.hook}`,
+          `Manual retention heuristic: ${manualTimelinePlan.structuredOutput.retentionImpact}`
+        )
+        for (const warning of manualTimelinePlan.warnings) {
+          optimizationNotes.push(warning)
+        }
+        await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
+          status: 'completed',
+          completedAt: toIsoNow(),
+          meta: {
+            selectedHook: manualHookForJudge,
+            hookSelectionMode: 'manual',
+            hookSelectionSource: selectedHookSelectionSource,
+            manualTimestampEditor: true,
+            manualHookSource: manualTimelinePlan.hookSource
+          }
+        })
       }
 
       const baselineWindows = editPlan?.engagementWindows ?? engagementWindowsForAnalysis
@@ -17759,7 +18374,11 @@ const processJob = async (
           editorMode: editorModeForRender,
           qualityGateOffset: combinedQualityGateOffset,
           hookThresholdOffset
-        }
+        },
+        ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
+        manual_override_plan: manualTimelinePlanForAnalysis?.structuredOutput ?? null,
+        manual_micro_hook_suggestions: manualTimelinePlanForAnalysis?.microHookSuggestions ?? [],
+        manual_warnings: manualTimelinePlanForAnalysis?.warnings ?? []
       },
       renderConfig,
       retentionTargetPlatform: retentionTargetPlatform,
@@ -17772,6 +18391,7 @@ const processJob = async (
       longFormAggression: options.longFormAggression,
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
+      manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
       outputPaths
     })
@@ -17803,6 +18423,7 @@ const processJob = async (
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
+        manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: persistedVerticalCaptionConfig
       }),
       analysis: nextAnalysis
@@ -17865,6 +18486,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         longFormAggression: getLongFormAggressionFromJob(existing),
         longFormClarityVsSpeed: getLongFormClarityVsSpeedFromJob(existing),
         tangentKiller: getTangentKillerFromJob(existing),
+        manualTimestampConfig: getManualTimestampConfigFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       })
@@ -18216,6 +18838,8 @@ const handleCreateJob = async (req: any, res: any) => {
     const longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
+    const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -18320,6 +18944,7 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormAggression: longFormAggressionOverride,
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
             tangentKiller: tangentKillerOverride,
+            manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride
           }),
           algorithm_config_version_id: configSelection.config_version_id,
@@ -18358,7 +18983,8 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(longFormPresetOverride === null ? {} : { longFormPreset: longFormPresetOverride, longformPreset: longFormPresetOverride, longform_preset: longFormPresetOverride }),
             ...(longFormAggressionOverride === null ? {} : { longFormAggression: longFormAggressionOverride, longformAggression: longFormAggressionOverride, long_form_aggression: longFormAggressionOverride }),
             ...(longFormClarityVsSpeedOverride === null ? {} : { longFormClarityVsSpeed: longFormClarityVsSpeedOverride, longformClarityVsSpeed: longFormClarityVsSpeedOverride, long_form_clarity_vs_speed: longFormClarityVsSpeedOverride }),
-            ...(tangentKillerOverride === null ? {} : { tangentKiller: tangentKillerOverride, tangent_killer: tangentKillerOverride })
+            ...(tangentKillerOverride === null ? {} : { tangentKiller: tangentKillerOverride, tangent_killer: tangentKillerOverride }),
+            ...(manualTimestampConfigOverride ? buildManualTimestampPersistenceFields(manualTimestampConfigOverride) : {})
           },
           renderConfig,
           retentionTargetPlatform,
@@ -18374,6 +19000,7 @@ const handleCreateJob = async (req: any, res: any) => {
           longFormAggression: longFormAggressionOverride,
           longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
           tangentKiller: tangentKillerOverride,
+          manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
           outputPaths: null
         })
@@ -18905,6 +19532,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
     const resolvedLongFormClarityVsSpeed = longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job)
     const resolvedTangentKiller = tangentKillerOverride ?? getTangentKillerFromJob(job)
+    const resolvedManualTimestampConfig = manualTimestampConfigOverride ?? getManualTimestampConfigFromJob(job)
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -18963,6 +19591,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
+      ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
@@ -18997,7 +19626,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       longformClarityVsSpeed: resolvedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
-      tangent_killer: resolvedTangentKiller
+      tangent_killer: resolvedTangentKiller,
+      ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {})
     }
 
     const { plan, tier } = await getUserPlan(req.user.id)
@@ -19083,6 +19713,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -19110,6 +19742,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
@@ -19144,7 +19777,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -19161,6 +19795,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
+      manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -19231,6 +19866,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -19258,6 +19894,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
@@ -19292,7 +19929,8 @@ router.post('/:id/process', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -19309,6 +19947,7 @@ router.post('/:id/process', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
+      manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -19625,7 +20264,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -19662,6 +20302,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }

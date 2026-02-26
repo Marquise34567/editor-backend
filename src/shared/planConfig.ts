@@ -33,10 +33,10 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     name: 'Founder',
     priceMonthly: 149,
     priceLabel: '$149',
-    description: 'Limited lifetime access for the first 100 builders.',
-    maxRendersPerMonth: 500,
+    description: 'Lifetime plan for the first 100 users.',
+    maxRendersPerMonth: 5000,
     maxRerendersPerDay: 50,
-    maxMinutesPerMonth: null,
+    maxMinutesPerMonth: 500,
     exportQuality: '4k',
     watermark: false,
     priority: true,
@@ -48,13 +48,14 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     badge: 'founder',
     features: [
       'Lifetime access',
-      '500 renders / month',
+      '500 minutes / month forever',
       '4K exports',
-      'All subtitle presets',
-      'Full auto zoom up to 1.15',
       'Priority queue',
-      'Future features included',
-      'Founder badge',
+      'All premium features',
+      'First 100 users only',
+      '5000 renders / month',
+      'No recurring billing',
+      'All subtitle presets',
       'Locked price forever'
     ]
   },
@@ -66,7 +67,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     description: 'For trying AutoEditor on small projects.',
     maxRendersPerMonth: 10,
     maxRerendersPerDay: 3,
-    maxMinutesPerMonth: null,
+    maxMinutesPerMonth: 10,
     exportQuality: '720p',
     watermark: true,
     priority: false,
@@ -77,10 +78,11 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     includesFutureFeatures: false,
     badge: null,
     features: [
+      '10 minutes / month',
       '720p exports',
-      '10 renders / month',
       'Watermark',
       'Standard queue',
+      '3 renders / day',
       'Subtitles: 1 preset',
       'Auto zoom max 1.10'
     ]
@@ -93,7 +95,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     description: 'For creators publishing regularly.',
     maxRendersPerMonth: 20,
     maxRerendersPerDay: 8,
-    maxMinutesPerMonth: null,
+    maxMinutesPerMonth: 60,
     exportQuality: '1080p',
     watermark: false,
     priority: false,
@@ -104,13 +106,13 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     includesFutureFeatures: true,
     badge: null,
     features: [
+      '60 minutes / month',
       '1080p exports',
       '20 renders / month',
       'No watermark',
+      'Standard queue',
       'Subtitles: 4 presets',
-      'Auto zoom max 1.12',
-      'High-energy animated captions',
-      'Future features included'
+      'Auto zoom max 1.12'
     ]
   },
   creator: {
@@ -118,13 +120,13 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     name: 'Creator',
     priceMonthly: 29,
     priceLabel: '$29',
-    description: 'For teams shipping content at scale.',
+    description: 'For creators scaling output.',
     maxRendersPerMonth: 100,
     maxRerendersPerDay: 25,
-    maxMinutesPerMonth: null,
+    maxMinutesPerMonth: 300,
     exportQuality: '4k',
     watermark: false,
-    priority: false,
+    priority: true,
     allowedSubtitlePresets: 'ALL',
     autoZoomMax: 1.15,
     advancedEffects: false,
@@ -132,13 +134,14 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     includesFutureFeatures: true,
     badge: 'popular',
     features: [
+      '300 minutes / month',
       '4K exports',
       '100 renders / month',
       'No watermark',
+      'Priority queue',
       'Subtitles: All presets',
-      'Karaoke highlight',
-      'Auto zoom max 1.15',
-      'Future features included'
+      'All presets',
+      'Auto zoom max 1.15'
     ]
   },
   studio: {
@@ -149,7 +152,7 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     description: 'For studios that need priority and scale.',
     maxRendersPerMonth: 5000,
     maxRerendersPerDay: 250,
-    maxMinutesPerMonth: null,
+    maxMinutesPerMonth: 1500,
     exportQuality: '4k',
     watermark: false,
     priority: true,
@@ -160,13 +163,14 @@ export const PLAN_CONFIG: Record<PlanTier, PlanConfig> = {
     includesFutureFeatures: true,
     badge: null,
     features: [
+      '1500 minutes / month',
       '4K exports',
-      '5000 renders / month',
       'Priority queue',
+      'All features',
+      'Unlimited team members',
+      '5000 renders / month',
       'All subtitle styles',
-      'Full zoom control up to 1.15',
-      'Advanced effects',
-      'Future features included'
+      'Advanced effects'
     ]
   }
 }

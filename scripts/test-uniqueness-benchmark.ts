@@ -19,7 +19,7 @@ if (typeof buildUniquenessSignatureForTest !== 'function') {
 }
 
 const run = () => {
-  const modes = ['reaction', 'commentary', 'vlog', 'gaming', 'sports', 'podcast'] as const
+  const modes = ['reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'podcast'] as const
   const vibes = [
     {
       key: 'grounded',
@@ -86,7 +86,7 @@ const run = () => {
     `[uniqueness] factor-sensitivity run: ${factorTotal} scenarios, ${factorUniqueCount} unique signatures (${(factorRatio * 100).toFixed(1)}%).`
   )
 
-  const propagationModes = ['reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education', 'podcast'] as const
+  const propagationModes = ['reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'education', 'podcast'] as const
   const strategies = ['safe', 'balanced', 'viral'] as const
   const platforms = ['youtube', 'tiktok', 'instagram_reels'] as const
   const payloadProfiles = [
@@ -118,7 +118,7 @@ const run = () => {
       ))
     ))
   ))
-  assert.strictEqual(propagationScenarios.length, 126, 'propagation benchmark should evaluate 126 scenarios')
+  assert.strictEqual(propagationScenarios.length, 144, 'propagation benchmark should evaluate 144 scenarios')
 
   const persistedSignatureSet = new Set<string>()
   for (const scenario of propagationScenarios) {

@@ -322,7 +322,7 @@ const applyPromptPresetIntent = ({
 }
 
 type PlatformModeSelection = 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'long_form'
-type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
+type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type RetentionTiltSelection = 'safe' | 'balanced' | 'viral'
 type EntertainmentLevelSelection = 'high' | 'medium' | 'low'
 type FormatSelection = 'short' | 'long'
@@ -437,6 +437,7 @@ const normalizeContentTypeModeSelection = (raw: string): ContentTypeModeSelectio
   if (/(^| )auto( |$)/.test(value)) matches.push('auto')
   if (/(^| )reaction( |$)/.test(value)) matches.push('reaction')
   if (/(^| )commentary( |$)/.test(value)) matches.push('commentary')
+  if (/(^| )(savage[\s-]?roast|roast commentary)( |$)/.test(value)) matches.push('savage-roast')
   if (/(^| )vlog( |$)/.test(value)) matches.push('vlog')
   if (/(^| )gaming( |$)/.test(value)) matches.push('gaming')
   if (/(^| )sports?( |$)/.test(value)) matches.push('sports')
@@ -518,6 +519,7 @@ const resolveContentTypeModeFromPrompt = (prompt: string): ContentTypeModeSelect
       { mode: 'auto', pattern: /\bauto\b/i },
       { mode: 'reaction', pattern: /\breaction\b/i },
       { mode: 'commentary', pattern: /\bcommentary\b/i },
+      { mode: 'savage-roast', pattern: /\b(savage[\s-]?roast|roast\s+commentary)\b/i },
       { mode: 'vlog', pattern: /\bvlog\b/i },
       { mode: 'gaming', pattern: /\bgaming\b/i },
       { mode: 'sports', pattern: /\bsports?\b/i },
@@ -584,6 +586,7 @@ const resolveNicheLabelFromPrompt = (prompt: string): string | null => {
 const inferContentTypeModeFromNiche = (nicheRaw: string): ContentTypeModeSelection | null => {
   const niche = String(nicheRaw || '').toLowerCase()
   if (!niche) return null
+  if (/\b(roast|savage|prank|dating\s+show|chaotic\s+interview|drama)\b/.test(niche)) return 'savage-roast'
   if (/\b(podcast|interview|roundtable|talk\s*show|multi[-\s]?speaker)\b/.test(niche)) return 'podcast'
   if (/\b(gameplay|gaming|fps|stream|montage|frag|battle\s*royale)\b/.test(niche)) return 'gaming'
   if (/\b(sports?|highlight|mma|boxing|soccer|nba|nfl|extreme\s+sports?)\b/.test(niche)) return 'sports'
@@ -799,6 +802,20 @@ const CONTENT_MODE_OVERLAYS: Record<ContentTypeModeSelection, {
     },
     subtitleMode: 'commentary_transcriptive',
     reason: 'Commentary overlay'
+  },
+  'savage-roast': {
+    delta: {
+      cut_aggression: 16,
+      pacing_multiplier: 0.24,
+      pattern_interrupt_every_sec: -2.4,
+      spike_boost: 0.56,
+      hook_priority_weight: 0.28,
+      story_coherence_guard: -12,
+      jank_guard: -12,
+      energy_floor: 0.12
+    },
+    subtitleMode: 'savage_roast_burst_caps',
+    reason: 'Savage roast commentary overlay'
   },
   vlog: {
     delta: {
