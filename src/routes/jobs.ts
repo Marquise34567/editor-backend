@@ -948,7 +948,8 @@ type EditOptions = {
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education'
 type HookSelectionMode = 'manual' | 'auto'
-type LongFormPreset = 'balanced' | 'aggressive' | 'ultra'
+type LongFormPreset = 'auto' | 'balanced' | 'aggressive' | 'ultra'
+type ConcreteLongFormPreset = Exclude<LongFormPreset, 'auto'>
 type ContentStyleProfile = {
   style: ContentStyle
   confidence: number
@@ -985,6 +986,8 @@ type VideoNicheProfile = {
 
 const HOOK_MIN = EDITOR_RETENTION_CONFIG.hookMin
 const HOOK_MAX = EDITOR_RETENTION_CONFIG.hookMax
+const AUTO_HOOK_DURATION_MIN_SECONDS = 5
+const AUTO_HOOK_DURATION_MAX_SECONDS = 8
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -999,7 +1002,7 @@ const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
 const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
-const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['balanced', 'aggressive', 'ultra']
+const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['auto', 'balanced', 'aggressive', 'ultra']
 const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, ContentStyle> = {
   reaction: 'reaction',
   commentary: 'vlog',
@@ -2107,7 +2110,7 @@ type LongFormPresetConfig = {
   enforceFillerRemoval: boolean
   sentenceTightening: boolean
 }
-const LONG_FORM_PRESET_CONFIG: Record<LongFormPreset, LongFormPresetConfig> = {
+const LONG_FORM_PRESET_CONFIG: Record<ConcreteLongFormPreset, LongFormPresetConfig> = {
   balanced: {
     maxSilenceSeconds: 0.28,
     maxGapBetweenMeaningfulMoments: 4,
@@ -2154,6 +2157,7 @@ type LongFormRuntimeTuning = LongFormPresetConfig & {
 }
 const parseLongFormPreset = (value?: any): LongFormPreset => {
   const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'auto' || raw === 'automatic' || raw === 'adaptive') return 'auto'
   if (raw === 'aggressive') return 'aggressive'
   if (raw === 'ultra') return 'ultra'
   return 'balanced'
@@ -2170,10 +2174,31 @@ const parseLongFormClarityVsSpeed = (value?: any): number | null => {
   if (!Number.isFinite(numeric)) return null
   return Math.round(clamp(numeric, LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX))
 }
-const resolveLongFormPresetByAggression = (aggression: number): LongFormPreset => {
+const resolveLongFormPresetByAggression = (aggression: number): ConcreteLongFormPreset => {
   if (aggression >= 85) return 'ultra'
   if (aggression >= 55) return 'aggressive'
   return 'balanced'
+}
+const resolveAutoLongFormPreset = ({
+  aggression,
+  clarityVsSpeed,
+  durationSeconds
+}: {
+  aggression: number
+  clarityVsSpeed: number
+  durationSeconds: number
+}): ConcreteLongFormPreset => {
+  const base = resolveLongFormPresetByAggression(aggression)
+  const runtimeMinutes = Math.max(0, Number(durationSeconds || 0)) / 60
+  const clarityBias = clamp(Math.round(clarityVsSpeed), LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX)
+  if (runtimeMinutes >= 45) {
+    if (base === 'ultra') return 'aggressive'
+    if (base === 'aggressive' && clarityBias >= 65) return 'balanced'
+  }
+  if (runtimeMinutes <= 18 && clarityBias <= 42 && aggression >= 68) {
+    return 'ultra'
+  }
+  return base
 }
 const resolveLongFormRuntimeTuning = ({
   durationSeconds,
@@ -2190,7 +2215,14 @@ const resolveLongFormRuntimeTuning = ({
 }): LongFormRuntimeTuning => {
   const safeAggression = clamp(Math.round(aggression), LONG_FORM_AGGRESSION_MIN, LONG_FORM_AGGRESSION_MAX)
   const safeClarity = clamp(Math.round(clarityVsSpeed), LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX)
-  const presetConfig = LONG_FORM_PRESET_CONFIG[preset]
+  const resolvedPreset: ConcreteLongFormPreset = preset === 'auto'
+    ? resolveAutoLongFormPreset({
+        aggression: safeAggression,
+        clarityVsSpeed: safeClarity,
+        durationSeconds
+      })
+    : preset
+  const presetConfig = LONG_FORM_PRESET_CONFIG[resolvedPreset]
   const speedBias = clamp01(1 - safeClarity / 100)
   const aggressionBias = clamp01(safeAggression / 100)
   const blendedThresholdDrop = 0.18 * aggressionBias + 0.08 * speedBias
@@ -2217,7 +2249,7 @@ const resolveLongFormRuntimeTuning = ({
   )
   return {
     ...presetConfig,
-    preset,
+    preset: resolvedPreset,
     aggression: safeAggression,
     clarityVsSpeed: safeClarity,
     tangentKiller: Boolean(tangentKiller),
@@ -2263,7 +2295,8 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   retentionStrategyProfile: 'balanced',
   maxCutsRequested: null,
   editorMode: null,
-  longFormPreset: 'balanced',
+  hookSelectionMode: 'auto',
+  longFormPreset: 'auto',
   longFormAggression: 55,
   longFormClarityVsSpeed: 60,
   tangentKiller: false
@@ -2548,14 +2581,15 @@ const parseHookSelectionMode = (
   value: any,
   fallback: HookSelectionMode | null = null
 ): HookSelectionMode | null => {
-  if (value === null || value === undefined) return fallback
+  const normalizeResolved = (mode: HookSelectionMode | null) => (mode === 'manual' ? 'auto' : mode)
+  if (value === null || value === undefined) return normalizeResolved(fallback)
   const normalized = String(value).trim().toLowerCase()
-  if (!normalized) return fallback
+  if (!normalized) return normalizeResolved(fallback)
   if (normalized === 'auto' || normalized === 'automatic' || normalized === 'editor') return 'auto'
-  if (normalized === 'manual' || normalized === 'user' || normalized === 'user_selected') return 'manual'
+  if (normalized === 'manual' || normalized === 'user' || normalized === 'user_selected') return 'auto'
   return (HOOK_SELECTION_MODE_VALUES as string[]).includes(normalized)
-    ? (normalized as HookSelectionMode)
-    : fallback
+    ? normalizeResolved(normalized as HookSelectionMode)
+    : normalizeResolved(fallback)
 }
 
 const parseBooleanFlag = (value: any): boolean | null => {
@@ -2796,7 +2830,7 @@ const getHookSelectionModeFromPayload = (payload?: any): HookSelectionMode | nul
     parseBooleanFlag((payload as any).manualHookSelection) ??
     parseBooleanFlag((payload as any).manual_hook_selection)
   )
-  if (manualFlag === true) return 'manual'
+  if (manualFlag === true) return 'auto'
   if (manualFlag === false) return 'auto'
   return (
     parseHookSelectionMode((payload as any).hookSelectionMode) ??
@@ -3213,7 +3247,7 @@ const buildPersistedRenderSettings = (
   const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
   const maxCuts = parseMaxCutsPreference(opts?.maxCuts)
   const editorMode = parseEditorModeSelection(opts?.editorMode)
-  const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'manual') || 'manual'
+  const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'auto') || 'auto'
   const longFormAggression = parseLongFormAggression(opts?.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
@@ -3305,8 +3339,8 @@ const buildPersistedRenderAnalysis = ({
     (existing as any)?.hook_selection_mode ??
     (existing as any)?.hookMode ??
     (existing as any)?.hook_mode,
-    'manual'
-  ) || 'manual'
+    'auto'
+  ) || 'auto'
   const resolvedLongFormAggression = parseLongFormAggression(
     longFormAggression ??
     (existing as any)?.longFormAggression ??
@@ -10560,6 +10594,30 @@ const parsePreferredHookCandidateFromPayload = (raw: any): HookCandidate | null 
   return normalized[0] ?? null
 }
 
+const enforceAutoHookDurationRange = ({
+  candidate,
+  durationSeconds
+}: {
+  candidate: HookCandidate
+  durationSeconds: number
+}): HookCandidate => {
+  const safeDuration = Math.max(0.2, Number(durationSeconds || 0))
+  const maxDuration = clamp(
+    Math.min(AUTO_HOOK_DURATION_MAX_SECONDS, safeDuration),
+    0.2,
+    AUTO_HOOK_DURATION_MAX_SECONDS
+  )
+  const minDuration = clamp(Math.min(AUTO_HOOK_DURATION_MIN_SECONDS, maxDuration), 0.2, maxDuration)
+  const nextDuration = clamp(Number(candidate.duration || minDuration), minDuration, maxDuration)
+  const maxStart = Math.max(0, safeDuration - nextDuration)
+  const nextStart = clamp(Number(candidate.start || 0), 0, maxStart)
+  return {
+    ...candidate,
+    start: Number(nextStart.toFixed(3)),
+    duration: Number(nextDuration.toFixed(3))
+  }
+}
+
 const matchPreferredHookCandidate = ({
   preferred,
   candidates
@@ -10649,7 +10707,7 @@ const waitForPreferredHookSelection = async ({
       analysis.hookSelectionMode ??
       analysis.hook_mode ??
       analysis.hookMode,
-      'manual'
+      'auto'
     )
     if (hookSelectionMode === 'auto') return null
     const preferred = parsePreferredHookCandidateFromPayload(analysis.preferred_hook)
@@ -12544,8 +12602,8 @@ const getEditOptionsForUser = async (
     overrides?.hookSelectionMode ??
     (settings as any)?.hookSelectionMode ??
     (settings as any)?.hook_selection_mode,
-    'manual'
-  ) || 'manual'
+    'auto'
+  ) || 'auto'
   const longFormAggression = parseLongFormAggression(
     overrides?.longFormAggression ??
     (settings as any)?.longFormAggression ??
@@ -13104,8 +13162,8 @@ const processJob = async (
   let requestedEditorMode: EditorModeSelection | null = requestedEditorModeRaw
   const requestedHookSelectionMode = parseHookSelectionMode(
     options.hookSelectionMode ?? getHookSelectionModeFromJob(job),
-    'manual'
-  ) || 'manual'
+    'auto'
+  ) || 'auto'
   const outcomeMenuProfile = await loadOutcomeMenuProfile(user.id, {
     requestedStrategy: requestedStrategyProfile,
     requestedTargetPlatform: retentionTargetPlatform,
@@ -13977,12 +14035,27 @@ const processJob = async (
       if (hookSelectionModeForRender === 'auto') {
         optimizationNotes.push('Auto hook mode enabled: editor-selected hook used for opening.')
       }
-      const initialHook = preferredHookCandidate || resolvedHookDecision.candidate
+      const autoHookSource = preferredHookCandidate || resolvedHookDecision.candidate
+      const initialHook = enforceAutoHookDurationRange({
+        candidate: autoHookSource,
+        durationSeconds
+      })
       selectedHookSelectionSource = preferredHookCandidate
         ? 'user_selected'
         : resolvedHookDecision.usedFallback
           ? 'fallback'
           : 'auto'
+      if (
+        Math.abs(initialHook.duration - autoHookSource.duration) > 0.001 ||
+        Math.abs(initialHook.start - autoHookSource.start) > 0.001
+      ) {
+        optimizationNotes.push(
+          `Auto hook duration normalized to ${AUTO_HOOK_DURATION_MIN_SECONDS}-${AUTO_HOOK_DURATION_MAX_SECONDS}s window (${formatHookRange(
+            initialHook.start,
+            initialHook.start + initialHook.duration
+          )}).`
+        )
+      }
       // User-selected hooks must always be stitched to the opening so the
       // chosen intro is guaranteed to lead the final edit.
       const shouldMoveHookForRender =
@@ -16413,7 +16486,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const resolvedEditorMode = editorModeOverride ?? getEditorModeFromJob(job)
-    const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
     const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
     const resolvedLongFormClarityVsSpeed = longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job)
@@ -16579,7 +16652,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
@@ -16720,7 +16793,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
@@ -16903,7 +16976,7 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
     }
 
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body)
-    const hookSelectionMode = requestedHookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const hookSelectionMode = requestedHookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
 
     const analysis = ((job.analysis as any) || {}) as Record<string, any>
     const availableHookCandidates = getHookCandidatesFromAnalysis(analysis)
@@ -17054,7 +17127,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     )
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
