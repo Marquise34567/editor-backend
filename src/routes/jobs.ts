@@ -63,6 +63,7 @@ import {
 import { applyWatermarkOverride, getFeatureLabControls } from '../services/featureLab'
 import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
+import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
 
 const router = express.Router()
 
@@ -1032,7 +1033,7 @@ type VerticalRetentionCandidate = {
   predictorBreakdown: VerticalRetentionPredictorBreakdown
   reason: string
 }
-type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'none'
+type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'bounce' | 'glitch' | 'none'
 type VerticalCaptionPreset =
   | 'basic_clean'
   | 'mrbeast_animated'
@@ -1048,6 +1049,7 @@ type VerticalCaptionConfig = {
   autoGenerate: boolean
   preset: VerticalCaptionPreset
   animationEnabled: boolean
+  animation: VerticalClipCaptionAnimation
   fontId: SubtitleFontId
   fontSize: number | null
   text: string
@@ -1340,6 +1342,12 @@ const VERTICAL_ZOOM_PROFILE_VALUES: VerticalZoomProfile[] = ['none', 'smooth', '
 const DEFAULT_VERTICAL_SELECTION_MODE: VerticalSelectionMode = 'best_moments'
 const DEFAULT_VERTICAL_ZOOM_PROFILE: VerticalZoomProfile = 'smooth'
 const DEFAULT_VERTICAL_ZOOM_INTENSITY = 0.62
+const DEFAULT_VERTICAL_CLIP_COUNT_BY_SELECTION_MODE: Record<VerticalSelectionMode, number> = {
+  best_moments: 3,
+  story_arc: 2,
+  hook_storm: 5,
+  loop_builder: 4
+}
 const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = [
   'basic_clean',
   'mrbeast_animated',
@@ -1467,6 +1475,7 @@ const MAX_CUT_RATIO = 0.68
 const AGGRESSIVE_MAX_CUT_RATIO = 0.74
 const AGGRESSIVE_CUT_GAP_MULTIPLIER = 0.78
 const ZOOM_HARD_MAX = 1.15
+const VERTICAL_ZOOM_HARD_MAX = 1.3
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
 const MANUAL_ZOOM_INTENSITY_MIN = 0.2
@@ -2066,13 +2075,34 @@ const resolveHookCandidateTarget = (durationSeconds: number) => {
 const resolveClipCandidateTarget = ({
   durationSeconds,
   editorMode,
-  nicheProfile
+  nicheProfile,
+  selectionMode
 }: {
   durationSeconds: number
   editorMode?: EditorModeSelection | null
   nicheProfile?: VideoNicheProfile | null
+  selectionMode?: VerticalSelectionMode | null
 }) => {
+  const resolvedSelectionMode = selectionMode
+    ? parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+    : null
   const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
+  if (resolvedSelectionMode) {
+    let target = resolvedSelectionMode === 'story_arc'
+      ? 18
+      : resolvedSelectionMode === 'hook_storm'
+        ? 34
+        : resolvedSelectionMode === 'loop_builder'
+          ? 28
+          : 24
+    if (minutes >= 120) target += 8
+    else if (minutes >= 90) target += 6
+    else if (minutes >= 60) target += 5
+    else if (minutes >= 40) target += 3
+    if (resolvedSelectionMode === 'hook_storm' && nicheProfile?.niche === 'high_energy') target += 4
+    if (resolvedSelectionMode === 'story_arc' && (editorMode === 'education' || nicheProfile?.niche === 'education')) target -= 2
+    return clamp(Math.round(target), CLIP_CANDIDATE_POOL_MIN, CLIP_CANDIDATE_POOL_MAX)
+  }
   let target = 15
   if (minutes >= 120) target = 50
   else if (minutes >= 90) target = 44
@@ -2092,13 +2122,26 @@ const resolveClipCandidateTarget = ({
 const resolveAutoExportClipTarget = ({
   durationSeconds,
   editorMode,
-  nicheProfile
+  nicheProfile,
+  selectionMode
 }: {
   durationSeconds: number
   editorMode?: EditorModeSelection | null
   nicheProfile?: VideoNicheProfile | null
+  selectionMode?: VerticalSelectionMode | null
 }) => {
+  const resolvedSelectionMode = selectionMode
+    ? parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+    : null
   const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
+  if (resolvedSelectionMode) {
+    let target = getVerticalSelectionDefaultClipCount(resolvedSelectionMode)
+    if (minutes >= 180) target += 2
+    else if (minutes >= 90) target += 1
+    if (resolvedSelectionMode === 'hook_storm' && nicheProfile?.niche === 'high_energy') target += 1
+    if (resolvedSelectionMode === 'story_arc' && minutes < 8) target -= 1
+    return clamp(Math.round(target), 1, MAX_VERTICAL_CLIPS)
+  }
   let target = 8
   if (minutes >= 120) target = 20
   else if (minutes >= 90) target = 18
@@ -3007,9 +3050,19 @@ const parseVerticalZoomIntensity = (value?: any, fallback = DEFAULT_VERTICAL_ZOO
   return Number(clamp(parsed, 0, 1).toFixed(3))
 }
 
-const parseVerticalClipCount = (value?: any) => {
+const getVerticalSelectionDefaultClipCount = (selectionMode?: VerticalSelectionMode | null) => {
+  const resolvedMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+  return DEFAULT_VERTICAL_CLIP_COUNT_BY_SELECTION_MODE[resolvedMode]
+}
+
+const parseVerticalClipCount = (
+  value?: any,
+  fallback = getVerticalSelectionDefaultClipCount(DEFAULT_VERTICAL_SELECTION_MODE)
+) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
-  if (!Number.isFinite(parsed)) return 1
+  if (!Number.isFinite(parsed)) {
+    return clamp(Math.round(fallback), 0, MAX_VERTICAL_CLIPS)
+  }
   return clamp(parsed, 0, MAX_VERTICAL_CLIPS)
 }
 
@@ -3204,14 +3257,16 @@ const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
     return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
   }
   const legacyCrop = parseLegacyVerticalCrop(body?.webcamCrop)
+  const verticalMode = buildVerticalModeSettings({
+    value: body?.verticalMode,
+    legacyCrop
+  })
+  const fallbackClipCount = getVerticalSelectionDefaultClipCount(verticalMode.selectionMode)
   return {
     mode: 'vertical',
-    verticalClipCount: parseVerticalClipCount(body?.verticalClipCount),
+    verticalClipCount: parseVerticalClipCount(body?.verticalClipCount, fallbackClipCount),
     horizontalMode,
-    verticalMode: buildVerticalModeSettings({
-      value: body?.verticalMode,
-      legacyCrop
-    })
+    verticalMode
   }
 }
 
@@ -3226,18 +3281,33 @@ const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): Re
     return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
   }
   const legacyCrop = parseLegacyVerticalCrop(analysis?.vertical?.webcamCrop)
+  const verticalMode = buildVerticalModeSettings({
+    value: renderSettings?.verticalMode ?? analysis?.verticalMode ?? analysis?.vertical?.mode,
+    legacyCrop
+  })
+  const fallbackClipCount = getVerticalSelectionDefaultClipCount(verticalMode.selectionMode)
   return {
     mode: 'vertical',
     verticalClipCount: parseVerticalClipCount(
-      renderSettings?.verticalClipCount ?? analysis?.verticalClipCount ?? analysis?.vertical?.clipCount
+      renderSettings?.verticalClipCount ?? analysis?.verticalClipCount ?? analysis?.vertical?.clipCount,
+      fallbackClipCount
     ),
     horizontalMode,
-    verticalMode: buildVerticalModeSettings({
-      value: renderSettings?.verticalMode ?? analysis?.verticalMode ?? analysis?.vertical?.mode,
-      legacyCrop
-    })
+    verticalMode
   }
 }
+
+const hasRenderConfigOverrideInPayload = (payload?: any) => Boolean(
+  payload &&
+  (
+    payload?.renderMode !== undefined ||
+    payload?.mode !== undefined ||
+    payload?.horizontalMode !== undefined ||
+    payload?.verticalMode !== undefined ||
+    payload?.verticalClipCount !== undefined ||
+    payload?.webcamCrop !== undefined
+  )
+)
 
 const getRetentionStrategyFromPayload = (payload?: any) => {
   if (!payload || typeof payload !== 'object') return DEFAULT_EDIT_OPTIONS.retentionStrategyProfile
@@ -3789,12 +3859,24 @@ const parseVerticalCaptionAnimationEnabled = (value: any): boolean | null => {
   if (typeof value === 'boolean') return value
   const normalized = String(value ?? '').trim().toLowerCase()
   if (!normalized) return null
-  if (['1', 'true', 'yes', 'on', 'enabled', 'enable', 'animated', 'animate', 'pop', 'auto'].includes(normalized)) {
+  if (['1', 'true', 'yes', 'on', 'enabled', 'enable', 'animated', 'animate', 'pop', 'slide', 'fade', 'bounce', 'glitch', 'auto'].includes(normalized)) {
     return true
   }
   if (['0', 'false', 'no', 'off', 'disabled', 'disable', 'none', 'static', 'still'].includes(normalized)) {
     return false
   }
+  return null
+}
+
+const parseVerticalCaptionAnimationMode = (value: any): VerticalClipCaptionAnimation | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['none', 'off', 'disabled', 'static', 'still'].includes(normalized)) return 'none'
+  if (['pop', 'pulse', 'punch'].includes(normalized)) return 'pop'
+  if (['slide', 'swipe'].includes(normalized)) return 'slide'
+  if (['fade', 'dissolve'].includes(normalized)) return 'fade'
+  if (['bounce', 'spring'].includes(normalized)) return 'bounce'
+  if (['glitch', 'jitter'].includes(normalized)) return 'glitch'
   return null
 }
 
@@ -4025,6 +4107,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedShadowColor = parseVerticalCaptionHexColor(shadowColorCandidate)
   const parsedShadowBlur = parseVerticalCaptionShadowBlur(shadowBlurCandidate)
   const parsedBoxColor = parseVerticalCaptionHexColor(boxColorCandidate)
+  const parsedAnimation = parseVerticalCaptionAnimationMode(animationCandidate)
   const parsedAnimationEnabled = parseVerticalCaptionAnimationEnabled(animationCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
@@ -4042,6 +4125,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedShadowBlur !== null ? { shadowBlur: parsedShadowBlur } : {}),
     ...(boxEnabledCandidate === null ? {} : { boxEnabled: boxEnabledCandidate }),
     ...(parsedBoxColor ? { boxColor: parsedBoxColor } : {}),
+    ...(parsedAnimation ? { animation: parsedAnimation } : {}),
     ...(parsedAnimationEnabled === null ? {} : { animationEnabled: parsedAnimationEnabled }),
     ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
     ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
@@ -4068,7 +4152,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 0,
         boxEnabled: true,
         boxColor: '020617',
-        animationEnabled: false
+        animationEnabled: false,
+        animation: 'none' as VerticalClipCaptionAnimation
       }
     }
     if (preset === 'neon_glow') {
@@ -4083,7 +4168,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 26,
         boxEnabled: false,
         boxColor: '0A0F1E',
-        animationEnabled: true
+        animationEnabled: true,
+        animation: 'slide' as VerticalClipCaptionAnimation
       }
     }
     if (preset === 'bold_clean_box') {
@@ -4098,7 +4184,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 10,
         boxEnabled: true,
         boxColor: '111827',
-        animationEnabled: false
+        animationEnabled: false,
+        animation: 'none' as VerticalClipCaptionAnimation
       }
     }
     if (preset === 'rage_mode') {
@@ -4113,7 +4200,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 18,
         boxEnabled: false,
         boxColor: '240202',
-        animationEnabled: true
+        animationEnabled: true,
+        animation: 'bounce' as VerticalClipCaptionAnimation
       }
     }
     if (preset === 'ice_pop') {
@@ -4128,7 +4216,56 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 18,
         boxEnabled: false,
         boxColor: '041426',
-        animationEnabled: true
+        animationEnabled: true,
+        animation: 'pop' as VerticalClipCaptionAnimation
+      }
+    }
+    if (preset === 'retro_wave') {
+      return {
+        fontId: 'display_black' as SubtitleFontId,
+        textColor: 'FFE8FF',
+        accentColor: '5CF6FF',
+        outlineColor: '25003A',
+        outlineWidth: 9,
+        shadowEnabled: true,
+        shadowColor: '6D28D9',
+        shadowBlur: 16,
+        boxEnabled: false,
+        boxColor: '240046',
+        animationEnabled: true,
+        animation: 'slide' as VerticalClipCaptionAnimation
+      }
+    }
+    if (preset === 'glitch_pop') {
+      return {
+        fontId: 'mono_bold' as SubtitleFontId,
+        textColor: 'F8FAFC',
+        accentColor: '67E8F9',
+        outlineColor: '111827',
+        outlineWidth: 8,
+        shadowEnabled: true,
+        shadowColor: '111827',
+        shadowBlur: 12,
+        boxEnabled: false,
+        boxColor: '020617',
+        animationEnabled: true,
+        animation: 'glitch' as VerticalClipCaptionAnimation
+      }
+    }
+    if (preset === 'cinema_punch') {
+      return {
+        fontId: 'serif_bold' as SubtitleFontId,
+        textColor: 'FFF8E8',
+        accentColor: 'FFD166',
+        outlineColor: '1A1203',
+        outlineWidth: 7,
+        shadowEnabled: true,
+        shadowColor: '1A1203',
+        shadowBlur: 8,
+        boxEnabled: true,
+        boxColor: '1F172A',
+        animationEnabled: false,
+        animation: 'none' as VerticalClipCaptionAnimation
       }
     }
     return {
@@ -4142,13 +4279,40 @@ const resolveVerticalCaptionConfig = (
       shadowBlur: 8,
       boxEnabled: false,
       boxColor: '000000',
-      animationEnabled: true
+      animationEnabled: true,
+      animation: 'pop' as VerticalClipCaptionAnimation
     }
   }
   const fallbackPreset = parseVerticalCaptionPreset(defaults?.preset) || 'mrbeast_animated'
   const requestedPreset = parseVerticalCaptionPreset(override.preset)
   const resolvedPreset = requestedPreset || fallbackPreset
   const fallbackPresetStyle = getPresetStyleDefaults(fallbackPreset)
+  const fallbackAnimationFromDefaults = parseVerticalCaptionAnimationMode(
+    pickFirstDefinedValue(
+      (defaults as any)?.animation,
+      (defaults as any)?.animationMode,
+      (defaults as any)?.animation_mode,
+      (defaults as any)?.verticalCaptionAnimation,
+      (defaults as any)?.vertical_caption_animation,
+      (defaults as any)?.captionAnimation,
+      (defaults as any)?.caption_animation
+    )
+  )
+  const fallbackAnimationEnabledFromDefaults = parseVerticalCaptionAnimationEnabled(
+    pickFirstDefinedValue(
+      (defaults as any)?.animationEnabled,
+      (defaults as any)?.animation_enabled,
+      (defaults as any)?.verticalCaptionAnimationEnabled,
+      (defaults as any)?.vertical_caption_animation_enabled,
+      (defaults as any)?.captionAnimationEnabled,
+      (defaults as any)?.caption_animation_enabled
+    )
+  )
+  const resolvedFallbackAnimation = fallbackAnimationFromDefaults
+    ? fallbackAnimationFromDefaults
+    : fallbackAnimationEnabledFromDefaults === false
+      ? 'none'
+      : fallbackPresetStyle.animation
   const fallbackStyle = {
     fontId: parseVerticalCaptionFontId(defaults?.fontId) || fallbackPresetStyle.fontId,
     textColor: parseVerticalCaptionHexColor(defaults?.textColor) || fallbackPresetStyle.textColor,
@@ -4160,20 +4324,8 @@ const resolveVerticalCaptionConfig = (
     shadowBlur: parseVerticalCaptionShadowBlur(defaults?.shadowBlur) ?? fallbackPresetStyle.shadowBlur,
     boxEnabled: typeof defaults?.boxEnabled === 'boolean' ? defaults.boxEnabled : fallbackPresetStyle.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor,
-    animationEnabled: parseVerticalCaptionAnimationEnabled(
-      pickFirstDefinedValue(
-        (defaults as any)?.animationEnabled,
-        (defaults as any)?.animation_enabled,
-        (defaults as any)?.verticalCaptionAnimationEnabled,
-        (defaults as any)?.vertical_caption_animation_enabled,
-        (defaults as any)?.captionAnimationEnabled,
-        (defaults as any)?.caption_animation_enabled,
-        (defaults as any)?.verticalCaptionAnimation,
-        (defaults as any)?.vertical_caption_animation,
-        (defaults as any)?.captionAnimation,
-        (defaults as any)?.caption_animation
-      )
-    ) ?? fallbackPresetStyle.animationEnabled
+    animation: resolvedFallbackAnimation,
+    animationEnabled: resolvedFallbackAnimation !== 'none'
   }
   const styleBaseline = requestedPreset && requestedPreset !== fallbackPreset
     ? getPresetStyleDefaults(requestedPreset)
@@ -4184,6 +4336,16 @@ const resolveVerticalCaptionConfig = (
   const fallbackText = normalizeVerticalCaptionTextInput(defaults?.text ?? '')
   const fallbackPositionX = parseVerticalCaptionPosition(defaults?.positionX) ?? 0.5
   const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? 0.84
+  const overrideAnimation = parseVerticalCaptionAnimationMode((override as any)?.animation)
+  const overrideAnimationEnabled = typeof override.animationEnabled === 'boolean'
+    ? override.animationEnabled
+    : null
+  let resolvedAnimation = overrideAnimation || styleBaseline.animation
+  if (overrideAnimationEnabled === false) {
+    resolvedAnimation = 'none'
+  } else if (overrideAnimationEnabled === true && resolvedAnimation === 'none') {
+    resolvedAnimation = 'pop'
+  }
 
   return {
     enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
@@ -4201,7 +4363,8 @@ const resolveVerticalCaptionConfig = (
     shadowBlur: parseVerticalCaptionShadowBlur(override.shadowBlur) ?? styleBaseline.shadowBlur,
     boxEnabled: typeof override.boxEnabled === 'boolean' ? override.boxEnabled : styleBaseline.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(override.boxColor) || styleBaseline.boxColor,
-    animationEnabled: typeof override.animationEnabled === 'boolean' ? override.animationEnabled : styleBaseline.animationEnabled,
+    animationEnabled: resolvedAnimation !== 'none',
+    animation: resolvedAnimation,
     positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
     positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY
   }
@@ -4214,6 +4377,7 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     autoGenerate: true,
     preset,
     animationEnabled: true,
+    animation: 'pop',
     fontId: 'impact',
     fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
     text: '',
@@ -4254,11 +4418,22 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
   const defaults = resolveVerticalCaptionConfig({ preset }, getDefaultVerticalCaptionConfig())
   const fontSize = parseVerticalCaptionFontSize(config.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
   const text = normalizeVerticalCaptionTextInput(config.text)
+  const requestedAnimation = parseVerticalCaptionAnimationMode(config.animation)
+  const requestedAnimationEnabled = typeof config.animationEnabled === 'boolean'
+    ? config.animationEnabled
+    : null
+  let resolvedAnimation = requestedAnimation || defaults.animation
+  if (requestedAnimationEnabled === false) {
+    resolvedAnimation = 'none'
+  } else if (requestedAnimationEnabled === true && resolvedAnimation === 'none') {
+    resolvedAnimation = 'pop'
+  }
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
     preset,
-    animationEnabled: typeof config.animationEnabled === 'boolean' ? config.animationEnabled : defaults.animationEnabled,
+    animationEnabled: resolvedAnimation !== 'none',
+    animation: resolvedAnimation,
     fontId: parseVerticalCaptionFontId(config.fontId) || defaults.fontId,
     fontSize,
     text,
@@ -4274,7 +4449,7 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     positionX: parseVerticalCaptionPosition(config.positionX) ?? defaults.positionX,
     positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY
   }
-  const animationMode: VerticalClipCaptionAnimation = normalized.animationEnabled ? 'pop' : 'none'
+  const animationMode: VerticalClipCaptionAnimation = normalized.animation
   return {
     verticalCaptions: {
       enabled: normalized.enabled,
@@ -4283,6 +4458,8 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       animationEnabled: normalized.animationEnabled,
       animation_enabled: normalized.animationEnabled,
       animation: animationMode,
+      animationMode: animationMode,
+      animation_mode: animationMode,
       fontId: normalized.fontId,
       fontSize,
       text,
@@ -8105,7 +8282,7 @@ const parseTranscriptCues = (srtPath: string | null) => {
 }
 
 const CAPTION_EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u
-const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯', '⚡']
+const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯']
 const VIRAL_KEYWORD_PATTERN = /\b(crazy|insane|what|no way|can't believe|cant believe|bro|wild|shocking|wtf)\b/i
 
 const sanitizeCaptionPhrase = (value: string) => (
@@ -8279,6 +8456,7 @@ const buildVerticalClipCaptionOverlays = ({
   transcriptCues,
   captionPreset,
   animationEnabled,
+  animationMode,
   autoGenerateFromTranscript,
   editorMode,
   styleProfile,
@@ -8291,6 +8469,7 @@ const buildVerticalClipCaptionOverlays = ({
   transcriptCues?: TranscriptCue[]
   captionPreset?: VerticalCaptionPreset
   animationEnabled?: boolean
+  animationMode?: VerticalClipCaptionAnimation | null
   autoGenerateFromTranscript?: boolean
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
@@ -8375,11 +8554,16 @@ const buildVerticalClipCaptionOverlays = ({
     .slice(0, 6)
   const fallbackAnchors = [0.16, 0.45, 0.72]
   const maxStart = Math.max(0, clipDuration - 0.4)
-  const animations: VerticalClipCaptionAnimation[] = animationEnabled === false
+  const preferredAnimation = parseVerticalCaptionAnimationMode(animationMode)
+  const animations: VerticalClipCaptionAnimation[] = (
+    animationEnabled === false || preferredAnimation === 'none'
+  )
     ? ['none']
-    : (highEnergy
-      ? ['pop', 'slide', 'fade']
-      : ['fade', 'slide', 'fade'])
+    : preferredAnimation
+      ? [preferredAnimation]
+      : (highEnergy
+        ? ['pop', 'slide', 'fade']
+        : ['fade', 'slide', 'fade'])
   const overlays: VerticalClipCaptionOverlay[] = []
   let cursor = 0
   for (let index = 0; index < selectedPhrases.length; index += 1) {
@@ -10716,14 +10900,23 @@ const buildVerticalMetadataSummary = ({
   selectedCandidates,
   selectionResult,
   preScan,
-  clipCaptionOverlaysByClip
+  clipCaptionOverlaysByClip,
+  selectionMode,
+  zoomProfile,
+  zoomIntensity
 }: {
   durationSeconds: number
   selectedCandidates: VerticalRetentionCandidate[]
   selectionResult: VerticalRetentionSelectionResult
   preScan?: LongFormPreScanSummary | null
   clipCaptionOverlaysByClip?: VerticalClipCaptionOverlay[][]
+  selectionMode?: VerticalSelectionMode | null
+  zoomProfile?: VerticalZoomProfile | null
+  zoomIntensity?: number | null
 }) => {
+  const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+  const resolvedZoomProfile = parseVerticalZoomProfile(zoomProfile, DEFAULT_VERTICAL_ZOOM_PROFILE)
+  const resolvedZoomIntensity = parseVerticalZoomIntensity(zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
   const safeDuration = Math.max(0.1, Number.isFinite(durationSeconds) ? durationSeconds : 0)
   const clipDetails = selectedCandidates.map((candidate, index) => {
     const range = candidate.range
@@ -10762,7 +10955,10 @@ const buildVerticalMetadataSummary = ({
   return {
     metadataVersion: 3,
     generatedAt: toIsoNow(),
-    selectionMode: 'retention_ranked_2026',
+    selectionMode: resolvedSelectionMode,
+    selectionStrategy: 'retention_ranked_2026',
+    zoomProfile: resolvedZoomProfile,
+    zoomIntensity: resolvedZoomIntensity,
     clipCount: selectedCandidates.length,
     coverageRatio: Number(clamp01(coverage / safeDuration).toFixed(4)),
     predictedAverage,
@@ -10786,8 +10982,8 @@ const buildVerticalMetadataSummary = ({
       paddingCount: Number(selectionResult.paddingCount || 0),
       paddingReason: selectionResult.paddingReason || null,
       targetRange: {
-        min: CLIP_EXPORT_TARGET_MIN,
-        max: CLIP_EXPORT_TARGET_MAX
+        min: 1,
+        max: MAX_VERTICAL_CLIPS
       }
     },
     clips: clipDetails,
@@ -12562,6 +12758,8 @@ const resolveSubtitleFontName = (fontId?: SubtitleFontId) => {
   if (fontId === 'sans_bold') return 'DejaVu Sans'
   if (fontId === 'condensed') return 'DejaVu Sans Condensed'
   if (fontId === 'serif_bold') return 'DejaVu Serif'
+  if (fontId === 'display_black') return 'DejaVu Sans'
+  if (fontId === 'mono_bold') return 'DejaVu Sans Mono'
   return 'Impact'
 }
 
@@ -12652,6 +12850,7 @@ const buildMrBeastAnimatedAss = ({
 const buildVerticalCaptionSubtitleStyle = ({
   preset,
   animationEnabled,
+  animation,
   fontId,
   fontSize,
   textColor,
@@ -12662,6 +12861,7 @@ const buildVerticalCaptionSubtitleStyle = ({
 }: {
   preset: VerticalCaptionPreset
   animationEnabled?: boolean | null
+  animation?: VerticalClipCaptionAnimation | null
   fontId?: SubtitleFontId | null
   fontSize: number | null
   textColor?: string | null
@@ -12671,7 +12871,12 @@ const buildVerticalCaptionSubtitleStyle = ({
   fallbackStyle?: string | null
 }) => {
   const resolvedFontSize = parseVerticalCaptionFontSize(fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
-  const prefersNeonBase = preset === 'neon_glow' || preset === 'ice_pop'
+  const prefersNeonBase = (
+    preset === 'neon_glow' ||
+    preset === 'ice_pop' ||
+    preset === 'retro_wave' ||
+    preset === 'glitch_pop'
+  )
   const stylePreset = prefersNeonBase ? 'neon_glow' : 'mrbeast_animated'
   const fallback = parseSubtitleStyleConfig(fallbackStyle)
   const base = fallback.preset === stylePreset ? fallback : parseSubtitleStyleConfig(stylePreset)
@@ -12721,6 +12926,33 @@ const buildVerticalCaptionSubtitleStyle = ({
         animation: 'pop' as const
       }
     }
+    if (preset === 'retro_wave') {
+      return {
+        textColor: 'FFE8FF',
+        accentColor: '5CF6FF',
+        outlineColor: '25003A',
+        outlineWidth: 9,
+        animation: 'pop' as const
+      }
+    }
+    if (preset === 'glitch_pop') {
+      return {
+        textColor: 'F8FAFC',
+        accentColor: '67E8F9',
+        outlineColor: '111827',
+        outlineWidth: 8,
+        animation: 'pop' as const
+      }
+    }
+    if (preset === 'cinema_punch') {
+      return {
+        textColor: 'FFF8E8',
+        accentColor: 'FFD166',
+        outlineColor: '1A1203',
+        outlineWidth: 7,
+        animation: 'none' as const
+      }
+    }
     return {
       textColor: 'FFE500',
       accentColor: 'FFF173',
@@ -12734,9 +12966,14 @@ const buildVerticalCaptionSubtitleStyle = ({
   const resolvedAccentColor = parseVerticalCaptionHexColor(accentColor) || defaultStyleByPreset.accentColor
   const resolvedOutlineColor = parseVerticalCaptionHexColor(outlineColor) || defaultStyleByPreset.outlineColor
   const resolvedOutlineWidth = parseVerticalCaptionOutlineWidth(outlineWidth) ?? defaultStyleByPreset.outlineWidth
-  const resolvedAnimation = typeof animationEnabled === 'boolean'
-    ? (animationEnabled ? 'pop' : 'none')
-    : defaultStyleByPreset.animation
+  const requestedAnimation = parseVerticalCaptionAnimationMode(animation)
+  const resolvedAnimation: 'pop' | 'none' = requestedAnimation === 'none'
+    ? 'none'
+    : requestedAnimation
+      ? 'pop'
+      : typeof animationEnabled === 'boolean'
+        ? (animationEnabled ? 'pop' : 'none')
+        : (defaultStyleByPreset.animation === 'none' ? 'none' : 'pop')
   return serializeSubtitleStyleConfig({
     ...base,
     preset: stylePreset,
@@ -12790,8 +13027,13 @@ const buildVerticalCaptionAss = ({
   const backColor = boxEnabled ? boxColor : shadowColor
   const posX = Math.round(clamp(config.positionX || 0.5, 0.02, 0.98) * 1080)
   const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
-  const usePop = Boolean(config.animationEnabled)
-  const useUppercase = config.preset !== 'basic_clean' && config.preset !== 'bold_clean_box'
+  const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
+    (config.animationEnabled ? 'pop' : 'none')
+  const useUppercase = (
+    config.preset !== 'basic_clean' &&
+    config.preset !== 'bold_clean_box' &&
+    config.preset !== 'cinema_punch'
+  )
   const assLines: string[] = [
     '[Script Info]',
     'ScriptType: v4.00+',
@@ -12815,9 +13057,24 @@ const buildVerticalCaptionAss = ({
     const phrase = sanitizeCaptionPhrase(String(cue.text || ''))
     if (!phrase) continue
     const text = escapeAssDialogueText(useUppercase ? phrase.toUpperCase() : phrase)
-    const animationTag = usePop
-      ? `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,120,\\fscx100\\fscy100)}`
-      : `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
+    const animationTag = (() => {
+      if (animationMode === 'none') {
+        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
+      }
+      if (animationMode === 'slide') {
+        return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,180)\\bord${outlineWidth}}`
+      }
+      if (animationMode === 'fade') {
+        return `{\\an5\\pos(${posX},${posY})\\fad(80,70)\\bord${outlineWidth}}`
+      }
+      if (animationMode === 'bounce') {
+        return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,120,\\fscx110\\fscy110)\\t(120,240,\\fscx100\\fscy100)}`
+      }
+      if (animationMode === 'glitch') {
+        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,80,\\frz-2)\\t(80,160,\\frz1.4)\\t(160,260,\\frz0)}`
+      }
+      return `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,120,\\fscx100\\fscy100)}`
+    })()
     assLines.push(
       `Dialogue: 0,${toAssTimestamp(start)},${toAssTimestamp(end)},Viral,,0,0,0,,${animationTag}${text}`
     )
@@ -13996,13 +14253,16 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   platformProfile,
   strategyProfile,
   editorMode,
-  styleProfile
+  styleProfile,
+  selectionMode
 }: {
   platformProfile?: PlatformProfile
   strategyProfile?: RetentionStrategyProfile | null
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
+  selectionMode?: VerticalSelectionMode | null
 }): number => {
+  const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
   const normalized = parsePlatformProfile(platformProfile, 'auto')
   let platformBaseline = 4
   if (normalized === 'tiktok') platformBaseline = 3.2
@@ -14023,6 +14283,9 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   else if (editorMode === 'commentary') combined += 0.18
   else if (editorMode === 'podcast') combined += 0.34
   else if (editorMode === 'vlog') combined += 0.08
+  if (resolvedSelectionMode === 'story_arc') combined += 0.45
+  else if (resolvedSelectionMode === 'hook_storm') combined -= 0.55
+  else if (resolvedSelectionMode === 'loop_builder') combined -= 0.2
   return Number(clamp(combined, 2.2, 5.4).toFixed(2))
 }
 
@@ -14045,32 +14308,63 @@ type VerticalModeScoreBias = {
   caption: number
 }
 
-const getVerticalModeScoreBias = (editorMode?: EditorModeSelection | null): VerticalModeScoreBias => {
+const addVerticalModeScoreBias = (
+  base: VerticalModeScoreBias,
+  patch: VerticalModeScoreBias
+): VerticalModeScoreBias => ({
+  hook: Number((base.hook + patch.hook).toFixed(4)),
+  interrupt: Number((base.interrupt + patch.interrupt).toFixed(4)),
+  ending: Number((base.ending + patch.ending).toFixed(4)),
+  energy: Number((base.energy + patch.energy).toFixed(4)),
+  caption: Number((base.caption + patch.caption).toFixed(4))
+})
+
+const getVerticalModeScoreBias = (
+  editorMode?: EditorModeSelection | null,
+  selectionMode: VerticalSelectionMode = DEFAULT_VERTICAL_SELECTION_MODE
+): VerticalModeScoreBias => {
+  const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+  let bias: VerticalModeScoreBias =
+    resolvedSelectionMode === 'story_arc'
+      ? { hook: -0.02, interrupt: -0.07, ending: 0.1, energy: -0.03, caption: 0.06 }
+      : resolvedSelectionMode === 'hook_storm'
+        ? { hook: 0.08, interrupt: 0.1, ending: 0.01, energy: 0.08, caption: -0.03 }
+        : resolvedSelectionMode === 'loop_builder'
+          ? { hook: 0.04, interrupt: 0.03, ending: 0.1, energy: 0.04, caption: 0.03 }
+          : { hook: 0, interrupt: 0, ending: 0, energy: 0, caption: 0 }
   if (editorMode === 'sports') {
-    return { hook: 0.02, interrupt: 0.08, ending: 0.03, energy: 0.05, caption: -0.02 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0.02, interrupt: 0.08, ending: 0.03, energy: 0.05, caption: -0.02 })
+    return bias
   }
   if (editorMode === 'savage-roast') {
-    return { hook: 0.04, interrupt: 0.08, ending: 0.02, energy: 0.06, caption: -0.02 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0.04, interrupt: 0.08, ending: 0.02, energy: 0.06, caption: -0.02 })
+    return bias
   }
   if (editorMode === 'gaming') {
-    return { hook: 0.02, interrupt: 0.06, ending: 0.01, energy: 0.04, caption: -0.01 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0.02, interrupt: 0.06, ending: 0.01, energy: 0.04, caption: -0.01 })
+    return bias
   }
   if (editorMode === 'reaction') {
-    return { hook: 0.03, interrupt: 0.05, ending: 0.01, energy: 0.03, caption: -0.01 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0.03, interrupt: 0.05, ending: 0.01, energy: 0.03, caption: -0.01 })
+    return bias
   }
   if (editorMode === 'education') {
-    return { hook: 0, interrupt: -0.06, ending: 0.06, energy: -0.03, caption: 0.06 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0, interrupt: -0.06, ending: 0.06, energy: -0.03, caption: 0.06 })
+    return bias
   }
   if (editorMode === 'commentary') {
-    return { hook: 0, interrupt: -0.03, ending: 0.03, energy: -0.01, caption: 0.03 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0, interrupt: -0.03, ending: 0.03, energy: -0.01, caption: 0.03 })
+    return bias
   }
   if (editorMode === 'podcast') {
-    return { hook: -0.01, interrupt: -0.08, ending: 0.08, energy: -0.04, caption: 0.07 }
+    bias = addVerticalModeScoreBias(bias, { hook: -0.01, interrupt: -0.08, ending: 0.08, energy: -0.04, caption: 0.07 })
+    return bias
   }
   if (editorMode === 'vlog') {
-    return { hook: 0.01, interrupt: -0.01, ending: 0.03, energy: 0.01, caption: 0.02 }
+    bias = addVerticalModeScoreBias(bias, { hook: 0.01, interrupt: -0.01, ending: 0.03, energy: 0.01, caption: 0.02 })
+    return bias
   }
-  return { hook: 0, interrupt: 0, ending: 0, energy: 0, caption: 0 }
+  return bias
 }
 
 const collectInterruptMarkersForRange = ({
@@ -14316,7 +14610,8 @@ const scoreVerticalRetentionCandidate = ({
   platformProfile,
   strategyProfile,
   editorMode,
-  styleProfile
+  styleProfile,
+  selectionMode
 }: {
   range: TimeRange
   windows: EngagementWindow[]
@@ -14324,14 +14619,30 @@ const scoreVerticalRetentionCandidate = ({
   strategyProfile?: RetentionStrategyProfile | null
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
+  selectionMode?: VerticalSelectionMode
 }): { candidate: VerticalRetentionCandidate | null; rejectReason: string | null } => {
+  const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
   const start = Number(range.start.toFixed(3))
   const end = Number(range.end.toFixed(3))
   const duration = Math.max(0.1, end - start)
-  if (duration < 15) {
+  const minDuration = resolvedSelectionMode === 'hook_storm'
+    ? 12
+    : resolvedSelectionMode === 'loop_builder'
+      ? 14
+      : resolvedSelectionMode === 'story_arc'
+        ? 20
+        : 15
+  const maxDuration = resolvedSelectionMode === 'story_arc'
+    ? 75
+    : resolvedSelectionMode === 'hook_storm'
+      ? 45
+      : resolvedSelectionMode === 'loop_builder'
+        ? 55
+        : 60
+  if (duration < minDuration) {
     return { candidate: null, rejectReason: 'clip_too_short' }
   }
-  if (duration > 60) {
+  if (duration > maxDuration) {
     return { candidate: null, rejectReason: 'clip_too_long' }
   }
   const framingQuality = computeVerticalFramingQuality({ start, end, windows })
@@ -14365,7 +14676,8 @@ const scoreVerticalRetentionCandidate = ({
     platformProfile,
     strategyProfile,
     editorMode,
-    styleProfile
+    styleProfile,
+    selectionMode: resolvedSelectionMode
   })
   const targetCount = Math.max(1, Math.ceil(duration / targetInterval))
   const interruptCoverage = clamp01(interruptMarks.length / targetCount)
@@ -14392,7 +14704,7 @@ const scoreVerticalRetentionCandidate = ({
     windows,
     framingQuality
   })
-  const modeBias = getVerticalModeScoreBias(editorMode)
+  const modeBias = getVerticalModeScoreBias(editorMode, resolvedSelectionMode)
   const biasedHookStrength = clamp01(hookStrength + modeBias.hook)
   const biasedInterruptDensityQuality = clamp01(interruptDensityQuality + modeBias.interrupt)
   const biasedEndingLoopPotential = clamp01(endingLoopPotential + modeBias.ending)
@@ -14525,6 +14837,7 @@ const buildPaddingVerticalRetentionCandidate = ({
   strategyProfile,
   editorMode,
   styleProfile,
+  selectionMode,
   clipIndex
 }: {
   range: TimeRange
@@ -14533,6 +14846,7 @@ const buildPaddingVerticalRetentionCandidate = ({
   strategyProfile?: RetentionStrategyProfile | null
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
+  selectionMode?: VerticalSelectionMode
   clipIndex: number
 }) => {
   const scored = windows.length
@@ -14542,7 +14856,8 @@ const buildPaddingVerticalRetentionCandidate = ({
         platformProfile,
         strategyProfile,
         editorMode,
-        styleProfile
+        styleProfile,
+        selectionMode
       }).candidate
     : null
   if (scored) {
@@ -14569,7 +14884,8 @@ const buildVerticalRetentionCandidates = ({
   strategyProfile,
   editorMode,
   styleProfile,
-  nicheProfile
+  nicheProfile,
+  selectionMode
 }: {
   durationSeconds: number
   requestedCount: number
@@ -14579,8 +14895,11 @@ const buildVerticalRetentionCandidates = ({
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
+  selectionMode?: VerticalSelectionMode
 }): VerticalRetentionSelectionResult => {
   const total = Math.max(0, durationSeconds || 0)
+  const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
+  const modeDefaultClipCount = getVerticalSelectionDefaultClipCount(resolvedSelectionMode)
   const normalizedRequestedCount = Math.round(clamp(
     Number.isFinite(Number(requestedCount)) ? Number(requestedCount) : 0,
     0,
@@ -14590,15 +14909,17 @@ const buildVerticalRetentionCandidates = ({
   const modeAwareAutoExportTarget = resolveAutoExportClipTarget({
     durationSeconds: total,
     editorMode: editorMode ?? null,
-    nicheProfile: nicheProfile ?? null
+    nicheProfile: nicheProfile ?? null,
+    selectionMode: resolvedSelectionMode
   })
   const outputTarget = exactCountRequested
     ? Math.round(clamp(normalizedRequestedCount, 1, MAX_VERTICAL_CLIPS))
-    : Math.round(clamp(modeAwareAutoExportTarget, CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX))
+    : Math.round(clamp(modeAwareAutoExportTarget, 1, MAX_VERTICAL_CLIPS))
   const modeAwareCandidateTarget = resolveClipCandidateTarget({
     durationSeconds: total,
     editorMode: editorMode ?? null,
-    nicheProfile: nicheProfile ?? null
+    nicheProfile: nicheProfile ?? null,
+    selectionMode: resolvedSelectionMode
   })
   if (total <= 0) {
     return {
@@ -14659,17 +14980,22 @@ const buildVerticalRetentionCandidates = ({
       paddingReason: 'Generated fallback clip windows because analysis peaks were unavailable.'
     }
   }
-  const minDuration = 15
-  const clipDurations = [
-    15,
-    18,
-    22,
-    26,
-    30,
-    35,
-    45,
-    60
-  ].filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total)
+  const minDuration = resolvedSelectionMode === 'hook_storm'
+    ? 12
+    : resolvedSelectionMode === 'loop_builder'
+      ? 14
+      : resolvedSelectionMode === 'story_arc'
+        ? 20
+        : 15
+  const clipDurations = (
+    resolvedSelectionMode === 'story_arc'
+      ? [20, 24, 28, 34, 42, 50, 60, 72]
+      : resolvedSelectionMode === 'hook_storm'
+        ? [12, 15, 18, 22, 26, 30, 36, 42]
+        : resolvedSelectionMode === 'loop_builder'
+          ? [14, 18, 22, 26, 30, 35, 40, 48]
+          : [15, 18, 22, 26, 30, 35, 45, 60]
+  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total)
   const stepSeconds = total >= 3600
     ? 6
     : total >= 1800
@@ -14680,7 +15006,7 @@ const buildVerticalRetentionCandidates = ({
           ? 2
           : 1
   const preScored: Array<{ range: TimeRange; score: number }> = []
-  const modeBias = getVerticalModeScoreBias(editorMode)
+  const modeBias = getVerticalModeScoreBias(editorMode, resolvedSelectionMode)
   for (let start = 0; start + minDuration <= total; start += stepSeconds) {
     const startTime = Number(start.toFixed(3))
     for (const duration of clipDurations) {
@@ -14757,7 +15083,7 @@ const buildVerticalRetentionCandidates = ({
   if (!preScored.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: outputTarget
+      count: outputTarget || modeDefaultClipCount
     })
     const fallbackCandidates = fallbackRanges
       .slice(0, outputTarget)
@@ -14768,6 +15094,7 @@ const buildVerticalRetentionCandidates = ({
         strategyProfile,
         editorMode,
         styleProfile,
+        selectionMode: resolvedSelectionMode,
         clipIndex: index
       }))
     return {
@@ -14798,7 +15125,8 @@ const buildVerticalRetentionCandidates = ({
       platformProfile,
       strategyProfile,
       editorMode,
-      styleProfile
+      styleProfile,
+      selectionMode: resolvedSelectionMode
     })
     if (scored.candidate) {
       evaluated.push(scored.candidate)
@@ -14820,6 +15148,7 @@ const buildVerticalRetentionCandidates = ({
         strategyProfile,
         editorMode,
         styleProfile,
+        selectionMode: resolvedSelectionMode,
         clipIndex: index
       }))
     return {
@@ -14852,7 +15181,8 @@ const buildVerticalRetentionCandidates = ({
     platformProfile,
     strategyProfile,
     editorMode,
-    styleProfile
+    styleProfile,
+    selectionMode: resolvedSelectionMode
   }) * 2)
   for (const candidate of sortedAccepted) {
     if (selected.length >= outputTarget) break
@@ -14886,7 +15216,7 @@ const buildVerticalRetentionCandidates = ({
   if (selected.length < outputTarget) {
     const paddingRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: Math.max(outputTarget, CLIP_EXPORT_TARGET_MIN)
+      count: Math.max(outputTarget, modeDefaultClipCount)
     })
     let index = 0
     while (selected.length < outputTarget && paddingRanges.length) {
@@ -14903,6 +15233,7 @@ const buildVerticalRetentionCandidates = ({
         strategyProfile,
         editorMode,
         styleProfile,
+        selectionMode: resolvedSelectionMode,
         clipIndex: selected.length
       }))
       paddingCount += 1
@@ -15104,6 +15435,60 @@ const buildVerticalSingleFilterGraph = ({
   return filters.join(';')
 }
 
+const buildVerticalSmartZoomFilters = ({
+  outputWidth,
+  outputHeight,
+  clipDuration,
+  zoomProfile,
+  zoomIntensity,
+  autoZoomMax
+}: {
+  outputWidth: number
+  outputHeight: number
+  clipDuration: number
+  zoomProfile: VerticalZoomProfile
+  zoomIntensity: number
+  autoZoomMax: number
+}) => {
+  if (zoomProfile === 'none') return [] as string[]
+  const intensity = parseVerticalZoomIntensity(zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
+  const requestedZoom = clamp(Number(autoZoomMax || 1.08), 1.02, VERTICAL_ZOOM_HARD_MAX)
+  const profileMax = zoomProfile === 'smooth'
+    ? 1.05 + intensity * 0.09
+    : zoomProfile === 'punch'
+      ? 1.08 + intensity * 0.14
+      : 1.1 + intensity * 0.2
+  const maxZoom = clamp(Math.max(requestedZoom, profileMax), 1.02, VERTICAL_ZOOM_HARD_MAX)
+  if (zoomProfile === 'smooth') {
+    const scaledWidth = Math.max(outputWidth + 2, Math.round(outputWidth * maxZoom))
+    const scaledHeight = Math.max(outputHeight + 2, Math.round(outputHeight * maxZoom))
+    return [
+      `scale=${scaledWidth}:${scaledHeight}:flags=lanczos`,
+      `crop=${outputWidth}:${outputHeight}:(iw-ow)/2:(ih-oh)/2`
+    ]
+  }
+
+  const zoomRange = zoomProfile === 'kinetic'
+    ? 0.06 + intensity * 0.08
+    : 0.04 + intensity * 0.05
+  const minZoom = clamp(maxZoom - zoomRange, 1.01, maxZoom)
+  const zoomDelta = Math.max(0.01, maxZoom - minZoom)
+  const pulsePeriod = zoomProfile === 'kinetic'
+    ? Number(clamp(clipDuration * 0.28, 0.32, 0.9).toFixed(3))
+    : Number(clamp(clipDuration * 0.42, 0.42, 1.2).toFixed(3))
+  const zoomExpr = `max(${toFilterNumber(minZoom)},min(${toFilterNumber(maxZoom)},${toFilterNumber(minZoom)}+${toFilterNumber(zoomDelta)}*(1+sin(2*PI*t/${toFilterNumber(pulsePeriod)}))/2))`
+  const panX = zoomProfile === 'kinetic'
+    ? `max(0,min(iw-ow,(iw-ow)/2 + (iw-ow)*0.18*sin(2*PI*t/${toFilterNumber(pulsePeriod)})))`
+    : '(iw-ow)/2'
+  const panY = zoomProfile === 'kinetic'
+    ? `max(0,min(ih-oh,(ih-oh)/2 + (ih-oh)*0.12*cos(2*PI*t/${toFilterNumber(Number((pulsePeriod * 1.31).toFixed(3)))})))`
+    : '(ih-oh)/2'
+  return [
+    `scale=w='trunc(${outputWidth}*(${zoomExpr})/2)*2':h='trunc(${outputHeight}*(${zoomExpr})/2)*2':flags=lanczos:eval=frame`,
+    `crop=${outputWidth}:${outputHeight}:x='${panX}':y='${panY}'`
+  ]
+}
+
 const renderVerticalClip = async ({
   inputPath,
   outputPath,
@@ -15194,18 +15579,21 @@ const renderVerticalClip = async ({
     graphParts.push(`[${videoLabel}]${subtitleFilter}[vsub]`)
     videoLabel = 'vsub'
   }
-  const shouldApplySmartZoom = Boolean(enableSmartZoom)
+  const resolvedZoomProfile = parseVerticalZoomProfile(verticalMode.zoomProfile, DEFAULT_VERTICAL_ZOOM_PROFILE)
+  const resolvedZoomIntensity = parseVerticalZoomIntensity(verticalMode.zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
+  const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none'
   const shouldApplyClipTransitions = Boolean(enableTransitions)
   if (shouldApplySmartZoom || shouldApplyClipTransitions) {
     const videoFx: string[] = []
     if (shouldApplySmartZoom) {
-      const zoomFactor = clamp(Number(autoZoomMax || 1.08), 1.04, ZOOM_HARD_MAX)
-      const scaledWidth = Math.max(outputWidth + 2, Math.round(outputWidth * zoomFactor))
-      const scaledHeight = Math.max(outputHeight + 2, Math.round(outputHeight * zoomFactor))
-      videoFx.push(
-        `scale=${scaledWidth}:${scaledHeight}:flags=lanczos`,
-        `crop=${outputWidth}:${outputHeight}:(iw-ow)/2:(ih-oh)/2`
-      )
+      videoFx.push(...buildVerticalSmartZoomFilters({
+        outputWidth,
+        outputHeight,
+        clipDuration,
+        zoomProfile: resolvedZoomProfile,
+        zoomIntensity: resolvedZoomIntensity,
+        autoZoomMax
+      }))
     }
     if (shouldApplyClipTransitions) {
       videoFx.push(
@@ -17093,6 +17481,7 @@ const processJob = async (
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
         preset: verticalCaptionConfig.preset,
         animationEnabled: verticalCaptionConfig.animationEnabled,
+        animation: verticalCaptionConfig.animation,
         fontId: verticalCaptionConfig.fontId,
         fontSize: verticalCaptionConfig.fontSize,
         textColor: verticalCaptionConfig.textColor,
@@ -17131,7 +17520,8 @@ const processJob = async (
         strategyProfile,
         editorMode: editorModeForRender,
         styleProfile: verticalStyleProfile,
-        nicheProfile: verticalNicheProfile
+        nicheProfile: verticalNicheProfile,
+        selectionMode: resolvedVerticalMode.selectionMode
       })
       const requestedVerticalClipCount = verticalSelection.requestedCount
       const targetRenderCount = verticalSelection.outputTarget
@@ -17190,6 +17580,7 @@ const processJob = async (
               transcriptCues: verticalSourceCues,
               captionPreset: verticalCaptionConfig.preset,
               animationEnabled: verticalCaptionConfig.animationEnabled,
+              animationMode: verticalCaptionConfig.animation,
               autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
               editorMode: editorModeForRender,
               styleProfile: verticalStyleProfile,
@@ -17310,7 +17701,10 @@ const processJob = async (
         selectedCandidates: selectedVerticalCandidates,
         selectionResult: verticalSelection,
         preScan: verticalPreScan,
-        clipCaptionOverlaysByClip: verticalClipCaptionOverlays
+        clipCaptionOverlaysByClip: verticalClipCaptionOverlays,
+        selectionMode: resolvedVerticalMode.selectionMode,
+        zoomProfile: resolvedVerticalMode.zoomProfile,
+        zoomIntensity: resolvedVerticalMode.zoomIntensity
       })
       const verticalClipDetails = selectedVerticalCandidates.map((candidate, index) => {
         const range = candidate.range
@@ -17373,6 +17767,9 @@ const processJob = async (
           vertical_selection: {
             requestedClipCount: requestedVerticalClipCount,
             renderedClipCount: clipRanges.length,
+            selectionMode: resolvedVerticalMode.selectionMode,
+            zoomProfile: resolvedVerticalMode.zoomProfile,
+            zoomIntensity: resolvedVerticalMode.zoomIntensity,
             outputTarget: verticalSelection.outputTarget,
             candidateTarget: verticalSelection.candidateTarget,
             evaluatedCount: verticalSelection.evaluatedCount,
@@ -21262,6 +21659,29 @@ router.post('/:id/reprocess', async (req: any, res) => {
       return res.status(403).json(rerenderLimitViolation.payload)
     }
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
+    const persistedRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const requestedVerticalModeOverride = (
+      req.body?.verticalMode && typeof req.body.verticalMode === 'object'
+    )
+      ? {
+          ...(persistedRenderConfig.verticalMode || {}),
+          ...(req.body.verticalMode || {}),
+          output: {
+            ...((persistedRenderConfig.verticalMode as any)?.output || {}),
+            ...((req.body.verticalMode as any)?.output || {})
+          }
+        }
+      : (req.body?.verticalMode ?? persistedRenderConfig.verticalMode)
+    const effectiveRenderConfig = hasRenderConfigOverrideInPayload(req.body)
+      ? parseRenderConfigFromRequest({
+          ...req.body,
+          renderMode: req.body?.renderMode ?? req.body?.mode ?? persistedRenderConfig.mode,
+          mode: req.body?.mode ?? req.body?.renderMode ?? persistedRenderConfig.mode,
+          horizontalMode: req.body?.horizontalMode ?? persistedRenderConfig.horizontalMode,
+          verticalMode: requestedVerticalModeOverride,
+          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount
+        })
+      : persistedRenderConfig
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -21326,6 +21746,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
 
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
+      renderMode: effectiveRenderConfig.mode,
+      horizontalMode: effectiveRenderConfig.horizontalMode,
+      verticalClipCount: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalClipCount : 1,
+      verticalMode: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalMode : null,
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
       retentionStrategyProfile: requestedStrategyProfile,
@@ -21361,6 +21785,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
+      renderMode: effectiveRenderConfig.mode,
+      horizontalMode: effectiveRenderConfig.horizontalMode,
+      verticalMode: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalMode : null,
+      verticalClipCount: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalClipCount : 1,
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
       retentionStrategyProfile: requestedStrategyProfile,
@@ -21463,10 +21891,31 @@ router.post('/:id/retention-feedback', async (req: any, res) => {
     await persistRetentionFeedbackForJob({ job, feedback })
 
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
+    let feedbackLoop: {
+      applied: boolean
+      reason: string
+      last_applied_at: string | null
+      last_applied_config_version_id: string | null
+    } | null = null
+    try {
+      const loop = await runFeedbackLoop({
+        trigger: 'feedback_submission',
+        actorUserId: req.user?.id || null
+      })
+      feedbackLoop = {
+        applied: loop.applied,
+        reason: loop.reason,
+        last_applied_at: loop.status.runtime.last_applied_at,
+        last_applied_config_version_id: loop.status.runtime.last_applied_config_version_id
+      }
+    } catch (error) {
+      console.warn('feedback loop run failed after retention feedback', error)
+    }
     return res.json({
       ok: true,
       feedback,
-      hookCalibration
+      hookCalibration,
+      feedbackLoop
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -21491,10 +21940,31 @@ router.post('/:id/platform-feedback', async (req: any, res) => {
 
     await persistRetentionFeedbackForJob({ job, feedback })
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
+    let feedbackLoop: {
+      applied: boolean
+      reason: string
+      last_applied_at: string | null
+      last_applied_config_version_id: string | null
+    } | null = null
+    try {
+      const loop = await runFeedbackLoop({
+        trigger: 'platform_feedback_submission',
+        actorUserId: req.user?.id || null
+      })
+      feedbackLoop = {
+        applied: loop.applied,
+        reason: loop.reason,
+        last_applied_at: loop.status.runtime.last_applied_at,
+        last_applied_config_version_id: loop.status.runtime.last_applied_config_version_id
+      }
+    } catch (error) {
+      console.warn('feedback loop run failed after platform feedback', error)
+    }
     return res.json({
       ok: true,
       feedback,
-      hookCalibration
+      hookCalibration,
+      feedbackLoop
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -21542,11 +22012,32 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
     })
 
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
+    let feedbackLoop: {
+      applied: boolean
+      reason: string
+      last_applied_at: string | null
+      last_applied_config_version_id: string | null
+    } | null = null
+    try {
+      const loop = await runFeedbackLoop({
+        trigger: 'creator_feedback_submission',
+        actorUserId: req.user?.id || null
+      })
+      feedbackLoop = {
+        applied: loop.applied,
+        reason: loop.reason,
+        last_applied_at: loop.status.runtime.last_applied_at,
+        last_applied_config_version_id: loop.status.runtime.last_applied_config_version_id
+      }
+    } catch (error) {
+      console.warn('feedback loop run failed after creator feedback', error)
+    }
     return res.json({
       ok: true,
       creatorFeedback,
       feedback,
-      hookCalibration
+      hookCalibration,
+      feedbackLoop
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
