@@ -343,6 +343,182 @@ const runFfmpeg = async (args: string[]) => {
   throw err
 }
 
+const escapeFfmpegDrawtextText = (value: string) => (
+  String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'")
+    .replace(/\[/g, '\\[')
+    .replace(/\]/g, '\\]')
+    .replace(/%/g, '\\%')
+)
+
+const executeFFmpegPlan = async (input: string, plan: EditPlan, options: any) => {
+  const safePlan: Partial<EditPlan> & Record<string, any> = (
+    plan && typeof plan === 'object'
+      ? (plan as Partial<EditPlan> & Record<string, any>)
+      : { segments: [] }
+  )
+  const outputPath = String(
+    options?.outputPath ||
+    path.join(os.tmpdir(), `ffmpeg-plan-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`)
+  )
+  const fps = Number.isFinite(Number(options?.fps)) ? Math.max(1, Number(options.fps)) : 25
+  const preset = String(options?.preset || 'slow')
+  const crf = String(options?.crf || '23')
+  const sfxInputs = Array.isArray(options?.sfxInputs)
+    ? options.sfxInputs.map((entry: any) => String(entry || '').trim()).filter(Boolean)
+    : []
+  const sfxVolume = Number.isFinite(Number(options?.sfxVolume))
+    ? clamp(Number(options.sfxVolume), 0, 2)
+    : 0.75
+
+  const rawCuts = Array.isArray((safePlan as any)?.cuts) && (safePlan as any).cuts.length
+    ? (safePlan as any).cuts
+    : (safePlan.segments || []).map((segment, index) => ({
+      id: index,
+      start: segment.start,
+      end: segment.end
+    }))
+  const normalizedCuts = rawCuts
+    .map((cut: any, index: number) => {
+      const start = Number(cut?.start)
+      const end = Number(cut?.end)
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
+      return {
+        id: Number.isFinite(Number(cut?.id)) ? Number(cut.id) : index,
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        duration: Number((end - start).toFixed(3))
+      }
+    })
+    .filter((cut: any) => Boolean(cut))
+
+  const rawZooms = Array.isArray((safePlan as any)?.zooms) ? (safePlan as any).zooms : []
+  const normalizedZooms = rawZooms
+    .map((zoom: any, index: number) => {
+      const intensity = Number.isFinite(Number(zoom?.intensity)) ? clamp(Number(zoom.intensity), 0, 3) : 0
+      const duration = Number.isFinite(Number(zoom?.duration)) ? Math.max(0.08, Number(zoom.duration)) : 0
+      const inputId = Number.isFinite(Number(zoom?.inputId)) ? Number(zoom.inputId) : null
+      if (!intensity || !duration) return null
+      return {
+        id: Number.isFinite(Number(zoom?.id)) ? Number(zoom.id) : index,
+        inputId,
+        intensity,
+        duration
+      }
+    })
+    .filter((zoom: any) => Boolean(zoom))
+
+  const rawCaptions = Array.isArray((safePlan as any)?.captions) ? (safePlan as any).captions : []
+  const normalizedCaptions = rawCaptions
+    .map((caption: any) => {
+      const text = String(caption?.text || '').trim()
+      const start = Number(caption?.start)
+      const end = Number(caption?.end)
+      if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
+      return {
+        text,
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3))
+      }
+    })
+    .filter((caption: any) => Boolean(caption))
+
+  const filterComplex: string[] = []
+  let currentVideoLabel = '0:v'
+  let hasVideoFilter = false
+
+  if (normalizedCuts.length > 0) {
+    normalizedCuts.forEach((cut: { id: number; start: number; end: number }) => {
+      filterComplex.push(
+        `[0:v]trim=start=${toFilterNumber(cut.start)}:end=${toFilterNumber(cut.end)},setpts=PTS-STARTPTS[vcut${cut.id}]`
+      )
+    })
+    const concatInputs = normalizedCuts.map((cut: { id: number }) => `[vcut${cut.id}]`).join('')
+    filterComplex.push(`${concatInputs}concat=n=${normalizedCuts.length}:v=1:a=0[vcuts]`)
+    currentVideoLabel = 'vcuts'
+    hasVideoFilter = true
+  }
+
+  normalizedZooms.forEach((zoom: { id: number; inputId: number | null; intensity: number; duration: number }, index: number) => {
+    const sourceLabel = zoom.inputId !== null
+      ? `vcut${zoom.inputId}`
+      : currentVideoLabel
+    const availableInput = hasVideoFilter ? `[${sourceLabel}]` : '[0:v]'
+    const zoomLabel = `vzoom${zoom.id}`
+    const frameCount = Math.max(1, Math.round(zoom.duration * fps))
+    filterComplex.push(
+      `${availableInput}zoompan=z='zoom+0.001*${toFilterNumber(zoom.intensity)}':d=${frameCount}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'[${zoomLabel}]`
+    )
+    currentVideoLabel = zoomLabel
+    hasVideoFilter = true
+  })
+
+  normalizedCaptions.forEach((caption: { text: string; start: number; end: number }, index: number) => {
+    const sourceLabel = hasVideoFilter ? `[${currentVideoLabel}]` : '[0:v]'
+    const outLabel = `vcap${index}`
+    const escapedText = escapeFfmpegDrawtextText(caption.text)
+    filterComplex.push(
+      `${sourceLabel}drawtext=text='${escapedText}':fontfile=KomikaAxis.ttf:fontsize=120:fontcolor=yellow@1.0:borderw=16:bordercolor=black:x=(w-tw)/2:y=h-th-100:enable='between(t,${toFilterNumber(caption.start)},${toFilterNumber(caption.end)})':alpha='if(lt(t-${toFilterNumber(caption.start)},0.3),(t-${toFilterNumber(caption.start)})/0.3,1)'[${outLabel}]`
+    )
+    currentVideoLabel = outLabel
+    hasVideoFilter = true
+  })
+
+  let audioMap = '0:a?'
+  if (sfxInputs.length > 0) {
+    filterComplex.push('[0:a]aformat=sample_rates=48000:channel_layouts=stereo[abase]')
+    const mixInputs = ['[abase]']
+    sfxInputs.forEach((_, index) => {
+      const sfxLabel = `asfx${index}`
+      filterComplex.push(
+        `[${index + 1}:a]aformat=sample_rates=48000:channel_layouts=stereo,volume=${toFilterNumber(sfxVolume)}[${sfxLabel}]`
+      )
+      mixInputs.push(`[${sfxLabel}]`)
+    })
+    filterComplex.push(
+      `${mixInputs.join('')}amix=inputs=${mixInputs.length}:dropout_transition=0:normalize=0[aout]`
+    )
+    audioMap = '[aout]'
+  }
+
+  const command = [
+    '-y',
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    input,
+    ...sfxInputs.flatMap((entry) => ['-i', entry]),
+    '-movflags',
+    '+faststart'
+  ]
+  if (filterComplex.length) {
+    command.push('-filter_complex', filterComplex.join(';'))
+  }
+  command.push('-map', hasVideoFilter ? `[${currentVideoLabel}]` : '0:v')
+  command.push('-map', audioMap)
+  command.push(
+    '-c:v',
+    'libx264',
+    '-preset',
+    preset,
+    '-crf',
+    crf,
+    '-pix_fmt',
+    'yuv420p',
+    '-c:a',
+    'aac',
+    '-b:a',
+    String(options?.audioBitrate || '160k'),
+    outputPath
+  )
+  await runFfmpeg(command)
+  return outputPath
+}
+
 const formatFfmpegCommand = (args: string[]) => {
   return formatCommand(FFMPEG_PATH, args)
 }
@@ -960,7 +1136,7 @@ type EditOptions = {
   tangentKiller: boolean
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
-type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education'
+type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type HookSelectionMode = 'manual' | 'auto'
 type LongFormPreset = 'auto' | 'balanced' | 'aggressive' | 'ultra'
 type ConcreteLongFormPreset = Exclude<LongFormPreset, 'auto'>
@@ -1014,24 +1190,26 @@ const LONG_FORM_AGGRESSION_MIN = 0
 const LONG_FORM_AGGRESSION_MAX = 100
 const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
-const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education']
+const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education', 'podcast']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
 const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['auto', 'balanced', 'aggressive', 'ultra']
 const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, ContentStyle> = {
   reaction: 'reaction',
-  commentary: 'vlog',
+  commentary: 'story',
   vlog: 'vlog',
   gaming: 'gaming',
-  sports: 'gaming',
-  education: 'tutorial'
+  sports: 'reaction',
+  education: 'tutorial',
+  podcast: 'tutorial'
 }
 const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingNiche> = {
   reaction: 'high_energy',
   commentary: 'talking_head',
-  vlog: 'talking_head',
+  vlog: 'story',
   gaming: 'high_energy',
   sports: 'high_energy',
-  education: 'education'
+  education: 'education',
+  podcast: 'talking_head'
 }
 const resolveLowRetentionRecoveryEditorMode = ({
   contentFormat,
@@ -1045,13 +1223,16 @@ const resolveLowRetentionRecoveryEditorMode = ({
   nicheProfile?: VideoNicheProfile | null
 }): { mode: Exclude<EditorModeSelection, 'auto'>; reason: string } => {
   const normalizedPlatform = parseRetentionTargetPlatform(targetPlatform || 'auto')
+  if (contentFormat === 'podcast_clip') {
+    return { mode: 'podcast', reason: 'Podcast clip format detected; preserving multi-speaker breathing room.' }
+  }
   if (styleProfile?.style === 'gaming') {
     return { mode: 'gaming', reason: 'Detected gaming visual rhythm.' }
   }
   if (styleProfile?.style === 'reaction') {
     return { mode: 'reaction', reason: 'Detected reaction-style pacing opportunities.' }
   }
-  if (styleProfile?.style === 'tutorial' || nicheProfile?.niche === 'education' || contentFormat === 'podcast_clip') {
+  if (styleProfile?.style === 'tutorial' || nicheProfile?.niche === 'education') {
     return { mode: 'education', reason: 'Detected education/talking-head signals that benefit from clarity-first pacing.' }
   }
   if (nicheProfile?.niche === 'high_energy') {
@@ -1667,11 +1848,15 @@ const applyDurationBandSpeedTuning = ({
     }
     if (energyEditorMode === 'education' || energyEditorMode === 'commentary') {
       target = Math.min(target, band.maxSpeed - 0.05)
+    } else if (energyEditorMode === 'podcast') {
+      target = Math.min(target, band.maxSpeed - 0.09)
     }
     if (energyEditorMode === 'sports') {
-      target += 0.05
-    } else if (energyEditorMode === 'reaction' || energyEditorMode === 'gaming') {
+      target += 0.06
+    } else if (energyEditorMode === 'gaming') {
       target += 0.03
+    } else if (energyEditorMode === 'reaction') {
+      target += 0.025
     }
     target = clamp(target, band.minSpeed, band.maxSpeed)
     return { ...segment, speed: Number(target.toFixed(3)) }
@@ -1703,7 +1888,10 @@ const resolveClipCandidateTarget = ({
   else if (minutes >= 40) target = 32
   else if (minutes >= 20) target = 24
   if (editorMode === 'sports') target += 5
-  else if (editorMode === 'reaction' || editorMode === 'gaming') target += 4
+  else if (editorMode === 'reaction') target += 4
+  else if (editorMode === 'gaming') target += 3
+  else if (editorMode === 'podcast') target -= 3
+  else if (editorMode === 'commentary') target -= 1
   if (nicheProfile?.niche === 'high_energy') target += 4
   if (editorMode === 'education' || nicheProfile?.niche === 'education') target -= 2
   return clamp(Math.round(target), CLIP_CANDIDATE_POOL_MIN, CLIP_CANDIDATE_POOL_MAX)
@@ -1724,7 +1912,9 @@ const resolveAutoExportClipTarget = ({
   else if (minutes >= 60) target = 15
   else if (minutes >= 40) target = 12
   if (editorMode === 'sports') target += 3
-  else if (editorMode === 'reaction' || editorMode === 'gaming') target += 2
+  else if (editorMode === 'reaction') target += 2
+  else if (editorMode === 'gaming') target += 1
+  else if (editorMode === 'podcast') target -= 2
   if (nicheProfile?.niche === 'high_energy') target += 2
   return clamp(Math.round(target), CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX)
 }
@@ -1758,9 +1948,15 @@ const resolveInterruptIntervalRange = ({
   } else if (editorMode === 'reaction') {
     minSec = 2.2
     maxSec = 4
-  } else if (editorMode === 'education' || editorMode === 'commentary') {
+  } else if (editorMode === 'education') {
     minSec = 3
     maxSec = 5
+  } else if (editorMode === 'commentary') {
+    minSec = 3.2
+    maxSec = 5.4
+  } else if (editorMode === 'podcast') {
+    minSec = 4
+    maxSec = 6.2
   }
   if (styleProfile?.style === 'tutorial') {
     minSec = Math.max(minSec, 3)
@@ -1834,7 +2030,13 @@ const computeNicheFitScore = ({
   if (mode === 'reaction') {
     return clamp01(0.46 * action + 0.32 * emotion + 0.22 * curiosity)
   }
-  if (mode === 'education' || mode === 'commentary') {
+  if (mode === 'education') {
+    return clamp01(0.56 * speech + 0.24 * curiosity + 0.2 * (1 - action * 0.42))
+  }
+  if (mode === 'podcast') {
+    return clamp01(0.64 * speech + 0.22 * curiosity + 0.14 * emotion)
+  }
+  if (mode === 'commentary') {
     return clamp01(0.52 * speech + 0.22 * curiosity + 0.26 * (1 - action * 0.5))
   }
   if (mode === 'vlog') {
@@ -5728,7 +5930,6 @@ const maybeAllowQualityGateOverride = ({
 
 const shouldForceRescueRender = (judge: RetentionJudgeReport) => {
   return (
-    judge.retention_score >= MIN_PREDICTED_COMPLETION_PERCENT &&
     judge.retention_score >= RESCUE_RENDER_MINIMUMS.retention_score &&
     judge.hook_strength >= RESCUE_RENDER_MINIMUMS.hook_strength &&
     judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score
@@ -6534,6 +6735,9 @@ const buildAutoVerticalCaptionPool = ({
 }) => {
   if (editorMode === 'education' || nicheProfile?.niche === 'education' || styleProfile?.style === 'tutorial') {
     return ['Save this tip ✅', 'Use this next 👇', 'Replay this step 🔁']
+  }
+  if (editorMode === 'podcast') {
+    return ['Key point here 🎙️', 'Listen to this part 👂', 'Worth replaying 🔁']
   }
   if (editorMode === 'gaming' || editorMode === 'sports' || styleProfile?.style === 'gaming') {
     return ['NO WAY 🤯', 'CLUTCH MOMENT 🎯', 'RUN IT BACK 🔁', 'THIS IS WILD 😤']
@@ -11625,6 +11829,7 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   else if (editorMode === 'reaction') combined -= 0.18
   else if (editorMode === 'education') combined += 0.28
   else if (editorMode === 'commentary') combined += 0.18
+  else if (editorMode === 'podcast') combined += 0.34
   else if (editorMode === 'vlog') combined += 0.08
   return Number(clamp(combined, 2.2, 5.4).toFixed(2))
 }
@@ -11663,6 +11868,9 @@ const getVerticalModeScoreBias = (editorMode?: EditorModeSelection | null): Vert
   }
   if (editorMode === 'commentary') {
     return { hook: 0, interrupt: -0.03, ending: 0.03, energy: -0.01, caption: 0.03 }
+  }
+  if (editorMode === 'podcast') {
+    return { hook: -0.01, interrupt: -0.08, ending: 0.08, energy: -0.04, caption: 0.07 }
   }
   if (editorMode === 'vlog') {
     return { hook: 0.01, interrupt: -0.01, ending: 0.03, energy: 0.01, caption: 0.02 }
@@ -18475,6 +18683,204 @@ router.get('/:id/local-output', async (req: any, res) => {
   }
 })
 
+const buildUniquenessSignatureForTest = ({
+  strategyProfile,
+  targetPlatform,
+  editorMode,
+  maxCuts,
+  longFormAggression,
+  longFormClarityVsSpeed,
+  tangentKiller,
+  durationSeconds = 300
+}: {
+  strategyProfile?: RetentionStrategyProfile | string | null
+  targetPlatform?: RetentionTargetPlatform | string | null
+  editorMode?: EditorModeSelection | string | null
+  maxCuts?: number | null
+  longFormAggression?: number | null
+  longFormClarityVsSpeed?: number | null
+  tangentKiller?: boolean | null
+  durationSeconds?: number | null
+}) => {
+  const resolvedStrategy = parseRetentionStrategyProfile(strategyProfile)
+  const resolvedTargetPlatform = parseRetentionTargetPlatform(targetPlatform || 'auto')
+  const resolvedEditorMode = parseEditorModeSelection(editorMode) || 'auto'
+  const resolvedMaxCuts = parseMaxCutsPreference(maxCuts) ?? 8
+  const resolvedLongFormAggression = parseLongFormAggression(longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const resolvedLongFormClarity = parseLongFormClarityVsSpeed(longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const resolvedTangentKiller = typeof tangentKiller === 'boolean' ? tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const resolvedDuration = Math.max(60, Number.isFinite(Number(durationSeconds)) ? Number(durationSeconds) : 300)
+  const resolvedAggressionLevel = STRATEGY_TO_AGGRESSION[resolvedStrategy] || 'medium'
+
+  const fallbackMode = resolvedEditorMode !== 'auto' ? resolvedEditorMode : null
+  const styleProfile: ContentStyleProfile | null = fallbackMode
+    ? {
+        style: EDITOR_MODE_TO_STYLE[fallbackMode],
+        confidence: 1,
+        rationale: ['Synthetic uniqueness benchmark mode override.'],
+        tempoBias: 0,
+        interruptBias: 0,
+        hookBias: 0
+      }
+    : null
+  const nicheProfile: VideoNicheProfile | null = fallbackMode
+    ? {
+        niche: EDITOR_MODE_TO_NICHE[fallbackMode],
+        confidence: 1,
+        rationale: ['Synthetic uniqueness benchmark mode override.'],
+        styleAlignment: EDITOR_MODE_TO_STYLE[fallbackMode],
+        metrics: {
+          avgSpeech: 0.54,
+          avgScene: 0.42,
+          avgEmotion: 0.5,
+          spikeRatio: 0.36,
+          transcriptCueCount: 18,
+          durationSeconds: resolvedDuration
+        }
+      }
+    : null
+
+  const syntheticWindows: EngagementWindow[] = [
+    {
+      time: 6,
+      audioEnergy: 0.44,
+      speechIntensity: 0.58,
+      motionScore: 0.41,
+      facePresence: 0.52,
+      textDensity: 0.18,
+      sceneChangeRate: 0.32,
+      emotionalSpike: 0,
+      vocalExcitement: 0.46,
+      emotionIntensity: 0.5,
+      audioVariance: 0.34,
+      keywordIntensity: 0.4,
+      curiosityTrigger: 0.32,
+      fillerDensity: 0.08,
+      boredomScore: 0.24,
+      hookScore: 0.56,
+      narrativeProgress: 0.26,
+      score: 0.52
+    },
+    {
+      time: 18,
+      audioEnergy: 0.62,
+      speechIntensity: 0.7,
+      motionScore: 0.54,
+      facePresence: 0.58,
+      textDensity: 0.2,
+      sceneChangeRate: 0.46,
+      emotionalSpike: 1,
+      vocalExcitement: 0.64,
+      emotionIntensity: 0.68,
+      audioVariance: 0.46,
+      keywordIntensity: 0.56,
+      curiosityTrigger: 0.48,
+      fillerDensity: 0.06,
+      boredomScore: 0.16,
+      hookScore: 0.72,
+      narrativeProgress: 0.5,
+      score: 0.69
+    },
+    {
+      time: 30,
+      audioEnergy: 0.38,
+      speechIntensity: 0.52,
+      motionScore: 0.34,
+      facePresence: 0.5,
+      textDensity: 0.16,
+      sceneChangeRate: 0.28,
+      emotionalSpike: 0,
+      vocalExcitement: 0.4,
+      emotionIntensity: 0.43,
+      audioVariance: 0.3,
+      keywordIntensity: 0.28,
+      curiosityTrigger: 0.24,
+      fillerDensity: 0.1,
+      boredomScore: 0.28,
+      hookScore: 0.44,
+      narrativeProgress: 0.72,
+      score: 0.46
+    }
+  ]
+  const tunedSegments = applyDurationBandSpeedTuning({
+    segments: [
+      { start: 0, end: 10, speed: 1.04 },
+      { start: 10, end: 20, speed: 1.02 },
+      { start: 20, end: 32, speed: 1.01 }
+    ],
+    windows: syntheticWindows,
+    durationSeconds: resolvedDuration,
+    editorMode: resolvedEditorMode
+  })
+  const avgSpeed = tunedSegments.length
+    ? tunedSegments.reduce((sum, segment) => sum + Number(segment.speed || 1), 0) / tunedSegments.length
+    : 1
+
+  const interruptRange = resolveInterruptIntervalRange({
+    strategyProfile: resolvedStrategy,
+    editorMode: resolvedEditorMode,
+    styleProfile
+  })
+  const verticalInterruptTarget = getVerticalInterruptTargetIntervalSeconds({
+    platformProfile: parsePlatformProfile(resolvedTargetPlatform, 'auto'),
+    strategyProfile: resolvedStrategy,
+    editorMode: resolvedEditorMode,
+    styleProfile
+  })
+  const clipCandidateTarget = resolveClipCandidateTarget({
+    durationSeconds: resolvedDuration,
+    editorMode: resolvedEditorMode,
+    nicheProfile
+  })
+  const clipExportTarget = resolveAutoExportClipTarget({
+    durationSeconds: resolvedDuration,
+    editorMode: resolvedEditorMode,
+    nicheProfile
+  })
+  const contentFormat: RetentionContentFormat = resolvedEditorMode === 'podcast'
+    ? 'podcast_clip'
+    : resolvedTargetPlatform === 'tiktok' || resolvedTargetPlatform === 'instagram_reels'
+      ? 'tiktok_short'
+      : 'youtube_long'
+  const qualityThresholds = resolveQualityGateThresholds({
+    aggressionLevel: resolvedAggressionLevel,
+    hasTranscript: true,
+    signalStrength: 0.64,
+    contentFormat,
+    targetPlatform: resolvedTargetPlatform
+  })
+  const modeBias = getVerticalModeScoreBias(resolvedEditorMode)
+  const maxCutsPerTen = getMaxCutsPer10Seconds({
+    renderMode: 'horizontal',
+    targetPlatform: resolvedTargetPlatform
+  })
+  const hardCutBudget = Math.max(1, Math.floor((resolvedDuration / 10) * maxCutsPerTen))
+  const effectiveCuts = Math.min(hardCutBudget, resolvedMaxCuts)
+  const longFormPreset = resolveLongFormPresetByAggression(resolvedLongFormAggression)
+
+  return JSON.stringify({
+    strategy: resolvedStrategy,
+    targetPlatform: resolvedTargetPlatform,
+    editorMode: resolvedEditorMode,
+    mappedStyle: styleProfile?.style || null,
+    mappedNiche: nicheProfile?.niche || null,
+    maxCuts: resolvedMaxCuts,
+    effectiveCuts,
+    hardCutBudget,
+    longFormPreset,
+    longFormAggression: resolvedLongFormAggression,
+    longFormClarityVsSpeed: resolvedLongFormClarity,
+    tangentKiller: resolvedTangentKiller,
+    interval: interruptRange,
+    verticalInterruptTarget,
+    clipCandidateTarget,
+    clipExportTarget,
+    qualityThresholds,
+    modeBias,
+    avgSpeed: Number(avgSpeed.toFixed(4))
+  })
+}
+
 const buildEditPlanForTest = async ({
   filePath,
   aggressionLevel,
@@ -18531,6 +18937,7 @@ export const __retentionTestUtils = {
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis,
+  buildUniquenessSignatureForTest,
   buildEditPlanForTest
 }
 

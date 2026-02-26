@@ -20,6 +20,8 @@
     "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts",
     "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts",
     "test:algorithm-control-room": "ts-node scripts/test-algorithm-control-room.ts",
+    "test:uniqueness-benchmark": "ts-node scripts/test-uniqueness-benchmark.ts",
+    "test:pre-push": "npm run test:algorithm-control-room && npm run test:retention-enforcer && npm run test:uniqueness-benchmark",
     "tune:emotional-real-clips": "ts-node scripts/tune-emotional-real-clips.ts"
   },
   "dependencies": {

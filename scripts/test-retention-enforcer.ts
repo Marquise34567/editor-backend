@@ -350,7 +350,13 @@ const run = () => {
       runtimeSeconds: 16,
       contentFormat: 'tiktok_short' as const,
       targetPlatform: 'tiktok' as const,
-      pacingTargetSeconds: 6
+      pacingTargetSeconds: 6,
+      introHold: 0.86,
+      endingReplayPotential: 0.82,
+      energyCurve: 0.8,
+      silentCaptionViability: 0.84,
+      nicheFit: 0.81,
+      predictedCompletion: 92
     }
   }
   const strongWindows = windows.map((window) => ({
@@ -386,7 +392,13 @@ const run = () => {
       runtimeSeconds: 12,
       contentFormat: 'tiktok_short' as const,
       targetPlatform: 'tiktok' as const,
-      pacingTargetSeconds: 6
+      pacingTargetSeconds: 6,
+      introHold: 0.42,
+      endingReplayPotential: 0.4,
+      energyCurve: 0.34,
+      silentCaptionViability: 0.46,
+      nicheFit: 0.38,
+      predictedCompletion: 48
     }
   }
   const weakWindows = windows.map((window) => ({
