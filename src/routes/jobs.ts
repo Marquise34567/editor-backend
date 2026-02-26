@@ -19875,7 +19875,6 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
-    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -19903,6 +19902,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -20029,6 +20029,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -20056,6 +20057,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -20378,6 +20380,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -20429,6 +20432,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     const nextAnalysis = {
