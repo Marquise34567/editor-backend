@@ -324,6 +324,7 @@ const applyPromptPresetIntent = ({
 type PlatformModeSelection = 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'long_form'
 type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type RetentionTiltSelection = 'safe' | 'balanced' | 'viral'
+type EntertainmentLevelSelection = 'high' | 'medium' | 'low'
 type FormatSelection = 'short' | 'long'
 type OrientationSelection = 'vertical' | 'horizontal'
 
@@ -389,6 +390,13 @@ const ADVANCED_MODE_SPEC_MARKERS: RegExp[] = [
   /\bplatform\s+modes?\b/i,
   /\bcontent(?:\s*-\s*|\s+)type\s+modes?\b/i,
   /\bselected\s+modes?\b/i,
+  /\bvideo\s+uniqueness\b/i,
+  /\bniche\s*:/i,
+  /\bentertainment\s+level\s*:/i,
+  /\bhook\s+candidates?\s+ranked\b/i,
+  /\bprimary\s+hook\b/i,
+  /\bretention\s+score\b/i,
+  /\beta\s+estimate\b/i,
   /\bbest\s+primary\s+hook\b/i,
   /\bfull\s+edit\s+summary\b/i,
   /\bfinal\s+recommendations\b/i
@@ -520,6 +528,72 @@ const resolveContentTypeModeFromPrompt = (prompt: string): ContentTypeModeSelect
   return mentions.length === 1 ? mentions[0] : null
 }
 
+const normalizeEntertainmentLevelSelection = (raw: string): EntertainmentLevelSelection | null => {
+  const value = String(raw || '')
+    .toLowerCase()
+    .replace(/[\[\]{}()]/g, ' ')
+    .replace(/[^a-z0-9+ _-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!value) return null
+  const matches: EntertainmentLevelSelection[] = []
+  if (/(^| )high( |$)/.test(value)) matches.push('high')
+  if (/(^| )medium( |$)/.test(value)) matches.push('medium')
+  if (/(^| )low( |$)/.test(value)) matches.push('low')
+  return matches.length === 1 ? matches[0] : null
+}
+
+const resolveEntertainmentLevelFromPrompt = (prompt: string): EntertainmentLevelSelection | null => {
+  const explicit = extractFirstMatchingMode<EntertainmentLevelSelection>({
+    prompt,
+    normalize: normalizeEntertainmentLevelSelection,
+    patterns: [
+      /\bentertainment\s+level\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\bengagement\s+level\s*[:=]\s*([^\n\r|;,]+)/i
+    ]
+  })
+  if (explicit) return explicit
+  const mentions = collectMentionedModes<EntertainmentLevelSelection>({
+    prompt,
+    patterns: [
+      { mode: 'high', pattern: /\bhigh[-\s]?entertainment\b/i },
+      { mode: 'medium', pattern: /\bmedium[-\s]?entertainment\b/i },
+      { mode: 'low', pattern: /\blow[-\s]?entertainment\b/i }
+    ]
+  })
+  return mentions.length === 1 ? mentions[0] : null
+}
+
+const resolveNicheLabelFromPrompt = (prompt: string): string | null => {
+  const match =
+    prompt.match(/\bniche\s*[:=]\s*([^\n\r]+)/i) ||
+    prompt.match(/\bvideo\s+niche\s*[:=]\s*([^\n\r]+)/i)
+  const raw = String(match?.[1] || '').trim()
+  if (!raw) return null
+  const normalized = raw
+    .replace(/^[\[\(]+/, '')
+    .replace(/[\]\)]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!normalized || normalized.length < 3) return null
+  if (/^\s*(high|medium|low)\s*$/i.test(normalized)) return null
+  if (/^\s*precise\s+classification\s*$/i.test(normalized)) return null
+  return normalized.slice(0, 140)
+}
+
+const inferContentTypeModeFromNiche = (nicheRaw: string): ContentTypeModeSelection | null => {
+  const niche = String(nicheRaw || '').toLowerCase()
+  if (!niche) return null
+  if (/\b(podcast|interview|roundtable|talk\s*show|multi[-\s]?speaker)\b/.test(niche)) return 'podcast'
+  if (/\b(gameplay|gaming|fps|stream|montage|frag|battle\s*royale)\b/.test(niche)) return 'gaming'
+  if (/\b(sports?|highlight|mma|boxing|soccer|nba|nfl|extreme\s+sports?)\b/.test(niche)) return 'sports'
+  if (/\b(tutorial|how\s*to|course|lecture|education|explain|lesson)\b/.test(niche)) return 'education'
+  if (/\b(reaction|reacting|responding)\b/.test(niche)) return 'reaction'
+  if (/\b(vlog|day\s+in\s+the\s+life|travel\s+log)\b/.test(niche)) return 'vlog'
+  if (/\b(commentary|analysis|opinion|rant)\b/.test(niche)) return 'commentary'
+  return null
+}
+
 const resolveRetentionTiltFromPrompt = (prompt: string): RetentionTiltSelection | null => {
   const explicit = extractFirstMatchingMode<RetentionTiltSelection>({
     prompt,
@@ -563,9 +637,18 @@ const resolveCaptionsPreferenceFromPrompt = (prompt: string): 'on' | 'off' | nul
 }
 
 const resolveFormatFromPrompt = (prompt: string): FormatSelection | null => {
+  const bracketMatch = prompt.match(/\bformat\s*[:=]\s*\[\s*([^\]]+)\s*\]/i)
+  if (bracketMatch?.[1]) {
+    const bracketValue = bracketMatch[1].toLowerCase()
+    const hasShort = /\bshort(?:[\s-]?form)?\b/.test(bracketValue)
+    const hasLong = /\blong(?:[\s-]?form)?\b/.test(bracketValue)
+    if (hasShort && !hasLong) return 'short'
+    if (hasLong && !hasShort) return 'long'
+    return null
+  }
   const match = prompt.match(/\bformat\s*[:=]\s*(short(?:[\s-]?form)?|long(?:[\s-]?form)?)\b/i)
   if (!match?.[1]) return null
-  const normalized = match[1].toLowerCase()
+  const normalized = String(match[1]).toLowerCase()
   if (normalized.includes('short')) return 'short'
   if (normalized.includes('long')) return 'long'
   return null
@@ -820,6 +903,38 @@ const RETENTION_TILT_OVERLAYS: Record<RetentionTiltSelection, Partial<Record<Num
   }
 }
 
+const ENTERTAINMENT_LEVEL_OVERLAYS: Record<EntertainmentLevelSelection, Partial<Record<NumericParamKey, number>>> = {
+  high: {
+    cut_aggression: 11,
+    pacing_multiplier: 0.18,
+    pattern_interrupt_every_sec: -2.1,
+    hook_priority_weight: 0.26,
+    spike_boost: 0.34,
+    energy_floor: 0.1,
+    story_coherence_guard: -7,
+    jank_guard: -6
+  },
+  medium: {
+    cut_aggression: 2,
+    pacing_multiplier: 0.04,
+    pattern_interrupt_every_sec: -0.4,
+    hook_priority_weight: 0.07,
+    spike_boost: 0.08
+  },
+  low: {
+    cut_aggression: -12,
+    pacing_multiplier: -0.16,
+    pattern_interrupt_every_sec: 3.6,
+    story_coherence_guard: 12,
+    jank_guard: 11,
+    max_clip_len_ms: 1_400,
+    filler_word_weight: 0.28,
+    redundancy_weight: 0.2,
+    spike_boost: -0.12,
+    energy_floor: -0.06
+  }
+}
+
 const parsePromptIntoParams = async ({
   prompt,
   base,
@@ -908,22 +1023,36 @@ const parsePromptIntoParams = async ({
   const advancedModeSpec = isAdvancedModeSpecPrompt(normalizedPrompt)
   const requestedPlatformMode = resolvePlatformModeFromPrompt(normalizedPrompt)
   const requestedContentMode = resolveContentTypeModeFromPrompt(normalizedPrompt)
+  const requestedEntertainmentLevel = resolveEntertainmentLevelFromPrompt(normalizedPrompt)
+  const requestedNicheLabel = resolveNicheLabelFromPrompt(normalizedPrompt)
+  const inferredContentModeFromNiche = requestedNicheLabel
+    ? inferContentTypeModeFromNiche(requestedNicheLabel)
+    : null
   const requestedTilt = resolveRetentionTiltFromPrompt(normalizedPrompt)
   const requestedFormat = resolveFormatFromPrompt(normalizedPrompt)
   const requestedOrientation = resolveOrientationFromPrompt(normalizedPrompt)
   const requestedCutCount = resolveCutCountFromPrompt(normalizedPrompt)
   const captionsPreference = resolveCaptionsPreferenceFromPrompt(normalizedPrompt)
   const hookAndCutOnly = resolveHookAndCutOnlyFromPrompt(normalizedPrompt)
+  const strictHookPlacementRequested =
+    /\bprimary\s+hook\b[\s\S]{0,160}\b(?:very\s+beginning|beginning|0:00)\b/i.test(normalizedPrompt) ||
+    /\bplaced\s+at\s*:\s*0:00\b/i.test(normalizedPrompt)
+  const multiHookCadenceRequested =
+    /\bsecondary\s+hooks?\b/i.test(normalizedPrompt) ||
+    /\bmicro-hooks?\b/i.test(normalizedPrompt)
 
   const hasExplicitModeSelection = Boolean(
     requestedPlatformMode ||
     requestedContentMode ||
     requestedFormat ||
-    requestedOrientation
+    requestedOrientation ||
+    requestedEntertainmentLevel
   )
   const hasModeSelectionSignal = Boolean(
     hasExplicitModeSelection ||
     (advancedModeSpec && (
+      requestedEntertainmentLevel ||
+      inferredContentModeFromNiche ||
       requestedTilt ||
       requestedCutCount !== null ||
       captionsPreference ||
@@ -937,7 +1066,7 @@ const parsePromptIntoParams = async ({
       if (requestedFormat === 'short' || requestedOrientation === 'vertical') resolvedPlatformMode = 'youtube_shorts'
       else resolvedPlatformMode = 'long_form'
     }
-    const resolvedContentMode = requestedContentMode || 'auto'
+    const resolvedContentMode = requestedContentMode || inferredContentModeFromNiche || 'auto'
     const platformBaseline = PLATFORM_MODE_BASELINES[resolvedPlatformMode]
     const contentOverlay = CONTENT_MODE_OVERLAYS[resolvedContentMode]
     const hasExplicitSubtitleInstruction = Boolean(subtitleModeMatch?.[1])
@@ -985,6 +1114,49 @@ const parsePromptIntoParams = async ({
         deltas: RETENTION_TILT_OVERLAYS[requestedTilt],
         source: 'prompt_intent',
         reasonPrefix: `Retention tilt ${requestedTilt}`
+      })
+    }
+
+    if (requestedEntertainmentLevel) {
+      applyNumericDeltas({
+        next,
+        changes,
+        deltas: ENTERTAINMENT_LEVEL_OVERLAYS[requestedEntertainmentLevel],
+        source: 'prompt_intent',
+        reasonPrefix: `Entertainment level ${requestedEntertainmentLevel}`
+      })
+    }
+
+    if (strictHookPlacementRequested) {
+      applyNumericDeltas({
+        next,
+        changes,
+        deltas: {
+          hook_priority_weight: 0.34,
+          pattern_interrupt_every_sec: -0.9,
+          spike_boost: 0.1
+        },
+        source: 'prompt_intent',
+        reasonPrefix: 'Primary hook at 0:00'
+      })
+    }
+
+    if (multiHookCadenceRequested) {
+      applyNumericDeltas({
+        next,
+        changes,
+        deltas: resolvedPlatformMode === 'long_form'
+          ? {
+              pattern_interrupt_every_sec: -1.2,
+              story_coherence_guard: 5,
+              hook_priority_weight: 0.12
+            }
+          : {
+              pattern_interrupt_every_sec: -0.5,
+              hook_priority_weight: 0.1
+            },
+        source: 'prompt_intent',
+        reasonPrefix: 'Secondary hook cadence'
       })
     }
 
@@ -1066,10 +1238,22 @@ const parsePromptIntoParams = async ({
     }
 
     if (!requestedPlatformMode && advancedModeSpec) {
-      warnings.push('Platform mode was not explicitly selected; defaulted to Long-Form baseline for deterministic tuning.')
+      const platformLabel = resolvedPlatformMode === 'youtube_shorts'
+        ? 'YouTube Shorts'
+        : resolvedPlatformMode === 'instagram_reels'
+          ? 'IG Reels'
+          : resolvedPlatformMode === 'tiktok'
+            ? 'TikTok'
+            : 'Long-Form'
+      warnings.push(`Platform mode was not explicitly selected; defaulted to ${platformLabel} baseline for deterministic tuning.`)
     }
-    if (!requestedContentMode && advancedModeSpec) {
+    if (!requestedContentMode && inferredContentModeFromNiche) {
+      warnings.push(`Content-Type mode was inferred from niche classification: ${inferredContentModeFromNiche}.`)
+    } else if (!requestedContentMode && advancedModeSpec) {
       warnings.push('Content-Type mode was not explicitly selected; defaulted to Auto overlay.')
+    }
+    if (!requestedEntertainmentLevel && advancedModeSpec) {
+      warnings.push('Entertainment level was not explicitly selected; no entertainment-level overlay was applied.')
     }
 
     strategy = strategy === 'prompt_directive' ? 'prompt_directive' : 'prompt_intent'
