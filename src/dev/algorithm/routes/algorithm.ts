@@ -322,7 +322,7 @@ const applyPromptPresetIntent = ({
 }
 
 type PlatformModeSelection = 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'long_form'
-type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education'
+type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type RetentionTiltSelection = 'safe' | 'balanced' | 'viral'
 type FormatSelection = 'short' | 'long'
 type OrientationSelection = 'vertical' | 'horizontal'
@@ -433,6 +433,7 @@ const normalizeContentTypeModeSelection = (raw: string): ContentTypeModeSelectio
   if (/(^| )gaming( |$)/.test(value)) matches.push('gaming')
   if (/(^| )sports?( |$)/.test(value)) matches.push('sports')
   if (/(^| )education(?:al)?( |$)/.test(value)) matches.push('education')
+  if (/(^| )podcast( |$)/.test(value)) matches.push('podcast')
   return matches.length === 1 ? matches[0] : null
 }
 
@@ -512,7 +513,8 @@ const resolveContentTypeModeFromPrompt = (prompt: string): ContentTypeModeSelect
       { mode: 'vlog', pattern: /\bvlog\b/i },
       { mode: 'gaming', pattern: /\bgaming\b/i },
       { mode: 'sports', pattern: /\bsports?\b/i },
-      { mode: 'education', pattern: /\beducation(?:al)?\b/i }
+      { mode: 'education', pattern: /\beducation(?:al)?\b/i },
+      { mode: 'podcast', pattern: /\bpodcast\b/i }
     ]
   })
   return mentions.length === 1 ? mentions[0] : null
@@ -769,6 +771,22 @@ const CONTENT_MODE_OVERLAYS: Record<ContentTypeModeSelection, {
     },
     subtitleMode: 'education_key_terms',
     reason: 'Education overlay'
+  },
+  podcast: {
+    delta: {
+      cut_aggression: -10,
+      pacing_multiplier: -0.16,
+      pattern_interrupt_every_sec: 6.4,
+      story_coherence_guard: 14,
+      jank_guard: 14,
+      filler_word_weight: 0.38,
+      redundancy_weight: 0.26,
+      silence_min_ms: 220,
+      spike_boost: -0.2,
+      energy_floor: -0.08
+    },
+    subtitleMode: 'podcast_readable_dual',
+    reason: 'Podcast overlay'
   }
 }
 
@@ -897,12 +915,20 @@ const parsePromptIntoParams = async ({
   const captionsPreference = resolveCaptionsPreferenceFromPrompt(normalizedPrompt)
   const hookAndCutOnly = resolveHookAndCutOnlyFromPrompt(normalizedPrompt)
 
-  const hasModeSelectionSignal = Boolean(
-    advancedModeSpec ||
+  const hasExplicitModeSelection = Boolean(
     requestedPlatformMode ||
     requestedContentMode ||
     requestedFormat ||
     requestedOrientation
+  )
+  const hasModeSelectionSignal = Boolean(
+    hasExplicitModeSelection ||
+    (advancedModeSpec && (
+      requestedTilt ||
+      requestedCutCount !== null ||
+      captionsPreference ||
+      hookAndCutOnly
+    ))
   )
 
   if (hasModeSelectionSignal) {
