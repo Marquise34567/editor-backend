@@ -15314,6 +15314,20 @@ const processJob = async (
         hook_text: selectedHook?.text ?? (job.analysis as any)?.hook_text ?? null,
         hook_reason: selectedHook?.reason ?? (job.analysis as any)?.hook_reason ?? null,
         hook_synthetic: selectedHook?.synthetic ?? (job.analysis as any)?.hook_synthetic ?? false,
+        preferred_hook: hookSelectionModeForRender === 'auto'
+          ? null
+          : (
+              selectedHookSelectionSource === 'user_selected'
+                ? selectedHook
+                : ((job.analysis as any)?.preferred_hook ?? null)
+            ),
+        preferred_hook_updated_at: hookSelectionModeForRender === 'auto'
+          ? null
+          : (
+              selectedHookSelectionSource === 'user_selected'
+                ? toIsoNow()
+                : ((job.analysis as any)?.preferred_hook_updated_at ?? null)
+            ),
         hookSelectionMode: hookSelectionModeForRender,
         hook_selection_mode: hookSelectionModeForRender,
         hook_selection_source: selectedHookSelectionSource,
@@ -16918,7 +16932,11 @@ router.post('/:id/preferred-hook', async (req: any, res) => {
         )
     const resolvedHookSelectionSource: 'auto' | 'user_selected' | 'fallback' = hookSelectionMode === 'auto'
       ? 'auto'
-      : (resolvedPreferredHook ? 'user_selected' : 'auto')
+      : (
+          resolvedPreferredHook
+            ? 'user_selected'
+            : (analysis.hook_selection_source === 'fallback' ? 'fallback' : 'auto')
+        )
 
     const nowIso = toIsoNow()
     const existingSteps = normalizePipelineStepMap(analysis.pipelineSteps)
