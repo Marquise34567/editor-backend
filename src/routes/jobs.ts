@@ -882,7 +882,7 @@ type HookCandidate = {
   reason: string
   synthetic?: boolean
 }
-type ManualTimestampMarkerType = 'keep' | 'remove' | 'hook'
+type ManualTimestampMarkerType = 'keep' | 'remove' | 'hook' | 'zoom'
 type ManualTimestampMarkerSource = 'user' | 'ai'
 type ManualTimestampMarker = {
   id: string
@@ -890,6 +890,9 @@ type ManualTimestampMarker = {
   start: number
   end: number
   source: ManualTimestampMarkerSource
+  zoomIntensity?: number
+  zoomFocusX?: number
+  zoomFocusY?: number
   rationale?: string
 }
 type ManualTimestampSuggestionType = 'hook' | 'remove' | 'cut'
@@ -1333,7 +1336,7 @@ const EFFECT_PREVIEW_PROXY_WIDTH = 854
 const EFFECT_PREVIEW_PROXY_HEIGHT = 480
 const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'education', 'podcast']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
-const MANUAL_TIMESTAMP_MARKER_TYPES: ManualTimestampMarkerType[] = ['keep', 'remove', 'hook']
+const MANUAL_TIMESTAMP_MARKER_TYPES: ManualTimestampMarkerType[] = ['keep', 'remove', 'hook', 'zoom']
 const MANUAL_TIMESTAMP_SUGGESTION_TYPES: ManualTimestampSuggestionType[] = ['hook', 'remove', 'cut']
 const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['auto', 'balanced', 'aggressive', 'ultra']
 const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, ContentStyle> = {
@@ -1436,6 +1439,9 @@ const AGGRESSIVE_CUT_GAP_MULTIPLIER = 0.78
 const ZOOM_HARD_MAX = 1.15
 const ZOOM_MAX_DURATION_RATIO = 0.1
 const ZOOM_EASE_SEC = 0.2
+const MANUAL_ZOOM_INTENSITY_MIN = 0.2
+const MANUAL_ZOOM_INTENSITY_MAX = 1
+const MANUAL_ZOOM_INTENSITY_DEFAULT = 0.62
 const STITCH_FADE_SEC = 0.08
 const JUMPCUT_FADE_SEC = 0.012
 const MIN_RENDER_SEGMENT_SECONDS = 0.08
@@ -3287,6 +3293,19 @@ const parseManualRetentionDeltaEstimate = (value: any): number | null => {
   return Number(clamp(parsed, -100, 100).toFixed(2))
 }
 
+const parseManualZoomIntensity = (value: any): number | null => {
+  if (value === null || value === undefined || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Number(clamp(parsed, MANUAL_ZOOM_INTENSITY_MIN, MANUAL_ZOOM_INTENSITY_MAX).toFixed(3))
+}
+
+const parseManualZoomFocus = (value: any, fallback: number, min: number, max: number) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return Number(clamp(fallback, min, max).toFixed(4))
+  return Number(clamp(parsed, min, max).toFixed(4))
+}
+
 const parseManualTimestampMarker = (value: any, index: number): ManualTimestampMarker | null => {
   if (!value || typeof value !== 'object') return null
   const type = parseManualTimestampMarkerType(
@@ -3303,6 +3322,30 @@ const parseManualTimestampMarker = (value: any, index: number): ManualTimestampM
   const rationale = typeof (value as any).rationale === 'string'
     ? (value as any).rationale.trim().slice(0, 280)
     : ''
+  const zoomIntensity = parseManualZoomIntensity(
+    (value as any).zoomIntensity ??
+    (value as any).zoom_intensity ??
+    (value as any).zoomAmount ??
+    (value as any).zoom_amount
+  )
+  const zoomFocusX = parseManualZoomFocus(
+    (value as any).zoomFocusX ??
+    (value as any).zoom_focus_x ??
+    (value as any).focusX ??
+    (value as any).focus_x,
+    0.5,
+    0.08,
+    0.92
+  )
+  const zoomFocusY = parseManualZoomFocus(
+    (value as any).zoomFocusY ??
+    (value as any).zoom_focus_y ??
+    (value as any).focusY ??
+    (value as any).focus_y,
+    0.42,
+    0.08,
+    0.88
+  )
   const idSource = typeof (value as any).id === 'string' ? (value as any).id.trim() : ''
   const id = idSource || `${type}_${index}_${Math.round(start * 1000)}_${Math.round(end * 1000)}`
   return {
@@ -3311,6 +3354,13 @@ const parseManualTimestampMarker = (value: any, index: number): ManualTimestampM
     start,
     end,
     source,
+    ...(type === 'zoom'
+      ? {
+          zoomIntensity: zoomIntensity ?? MANUAL_ZOOM_INTENSITY_DEFAULT,
+          zoomFocusX,
+          zoomFocusY
+        }
+      : {}),
     ...(rationale ? { rationale } : {})
   }
 }
@@ -11805,19 +11855,47 @@ const applyZoomEasing = (segments: Segment[]) => {
       eased.push(seg)
       continue
     }
-    const ease = Math.min(ZOOM_EASE_SEC, duration / 4)
-    if (ease <= 0) {
-      eased.push(seg)
+    const compactEase = () => {
+      const ease = Math.min(ZOOM_EASE_SEC, duration / 4)
+      if (ease <= 0) {
+        eased.push(seg)
+        return
+      }
+      const easeZoom = zoom * 0.25
+      const midStart = seg.start + ease
+      const midEnd = seg.end - ease
+      eased.push({ ...seg, end: midStart, zoom: easeZoom })
+      if (midEnd - midStart > 0.05) {
+        eased.push({ ...seg, start: midStart, end: midEnd, zoom })
+      }
+      eased.push({ ...seg, start: midEnd, zoom: easeZoom })
+    }
+    if (duration < 1.2) {
+      compactEase()
       continue
     }
-    const easeZoom = zoom * 0.4
-    const midStart = seg.start + ease
-    const midEnd = seg.end - ease
-    eased.push({ ...seg, end: midStart, zoom: easeZoom })
-    if (midEnd - midStart > 0.05) {
-      eased.push({ ...seg, start: midStart, end: midEnd, zoom })
+    const ramp = Math.min(0.28, duration / 5)
+    if (ramp <= 0.04) {
+      compactEase()
+      continue
     }
-    eased.push({ ...seg, start: midEnd, zoom: easeZoom })
+    const p1 = Number((seg.start + ramp).toFixed(3))
+    const p2 = Number((seg.start + ramp * 2).toFixed(3))
+    const p3 = Number((seg.end - ramp * 2).toFixed(3))
+    const p4 = Number((seg.end - ramp).toFixed(3))
+    if (p2 <= p1 + 0.04 || p3 <= p2 + 0.04 || p4 <= p3 + 0.04) {
+      compactEase()
+      continue
+    }
+    const lowZoom = zoom * 0.2
+    const midZoom = zoom * 0.55
+    eased.push({ ...seg, start: seg.start, end: p1, zoom: lowZoom })
+    eased.push({ ...seg, start: p1, end: p2, zoom: midZoom })
+    if (p3 - p2 > 0.05) {
+      eased.push({ ...seg, start: p2, end: p3, zoom })
+    }
+    eased.push({ ...seg, start: p3, end: p4, zoom: midZoom })
+    eased.push({ ...seg, start: p4, end: seg.end, zoom: lowZoom })
   }
   return eased
 }
@@ -12601,7 +12679,8 @@ const buildSubtitleStyle = (style?: string | null) => {
     BorderStyle: '1',
     Outline: '2',
     Shadow: '0',
-    Alignment: '2'
+    Alignment: '2',
+    Spacing: '1'
   }
   const mrBeastStyle: Partial<typeof base> = {
     FontName: resolveSubtitleFontName(styleConfig.fontId),
@@ -15579,10 +15658,17 @@ const buildTimelineWithHookAtStartForTest = (segments: Segment[], hook: HookCand
   return [{ ...hookRange, speed: 1 }, ...withoutHook]
 }
 
+type ManualZoomRange = TimeRange & {
+  focusX: number
+  focusY: number
+  intensity: number
+}
+
 type ManualTimelineRenderPlan = {
   active: boolean
   keepRanges: TimeRange[]
   removeRanges: TimeRange[]
+  zoomRanges: ManualZoomRange[]
   hookRange: TimeRange | null
   hookSource: 'user-set' | 'ai-suggested' | 'none'
   segments: Segment[]
@@ -15606,12 +15692,97 @@ const normalizeManualRangeForDuration = (range: TimeRange, durationSeconds: numb
   return { start, end }
 }
 
+const normalizeManualZoomRangeForDuration = (
+  marker: ManualTimestampMarker,
+  durationSeconds: number
+): ManualZoomRange | null => {
+  if (marker.type !== 'zoom') return null
+  const range = normalizeManualRangeForDuration({ start: marker.start, end: marker.end }, durationSeconds)
+  if (!range) return null
+  const intensity = parseManualZoomIntensity(marker.zoomIntensity) ?? MANUAL_ZOOM_INTENSITY_DEFAULT
+  const focusX = parseManualZoomFocus(marker.zoomFocusX, 0.5, 0.08, 0.92)
+  const focusY = parseManualZoomFocus(marker.zoomFocusY, 0.42, 0.08, 0.88)
+  return {
+    ...range,
+    focusX,
+    focusY,
+    intensity
+  }
+}
+
+const applyManualZoomRangesToSegments = ({
+  segments,
+  zoomRanges,
+  maxZoomDelta
+}: {
+  segments: Segment[]
+  zoomRanges: ManualZoomRange[]
+  maxZoomDelta: number
+}): Segment[] => {
+  if (!segments.length) return []
+  if (!zoomRanges.length || maxZoomDelta <= 0) {
+    return segments.map((segment) => ({ ...segment }))
+  }
+  const out: Segment[] = []
+  for (const segment of segments) {
+    const splitPoints = new Set<number>([
+      Number(segment.start.toFixed(3)),
+      Number(segment.end.toFixed(3))
+    ])
+    for (const zoomRange of zoomRanges) {
+      if (zoomRange.end <= segment.start + 0.001 || zoomRange.start >= segment.end - 0.001) continue
+      splitPoints.add(Number(clamp(zoomRange.start, segment.start, segment.end).toFixed(3)))
+      splitPoints.add(Number(clamp(zoomRange.end, segment.start, segment.end).toFixed(3)))
+    }
+    const orderedPoints = [...splitPoints].sort((a, b) => a - b)
+    for (let index = 0; index < orderedPoints.length - 1; index += 1) {
+      const start = orderedPoints[index]
+      const end = orderedPoints[index + 1]
+      if (end - start < 0.05) continue
+      const midpoint = (start + end) / 2
+      let selectedRange: ManualZoomRange | null = null
+      let selectedOverlap = 0
+      for (const zoomRange of zoomRanges) {
+        if (midpoint < zoomRange.start || midpoint > zoomRange.end) continue
+        const overlap = Math.max(0, Math.min(end, zoomRange.end) - Math.max(start, zoomRange.start))
+        if (
+          !selectedRange ||
+          overlap > selectedOverlap + 0.001 ||
+          (Math.abs(overlap - selectedOverlap) <= 0.001 && zoomRange.intensity > selectedRange.intensity)
+        ) {
+          selectedRange = zoomRange
+          selectedOverlap = overlap
+        }
+      }
+      if (!selectedRange) {
+        out.push({ ...segment, start, end })
+        continue
+      }
+      const intensityScale = 0.32 + selectedRange.intensity * 0.68
+      const zoomDelta = Number(clamp(maxZoomDelta * intensityScale, 0.012, maxZoomDelta).toFixed(4))
+      out.push({
+        ...segment,
+        start,
+        end,
+        zoom: Math.max(segment.zoom ?? 0, zoomDelta),
+        faceFocusX: selectedRange.focusX,
+        faceFocusY: selectedRange.focusY,
+        transitionStyle: 'smooth',
+        emphasize: true
+      })
+    }
+  }
+  return out.length ? out : segments.map((segment) => ({ ...segment }))
+}
+
 const buildManualTimelineRenderPlan = ({
   config,
-  durationSeconds
+  durationSeconds,
+  maxZoomDelta
 }: {
   config?: ManualTimestampConfig | null
   durationSeconds: number
+  maxZoomDelta: number
 }): ManualTimelineRenderPlan | null => {
   if (!config?.enabled || !Number.isFinite(durationSeconds) || durationSeconds <= 0.1) return null
   const keepRanges = mergeRanges(
@@ -15626,6 +15797,10 @@ const buildManualTimelineRenderPlan = ({
       .map((marker) => normalizeManualRangeForDuration({ start: marker.start, end: marker.end }, durationSeconds))
       .filter((range: TimeRange | null): range is TimeRange => Boolean(range))
   )
+  const zoomRanges = config.markers
+    .map((marker) => normalizeManualZoomRangeForDuration(marker, durationSeconds))
+    .filter((range: ManualZoomRange | null): range is ManualZoomRange => Boolean(range))
+    .sort((a, b) => a.start - b.start || a.end - b.end)
   const baseKeepRanges = keepRanges.length
     ? keepRanges
     : [{ start: 0, end: Number(durationSeconds.toFixed(3)) }]
@@ -15646,12 +15821,17 @@ const buildManualTimelineRenderPlan = ({
   const hookSource: 'user-set' | 'ai-suggested' | 'none' = !hookMarker
     ? 'none'
     : (hookMarker.source === 'ai' ? 'ai-suggested' : 'user-set')
-  const segments = hookRange
+  const baseSegments = hookRange
     ? [{ start: hookRange.start, end: hookRange.end, speed: 1, emphasize: true }, ...subtractRange(
         effectiveKeepSegments.map((segment) => ({ ...segment })),
         hookRange
       )]
     : effectiveKeepSegments.map((segment) => ({ ...segment }))
+  const segments = applyManualZoomRangesToSegments({
+    segments: baseSegments,
+    zoomRanges,
+    maxZoomDelta
+  })
   const keepDuration = segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start), 0)
   const removedSeconds = Math.max(0, durationSeconds - keepDuration)
   const removedRatio = clamp01(removedSeconds / Math.max(0.1, durationSeconds))
@@ -15661,6 +15841,9 @@ const buildManualTimelineRenderPlan = ({
   else if (hookRange) retentionImpact += 4
   else retentionImpact -= 2
   retentionImpact += Math.min(6, segments.length * 0.8)
+  if (zoomRanges.length) {
+    retentionImpact += Math.min(3, zoomRanges.length * 0.6)
+  }
   if (removedRatio > 0.4) {
     retentionImpact -= Math.min(15, 4 + (removedRatio - 0.4) * 42)
   }
@@ -15670,6 +15853,9 @@ const buildManualTimelineRenderPlan = ({
   const warnings: string[] = []
   if (removedRatio > 0.4) {
     warnings.push('Warning: removing >40% may hurt retention.')
+  }
+  if (zoomRanges.length > 18) {
+    warnings.push('Warning: too many manual zoom windows can feel distracting.')
   }
   const microHookSuggestions: TimeRange[] = []
   if (durationSeconds >= 180) {
@@ -15691,6 +15877,7 @@ const buildManualTimelineRenderPlan = ({
     active: true,
     keepRanges: baseKeepRanges,
     removeRanges,
+    zoomRanges,
     hookRange,
     hookSource,
     segments,
@@ -15704,7 +15891,10 @@ const buildManualTimelineRenderPlan = ({
         : (config.autoAssist ? 'AI-suggested (not pinned)' : 'none'),
       userCuts: [
         ...baseKeepRanges.map((range) => `KEEP ${formatHookRange(range.start, range.end)}`),
-        ...removeRanges.map((range) => `REMOVE ${formatHookRange(range.start, range.end)}`)
+        ...removeRanges.map((range) => `REMOVE ${formatHookRange(range.start, range.end)}`),
+        ...zoomRanges.map((range) => (
+          `ZOOM ${formatHookRange(range.start, range.end)} @ ${Math.round(range.focusX * 100)}% x / ${Math.round(range.focusY * 100)}% y`
+        ))
       ],
       removals: removeRanges.map((range) => formatHookRange(range.start, range.end)),
       retentionImpact: `${Number(clamp(retentionImpact, -25, 25).toFixed(2)) >= 0 ? '+' : ''}${Number(clamp(retentionImpact, -25, 25).toFixed(2))} pts`,
@@ -18049,9 +18239,13 @@ const processJob = async (
         }
       }
 
+      const manualMaxZoomDelta = Number(
+        Math.max(0, Math.min(options.autoZoomMax || ZOOM_HARD_MAX, ZOOM_HARD_MAX) - 1).toFixed(4)
+      )
       const manualTimelinePlan = buildManualTimelineRenderPlan({
         config: requestedManualTimestampConfig,
-        durationSeconds
+        durationSeconds,
+        maxZoomDelta: manualMaxZoomDelta
       })
       if (manualTimelinePlan?.active) {
         manualTimelinePlanForAnalysis = manualTimelinePlan
