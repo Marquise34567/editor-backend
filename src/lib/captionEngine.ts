@@ -1,4 +1,6 @@
 import { spawnSync } from 'child_process'
+import { existsSync } from 'fs'
+import path from 'path'
 
 type CaptionProbeMode = 'whisper' | 'python_module'
 
@@ -19,7 +21,18 @@ export type CaptionEngineStatus = {
 }
 
 const CAPTION_ENGINE_CACHE_TTL_MS = 20_000
-const CAPTION_PROBE_TIMEOUT_MS = 5_000
+const DEFAULT_CAPTION_PROBE_TIMEOUT_MS = 25_000
+const MIN_CAPTION_PROBE_TIMEOUT_MS = 3_000
+const MAX_CAPTION_PROBE_TIMEOUT_MS = 120_000
+const CAPTION_PROBE_TIMEOUT_MS = (() => {
+  const raw = String(process.env.CAPTION_PROBE_TIMEOUT_MS || '').trim()
+  if (!raw) return DEFAULT_CAPTION_PROBE_TIMEOUT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed)) return DEFAULT_CAPTION_PROBE_TIMEOUT_MS
+  return Math.round(
+    Math.max(MIN_CAPTION_PROBE_TIMEOUT_MS, Math.min(parsed, MAX_CAPTION_PROBE_TIMEOUT_MS))
+  )
+})()
 const CAPTION_USAGE_SIGNATURE = /usage|--output_format|--model|transcribe/i
 const DEFAULT_PYTHON_UTF8_ENV = '1'
 const DEFAULT_PYTHON_IO_ENCODING = 'utf-8'
@@ -28,6 +41,22 @@ let cachedStatus: CaptionEngineStatus | null = null
 let cacheUpdatedAtMs = 0
 
 const trimToEmpty = (value?: string | null) => String(value || '').trim()
+
+const getLikelyWindowsWhisperBins = () => {
+  if (process.platform !== 'win32') return []
+  const roots = [
+    trimToEmpty(process.env.LOCALAPPDATA),
+    trimToEmpty(path.join(process.env.USERPROFILE || '', 'AppData', 'Local'))
+  ].filter(Boolean)
+  const versions = ['314', '313', '312', '311', '310', '39']
+  const bins: string[] = []
+  for (const root of roots) {
+    for (const version of versions) {
+      bins.push(path.join(root, 'Programs', 'Python', `Python${version}`, 'Scripts', 'whisper.exe'))
+    }
+  }
+  return bins.filter((candidate, idx) => bins.indexOf(candidate) === idx && existsSync(candidate))
+}
 
 const buildProbeAttempts = () => {
   const attempts: CaptionProbeAttempt[] = []
@@ -47,9 +76,16 @@ const buildProbeAttempts = () => {
   }
 
   addAttempt('WHISPER_BIN', process.env.WHISPER_BIN, ['--help'], 'whisper')
+  for (const candidate of getLikelyWindowsWhisperBins()) {
+    addAttempt(`WINDOWS_WHISPER_BIN(${candidate})`, candidate, ['--help'], 'whisper')
+  }
   addAttempt('whisper', 'whisper', ['--help'], 'whisper')
   addAttempt('python -m whisper', 'python', ['-m', 'whisper', '--help'], 'python_module')
   addAttempt('python3 -m whisper', 'python3', ['-m', 'whisper', '--help'], 'python_module')
+  addAttempt('py -3.11 -m whisper', 'py', ['-3.11', '-m', 'whisper', '--help'], 'python_module')
+  addAttempt('py -3.12 -m whisper', 'py', ['-3.12', '-m', 'whisper', '--help'], 'python_module')
+  addAttempt('py -3.10 -m whisper', 'py', ['-3.10', '-m', 'whisper', '--help'], 'python_module')
+  addAttempt('py -3 -m whisper', 'py', ['-3', '-m', 'whisper', '--help'], 'python_module')
   addAttempt('py -m whisper', 'py', ['-m', 'whisper', '--help'], 'python_module')
   return attempts
 }
