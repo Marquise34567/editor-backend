@@ -18839,7 +18839,6 @@ const handleCreateJob = async (req: any, res: any) => {
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
-    const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -19524,6 +19523,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
+    const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const resolvedEditorMode = editorModeOverride ?? getEditorModeFromJob(job)
@@ -19713,7 +19713,6 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
-    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
