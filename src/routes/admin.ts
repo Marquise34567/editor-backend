@@ -940,6 +940,148 @@ const parseEmotionMoments = (job: any) => {
   return [0.18, 0.39, 0.62, 0.84].map((ratio) => Number((ratio * duration).toFixed(1)))
 }
 
+const normalizeFeedbackPercent = (value: unknown) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  if (numeric >= 0 && numeric <= 1) return Number((numeric * 100).toFixed(2))
+  return Number(clamp(numeric, 0, 100).toFixed(2))
+}
+
+const readRetentionFeedbackSignals = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const direct = analysis?.retention_feedback && typeof analysis.retention_feedback === 'object'
+    ? analysis.retention_feedback
+    : null
+  const history = Array.isArray(analysis?.retention_feedback_history)
+    ? analysis.retention_feedback_history
+    : []
+  const latestHistory = history.length ? history[history.length - 1] : null
+  const payload = (direct || latestHistory || null) as Record<string, any> | null
+  if (!payload) {
+    return {
+      watchPct: null as number | null,
+      hookHoldPct: null as number | null,
+      completionPct: null as number | null,
+      rewatchPct: null as number | null
+    }
+  }
+  return {
+    watchPct: normalizeFeedbackPercent(
+      payload.watchPercent ??
+      payload.watch_percent ??
+      payload.avgWatchPercent ??
+      payload.averageWatchPercent
+    ),
+    hookHoldPct: normalizeFeedbackPercent(
+      payload.hookHoldPercent ??
+      payload.hook_hold_percent ??
+      payload.first8sRetention ??
+      payload.hookRetention
+    ),
+    completionPct: normalizeFeedbackPercent(
+      payload.completionPercent ??
+      payload.completion_percent ??
+      payload.finishRate
+    ),
+    rewatchPct: normalizeFeedbackPercent(
+      payload.rewatchRate ??
+      payload.rewatch_rate ??
+      payload.loopRate
+    )
+  }
+}
+
+const readJobDurationSeconds = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const metadataSummary = (analysis?.metadata_summary || {}) as Record<string, any>
+  const timeline = (metadataSummary?.timeline || {}) as Record<string, any>
+  const candidates = [
+    job?.inputDurationSeconds,
+    timeline?.sourceDurationSeconds,
+    analysis?.durationSeconds,
+    analysis?.duration_seconds
+  ]
+  for (const candidate of candidates) {
+    const value = Number(candidate)
+    if (Number.isFinite(value) && value > 0) return clamp(value, 0.1, 60 * 60 * 8)
+  }
+  return null
+}
+
+type TimelineMetricEvent = {
+  t: number
+  type: string
+}
+
+const readTimelineEvents = (job: any): TimelineMetricEvent[] => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const timeline = analysis?.edit_decision_timeline as Record<string, any> | null
+  const eventsRaw = Array.isArray(timeline?.events) ? timeline.events : []
+  return eventsRaw
+    .map((entry: any) => ({
+      t: Number(entry?.t),
+      type: String(entry?.type || '').trim().toLowerCase()
+    }))
+    .filter((entry) => Number.isFinite(entry.t) && entry.t >= 0 && Boolean(entry.type))
+}
+
+const getTimelineEventWeight = (eventType: string) => {
+  const key = String(eventType || '').toLowerCase()
+  if (key === 'hook') return 1.3
+  if (key === 'pattern_interrupt') return 1.15
+  if (key === 'cut') return 0.92
+  if (key === 'zoom') return 0.72
+  if (key === 'caption_emphasis') return 0.64
+  if (key === 'auto_escalation') return 0.86
+  if (key === 'broll') return 0.46
+  return 0.4
+}
+
+const getBucketIndex = (timeSeconds: number, durationSeconds: number, bucketCount: number) => {
+  if (!Number.isFinite(timeSeconds) || !Number.isFinite(durationSeconds) || durationSeconds <= 0 || bucketCount <= 0) {
+    return -1
+  }
+  const ratio = clamp(timeSeconds / Math.max(durationSeconds, 0.01), 0, 0.999999)
+  return Math.min(bucketCount - 1, Math.max(0, Math.floor(ratio * bucketCount)))
+}
+
+const readTimelineFeatureSignals = (job: any) => {
+  const analysis = (job?.analysis || {}) as Record<string, any>
+  const metadataSummary = (analysis?.metadata_summary || {}) as Record<string, any>
+  const retentionSummary = (metadataSummary?.retention || {}) as Record<string, any>
+  const styleTimelineFeatures = (retentionSummary?.styleTimelineFeatures || analysis?.style_timeline_features || {}) as Record<string, any>
+  if (!styleTimelineFeatures || typeof styleTimelineFeatures !== 'object') {
+    return {
+      captionRatePer10s: null as number | null,
+      energySpikeDensityPer10s: null as number | null,
+      patternSpacingSeconds: null as number | null,
+      cutsPer10s: null as number | null
+    }
+  }
+  const asNumber = (value: unknown) => {
+    const numeric = Number(value)
+    return Number.isFinite(numeric) ? numeric : null
+  }
+  return {
+    captionRatePer10s: asNumber(
+      styleTimelineFeatures.captionEmphasisRatePer10Seconds ??
+      styleTimelineFeatures.caption_emphasis_rate_per_10_seconds
+    ),
+    energySpikeDensityPer10s: asNumber(
+      styleTimelineFeatures.energySpikeDensityPer10Seconds ??
+      styleTimelineFeatures.energy_spike_density_per_10_seconds
+    ),
+    patternSpacingSeconds: asNumber(
+      styleTimelineFeatures.patternInterruptSpacingSeconds ??
+      styleTimelineFeatures.pattern_interrupt_spacing_seconds
+    ),
+    cutsPer10s: asNumber(
+      styleTimelineFeatures.cutsPer10Seconds ??
+      styleTimelineFeatures.cuts_per_10_seconds
+    )
+  }
+}
+
 const groupErrorsBySignature = (items: EnrichedAdminErrorLogEntry[]) => {
   const map = new Map<string, { type: string; count: number; severity: string; lastSeen: string }>()
   for (const item of items) {
@@ -1132,6 +1274,14 @@ const buildCommandCenterPayload = async () => {
   }).length
 
   const feedbackItems = extractFeedback(jobs30d, RANGE_MS['30d'])
+  const feedbackByJobId = feedbackItems.reduce((map, entry) => {
+    const key = String(entry?.jobId || '').trim()
+    if (!key) return map
+    const list = map.get(key) || []
+    list.push(entry)
+    map.set(key, list)
+    return map
+  }, new Map<string, FeedbackItem[]>())
   const feedbackHeatmap = Array.from(
     feedbackItems.reduce((map, item) => {
       const key = String(item.category || 'unknown')
@@ -1163,26 +1313,44 @@ const buildCommandCenterPayload = async () => {
   const averageUserRating = ratingSamples.length
     ? Number((ratingSamples.reduce((sum, value) => sum + value, 0) / ratingSamples.length).toFixed(2))
     : 0
-  const hookSuccessRate = toPct(
-    completed30d.filter((job) => {
+  const hookSuccessEvaluations = completed30d
+    .map((job) => {
       const analysis = ((job as any)?.analysis || {}) as Record<string, any>
       const hasHook = Number.isFinite(Number(analysis?.hook_score)) || Number.isFinite(Number(analysis?.hook_start_time))
-      const score = Number((job as any)?.retentionScore ?? 0)
-      return hasHook && score >= 70
-    }).length,
-    completed30d.length
-  )
+      if (!hasHook) return null
+      const feedbackSignals = readRetentionFeedbackSignals(job)
+      const retentionScore = Number((job as any)?.retentionScore ?? 0)
+      const successFromFeedback = (
+        (feedbackSignals.hookHoldPct !== null && feedbackSignals.hookHoldPct >= 60) ||
+        (feedbackSignals.watchPct !== null && feedbackSignals.watchPct >= 52) ||
+        (feedbackSignals.completionPct !== null && feedbackSignals.completionPct >= 46)
+      )
+      if (successFromFeedback) return 1
+      if (Number.isFinite(retentionScore)) return retentionScore >= 70 ? 1 : 0
+      return 0
+    })
+    .filter((value): value is 0 | 1 => value === 0 || value === 1)
+  const hookSuccessRate = hookSuccessEvaluations.length
+    ? toPct(hookSuccessEvaluations.reduce<number>((sum, value) => sum + value, 0), hookSuccessEvaluations.length)
+    : 0
 
   const predictionComparisons: number[] = completed30d
     .map((job) => {
-      const score = Number((job as any)?.retentionScore ?? 0)
-      if (!Number.isFinite(score)) return null
-      const predictedDropRisk = score < 70
-      const jobFeedback = feedbackItems.filter((entry) => entry.jobId && String(entry.jobId) === String((job as any)?.id || ''))
-      const actualDropSignal = jobFeedback.some((entry) => entry.sentiment === 'negative' || entry.sentiment === 'bug')
+      const predictedDropRisk = inferPredictedRetention(job) < 70
+      const feedbackSignals = readRetentionFeedbackSignals(job)
+      const observedDropFromFeedback =
+        (feedbackSignals.completionPct !== null && feedbackSignals.completionPct < 44) ||
+        (feedbackSignals.watchPct !== null && feedbackSignals.watchPct < 48) ||
+        (feedbackSignals.hookHoldPct !== null && feedbackSignals.hookHoldPct < 40)
+      const jobFeedback = feedbackByJobId.get(String((job as any)?.id || '')) || []
+      const observedDropFromSentiment = jobFeedback.some((entry) => entry.sentiment === 'negative' || entry.sentiment === 'bug')
+      let actualDropSignal = observedDropFromFeedback || observedDropFromSentiment
+      if (!observedDropFromFeedback && !observedDropFromSentiment) {
+        const score = Number((job as any)?.retentionScore ?? NaN)
+        if (Number.isFinite(score)) actualDropSignal = score < 62
+      }
       return predictedDropRisk === actualDropSignal ? 1 : 0
     })
-    .filter((value): value is 0 | 1 => value === 0 || value === 1)
     .map((value) => Number(value))
   const dropOffPredictionAccuracy = predictionComparisons.length
     ? Number(
@@ -1419,65 +1587,201 @@ const buildCommandCenterPayload = async () => {
       v: inferEmotionalIntensity(job)
     }))
 
-  const boringHeatBuckets = [
-    { segment: '0-10%', risk: 0.12 },
-    { segment: '10-20%', risk: 0.22 },
-    { segment: '20-30%', risk: 0.36 },
-    { segment: '30-40%', risk: 0.55 },
-    { segment: '40-50%', risk: 0.72 },
-    { segment: '50-60%', risk: 0.64 },
-    { segment: '60-70%', risk: 0.48 },
-    { segment: '70-80%', risk: 0.34 },
-    { segment: '80-90%', risk: 0.24 },
-    { segment: '90-100%', risk: 0.18 }
-  ].map((row) => ({ ...row }))
+  const boringSegments = ['0-10%', '10-20%', '20-30%', '30-40%', '40-50%', '50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
+  const boringFallbackRisk = [0.18, 0.26, 0.38, 0.54, 0.62, 0.57, 0.46, 0.35, 0.26, 0.2]
+  const boringBucketAccumulator = boringSegments.map((segment, index) => ({
+    segment,
+    index,
+    riskSum: 0,
+    samples: 0
+  }))
+  const brainBucketCount = 12
+  const brainAccumulator = Array.from({ length: brainBucketCount }).map((_, index) => ({
+    index,
+    hookSum: 0,
+    emotionalSpikeSum: 0,
+    patternInterruptSum: 0,
+    zoomBurstSum: 0,
+    captionImpactSum: 0,
+    predictedAttentionSum: 0,
+    samples: 0
+  }))
+  let jobsWithTimelineSignals = 0
+
   for (const job of completed30d) {
+    const duration = readJobDurationSeconds(job)
+    if (!duration || duration <= 0) continue
     const predicted = inferPredictedRetention(job)
-    const lowRetentionFactor = clamp((70 - predicted) / 70, 0, 1)
-    for (const bucket of boringHeatBuckets) {
-      bucket.risk += lowRetentionFactor * bucket.risk
+    const hookScore = inferHookScore(job)
+    const emotionalIntensity = inferEmotionalIntensity(job)
+    const feedbackSignals = readRetentionFeedbackSignals(job)
+    const timelineSignals = readTimelineFeatureSignals(job)
+    const hasAutoCaptions = Boolean((job as any)?.renderSettings?.autoCaptions)
+    const timelineEvents = readTimelineEvents(job)
+    const emotionMoments = parseEmotionMoments(job)
+    const heatActivity = new Array(boringSegments.length).fill(0)
+    const brainPatternCounts = new Array(brainBucketCount).fill(0)
+    const brainZoomCounts = new Array(brainBucketCount).fill(0)
+    const brainCaptionCounts = new Array(brainBucketCount).fill(0)
+    const brainHookCounts = new Array(brainBucketCount).fill(0)
+    const brainEmotionCounts = new Array(brainBucketCount).fill(0)
+
+    for (const event of timelineEvents) {
+      const weight = getTimelineEventWeight(event.type)
+      const heatIndex = getBucketIndex(event.t, duration, boringSegments.length)
+      if (heatIndex >= 0) heatActivity[heatIndex] += weight
+      const brainIndex = getBucketIndex(event.t, duration, brainBucketCount)
+      if (brainIndex < 0) continue
+      if (event.type === 'pattern_interrupt' || event.type === 'auto_escalation') brainPatternCounts[brainIndex] += 1
+      if (event.type === 'zoom') brainZoomCounts[brainIndex] += 1
+      if (event.type === 'caption_emphasis') brainCaptionCounts[brainIndex] += 1
+      if (event.type === 'hook') brainHookCounts[brainIndex] += 1
     }
+    for (const moment of emotionMoments) {
+      const heatIndex = getBucketIndex(moment, duration, boringSegments.length)
+      if (heatIndex >= 0) heatActivity[heatIndex] += 0.42
+      const brainIndex = getBucketIndex(moment, duration, brainBucketCount)
+      if (brainIndex >= 0) brainEmotionCounts[brainIndex] += 1
+    }
+
+    const maxHeatActivity = Math.max(0.25, ...heatActivity)
+    const lowRetentionFactor = clamp((68 - predicted) / 68, 0, 1)
+    const feedbackPenalty =
+      (feedbackSignals.completionPct !== null && feedbackSignals.completionPct < 48 ? 0.08 : 0) +
+      (feedbackSignals.watchPct !== null && feedbackSignals.watchPct < 50 ? 0.06 : 0) +
+      (feedbackSignals.hookHoldPct !== null && feedbackSignals.hookHoldPct < 45 ? 0.06 : 0)
+    for (let index = 0; index < boringBucketAccumulator.length; index += 1) {
+      const activityNorm = clamp(heatActivity[index] / maxHeatActivity, 0, 1)
+      const middlePenalty = index >= 3 && index <= 6 ? 0.12 : 0
+      const risk = clamp(
+        0.58 - activityNorm * 0.44 + lowRetentionFactor * 0.33 + middlePenalty + feedbackPenalty,
+        0.04,
+        0.98
+      )
+      boringBucketAccumulator[index].riskSum += risk
+      boringBucketAccumulator[index].samples += 1
+    }
+
+    const maxPattern = Math.max(1, ...brainPatternCounts)
+    const maxZoom = Math.max(1, ...brainZoomCounts)
+    const maxCaption = Math.max(1, ...brainCaptionCounts)
+    const maxEmotion = Math.max(1, ...brainEmotionCounts)
+    for (let index = 0; index < brainBucketCount; index += 1) {
+      const progress = index / Math.max(1, brainBucketCount - 1)
+      const hookPresence = brainHookCounts[index] > 0 ? 1 : 0
+      const patternNorm = clamp(brainPatternCounts[index] / maxPattern, 0, 1)
+      const zoomNorm = clamp(brainZoomCounts[index] / maxZoom, 0, 1)
+      const captionNorm = clamp(brainCaptionCounts[index] / maxCaption, 0, 1)
+      const emotionNorm = clamp(brainEmotionCounts[index] / maxEmotion, 0, 1)
+      const styleEnergyBoost = timelineSignals.energySpikeDensityPer10s !== null
+        ? clamp(timelineSignals.energySpikeDensityPer10s * 12, 0, 22)
+        : 0
+      const styleCaptionBoost = timelineSignals.captionRatePer10s !== null
+        ? clamp(timelineSignals.captionRatePer10s * 10, 0, 18)
+        : 0
+      const stylePatternBoost = timelineSignals.patternSpacingSeconds !== null
+        ? clamp((8 - timelineSignals.patternSpacingSeconds) * 3.2, 0, 16)
+        : 0
+      const hook = clamp(
+        hookPresence
+          ? hookScore * 1.04
+          : hookScore * Math.max(0.18, 1 - progress * 1.34),
+        0,
+        100
+      )
+      const emotionalSpike = clamp(
+        emotionalIntensity * (0.34 + emotionNorm * 0.44 + patternNorm * 0.16) + styleEnergyBoost,
+        0,
+        100
+      )
+      const patternInterrupt = clamp(
+        22 + patternNorm * 58 + stylePatternBoost - progress * 8,
+        0,
+        100
+      )
+      const zoomBias = featureLab.zoomIntensityLevel === 'high'
+        ? 20
+        : featureLab.zoomIntensityLevel === 'medium'
+          ? 13
+          : 8
+      const zoomBurst = clamp(18 + zoomNorm * 62 + zoomBias - progress * 5, 0, 100)
+      const captionBase = hasAutoCaptions ? 26 : 11
+      const captionImpact = clamp(captionBase + captionNorm * 60 + styleCaptionBoost - progress * 7, 0, 100)
+      const predictedAttention = clamp(
+        predicted * 0.34 +
+          hook * 0.15 +
+          emotionalSpike * 0.2 +
+          patternInterrupt * 0.13 +
+          zoomBurst * 0.08 +
+          captionImpact * 0.1,
+        0,
+        100
+      )
+      brainAccumulator[index].hookSum += hook
+      brainAccumulator[index].emotionalSpikeSum += emotionalSpike
+      brainAccumulator[index].patternInterruptSum += patternInterrupt
+      brainAccumulator[index].zoomBurstSum += zoomBurst
+      brainAccumulator[index].captionImpactSum += captionImpact
+      brainAccumulator[index].predictedAttentionSum += predictedAttention
+      brainAccumulator[index].samples += 1
+    }
+    jobsWithTimelineSignals += 1
   }
+
   const boringFeedbackSignals = feedbackItems.filter((item) =>
     /(boring|slow|generic|not engaging|not exciting)/i.test(`${item.category || ''} ${item.note || ''}`)
   ).length
-  if (boringFeedbackSignals > 0) {
-    const middleBoost = Math.min(0.38, boringFeedbackSignals / 25)
-    boringHeatBuckets.forEach((bucket, index) => {
-      if (index >= 3 && index <= 6) bucket.risk += middleBoost
-    })
-  }
-  const boringSegmentHeatmap = boringHeatBuckets.map((bucket) => ({
-    segment: bucket.segment,
-    v: Number(clamp(bucket.risk * 100, 0, 100).toFixed(1))
-  }))
+  const boringFeedbackBoost = boringFeedbackSignals > 0
+    ? Math.min(0.34, boringFeedbackSignals / 30)
+    : 0
+  const boringSegmentHeatmap = boringBucketAccumulator.map((bucket) => {
+    const measuredRisk = bucket.samples
+      ? bucket.riskSum / bucket.samples
+      : boringFallbackRisk[bucket.index] || 0.24
+    const boost = bucket.index >= 3 && bucket.index <= 6 ? boringFeedbackBoost : boringFeedbackBoost * 0.35
+    return {
+      segment: bucket.segment,
+      v: Number(clamp((measuredRisk + boost) * 100, 0, 100).toFixed(1))
+    }
+  })
 
-  const retentionBrainMap = Array.from({ length: 12 }).map((_, index) => {
-    const progress = index / 11
-    const hook = Number(clamp(100 - progress * 78 + hookStrengthScore * 0.08, 0, 100).toFixed(1))
-    const emotionalSpike = Number(clamp((Math.sin(progress * Math.PI * 3.2) + 1) * 34 + 12, 0, 100).toFixed(1))
-    const patternInterrupt = Number(clamp((index % 3 === 0 ? 78 : 34) + avgFirst8SecEngagementScore * 0.08, 0, 100).toFixed(1))
-    const zoomBurst = Number(clamp((featureLab.zoomIntensityLevel === 'high' ? 76 : featureLab.zoomIntensityLevel === 'medium' ? 58 : 42) + (index % 4 === 0 ? 12 : -4), 0, 100).toFixed(1))
-    const captionImpact = Number(clamp((toPct(subtitlesCount, Math.max(1, completed30d.length)) * 0.9) + 14 - progress * 8, 0, 100).toFixed(1))
-    const predictedAttention = Number(
-      clamp(
-        hook * 0.18 +
-          emotionalSpike * 0.24 +
+  const retentionBrainMap = Array.from({ length: brainBucketCount }).map((_, index) => {
+    const progress = index / Math.max(1, brainBucketCount - 1)
+    const sampleCount = brainAccumulator[index]?.samples || 0
+    const fallbackHook = clamp(96 - progress * 74 + hookStrengthScore * 0.09, 0, 100)
+    const fallbackEmotional = clamp(18 + avgFirst8SecEngagementScore * 0.22 + Math.sin(progress * Math.PI * 2.4) * 16, 0, 100)
+    const fallbackPattern = clamp(28 + (index % 3 === 0 ? 18 : 0) + avgFirst8SecEngagementScore * 0.12, 0, 100)
+    const fallbackZoom = clamp(
+      (featureLab.zoomIntensityLevel === 'high' ? 68 : featureLab.zoomIntensityLevel === 'medium' ? 52 : 38) +
+      (index % 4 === 0 ? 9 : -2),
+      0,
+      100
+    )
+    const fallbackCaption = clamp((toPct(subtitlesCount, Math.max(1, completed30d.length)) * 0.85) + 12 - progress * 6, 0, 100)
+    const hook = sampleCount ? brainAccumulator[index].hookSum / sampleCount : fallbackHook
+    const emotionalSpike = sampleCount ? brainAccumulator[index].emotionalSpikeSum / sampleCount : fallbackEmotional
+    const patternInterrupt = sampleCount ? brainAccumulator[index].patternInterruptSum / sampleCount : fallbackPattern
+    const zoomBurst = sampleCount ? brainAccumulator[index].zoomBurstSum / sampleCount : fallbackZoom
+    const captionImpact = sampleCount ? brainAccumulator[index].captionImpactSum / sampleCount : fallbackCaption
+    const predictedAttention = sampleCount
+      ? brainAccumulator[index].predictedAttentionSum / sampleCount
+      : clamp(
+          hook * 0.18 +
+          emotionalSpike * 0.22 +
           patternInterrupt * 0.16 +
           zoomBurst * 0.18 +
-          captionImpact * 0.24,
-        0,
-        100
-      ).toFixed(1)
-    )
+          captionImpact * 0.26,
+          0,
+          100
+        )
     return {
       t: `${Math.round(progress * 100)}%`,
-      hook,
-      emotionalSpike,
-      patternInterrupt,
-      zoomBurst,
-      captionImpact,
-      predictedAttention
+      hook: Number(hook.toFixed(1)),
+      emotionalSpike: Number(emotionalSpike.toFixed(1)),
+      patternInterrupt: Number(patternInterrupt.toFixed(1)),
+      zoomBurst: Number(zoomBurst.toFixed(1)),
+      captionImpact: Number(captionImpact.toFixed(1)),
+      predictedAttention: Number(predictedAttention.toFixed(1))
     }
   })
 
@@ -1938,7 +2242,8 @@ const buildCommandCenterPayload = async () => {
         boringSegmentHeatmap,
         strongHooksPct: strongHookVideoPct,
         avgFirst8SecEngagementScore,
-        dropOffRiskPredictionPct: dropOffRiskPrediction
+        dropOffRiskPredictionPct: dropOffRiskPrediction,
+        timelineSignalCoveragePct: toPct(jobsWithTimelineSignals, Math.max(1, completed30d.length))
       },
       retentionBrainMap
     },
