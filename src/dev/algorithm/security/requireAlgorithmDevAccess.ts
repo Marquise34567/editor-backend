@@ -1,9 +1,11 @@
 import { NextFunction, Request, Response } from 'express'
 import { supabaseAdmin } from '../../../supabaseClient'
 import { recordSecurityEvent } from './securityEvents'
+import { isControlPanelOwnerEmail } from '../../../lib/devAccounts'
 
-const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password') =>
+const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password' | 'unauthorized') =>
   res.status(401).json({ error: reason })
+const forbidden = (res: Response, reason: 'unauthorized_email') => res.status(403).json({ error: reason })
 
 const DEV_ALGORITHM_PASSWORD = String(process.env.DEV_ALGORITHM_PASSWORD || 'Quise').trim()
 
@@ -51,11 +53,39 @@ const resolveAuthUser = async (req: Request): Promise<{ id: string; email?: stri
 
 export const requireAlgorithmDevAccess = async (req: Request, res: Response, next: NextFunction) => {
   const authUser = await resolveAuthUser(req)
-  if (authUser) {
-    req.user = authUser
+  if (!authUser) {
+    await recordSecurityEvent({
+      type: 'dev_algorithm_access_denied',
+      meta: {
+        path: req.originalUrl,
+        method: req.method,
+        ip: getClientIp(req),
+        user_id: null,
+        allowed: false,
+        reason: 'unauthorized'
+      }
+    })
+    return unauthorized(res, 'unauthorized')
   }
+  req.user = authUser
 
   const userId = req.user?.id || null
+  const email = req.user?.email || null
+  if (!isControlPanelOwnerEmail(email)) {
+    await recordSecurityEvent({
+      type: 'dev_algorithm_access_denied',
+      meta: {
+        path: req.originalUrl,
+        method: req.method,
+        ip: getClientIp(req),
+        user_id: userId,
+        allowed: false,
+        reason: 'unauthorized_email'
+      }
+    })
+    return forbidden(res, 'unauthorized_email')
+  }
+
   const password = getPasswordFromRequest(req)
   const hasPassword = Boolean(password)
   const allowed = hasPassword && password === DEV_ALGORITHM_PASSWORD

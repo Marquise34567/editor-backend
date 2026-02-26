@@ -1,29 +1,21 @@
 import { resolveProfileAdminFlags } from '../services/adminTelemetry'
 
-const DEFAULT_DEV_ADMIN_EMAIL = 'fyequise03@gmail.com'
-const ADMIN_ROLE_SET = new Set(['ADMIN', 'OWNER', 'FOUNDER', 'SUPERADMIN'])
-
-const parseAllowedEmails = () => {
-  const configured = String(process.env.DEV_ADMIN_EMAILS || process.env.ADMIN_EMAILS || '')
-    .split(',')
-    .map((entry) => entry.trim().toLowerCase())
-    .filter(Boolean)
-  if (configured.length > 0) return new Set(configured)
-  return new Set([DEFAULT_DEV_ADMIN_EMAIL])
-}
-
-const ALLOWED_DEV_ADMIN_EMAILS = parseAllowedEmails()
+export const CONTROL_PANEL_OWNER_EMAIL = 'fyequise03@gmail.com'
+const ALLOWED_DEV_ADMIN_EMAILS = new Set([CONTROL_PANEL_OWNER_EMAIL])
 
 const normalizeEmail = (email?: string | null) => String(email || '').trim().toLowerCase()
 
-export const isDevAccount = (_userId?: string | null, email?: string | null) => {
+export const isControlPanelOwnerEmail = (email?: string | null) => {
   const normalized = normalizeEmail(email)
   return Boolean(normalized && ALLOWED_DEV_ADMIN_EMAILS.has(normalized))
 }
 
+export const isDevAccount = (_userId?: string | null, email?: string | null) => {
+  return isControlPanelOwnerEmail(email)
+}
+
 export const resolveDevAdminAccess = async (userId?: string | null, email?: string | null) => {
-  const normalizedEmail = normalizeEmail(email)
-  const emailAuthorized = Boolean(normalizedEmail && ALLOWED_DEV_ADMIN_EMAILS.has(normalizedEmail))
+  const emailAuthorized = isControlPanelOwnerEmail(email)
 
   if (!emailAuthorized || !userId) {
     return {
@@ -36,10 +28,9 @@ export const resolveDevAdminAccess = async (userId?: string | null, email?: stri
 
   const flags = await resolveProfileAdminFlags(String(userId))
   const role = String(flags?.role || 'USER').trim().toUpperCase() || 'USER'
-  const roleAuthorized = Boolean(flags?.isDevAdmin || ADMIN_ROLE_SET.has(role))
 
   return {
-    allowed: emailAuthorized && roleAuthorized,
+    allowed: emailAuthorized,
     emailAuthorized,
     role,
     isDevAdmin: Boolean(flags?.isDevAdmin)

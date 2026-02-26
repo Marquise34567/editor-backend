@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
+import { isControlPanelOwnerEmail } from '../lib/devAccounts'
 
 declare global {
   namespace Express {
@@ -12,6 +13,7 @@ declare global {
 
 const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password' | 'unauthorized') =>
   res.status(401).json({ error: reason })
+const forbidden = (res: Response, reason: 'unauthorized_email') => res.status(403).json({ error: reason })
 
 const getClientIp = (req: Request) => {
   const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0]?.trim()
@@ -90,6 +92,11 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
     const userId = data.user.id
     const email = data.user.email ?? null
     req.user = { id: userId, email: email ?? undefined }
+
+    if (!isControlPanelOwnerEmail(email)) {
+      await auditAccessAttempt({ req, allowed: false, email, userId, reason: 'unauthorized_email' })
+      return forbidden(res, 'unauthorized_email')
+    }
 
     const password = getPasswordFromRequest(req)
     if (!password) {
