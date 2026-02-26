@@ -12,6 +12,8 @@ export type SubtitleFontId =
   | 'sans_bold'
   | 'condensed'
   | 'serif_bold'
+  | 'display_black'
+  | 'mono_bold'
 
 export type SubtitleAnimationId = 'pop' | 'none'
 
@@ -58,7 +60,7 @@ const DEFAULT_MRBEAST_STYLE: Omit<SubtitleStyleConfig, 'preset'> = {
   animation: 'pop'
 }
 
-const FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold']
+const FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold', 'display_black', 'mono_bold']
 const ANIMATION_IDS: SubtitleAnimationId[] = ['pop', 'none']
 
 const LEGACY_PRESET_ALIASES: Record<string, SubtitlePresetId> = {

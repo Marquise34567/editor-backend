@@ -776,11 +776,16 @@ type HorizontalModeSettings = {
 }
 type VerticalFitMode = 'cover' | 'contain'
 type VerticalLayoutMode = 'stacked' | 'single'
+type VerticalSelectionMode = 'best_moments' | 'story_arc' | 'hook_storm' | 'loop_builder'
+type VerticalZoomProfile = 'none' | 'smooth' | 'punch' | 'kinetic'
 type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
 type VerticalModeSettings = {
   enabled: boolean
   output: { width: number; height: number }
   layout: VerticalLayoutMode
+  selectionMode: VerticalSelectionMode
+  zoomProfile: VerticalZoomProfile
+  zoomIntensity: number
   webcamCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
   bottomFit: VerticalFitMode
@@ -1027,12 +1032,22 @@ type VerticalRetentionCandidate = {
   predictorBreakdown: VerticalRetentionPredictorBreakdown
   reason: string
 }
-type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide'
-type VerticalCaptionPreset = 'basic_clean' | 'mrbeast_animated' | 'neon_glow' | 'bold_clean_box' | 'rage_mode' | 'ice_pop'
+type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'none'
+type VerticalCaptionPreset =
+  | 'basic_clean'
+  | 'mrbeast_animated'
+  | 'neon_glow'
+  | 'bold_clean_box'
+  | 'rage_mode'
+  | 'ice_pop'
+  | 'retro_wave'
+  | 'glitch_pop'
+  | 'cinema_punch'
 type VerticalCaptionConfig = {
   enabled: boolean
   autoGenerate: boolean
   preset: VerticalCaptionPreset
+  animationEnabled: boolean
   fontId: SubtitleFontId
   fontSize: number | null
   text: string
@@ -1320,8 +1335,23 @@ const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
 const EFFECT_PREVIEW_TYPES: EffectPreviewType[] = ['transitions', 'swoosh', 'zooms', 'all', 'auto']
 const VIRAL_PREVIEW_MODES: ViralPreviewMode[] = ['none', 'youtube', 'tiktok']
-const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = ['basic_clean', 'mrbeast_animated', 'neon_glow', 'bold_clean_box', 'rage_mode', 'ice_pop']
-const VERTICAL_CAPTION_FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold']
+const VERTICAL_SELECTION_MODE_VALUES: VerticalSelectionMode[] = ['best_moments', 'story_arc', 'hook_storm', 'loop_builder']
+const VERTICAL_ZOOM_PROFILE_VALUES: VerticalZoomProfile[] = ['none', 'smooth', 'punch', 'kinetic']
+const DEFAULT_VERTICAL_SELECTION_MODE: VerticalSelectionMode = 'best_moments'
+const DEFAULT_VERTICAL_ZOOM_PROFILE: VerticalZoomProfile = 'smooth'
+const DEFAULT_VERTICAL_ZOOM_INTENSITY = 0.62
+const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = [
+  'basic_clean',
+  'mrbeast_animated',
+  'neon_glow',
+  'bold_clean_box',
+  'rage_mode',
+  'ice_pop',
+  'retro_wave',
+  'glitch_pop',
+  'cinema_punch'
+]
+const VERTICAL_CAPTION_FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold', 'display_black', 'mono_bold']
 const VERTICAL_CAPTION_FONT_SIZE_MIN = 32
 const VERTICAL_CAPTION_FONT_SIZE_MAX = 220
 const VERTICAL_CAPTION_FONT_SIZE_DEFAULT = 110
@@ -2941,6 +2971,42 @@ const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'st
   return fallback
 }
 
+const parseVerticalSelectionMode = (
+  value?: any,
+  fallback: VerticalSelectionMode = DEFAULT_VERTICAL_SELECTION_MODE
+): VerticalSelectionMode => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw) return fallback
+  if (raw === 'best' || raw === 'best_moments' || raw === 'best-moments') return 'best_moments'
+  if (raw === 'story' || raw === 'story_arc' || raw === 'story-arc') return 'story_arc'
+  if (raw === 'hook' || raw === 'hook_storm' || raw === 'hook-storm') return 'hook_storm'
+  if (raw === 'loop' || raw === 'loop_builder' || raw === 'loop-builder') return 'loop_builder'
+  return VERTICAL_SELECTION_MODE_VALUES.includes(raw as VerticalSelectionMode)
+    ? (raw as VerticalSelectionMode)
+    : fallback
+}
+
+const parseVerticalZoomProfile = (
+  value?: any,
+  fallback: VerticalZoomProfile = DEFAULT_VERTICAL_ZOOM_PROFILE
+): VerticalZoomProfile => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (!raw) return fallback
+  if (raw === 'off') return 'none'
+  if (raw === 'soft') return 'smooth'
+  if (raw === 'aggressive') return 'kinetic'
+  return VERTICAL_ZOOM_PROFILE_VALUES.includes(raw as VerticalZoomProfile)
+    ? (raw as VerticalZoomProfile)
+    : fallback
+}
+
+const parseVerticalZoomIntensity = (value?: any, fallback = DEFAULT_VERTICAL_ZOOM_INTENSITY) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return Number(clamp(fallback, 0, 1).toFixed(3))
+  if (parsed > 1) return Number(clamp(parsed / 100, 0, 1).toFixed(3))
+  return Number(clamp(parsed, 0, 1).toFixed(3))
+}
+
 const parseVerticalClipCount = (value?: any) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   if (!Number.isFinite(parsed)) return 1
@@ -3058,6 +3124,18 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
     enabled: (value as any).enabled !== false,
     output: parseVerticalOutput((value as any).output),
     layout: parseVerticalLayoutMode((value as any).layout, 'stacked'),
+    selectionMode: parseVerticalSelectionMode(
+      (value as any).selectionMode ?? (value as any).selection_mode,
+      DEFAULT_VERTICAL_SELECTION_MODE
+    ),
+    zoomProfile: parseVerticalZoomProfile(
+      (value as any).zoomProfile ?? (value as any).zoom_profile,
+      DEFAULT_VERTICAL_ZOOM_PROFILE
+    ),
+    zoomIntensity: parseVerticalZoomIntensity(
+      (value as any).zoomIntensity ?? (value as any).zoom_intensity,
+      DEFAULT_VERTICAL_ZOOM_INTENSITY
+    ),
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
     bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover')
@@ -3078,6 +3156,9 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   enabled: true,
   output: { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT },
   layout: 'stacked',
+  selectionMode: DEFAULT_VERTICAL_SELECTION_MODE,
+  zoomProfile: DEFAULT_VERTICAL_ZOOM_PROFILE,
+  zoomIntensity: DEFAULT_VERTICAL_ZOOM_INTENSITY,
   webcamCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
   bottomFit: 'cover'
@@ -3651,7 +3732,13 @@ const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null =>
     rage_mode: 'rage_mode',
     rage: 'rage_mode',
     ice_pop: 'ice_pop',
-    ice: 'ice_pop'
+    ice: 'ice_pop',
+    retro_wave: 'retro_wave',
+    retro: 'retro_wave',
+    glitch_pop: 'glitch_pop',
+    glitch: 'glitch_pop',
+    cinema_punch: 'cinema_punch',
+    cinema: 'cinema_punch'
   }
   if (aliases[compact]) return aliases[compact]
   const normalizedSubtitle = normalizeSubtitlePreset(token)
@@ -3696,6 +3783,19 @@ const parseVerticalCaptionPosition = (value: any): number | null => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return null
   return Number(clamp(parsed, 0.02, 0.98).toFixed(4))
+}
+
+const parseVerticalCaptionAnimationEnabled = (value: any): boolean | null => {
+  if (typeof value === 'boolean') return value
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['1', 'true', 'yes', 'on', 'enabled', 'enable', 'animated', 'animate', 'pop', 'auto'].includes(normalized)) {
+    return true
+  }
+  if (['0', 'false', 'no', 'off', 'disabled', 'disable', 'none', 'static', 'still'].includes(normalized)) {
+    return false
+  }
+  return null
 }
 
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
@@ -3818,6 +3918,25 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.boxColor,
     nested?.box_color
   )
+  const animationCandidate = pickFirstDefinedValue(
+    (payload as any).animationEnabled,
+    (payload as any).animation_enabled,
+    (payload as any).verticalCaptionAnimationEnabled,
+    (payload as any).vertical_caption_animation_enabled,
+    (payload as any).captionAnimationEnabled,
+    (payload as any).caption_animation_enabled,
+    (payload as any).verticalCaptionAnimation,
+    (payload as any).vertical_caption_animation,
+    (payload as any).captionAnimation,
+    (payload as any).caption_animation,
+    nested?.animationEnabled,
+    nested?.animation_enabled,
+    nested?.captionAnimationEnabled,
+    nested?.caption_animation_enabled,
+    nested?.animation,
+    nested?.captionAnimation,
+    nested?.caption_animation
+  )
   const positionXCandidate = pickFirstDefinedValue(
     (payload as any).positionX,
     (payload as any).position_x,
@@ -3886,6 +4005,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     shadowColorCandidate === undefined &&
     shadowBlurCandidate === undefined &&
     boxColorCandidate === undefined &&
+    animationCandidate === undefined &&
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
     autoGenerateCandidate === null &&
@@ -3905,6 +4025,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedShadowColor = parseVerticalCaptionHexColor(shadowColorCandidate)
   const parsedShadowBlur = parseVerticalCaptionShadowBlur(shadowBlurCandidate)
   const parsedBoxColor = parseVerticalCaptionHexColor(boxColorCandidate)
+  const parsedAnimationEnabled = parseVerticalCaptionAnimationEnabled(animationCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   return {
@@ -3921,6 +4042,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedShadowBlur !== null ? { shadowBlur: parsedShadowBlur } : {}),
     ...(boxEnabledCandidate === null ? {} : { boxEnabled: boxEnabledCandidate }),
     ...(parsedBoxColor ? { boxColor: parsedBoxColor } : {}),
+    ...(parsedAnimationEnabled === null ? {} : { animationEnabled: parsedAnimationEnabled }),
     ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
     ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
     ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
@@ -3945,7 +4067,8 @@ const resolveVerticalCaptionConfig = (
         shadowColor: '020617',
         shadowBlur: 0,
         boxEnabled: true,
-        boxColor: '020617'
+        boxColor: '020617',
+        animationEnabled: false
       }
     }
     if (preset === 'neon_glow') {
@@ -3959,7 +4082,8 @@ const resolveVerticalCaptionConfig = (
         shadowColor: '2DF6FF',
         shadowBlur: 26,
         boxEnabled: false,
-        boxColor: '0A0F1E'
+        boxColor: '0A0F1E',
+        animationEnabled: true
       }
     }
     if (preset === 'bold_clean_box') {
@@ -3973,7 +4097,8 @@ const resolveVerticalCaptionConfig = (
         shadowColor: '000000',
         shadowBlur: 10,
         boxEnabled: true,
-        boxColor: '111827'
+        boxColor: '111827',
+        animationEnabled: false
       }
     }
     if (preset === 'rage_mode') {
@@ -3987,7 +4112,8 @@ const resolveVerticalCaptionConfig = (
         shadowColor: '120000',
         shadowBlur: 18,
         boxEnabled: false,
-        boxColor: '240202'
+        boxColor: '240202',
+        animationEnabled: true
       }
     }
     if (preset === 'ice_pop') {
@@ -4001,7 +4127,8 @@ const resolveVerticalCaptionConfig = (
         shadowColor: '49DEFF',
         shadowBlur: 18,
         boxEnabled: false,
-        boxColor: '041426'
+        boxColor: '041426',
+        animationEnabled: true
       }
     }
     return {
@@ -4014,7 +4141,8 @@ const resolveVerticalCaptionConfig = (
       shadowColor: '050505',
       shadowBlur: 8,
       boxEnabled: false,
-      boxColor: '000000'
+      boxColor: '000000',
+      animationEnabled: true
     }
   }
   const fallbackPreset = parseVerticalCaptionPreset(defaults?.preset) || 'mrbeast_animated'
@@ -4031,7 +4159,21 @@ const resolveVerticalCaptionConfig = (
     shadowColor: parseVerticalCaptionHexColor(defaults?.shadowColor) || fallbackPresetStyle.shadowColor,
     shadowBlur: parseVerticalCaptionShadowBlur(defaults?.shadowBlur) ?? fallbackPresetStyle.shadowBlur,
     boxEnabled: typeof defaults?.boxEnabled === 'boolean' ? defaults.boxEnabled : fallbackPresetStyle.boxEnabled,
-    boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor
+    boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor,
+    animationEnabled: parseVerticalCaptionAnimationEnabled(
+      pickFirstDefinedValue(
+        (defaults as any)?.animationEnabled,
+        (defaults as any)?.animation_enabled,
+        (defaults as any)?.verticalCaptionAnimationEnabled,
+        (defaults as any)?.vertical_caption_animation_enabled,
+        (defaults as any)?.captionAnimationEnabled,
+        (defaults as any)?.caption_animation_enabled,
+        (defaults as any)?.verticalCaptionAnimation,
+        (defaults as any)?.vertical_caption_animation,
+        (defaults as any)?.captionAnimation,
+        (defaults as any)?.caption_animation
+      )
+    ) ?? fallbackPresetStyle.animationEnabled
   }
   const styleBaseline = requestedPreset && requestedPreset !== fallbackPreset
     ? getPresetStyleDefaults(requestedPreset)
@@ -4059,6 +4201,7 @@ const resolveVerticalCaptionConfig = (
     shadowBlur: parseVerticalCaptionShadowBlur(override.shadowBlur) ?? styleBaseline.shadowBlur,
     boxEnabled: typeof override.boxEnabled === 'boolean' ? override.boxEnabled : styleBaseline.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(override.boxColor) || styleBaseline.boxColor,
+    animationEnabled: typeof override.animationEnabled === 'boolean' ? override.animationEnabled : styleBaseline.animationEnabled,
     positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
     positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY
   }
@@ -4070,6 +4213,7 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     enabled: true,
     autoGenerate: true,
     preset,
+    animationEnabled: true,
     fontId: 'impact',
     fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
     text: '',
@@ -4114,6 +4258,7 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
     preset,
+    animationEnabled: typeof config.animationEnabled === 'boolean' ? config.animationEnabled : defaults.animationEnabled,
     fontId: parseVerticalCaptionFontId(config.fontId) || defaults.fontId,
     fontSize,
     text,
@@ -4129,11 +4274,15 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     positionX: parseVerticalCaptionPosition(config.positionX) ?? defaults.positionX,
     positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY
   }
+  const animationMode: VerticalClipCaptionAnimation = normalized.animationEnabled ? 'pop' : 'none'
   return {
     verticalCaptions: {
       enabled: normalized.enabled,
       autoGenerate: normalized.autoGenerate,
       preset: normalized.preset,
+      animationEnabled: normalized.animationEnabled,
+      animation_enabled: normalized.animationEnabled,
+      animation: animationMode,
       fontId: normalized.fontId,
       fontSize,
       text,
@@ -4156,6 +4305,10 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     vertical_caption_auto_generate: normalized.autoGenerate,
     verticalCaptionPreset: normalized.preset,
     vertical_caption_preset: normalized.preset,
+    verticalCaptionAnimationEnabled: normalized.animationEnabled,
+    vertical_caption_animation_enabled: normalized.animationEnabled,
+    verticalCaptionAnimation: animationMode,
+    vertical_caption_animation: animationMode,
     verticalCaptionFontId: normalized.fontId,
     vertical_caption_font_id: normalized.fontId,
     verticalCaptionFontSize: fontSize,
@@ -8125,6 +8278,7 @@ const buildVerticalClipCaptionOverlays = ({
   userCaptionText,
   transcriptCues,
   captionPreset,
+  animationEnabled,
   autoGenerateFromTranscript,
   editorMode,
   styleProfile,
@@ -8136,6 +8290,7 @@ const buildVerticalClipCaptionOverlays = ({
   userCaptionText: string
   transcriptCues?: TranscriptCue[]
   captionPreset?: VerticalCaptionPreset
+  animationEnabled?: boolean
   autoGenerateFromTranscript?: boolean
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
@@ -8220,9 +8375,11 @@ const buildVerticalClipCaptionOverlays = ({
     .slice(0, 6)
   const fallbackAnchors = [0.16, 0.45, 0.72]
   const maxStart = Math.max(0, clipDuration - 0.4)
-  const animations: VerticalClipCaptionAnimation[] = highEnergy
-    ? ['pop', 'slide', 'fade']
-    : ['fade', 'slide', 'fade']
+  const animations: VerticalClipCaptionAnimation[] = animationEnabled === false
+    ? ['none']
+    : (highEnergy
+      ? ['pop', 'slide', 'fade']
+      : ['fade', 'slide', 'fade'])
   const overlays: VerticalClipCaptionOverlay[] = []
   let cursor = 0
   for (let index = 0; index < selectedPhrases.length; index += 1) {
@@ -12494,6 +12651,7 @@ const buildMrBeastAnimatedAss = ({
 
 const buildVerticalCaptionSubtitleStyle = ({
   preset,
+  animationEnabled,
   fontId,
   fontSize,
   textColor,
@@ -12503,6 +12661,7 @@ const buildVerticalCaptionSubtitleStyle = ({
   fallbackStyle
 }: {
   preset: VerticalCaptionPreset
+  animationEnabled?: boolean | null
   fontId?: SubtitleFontId | null
   fontSize: number | null
   textColor?: string | null
@@ -12575,6 +12734,9 @@ const buildVerticalCaptionSubtitleStyle = ({
   const resolvedAccentColor = parseVerticalCaptionHexColor(accentColor) || defaultStyleByPreset.accentColor
   const resolvedOutlineColor = parseVerticalCaptionHexColor(outlineColor) || defaultStyleByPreset.outlineColor
   const resolvedOutlineWidth = parseVerticalCaptionOutlineWidth(outlineWidth) ?? defaultStyleByPreset.outlineWidth
+  const resolvedAnimation = typeof animationEnabled === 'boolean'
+    ? (animationEnabled ? 'pop' : 'none')
+    : defaultStyleByPreset.animation
   return serializeSubtitleStyleConfig({
     ...base,
     preset: stylePreset,
@@ -12584,7 +12746,7 @@ const buildVerticalCaptionSubtitleStyle = ({
     accentColor: resolvedAccentColor,
     outlineColor: resolvedOutlineColor,
     outlineWidth: Math.max(1, Math.min(24, resolvedOutlineWidth || 1)),
-    animation: defaultStyleByPreset.animation
+    animation: resolvedAnimation
   })
 }
 
@@ -12628,7 +12790,7 @@ const buildVerticalCaptionAss = ({
   const backColor = boxEnabled ? boxColor : shadowColor
   const posX = Math.round(clamp(config.positionX || 0.5, 0.02, 0.98) * 1080)
   const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
-  const usePop = config.preset !== 'basic_clean' && config.preset !== 'bold_clean_box'
+  const usePop = Boolean(config.animationEnabled)
   const useUppercase = config.preset !== 'basic_clean' && config.preset !== 'bold_clean_box'
   const assLines: string[] = [
     '[Script Info]',
@@ -16930,6 +17092,7 @@ const processJob = async (
       const shouldApplyVerticalCaptionOverlays = Boolean(verticalCaptionConfig.enabled)
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
         preset: verticalCaptionConfig.preset,
+        animationEnabled: verticalCaptionConfig.animationEnabled,
         fontId: verticalCaptionConfig.fontId,
         fontSize: verticalCaptionConfig.fontSize,
         textColor: verticalCaptionConfig.textColor,
@@ -17026,6 +17189,7 @@ const processJob = async (
               userCaptionText: verticalCaptionTextInput,
               transcriptCues: verticalSourceCues,
               captionPreset: verticalCaptionConfig.preset,
+              animationEnabled: verticalCaptionConfig.animationEnabled,
               autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
               editorMode: editorModeForRender,
               styleProfile: verticalStyleProfile,
