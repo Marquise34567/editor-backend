@@ -1139,6 +1139,8 @@ type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
 type HookSelectionMode = 'manual' | 'auto'
 type LongFormPreset = 'auto' | 'balanced' | 'aggressive' | 'ultra'
+type EffectPreviewType = 'transitions' | 'swoosh' | 'zooms' | 'all' | 'auto'
+type ViralPreviewMode = 'none' | 'youtube' | 'tiktok'
 type ConcreteLongFormPreset = Exclude<LongFormPreset, 'auto'>
 type ContentStyleProfile = {
   style: ContentStyle
@@ -1190,6 +1192,13 @@ const LONG_FORM_AGGRESSION_MIN = 0
 const LONG_FORM_AGGRESSION_MAX = 100
 const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
+const EFFECT_PREVIEW_TYPES: EffectPreviewType[] = ['transitions', 'swoosh', 'zooms', 'all', 'auto']
+const VIRAL_PREVIEW_MODES: ViralPreviewMode[] = ['none', 'youtube', 'tiktok']
+const EFFECT_PREVIEW_DURATION_DEFAULT_SEC = 12
+const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
+const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
+const EFFECT_PREVIEW_PROXY_WIDTH = 854
+const EFFECT_PREVIEW_PROXY_HEIGHT = 480
 const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education', 'podcast']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
 const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['auto', 'balanced', 'aggressive', 'ultra']
@@ -3191,6 +3200,58 @@ const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   )
   if (candidate === undefined) return null
   return normalizeVerticalCaptionTextInput(candidate)
+}
+
+const parseEffectPreviewType = (value: any): EffectPreviewType | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized || normalized === 'off' || normalized === 'none') return null
+  if (normalized === 'transition') return 'transitions'
+  if (normalized === 'zoom' || normalized === 'smart_zoom' || normalized === 'smart-zoom') return 'zooms'
+  if (normalized === 'sfx' || normalized === 'soundfx' || normalized === 'sound_fx') return 'swoosh'
+  if (EFFECT_PREVIEW_TYPES.includes(normalized as EffectPreviewType)) {
+    return normalized as EffectPreviewType
+  }
+  return null
+}
+
+const getEffectPreviewTypeFromPayload = (payload?: any): EffectPreviewType | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const explicit = (
+    (payload as any).effectType ??
+    (payload as any).effect_type ??
+    (payload as any).enhanceMode ??
+    (payload as any).enhance_mode ??
+    (payload as any).effect
+  )
+  return parseEffectPreviewType(explicit)
+}
+
+const parseViralPreviewMode = (value: any): ViralPreviewMode => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized || normalized === 'none' || normalized === 'off') return 'none'
+  if (normalized === 'yt') return 'youtube'
+  if (normalized === 'tt') return 'tiktok'
+  if (VIRAL_PREVIEW_MODES.includes(normalized as ViralPreviewMode)) {
+    return normalized as ViralPreviewMode
+  }
+  return 'none'
+}
+
+const getViralPreviewModeFromPayload = (payload?: any): ViralPreviewMode => {
+  if (!payload || typeof payload !== 'object') return 'none'
+  const explicit = (
+    (payload as any).viralMode ??
+    (payload as any).viral_mode ??
+    (payload as any).modePreset ??
+    (payload as any).mode_preset
+  )
+  return parseViralPreviewMode(explicit)
+}
+
+const parseEffectPreviewDurationSeconds = (value: any) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return EFFECT_PREVIEW_DURATION_DEFAULT_SEC
+  return Number(clamp(parsed, EFFECT_PREVIEW_DURATION_MIN_SEC, EFFECT_PREVIEW_DURATION_MAX_SEC).toFixed(3))
 }
 
 const STYLE_ARCHETYPE_KEYS: Array<keyof StyleArchetypeBlend> = [
@@ -11466,6 +11527,279 @@ const generateProxy = async (inputPath: string, outPath: string, opts?: { width?
   await runFfmpeg(args)
 }
 
+const buildEffectPreviewScaleFilter = (width: number, height: number) =>
+  `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
+
+const findHighEnergyPreviewSegmentStart = ({
+  analysis,
+  durationSeconds,
+  clipDurationSeconds
+}: {
+  analysis?: any
+  durationSeconds: number
+  clipDurationSeconds: number
+}) => {
+  const safeDuration = Math.max(0.5, Number(durationSeconds) || 0.5)
+  const safeClipDuration = Math.max(0.2, Math.min(safeDuration, Number(clipDurationSeconds) || EFFECT_PREVIEW_DURATION_DEFAULT_SEC))
+  const maxStart = Math.max(0, safeDuration - safeClipDuration)
+  const hookStart = Number(analysis?.hook_start_time ?? analysis?.hook?.start ?? NaN)
+  if (Number.isFinite(hookStart)) return Number(clamp(hookStart, 0, maxStart).toFixed(3))
+
+  const windows = normalizeStoredEngagementWindows(analysis?.engagementWindows)
+  if (windows.length === 0) return Number(clamp(safeDuration * 0.2, 0, maxStart).toFixed(3))
+
+  const bestWindow = windows.reduce(
+    (best, window) => {
+      const combinedScore = clamp01(
+        0.46 * clamp01(window.score) +
+        0.2 * clamp01(window.audioEnergy) +
+        0.16 * clamp01(window.motionScore) +
+        0.1 * clamp01(window.vocalExcitement) +
+        0.08 * clamp01(window.sceneChangeRate)
+      )
+      if (combinedScore > best.score) return { score: combinedScore, time: window.time }
+      return best
+    },
+    { score: -1, time: 0 }
+  )
+  const centered = bestWindow.time - safeClipDuration * 0.35
+  return Number(clamp(centered, 0, maxStart).toFixed(3))
+}
+
+const renderEffectPreviewBaseClip = async ({
+  inputPath,
+  outputPath,
+  startSeconds,
+  durationSeconds,
+  hasAudio
+}: {
+  inputPath: string
+  outputPath: string
+  startSeconds: number
+  durationSeconds: number
+  hasAudio: boolean
+}) => {
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-ss',
+    toFilterNumber(startSeconds),
+    '-t',
+    toFilterNumber(durationSeconds),
+    '-i',
+    inputPath,
+    '-vf',
+    buildEffectPreviewScaleFilter(EFFECT_PREVIEW_PROXY_WIDTH, EFFECT_PREVIEW_PROXY_HEIGHT),
+    '-r',
+    '30',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '30',
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart'
+  ]
+  if (hasAudio) {
+    args.push('-c:a', 'aac', '-b:a', '128k')
+  } else {
+    args.push('-an')
+  }
+  args.push(outputPath)
+  await runFfmpeg(args)
+}
+
+const renderTransitionEffectPreview = async ({
+  inputPath,
+  outputPath,
+  durationSeconds,
+  hasAudio,
+  style
+}: {
+  inputPath: string
+  outputPath: string
+  durationSeconds: number
+  hasAudio: boolean
+  style: 'glitch' | 'light-leak'
+}) => {
+  const splitAt = Number(Math.max(0.6, durationSeconds * 0.5).toFixed(3))
+  const overlap = Number((style === 'glitch' ? 0.22 : 0.32).toFixed(3))
+  const offset = Number(Math.max(0.1, splitAt - overlap).toFixed(3))
+  const transitionName = style === 'glitch' ? 'slideleft' : 'fade'
+  const filterParts = [
+    `[0:v]split=2[vA][vB]`,
+    `[vA]trim=start=0:end=${toFilterNumber(splitAt)},setpts=PTS-STARTPTS[v0]`,
+    `[vB]trim=start=${toFilterNumber(splitAt)},setpts=PTS-STARTPTS[v1]`,
+    `[v0][v1]xfade=transition=${transitionName}:duration=${toFilterNumber(overlap)}:offset=${toFilterNumber(offset)}[v]`
+  ]
+  if (hasAudio) {
+    filterParts.push(
+      `[0:a]asplit=2[aA][aB]`,
+      `[aA]atrim=start=0:end=${toFilterNumber(splitAt)},asetpts=PTS-STARTPTS[a0]`,
+      `[aB]atrim=start=${toFilterNumber(splitAt)},asetpts=PTS-STARTPTS[a1]`,
+      `[a0][a1]acrossfade=d=${toFilterNumber(overlap)}[a]`
+    )
+  }
+  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-filter_complex', filterParts.join(';'), '-map', '[v]']
+  if (hasAudio) {
+    args.push('-map', '[a]')
+  } else {
+    args.push('-an')
+  }
+  args.push('-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', '-pix_fmt', 'yuv420p', '-movflags', '+faststart')
+  if (hasAudio) args.push('-c:a', 'aac', '-b:a', '128k')
+  args.push(outputPath)
+  await runFfmpeg(args)
+}
+
+const renderZoomEffectPreview = async ({
+  inputPath,
+  outputPath,
+  hasAudio,
+  style
+}: {
+  inputPath: string
+  outputPath: string
+  hasAudio: boolean
+  style: 'snap' | 'dolly'
+}) => {
+  const filter = style === 'snap'
+    ? `zoompan=z='if(lte(on,5),1,if(gte(zoom,1.24),1.06,zoom+0.018))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=${EFFECT_PREVIEW_PROXY_WIDTH}x${EFFECT_PREVIEW_PROXY_HEIGHT}`
+    : `zoompan=z='min(1.15,1+0.0018*on)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:fps=30:s=${EFFECT_PREVIEW_PROXY_WIDTH}x${EFFECT_PREVIEW_PROXY_HEIGHT}`
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-i',
+    inputPath,
+    '-vf',
+    filter,
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '28',
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart'
+  ]
+  if (hasAudio) {
+    args.push('-c:a', 'aac', '-b:a', '128k')
+  } else {
+    args.push('-an')
+  }
+  args.push(outputPath)
+  await runFfmpeg(args)
+}
+
+const renderSwooshEffectPreview = async ({
+  inputPath,
+  outputPath,
+  durationSeconds,
+  hasAudio,
+  style
+}: {
+  inputPath: string
+  outputPath: string
+  durationSeconds: number
+  hasAudio: boolean
+  style: 'punchy' | 'cinematic'
+}) => {
+  const firstFreq = style === 'punchy' ? 1680 : 1320
+  const secondFreq = style === 'punchy' ? 980 : 860
+  const firstVol = style === 'punchy' ? 0.22 : 0.17
+  const secondVol = style === 'punchy' ? 0.2 : 0.15
+  const delayMs = style === 'punchy' ? 720 : 900
+  const baseTrack = hasAudio
+    ? '[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,volume=1[a0]'
+    : `anullsrc=channel_layout=stereo:sample_rate=48000:d=${toFilterNumber(durationSeconds)}[a0]`
+  const filterComplex = [
+    baseTrack,
+    `sine=frequency=${firstFreq}:duration=0.18:sample_rate=48000,volume=${toFilterNumber(firstVol)}[s1]`,
+    `sine=frequency=${secondFreq}:duration=0.24:sample_rate=48000,volume=${toFilterNumber(secondVol)},adelay=${delayMs}|${delayMs}[s2]`,
+    '[a0][s1][s2]amix=inputs=3:normalize=0[a]'
+  ].join(';')
+  const args = [
+    '-hide_banner',
+    '-nostdin',
+    '-y',
+    '-i',
+    inputPath,
+    '-filter_complex',
+    filterComplex,
+    '-map',
+    '0:v:0',
+    '-map',
+    '[a]',
+    '-c:v',
+    'libx264',
+    '-preset',
+    'ultrafast',
+    '-crf',
+    '30',
+    '-pix_fmt',
+    'yuv420p',
+    '-movflags',
+    '+faststart',
+    '-c:a',
+    'aac',
+    '-b:a',
+    '160k',
+    outputPath
+  ]
+  await runFfmpeg(args)
+}
+
+const renderComboEffectPreview = async ({
+  inputPath,
+  outputPath,
+  durationSeconds,
+  hasAudio,
+  mode,
+  previewId
+}: {
+  inputPath: string
+  outputPath: string
+  durationSeconds: number
+  hasAudio: boolean
+  mode: ViralPreviewMode
+  previewId: string
+}) => {
+  const transitionTmp = path.join(os.tmpdir(), `${previewId}-combo-transition.mp4`)
+  const zoomTmp = path.join(os.tmpdir(), `${previewId}-combo-zoom.mp4`)
+  try {
+    await renderTransitionEffectPreview({
+      inputPath,
+      outputPath: transitionTmp,
+      durationSeconds,
+      hasAudio,
+      style: mode === 'tiktok' ? 'glitch' : 'light-leak'
+    })
+    await renderZoomEffectPreview({
+      inputPath: transitionTmp,
+      outputPath: zoomTmp,
+      hasAudio,
+      style: mode === 'tiktok' ? 'snap' : 'dolly'
+    })
+    await renderSwooshEffectPreview({
+      inputPath: zoomTmp,
+      outputPath,
+      durationSeconds,
+      hasAudio,
+      style: mode === 'tiktok' ? 'punchy' : 'cinematic'
+    })
+  } finally {
+    safeUnlink(transitionTmp)
+    safeUnlink(zoomTmp)
+  }
+}
+
 const normalizeStoredEngagementWindows = (raw: any): EngagementWindow[] => {
   if (!Array.isArray(raw)) return []
   return raw
@@ -17812,6 +18146,114 @@ router.post('/:id/proxy-url', async (req: any, res) => {
     return res.json({ url })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/effect-preview', async (req: any, res) => {
+  let tmpIn: string | null = null
+  let tmpBase: string | null = null
+  let tmpOut: string | null = null
+  try {
+    if (!hasFfmpeg()) {
+      return res.status(503).json({ error: 'ffmpeg_missing' })
+    }
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (!job.inputPath) return res.status(400).json({ error: 'input_not_available' })
+
+    const effectType = getEffectPreviewTypeFromPayload(req.body || {})
+    if (!effectType) return res.status(400).json({ error: 'invalid_effect' })
+    const viralMode = getViralPreviewModeFromPayload(req.body || {})
+    const requestedDuration = parseEffectPreviewDurationSeconds(
+      req.body?.duration ?? req.body?.previewDuration ?? req.body?.clipDuration
+    )
+    const previewToken = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`
+    tmpIn = path.join(os.tmpdir(), `${id}-effect-preview-input-${previewToken}.mp4`)
+    tmpBase = path.join(os.tmpdir(), `${id}-effect-preview-base-${previewToken}.mp4`)
+    tmpOut = path.join(os.tmpdir(), `${id}-effect-preview-output-${previewToken}.mp4`)
+
+    await downloadObjectToFile({ key: job.inputPath, destPath: tmpIn })
+    const sourceDuration = getDurationSeconds(tmpIn)
+    if (!sourceDuration || sourceDuration <= 0) {
+      return res.status(422).json({ error: 'duration_unavailable' })
+    }
+    const previewDuration = Number(
+      clamp(
+        requestedDuration,
+        Math.min(EFFECT_PREVIEW_DURATION_MIN_SEC, sourceDuration),
+        Math.max(Math.min(EFFECT_PREVIEW_DURATION_MAX_SEC, sourceDuration), 0.5)
+      ).toFixed(3)
+    )
+    const segmentStart = findHighEnergyPreviewSegmentStart({
+      analysis: job.analysis as any,
+      durationSeconds: sourceDuration,
+      clipDurationSeconds: previewDuration
+    })
+    const hasAudio = hasAudioStream(tmpIn)
+    await renderEffectPreviewBaseClip({
+      inputPath: tmpIn,
+      outputPath: tmpBase,
+      startSeconds: segmentStart,
+      durationSeconds: previewDuration,
+      hasAudio
+    })
+
+    if (effectType === 'transitions') {
+      await renderTransitionEffectPreview({
+        inputPath: tmpBase,
+        outputPath: tmpOut,
+        durationSeconds: previewDuration,
+        hasAudio,
+        style: viralMode === 'tiktok' ? 'glitch' : 'light-leak'
+      })
+    } else if (effectType === 'swoosh') {
+      await renderSwooshEffectPreview({
+        inputPath: tmpBase,
+        outputPath: tmpOut,
+        durationSeconds: previewDuration,
+        hasAudio,
+        style: viralMode === 'tiktok' ? 'punchy' : 'cinematic'
+      })
+    } else if (effectType === 'zooms') {
+      await renderZoomEffectPreview({
+        inputPath: tmpBase,
+        outputPath: tmpOut,
+        hasAudio,
+        style: viralMode === 'tiktok' ? 'snap' : 'dolly'
+      })
+    } else {
+      await renderComboEffectPreview({
+        inputPath: tmpBase,
+        outputPath: tmpOut,
+        durationSeconds: previewDuration,
+        hasAudio,
+        mode: viralMode,
+        previewId: `${id}-${previewToken}`
+      })
+    }
+
+    await ensureBucket(OUTPUT_BUCKET, false)
+    const outputKey = `${job.userId}/${job.id}/previews/effect-${effectType}-${viralMode}-${previewToken}.mp4`
+    await uploadFileToOutput({ key: outputKey, filePath: tmpOut, contentType: 'video/mp4' })
+    const previewUrl = await getSignedOutputUrl({ key: outputKey, expiresIn: 60 * 10 })
+    return res.json({
+      previewUrl,
+      effectType,
+      viralMode,
+      segmentStart,
+      duration: previewDuration
+    })
+  } catch (err) {
+    console.error('effect preview error', err)
+    return res.status(500).json({
+      error: 'effect_preview_failed',
+      message: formatFfmpegFailure(err)
+    })
+  } finally {
+    safeUnlink(tmpIn)
+    safeUnlink(tmpBase)
+    safeUnlink(tmpOut)
   }
 })
 
