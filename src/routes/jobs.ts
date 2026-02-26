@@ -746,6 +746,14 @@ type VerticalRetentionCandidate = {
   predictorBreakdown: VerticalRetentionPredictorBreakdown
   reason: string
 }
+type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide'
+type VerticalClipCaptionOverlay = {
+  text: string
+  start: number
+  end: number
+  animation: VerticalClipCaptionAnimation
+  position: 'center' | 'bottom'
+}
 type VerticalRetentionSelectionResult = {
   accepted: VerticalRetentionCandidate[]
   rejectedCount: number
@@ -753,6 +761,11 @@ type VerticalRetentionSelectionResult = {
   candidateTarget: number
   outputTarget: number
   evaluatedCount: number
+  requestedCount: number
+  exactCountRequested: boolean
+  paddingApplied: boolean
+  paddingCount: number
+  paddingReason: string | null
 }
 type EmotionModeProfile = {
   enabled: boolean
@@ -2911,6 +2924,41 @@ const getSubtitleStyleFromPayload = (payload?: any): string | null => {
   const text = String(candidate).trim()
   if (!text) return null
   return text.slice(0, 320)
+}
+
+const pickFirstDefinedValue = (...values: any[]) => {
+  for (const value of values) {
+    if (value !== undefined) return value
+  }
+  return undefined
+}
+
+const normalizeVerticalCaptionTextInput = (value: any): string => {
+  const normalized = String(value ?? '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+  if (!normalized) return ''
+  return normalized.slice(0, 1_800)
+}
+
+const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const nested = (payload as any).verticalCaptions
+  const candidate = pickFirstDefinedValue(
+    (payload as any).verticalCaptionText,
+    (payload as any).vertical_caption_text,
+    (payload as any).clipBuilderCaptionText,
+    (payload as any).clip_builder_caption_text,
+    (payload as any).captionText,
+    (payload as any).caption_text,
+    nested?.text,
+    nested?.captionText,
+    nested?.caption_text
+  )
+  if (candidate === undefined) return null
+  return normalizeVerticalCaptionTextInput(candidate)
 }
 
 const STYLE_ARCHETYPE_KEYS: Array<keyof StyleArchetypeBlend> = [
@@ -6414,6 +6462,234 @@ const parseTranscriptCues = (srtPath: string | null) => {
   return cues.sort((a, b) => a.start - b.start)
 }
 
+const CAPTION_EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u
+
+const sanitizeCaptionPhrase = (value: string) => (
+  String(value || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 84)
+)
+
+const splitVerticalCaptionPhrases = (rawText: string): string[] => {
+  const normalized = normalizeVerticalCaptionTextInput(rawText)
+  if (!normalized) return []
+  const buckets = normalized
+    .split(/\n+/)
+    .flatMap((line) => line.split(/[|•]+/g))
+    .flatMap((line) => line.split(/(?<=[.!?])\s+/g))
+    .map((phrase) => sanitizeCaptionPhrase(phrase))
+    .filter(Boolean)
+  if (!buckets.length) return []
+  const unique: string[] = []
+  for (const phrase of buckets) {
+    const lower = phrase.toLowerCase()
+    if (unique.some((entry) => entry.toLowerCase() === lower)) continue
+    unique.push(phrase)
+    if (unique.length >= 12) break
+  }
+  return unique
+}
+
+const inferHighEnergyVerticalClip = ({
+  range,
+  windows,
+  editorMode,
+  styleProfile,
+  nicheProfile
+}: {
+  range: TimeRange
+  windows: EngagementWindow[]
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+}) => {
+  if (editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'sports') return true
+  if (styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') return true
+  if (nicheProfile?.niche === 'high_energy') return true
+  const energy = averageWindowMetric(
+    windows,
+    range.start,
+    range.end,
+    (window) => (
+      0.34 * window.vocalExcitement +
+      0.28 * window.emotionIntensity +
+      0.2 * (window.actionSpike ?? 0) +
+      0.18 * window.motionScore
+    )
+  )
+  return energy >= 0.56
+}
+
+const buildAutoVerticalCaptionPool = ({
+  editorMode,
+  styleProfile,
+  nicheProfile,
+  highEnergy
+}: {
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  highEnergy: boolean
+}) => {
+  if (editorMode === 'education' || nicheProfile?.niche === 'education' || styleProfile?.style === 'tutorial') {
+    return ['Save this tip ✅', 'Use this next 👇', 'Replay this step 🔁']
+  }
+  if (editorMode === 'gaming' || editorMode === 'sports' || styleProfile?.style === 'gaming') {
+    return ['NO WAY 🤯', 'CLUTCH MOMENT 🎯', 'RUN IT BACK 🔁', 'THIS IS WILD 😤']
+  }
+  if (highEnergy) {
+    return ['WAIT FOR IT 😳', 'WHAT JUST HAPPENED?! 🤯', 'THIS PART IS CRAZY 🔥', 'WATCH TILL THE END 👀']
+  }
+  return ['Watch this 👀', 'Don’t miss this part 👇', 'This one hits 😮']
+}
+
+const buildVerticalClipCaptionOverlays = ({
+  range,
+  clipIndex,
+  windows,
+  userCaptionText,
+  editorMode,
+  styleProfile,
+  nicheProfile
+}: {
+  range: TimeRange
+  clipIndex: number
+  windows: EngagementWindow[]
+  userCaptionText: string
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+}): VerticalClipCaptionOverlay[] => {
+  const clipDuration = Math.max(0, Number(range.end) - Number(range.start))
+  if (clipDuration <= 0.35) return []
+  const userPhrases = splitVerticalCaptionPhrases(userCaptionText)
+  const highEnergy = inferHighEnergyVerticalClip({
+    range,
+    windows,
+    editorMode,
+    styleProfile,
+    nicheProfile
+  })
+  const phraseCount = Math.round(clamp(
+    clipDuration / (highEnergy ? 11 : 16),
+    1,
+    3
+  ))
+  const selectedPhrases: string[] = []
+  if (userPhrases.length) {
+    for (let index = 0; index < phraseCount; index += 1) {
+      let phrase = userPhrases[(clipIndex + index) % userPhrases.length]
+      if (highEnergy && !CAPTION_EMOJI_PATTERN.test(phrase) && phrase.length <= 78) {
+        phrase = `${phrase}${index === 0 ? ' 😳' : ' 🔥'}`
+      }
+      selectedPhrases.push(sanitizeCaptionPhrase(phrase))
+    }
+  } else {
+    const pool = buildAutoVerticalCaptionPool({
+      editorMode,
+      styleProfile,
+      nicheProfile,
+      highEnergy
+    })
+    for (let index = 0; index < phraseCount; index += 1) {
+      selectedPhrases.push(pool[(clipIndex + index) % pool.length])
+    }
+  }
+
+  const rankedWindows = windows
+    .filter((window) => window.time >= range.start && window.time <= range.end)
+    .slice()
+    .sort((left, right) => (
+      (
+        (right.hookScore ?? right.score) +
+        0.32 * (right.actionSpike ?? 0) +
+        0.2 * right.emotionIntensity +
+        0.16 * right.vocalExcitement +
+        0.12 * right.motionScore
+      ) -
+      (
+        (left.hookScore ?? left.score) +
+        0.32 * (left.actionSpike ?? 0) +
+        0.2 * left.emotionIntensity +
+        0.16 * left.vocalExcitement +
+        0.12 * left.motionScore
+      )
+    ))
+    .slice(0, 6)
+  const fallbackAnchors = [0.16, 0.45, 0.72]
+  const maxStart = Math.max(0, clipDuration - 0.4)
+  const animations: VerticalClipCaptionAnimation[] = highEnergy
+    ? ['pop', 'slide', 'fade']
+    : ['fade', 'slide', 'fade']
+  const overlays: VerticalClipCaptionOverlay[] = []
+  let cursor = 0
+  for (let index = 0; index < selectedPhrases.length; index += 1) {
+    const phrase = sanitizeCaptionPhrase(selectedPhrases[index] || '')
+    if (!phrase) continue
+    const ranked = rankedWindows[index]
+    const anchor = ranked
+      ? clamp(ranked.time - range.start - 0.3, 0.08, maxStart)
+      : clamp(clipDuration * fallbackAnchors[Math.min(index, fallbackAnchors.length - 1)], 0.08, maxStart)
+    const start = clamp(Math.max(cursor, anchor), 0, maxStart)
+    const duration = clamp(2 + phrase.length / 22 + (highEnergy ? 0.35 : 0), 2, 5)
+    const end = clamp(start + duration, start + 0.4, clipDuration)
+    overlays.push({
+      text: phrase,
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      animation: animations[index % animations.length],
+      position: highEnergy || index === 0 ? 'center' : 'bottom'
+    })
+    cursor = Math.min(maxStart, end + 0.12)
+  }
+  return overlays
+}
+
+const overlaysToTranscriptCues = (overlays: VerticalClipCaptionOverlay[]) => (
+  overlays
+    .map((overlay) => {
+      const start = Number(overlay.start)
+      const end = Number(overlay.end)
+      const text = sanitizeCaptionPhrase(overlay.text)
+      if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
+      return {
+        start,
+        end,
+        text,
+        ...scoreTranscriptSignals(text)
+      } as TranscriptCue
+    })
+    .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
+)
+
+const mergeTranscriptCueLayers = (layers: TranscriptCue[][]) => {
+  const flattened = layers.flat().filter((cue) => {
+    const start = Number(cue?.start)
+    const end = Number(cue?.end)
+    return Number.isFinite(start) && Number.isFinite(end) && end - start > 0.01 && String(cue?.text || '').trim().length > 0
+  })
+  if (!flattened.length) return [] as TranscriptCue[]
+  const sorted = flattened
+    .map((cue) => ({
+      ...cue,
+      start: Number(cue.start.toFixed(3)),
+      end: Number(cue.end.toFixed(3)),
+      text: sanitizeCaptionPhrase(cue.text)
+    }))
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  const merged: TranscriptCue[] = []
+  for (const cue of sorted) {
+    const last = merged.length ? merged[merged.length - 1] : null
+    if (last && last.text === cue.text && cue.start - last.end <= 0.08) {
+      last.end = Number(Math.max(last.end, cue.end).toFixed(3))
+      continue
+    }
+    merged.push(cue)
+  }
+  return merged
+}
+
 const buildTranscriptSignalBuckets = (durationSeconds: number, cues: TranscriptCue[]) => {
   const totalSeconds = Math.max(0, Math.ceil(durationSeconds))
   const buckets = new Array(totalSeconds).fill(null).map(() => ({
@@ -8681,17 +8957,30 @@ const buildVerticalMetadataSummary = ({
   durationSeconds,
   selectedCandidates,
   selectionResult,
-  preScan
+  preScan,
+  clipCaptionOverlaysByClip
 }: {
   durationSeconds: number
   selectedCandidates: VerticalRetentionCandidate[]
   selectionResult: VerticalRetentionSelectionResult
   preScan?: LongFormPreScanSummary | null
+  clipCaptionOverlaysByClip?: VerticalClipCaptionOverlay[][]
 }) => {
   const safeDuration = Math.max(0.1, Number.isFinite(durationSeconds) ? durationSeconds : 0)
   const clipDetails = selectedCandidates.map((candidate, index) => {
     const range = candidate.range
     const duration = Math.max(0, range.end - range.start)
+    const overlays = Array.isArray(clipCaptionOverlaysByClip?.[index])
+      ? clipCaptionOverlaysByClip![index]
+          .map((overlay) => ({
+            start: Number(Math.max(0, overlay.start).toFixed(3)),
+            end: Number(Math.max(0, overlay.end).toFixed(3)),
+            text: String(overlay.text || '').trim().slice(0, 140),
+            animation: overlay.animation,
+            position: overlay.position
+          }))
+          .filter((overlay) => overlay.text.length > 0 && overlay.end - overlay.start > 0.05)
+      : []
     return {
       clip: index + 1,
       start: Number(range.start.toFixed(3)),
@@ -8699,7 +8988,8 @@ const buildVerticalMetadataSummary = ({
       duration: Number(duration.toFixed(3)),
       predictedCompletion: Number(candidate.predictedCompletion.toFixed(2)),
       reason: candidate.reason,
-      predictorBreakdown: candidate.predictorBreakdown
+      predictorBreakdown: candidate.predictorBreakdown,
+      captionOverlays: overlays
     }
   })
   const coverage = selectedCandidates.reduce(
@@ -8732,6 +9022,11 @@ const buildVerticalMetadataSummary = ({
       candidateTarget: Number(selectionResult.candidateTarget || selectionResult.accepted.length),
       exportTarget: Number(selectionResult.outputTarget || selectedCandidates.length),
       rejectionReasonsSummary: selectionResult.rejectionReasonsSummary,
+      requestedCount: Number(selectionResult.requestedCount || 0),
+      exactCountRequested: Boolean(selectionResult.exactCountRequested),
+      paddingApplied: Boolean(selectionResult.paddingApplied),
+      paddingCount: Number(selectionResult.paddingCount || 0),
+      paddingReason: selectionResult.paddingReason || null,
       targetRange: {
         min: CLIP_EXPORT_TARGET_MIN,
         max: CLIP_EXPORT_TARGET_MAX
@@ -8739,7 +9034,10 @@ const buildVerticalMetadataSummary = ({
     },
     clips: clipDetails,
     preScan: preScan || null,
-    topHookReference: null
+    topHookReference: null,
+    warnings: selectionResult.paddingApplied && selectionResult.paddingReason
+      ? [selectionResult.paddingReason]
+      : []
   }
 }
 
@@ -11748,6 +12046,118 @@ const summarizeVerticalRejections = (reasons: string[]) => {
     .map(([reason, count]) => `${reason}:${count}`)
 }
 
+const buildSyntheticVerticalRetentionCandidate = ({
+  range,
+  reason,
+  predictedCompletion
+}: {
+  range: TimeRange
+  reason: string
+  predictedCompletion?: number
+}): VerticalRetentionCandidate => {
+  const start = Number(Math.max(0, range.start).toFixed(3))
+  const end = Number(Math.max(start + 0.2, range.end).toFixed(3))
+  const predicted = Number(
+    clamp(
+      Number.isFinite(Number(predictedCompletion)) ? Number(predictedCompletion) : MIN_PREDICTED_COMPLETION_PERCENT + 0.8,
+      MIN_PREDICTED_COMPLETION_PERCENT,
+      96
+    ).toFixed(2)
+  )
+  return {
+    range: { start, end },
+    predictedCompletion: predicted,
+    predictorBreakdown: {
+      hookStrength: 0.72,
+      interruptDensityQuality: 0.68,
+      endingLoopPotential: 0.64,
+      energyCurveQuality: 0.66,
+      captionSilentViability: 0.74,
+      introRetentionProxy: 0.71,
+      verticalFramingQuality: 0.72
+    },
+    reason
+  }
+}
+
+const buildVerticalPaddingRanges = ({
+  durationSeconds,
+  count
+}: {
+  durationSeconds: number
+  count: number
+}) => {
+  const total = Math.max(0, Number(durationSeconds) || 0)
+  const target = Math.max(0, Math.round(count))
+  if (total <= 0 || target <= 0) return [] as TimeRange[]
+  const minClip = total >= 15 ? 15 : Math.max(4, Math.min(total, 14.8))
+  const maxClip = Math.max(minClip, Math.min(60, total))
+  const durationTarget = clamp(
+    total / Math.max(1, Math.min(target, 4)),
+    minClip,
+    maxClip
+  )
+  const maxStart = Math.max(0, total - durationTarget)
+  const step = target > 1 ? maxStart / Math.max(1, target - 1) : 0
+  const ranges: TimeRange[] = []
+  for (let index = 0; index < target; index += 1) {
+    const start = Number(clamp(step * index, 0, maxStart).toFixed(3))
+    const end = Number(clamp(start + durationTarget, start + 0.2, total).toFixed(3))
+    if (end - start <= 0.01) continue
+    ranges.push({ start, end })
+  }
+  if (!ranges.length) {
+    ranges.push({
+      start: 0,
+      end: Number(Math.max(0.2, total).toFixed(3))
+    })
+  }
+  return ranges
+}
+
+const buildPaddingVerticalRetentionCandidate = ({
+  range,
+  windows,
+  platformProfile,
+  strategyProfile,
+  editorMode,
+  styleProfile,
+  clipIndex
+}: {
+  range: TimeRange
+  windows: EngagementWindow[]
+  platformProfile?: PlatformProfile
+  strategyProfile?: RetentionStrategyProfile | null
+  editorMode?: EditorModeSelection | null
+  styleProfile?: ContentStyleProfile | null
+  clipIndex: number
+}) => {
+  const scored = windows.length
+    ? scoreVerticalRetentionCandidate({
+        range,
+        windows,
+        platformProfile,
+        strategyProfile,
+        editorMode,
+        styleProfile
+      }).candidate
+    : null
+  if (scored) {
+    return {
+      ...scored,
+      reason: `${scored.reason} Added as backup to hit requested clip count.`
+    } as VerticalRetentionCandidate
+  }
+  const start = Number(Math.max(0, range.start).toFixed(3))
+  const end = Number(Math.max(start + 0.2, range.end).toFixed(3))
+  const basePrediction = MIN_PREDICTED_COMPLETION_PERCENT + 0.6 + (clipIndex % 3) * 0.35
+  return buildSyntheticVerticalRetentionCandidate({
+    range: { start, end },
+    predictedCompletion: basePrediction,
+    reason: `${Math.round(basePrediction)}% likely: Added backup clip to satisfy exact output count.`
+  })
+}
+
 const buildVerticalRetentionCandidates = ({
   durationSeconds,
   requestedCount,
@@ -11768,31 +12178,38 @@ const buildVerticalRetentionCandidates = ({
   nicheProfile?: VideoNicheProfile | null
 }): VerticalRetentionSelectionResult => {
   const total = Math.max(0, durationSeconds || 0)
+  const normalizedRequestedCount = Math.round(clamp(
+    Number.isFinite(Number(requestedCount)) ? Number(requestedCount) : 0,
+    0,
+    MAX_VERTICAL_CLIPS
+  ))
+  const exactCountRequested = normalizedRequestedCount > 0
   const modeAwareAutoExportTarget = resolveAutoExportClipTarget({
     durationSeconds: total,
     editorMode: editorMode ?? null,
     nicheProfile: nicheProfile ?? null
   })
-  const outputTarget = Math.round(clamp(
-    requestedCount > 0
-      ? Math.max(CLIP_EXPORT_TARGET_MIN, requestedCount * 4)
-      : modeAwareAutoExportTarget,
-    CLIP_EXPORT_TARGET_MIN,
-    CLIP_EXPORT_TARGET_MAX
-  ))
+  const outputTarget = exactCountRequested
+    ? Math.round(clamp(normalizedRequestedCount, 1, MAX_VERTICAL_CLIPS))
+    : Math.round(clamp(modeAwareAutoExportTarget, CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX))
   const modeAwareCandidateTarget = resolveClipCandidateTarget({
     durationSeconds: total,
     editorMode: editorMode ?? null,
     nicheProfile: nicheProfile ?? null
   })
-  if (total <= 0 || !windows.length) {
+  if (total <= 0) {
     return {
       accepted: [],
       rejectedCount: 1,
-      rejectionReasonsSummary: ['insufficient_signal_windows:1'],
+      rejectionReasonsSummary: ['invalid_duration:1'],
       candidateTarget: modeAwareCandidateTarget,
       outputTarget,
-      evaluatedCount: 0
+      evaluatedCount: 0,
+      requestedCount: normalizedRequestedCount,
+      exactCountRequested,
+      paddingApplied: false,
+      paddingCount: 0,
+      paddingReason: null
     }
   }
   const candidateTarget = Math.round(clamp(
@@ -11800,6 +12217,45 @@ const buildVerticalRetentionCandidates = ({
     CLIP_CANDIDATE_POOL_MIN,
     CLIP_CANDIDATE_POOL_MAX
   ))
+  if (!windows.length) {
+    const fallbackRanges = buildVerticalPaddingRanges({
+      durationSeconds: total,
+      count: outputTarget
+    })
+    const fallbackCandidates = fallbackRanges
+      .slice(0, outputTarget)
+      .map((range, index) => buildSyntheticVerticalRetentionCandidate({
+        range,
+        predictedCompletion: MIN_PREDICTED_COMPLETION_PERCENT + 0.6 + (index % 3) * 0.35,
+        reason: `${Math.round(MIN_PREDICTED_COMPLETION_PERCENT)}% likely: Added fallback clip because source analysis windows were unavailable.`
+      }))
+    const paddedCount = Math.max(0, outputTarget - fallbackCandidates.length)
+    if (paddedCount > 0 && fallbackCandidates.length) {
+      for (let index = 0; index < paddedCount; index += 1) {
+        const seed = fallbackCandidates[index % fallbackCandidates.length]
+        fallbackCandidates.push({
+          ...seed,
+          range: {
+            start: seed.range.start,
+            end: seed.range.end
+          }
+        })
+      }
+    }
+    return {
+      accepted: fallbackCandidates.slice(0, outputTarget),
+      rejectedCount: 1,
+      rejectionReasonsSummary: ['insufficient_signal_windows:1'],
+      candidateTarget,
+      outputTarget,
+      evaluatedCount: 0,
+      requestedCount: normalizedRequestedCount,
+      exactCountRequested,
+      paddingApplied: true,
+      paddingCount: outputTarget,
+      paddingReason: 'Generated fallback clip windows because analysis peaks were unavailable.'
+    }
+  }
   const minDuration = 15
   const clipDurations = [
     15,
@@ -11844,28 +12300,85 @@ const buildVerticalRetentionCandidates = ({
         0.25 * (window.keywordIntensity ?? 0) +
         0.25 * window.emotionIntensity
       ))
+      const entertainmentImpact = averageWindowMetric(windows, startTime, endTime, (window) => (
+        0.28 * (window.actionSpike ?? 0) +
+        0.24 * window.emotionIntensity +
+        0.2 * window.vocalExcitement +
+        0.16 * window.motionScore +
+        0.12 * (window.visualImpact ?? window.score)
+      ))
+      const nicheSupport = averageWindowMetric(windows, startTime, endTime, (window) => (
+        0.44 * (window.keywordIntensity ?? 0) +
+        0.34 * (window.curiosityTrigger ?? 0) +
+        0.22 * (window.hookScore ?? window.score)
+      ))
+      const nicheRelevance = clamp01(
+        nicheSupport +
+        (
+          nicheProfile?.niche === 'high_energy'
+            ? 0.08 * entertainmentImpact
+            : nicheProfile?.niche === 'education'
+              ? 0.08 * (tail + (core * 0.5))
+              : nicheProfile?.niche === 'talking_head'
+                ? 0.06 * intro
+                : 0.04 * core
+        )
+      )
+      const retentionPotential = clamp01(
+        0.52 * intro +
+        0.3 * tail +
+        0.18 * core
+      )
+      const visualAudioStrength = averageWindowMetric(windows, startTime, endTime, (window) => (
+        0.3 * window.motionScore +
+        0.24 * clamp01(window.sceneChangeRate * 1.8) +
+        0.22 * window.vocalExcitement +
+        0.12 * window.audioEnergy +
+        0.12 * (window.visualImpact ?? window.score)
+      ))
       const score = clamp01(
-        0.5 * intro +
-        0.32 * core +
-        0.18 * tail +
+        0.4 * entertainmentImpact +
+        0.3 * nicheRelevance +
+        0.2 * retentionPotential +
+        0.1 * visualAudioStrength +
         0.05 * modeBias.hook +
         0.05 * modeBias.interrupt +
         0.04 * modeBias.ending +
         0.03 * modeBias.energy +
         0.03 * modeBias.caption
       )
-      if (duration > 35 && score < 0.76) continue
+      if (duration > 35 && score < 0.72) continue
       preScored.push({ range: { start: startTime, end: endTime }, score })
     }
   }
   if (!preScored.length) {
+    const fallbackRanges = buildVerticalPaddingRanges({
+      durationSeconds: total,
+      count: outputTarget
+    })
+    const fallbackCandidates = fallbackRanges
+      .slice(0, outputTarget)
+      .map((range, index) => buildPaddingVerticalRetentionCandidate({
+        range,
+        windows,
+        platformProfile,
+        strategyProfile,
+        editorMode,
+        styleProfile,
+        clipIndex: index
+      }))
     return {
-      accepted: [],
+      accepted: fallbackCandidates,
       rejectedCount: 1,
       rejectionReasonsSummary: ['no_candidate_ranges:1'],
       candidateTarget,
       outputTarget,
-      evaluatedCount: 0
+      evaluatedCount: 0,
+      requestedCount: normalizedRequestedCount,
+      exactCountRequested,
+      paddingApplied: true,
+      paddingCount: Math.max(0, outputTarget - preScored.length),
+      paddingReason: 'Generated fallback clip windows because ranked peaks were unavailable.'
     }
   }
   const preLimit = Math.round(clamp(candidateTarget * 4, 80, 260))
@@ -11891,13 +12404,33 @@ const buildVerticalRetentionCandidates = ({
     }
   }
   if (!evaluated.length) {
+    const fallbackRanges = buildVerticalPaddingRanges({
+      durationSeconds: total,
+      count: outputTarget
+    })
+    const fallbackCandidates = fallbackRanges
+      .slice(0, outputTarget)
+      .map((range, index) => buildPaddingVerticalRetentionCandidate({
+        range,
+        windows,
+        platformProfile,
+        strategyProfile,
+        editorMode,
+        styleProfile,
+        clipIndex: index
+      }))
     return {
-      accepted: [],
+      accepted: fallbackCandidates,
       rejectedCount: Math.max(1, presorted.length),
       rejectionReasonsSummary: summarizeVerticalRejections(rejectedReasons),
       candidateTarget,
       outputTarget,
-      evaluatedCount: presorted.length
+      evaluatedCount: presorted.length,
+      requestedCount: normalizedRequestedCount,
+      exactCountRequested,
+      paddingApplied: true,
+      paddingCount: outputTarget,
+      paddingReason: 'Generated backup clips because all ranked peaks failed the quality gate.'
     }
   }
   const sortedAccepted = evaluated
@@ -11908,6 +12441,10 @@ const buildVerticalRetentionCandidates = ({
       a.range.start - b.range.start
     ))
   const selected: VerticalRetentionCandidate[] = []
+  const hasMatchingRange = (candidate: VerticalRetentionCandidate) => selected.some((entry) => (
+    Math.abs(entry.range.start - candidate.range.start) < 0.01 &&
+    Math.abs(entry.range.end - candidate.range.end) < 0.01
+  ))
   const minSpacing = Math.max(2, getVerticalInterruptTargetIntervalSeconds({
     platformProfile,
     strategyProfile,
@@ -11923,24 +12460,83 @@ const buildVerticalRetentionCandidates = ({
     if (overlaps) continue
     selected.push(candidate)
   }
-  if (selected.length < Math.min(CLIP_EXPORT_TARGET_MIN, sortedAccepted.length)) {
-    for (const candidate of sortedAccepted) {
-      if (selected.length >= Math.min(CLIP_EXPORT_TARGET_MIN, sortedAccepted.length)) break
-      const exists = selected.some((entry) => (
-        Math.abs(entry.range.start - candidate.range.start) < 0.01 &&
-        Math.abs(entry.range.end - candidate.range.end) < 0.01
-      ))
-      if (exists) continue
-      selected.push(candidate)
+  if (selected.length < outputTarget) {
+    const relaxedSpacings = [Math.max(1.25, minSpacing * 0.55), Math.max(0.5, minSpacing * 0.2), 0]
+    for (const spacing of relaxedSpacings) {
+      if (selected.length >= outputTarget) break
+      for (const candidate of sortedAccepted) {
+        if (selected.length >= outputTarget) break
+        if (hasMatchingRange(candidate)) continue
+        if (spacing > 0) {
+          const overlaps = selected.some((entry) => (
+            candidate.range.start < entry.range.end + spacing &&
+            candidate.range.end > entry.range.start - spacing
+          ))
+          if (overlaps) continue
+        }
+        selected.push(candidate)
+      }
     }
   }
+
+  let paddingCount = 0
+  if (selected.length < outputTarget) {
+    const paddingRanges = buildVerticalPaddingRanges({
+      durationSeconds: total,
+      count: Math.max(outputTarget, CLIP_EXPORT_TARGET_MIN)
+    })
+    let index = 0
+    while (selected.length < outputTarget && paddingRanges.length) {
+      const seed = paddingRanges[index % paddingRanges.length]
+      const duration = Math.max(0.2, seed.end - seed.start)
+      const maxStart = Math.max(0, total - duration)
+      const jitter = Math.min(maxStart, (index % 5) * 0.18)
+      const start = Number(clamp(seed.start + jitter, 0, maxStart).toFixed(3))
+      const end = Number(clamp(start + duration, start + 0.2, total).toFixed(3))
+      selected.push(buildPaddingVerticalRetentionCandidate({
+        range: { start, end },
+        windows,
+        platformProfile,
+        strategyProfile,
+        editorMode,
+        styleProfile,
+        clipIndex: selected.length
+      }))
+      paddingCount += 1
+      index += 1
+      if (index > outputTarget * 8) break
+    }
+  }
+
+  if (selected.length < outputTarget) {
+    for (const candidate of sortedAccepted) {
+      if (selected.length >= outputTarget) break
+      selected.push(candidate)
+      paddingCount += 1
+    }
+  }
+  const accepted = selected.slice(0, outputTarget)
+  const finalPaddingCount = Math.max(0, accepted.length - Math.min(sortedAccepted.length, outputTarget))
+  const paddingApplied = finalPaddingCount > 0
+  const paddingReason = paddingApplied
+    ? (
+      exactCountRequested
+        ? 'Video short on high-confidence peaks; padded with backup ranges to keep exact clip count.'
+        : 'Auto batch padded with backup ranges because ranked peaks were limited.'
+    )
+    : null
   return {
-    accepted: selected,
+    accepted,
     rejectedCount: Math.max(0, presorted.length - evaluated.length),
     rejectionReasonsSummary: summarizeVerticalRejections(rejectedReasons),
     candidateTarget,
     outputTarget,
-    evaluatedCount: presorted.length
+    evaluatedCount: presorted.length,
+    requestedCount: normalizedRequestedCount,
+    exactCountRequested,
+    paddingApplied,
+    paddingCount: Math.max(paddingCount, finalPaddingCount),
+    paddingReason
   }
 }
 
@@ -13737,6 +14333,11 @@ const processJob = async (
           })
           .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
       }
+      const verticalCaptionTextInput = getVerticalCaptionTextFromPayload(verticalAnalysis) ?? ''
+      const shouldApplyVerticalCaptionOverlays = true
+      const overlaySubtitleStyle = normalizedSubtitle === 'mrbeast_animated'
+        ? subtitleStyle
+        : 'mrbeast_animated'
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
         const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
@@ -13762,14 +14363,8 @@ const processJob = async (
         styleProfile: verticalStyleProfile,
         nicheProfile: verticalNicheProfile
       })
-      const requestedVerticalClipCount = Math.round(clamp(
-        Number(renderConfig.verticalClipCount || 0),
-        0,
-        MAX_VERTICAL_CLIPS
-      ))
-      const targetRenderCount = requestedVerticalClipCount > 0
-        ? requestedVerticalClipCount
-        : verticalSelection.outputTarget
+      const requestedVerticalClipCount = verticalSelection.requestedCount
+      const targetRenderCount = verticalSelection.outputTarget
       const selectedVerticalCandidates = verticalSelection.accepted.slice(0, targetRenderCount)
       const clipRanges = selectedVerticalCandidates.map((candidate) => ({
         start: Number(candidate.range.start.toFixed(3)),
@@ -13785,7 +14380,10 @@ const processJob = async (
             outputTarget: verticalSelection.outputTarget,
             rejectedCount: verticalSelection.rejectedCount,
             evaluatedCount: verticalSelection.evaluatedCount,
-            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary
+            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary,
+            exactCountRequested: verticalSelection.exactCountRequested,
+            paddingApplied: verticalSelection.paddingApplied,
+            paddingCount: verticalSelection.paddingCount
           }
         )
       }
@@ -13798,33 +14396,61 @@ const processJob = async (
       })
       await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: false })
 
+      const verticalClipCaptionOverlays: VerticalClipCaptionOverlay[][] = []
       for (let idx = 0; idx < clipRanges.length; idx += 1) {
         const range = clipRanges[idx]
         const localClipPath = path.join(localOutDir, `vertical-clip-${idx + 1}.mp4`)
         let clipSubtitlePath: string | null = null
         let clipSubtitleIsAss = false
+        let clipSubtitleStyle = subtitleStyle
+        const clipSegment: Segment = {
+          start: Number(range.start.toFixed(3)),
+          end: Number(range.end.toFixed(3)),
+          speed: 1
+        }
+        const clipCaptionOverlays = shouldApplyVerticalCaptionOverlays
+          ? buildVerticalClipCaptionOverlays({
+              range: {
+                start: clipSegment.start,
+                end: clipSegment.end
+              },
+              clipIndex: idx,
+              windows: verticalWindows,
+              userCaptionText: verticalCaptionTextInput,
+              editorMode: editorModeForRender,
+              styleProfile: verticalStyleProfile,
+              nicheProfile: verticalNicheProfile
+            })
+          : []
+        verticalClipCaptionOverlays.push(clipCaptionOverlays)
+
+        const clipOverlayCues = overlaysToTranscriptCues(clipCaptionOverlays)
+        const clipCueLayers: TranscriptCue[][] = []
         if (options.autoCaptions && verticalSourceCues.length) {
-          const clipSegment: Segment = {
-            start: Number(range.start.toFixed(3)),
-            end: Number(range.end.toFixed(3)),
-            speed: 1
-          }
           const remappedClipCues = remapTranscriptCuesToEditedTimeline(verticalSourceCues, [clipSegment])
           if (remappedClipCues.length) {
-            const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
-            const writtenClipSrt = writeTranscriptCuesToSrt(remappedClipCues, clipSrtPath)
-            if (writtenClipSrt) {
-              clipSubtitlePath = writtenClipSrt
-              if (normalizedSubtitle === 'mrbeast_animated') {
-                const clipAssPath = buildMrBeastAnimatedAss({
-                  srtPath: clipSubtitlePath,
-                  workingDir: workDir,
-                  style: subtitleStyle
-                })
-                if (clipAssPath) {
-                  clipSubtitlePath = clipAssPath
-                  clipSubtitleIsAss = true
-                }
+            clipCueLayers.push(remappedClipCues)
+          }
+        }
+        if (clipOverlayCues.length) {
+          clipCueLayers.push(clipOverlayCues)
+          clipSubtitleStyle = overlaySubtitleStyle
+        }
+        const mergedClipCues = mergeTranscriptCueLayers(clipCueLayers)
+        if (mergedClipCues.length) {
+          const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
+          const writtenClipSrt = writeTranscriptCuesToSrt(mergedClipCues, clipSrtPath)
+          if (writtenClipSrt) {
+            clipSubtitlePath = writtenClipSrt
+            if (normalizeSubtitlePreset(clipSubtitleStyle) === 'mrbeast_animated') {
+              const clipAssPath = buildMrBeastAnimatedAss({
+                srtPath: clipSubtitlePath,
+                workingDir: workDir,
+                style: clipSubtitleStyle
+              })
+              if (clipAssPath) {
+                clipSubtitlePath = clipAssPath
+                clipSubtitleIsAss = true
               }
             }
           }
@@ -13845,7 +14471,7 @@ const processJob = async (
           audioFilters: verticalAudioFilters,
           subtitlePath: clipSubtitlePath,
           subtitleIsAss: clipSubtitleIsAss,
-          subtitleStyle
+          subtitleStyle: clipSubtitleStyle
         })
         const clipStats = fs.statSync(localClipPath)
         if (!clipStats.isFile() || clipStats.size <= 0) {
@@ -13885,7 +14511,8 @@ const processJob = async (
         durationSeconds,
         selectedCandidates: selectedVerticalCandidates,
         selectionResult: verticalSelection,
-        preScan: verticalPreScan
+        preScan: verticalPreScan,
+        clipCaptionOverlaysByClip: verticalClipCaptionOverlays
       })
       const verticalClipDetails = selectedVerticalCandidates.map((candidate, index) => {
         const range = candidate.range
@@ -13896,7 +14523,8 @@ const processJob = async (
           duration: Number(Math.max(0, range.end - range.start).toFixed(3)),
           predictedCompletion: Number(candidate.predictedCompletion.toFixed(2)),
           reason: candidate.reason,
-          predictorBreakdown: candidate.predictorBreakdown
+          predictorBreakdown: candidate.predictorBreakdown,
+          captionOverlays: verticalClipCaptionOverlays[index] || []
         }
       })
       const verticalPredictedRetention = Number.isFinite(Number(verticalMetadataSummary?.predictedAverage))
@@ -13951,7 +14579,11 @@ const processJob = async (
             candidateTarget: verticalSelection.candidateTarget,
             evaluatedCount: verticalSelection.evaluatedCount,
             rejectedCount: verticalSelection.rejectedCount,
-            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary
+            rejectionReasonsSummary: verticalSelection.rejectionReasonsSummary,
+            exactCountRequested: verticalSelection.exactCountRequested,
+            paddingApplied: verticalSelection.paddingApplied,
+            paddingCount: verticalSelection.paddingCount,
+            paddingReason: verticalSelection.paddingReason
           },
           long_form_prescan: verticalPreScan,
           metadata_summary: verticalMetadataSummary,
@@ -13987,7 +14619,10 @@ const processJob = async (
           outputTarget: verticalSelection.outputTarget,
           candidateTarget: verticalSelection.candidateTarget,
           evaluatedCount: verticalSelection.evaluatedCount,
-          rejectedCount: verticalSelection.rejectedCount
+          rejectedCount: verticalSelection.rejectedCount,
+          exactCountRequested: verticalSelection.exactCountRequested,
+          paddingApplied: verticalSelection.paddingApplied,
+          paddingCount: verticalSelection.paddingCount
         }
       })
       await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
@@ -14000,7 +14635,10 @@ const processJob = async (
           outputTarget: verticalSelection.outputTarget,
           candidateTarget: verticalSelection.candidateTarget,
           evaluatedCount: verticalSelection.evaluatedCount,
-          rejectedCount: verticalSelection.rejectedCount
+          rejectedCount: verticalSelection.rejectedCount,
+          exactCountRequested: verticalSelection.exactCountRequested,
+          paddingApplied: verticalSelection.paddingApplied,
+          paddingCount: verticalSelection.paddingCount
         }
       })
 
@@ -14013,7 +14651,8 @@ const processJob = async (
         retentionScore: verticalPredictedRetention,
         optimizationNotes: [
           `Vertical candidate pool: ${verticalSelection.accepted.length} accepted, ${verticalSelection.rejectedCount} rejected below ${MIN_PREDICTED_COMPLETION_PERCENT}%.`,
-          `Exported top ${clipRanges.length} clips from ${verticalSelection.candidateTarget}-target candidate batch.`
+          `Exported ${clipRanges.length} clips from ${verticalSelection.candidateTarget}-target candidate batch.`,
+          ...(verticalSelection.paddingApplied && verticalSelection.paddingReason ? [verticalSelection.paddingReason] : [])
         ],
         renderSettings: buildPersistedRenderSettings(finalRenderConfig, {
           retentionAggressionLevel: aggressionLevel,
@@ -16253,6 +16892,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const styleBlendOverride = parseStyleArchetypeBlendFromPayload(req.body)
     const autoCaptionsOverride = getAutoCaptionsFromPayload(req.body)
     const subtitleStyleOverride = getSubtitleStyleFromPayload(req.body)
+    const verticalCaptionTextOverride = getVerticalCaptionTextFromPayload(req.body)
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -16335,7 +16975,11 @@ const handleCreateJob = async (req: any, res: any) => {
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
-          algorithm_config_source: configSelection.source
+          algorithm_config_source: configSelection.source,
+          ...(verticalCaptionTextOverride === null ? {} : {
+            verticalCaptionText: verticalCaptionTextOverride,
+            vertical_caption_text: verticalCaptionTextOverride
+          })
         },
         analysis: buildPersistedRenderAnalysis({
           existing: {
@@ -16356,6 +17000,10 @@ const handleCreateJob = async (req: any, res: any) => {
             algorithm_config_source: configSelection.source,
             ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
             ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+            ...(verticalCaptionTextOverride === null ? {} : {
+              verticalCaptionText: verticalCaptionTextOverride,
+              vertical_caption_text: verticalCaptionTextOverride
+            }),
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride }),
             ...(maxCutsOverride === null ? {} : { maxCuts: maxCutsOverride, max_cuts: maxCutsOverride, maxCutsRequested: maxCutsOverride }),
@@ -16825,6 +17473,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
+    const verticalCaptionTextOverride = (
+      getVerticalCaptionTextFromPayload(req.body) ??
+      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
+    )
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
@@ -16851,7 +17503,11 @@ const handleCompleteUpload = async (req: any, res: any) => {
       longformClarityVsSpeed: resolvedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
-      tangent_killer: resolvedTangentKiller
+      tangent_killer: resolvedTangentKiller,
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -16871,6 +17527,10 @@ const handleCompleteUpload = async (req: any, res: any) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      }),
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
       ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
@@ -16957,6 +17617,10 @@ router.post('/:id/analyze', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
+    const verticalCaptionTextOverride = (
+      getVerticalCaptionTextFromPayload(req.body) ??
+      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
+    )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
@@ -17011,6 +17675,10 @@ router.post('/:id/analyze', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      }),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
@@ -17024,7 +17692,11 @@ router.post('/:id/analyze', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      })
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -17098,6 +17770,10 @@ router.post('/:id/process', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
+    const verticalCaptionTextOverride = (
+      getVerticalCaptionTextFromPayload(req.body) ??
+      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
+    )
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
@@ -17132,7 +17808,11 @@ router.post('/:id/process', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      })
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -17152,6 +17832,10 @@ router.post('/:id/process', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      }),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
@@ -17433,6 +18117,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
+    const verticalCaptionTextOverride = (
+      getVerticalCaptionTextFromPayload(req.body) ??
+      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
+    )
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
@@ -17474,6 +18162,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
       hook_selection_mode: requestedHookSelectionMode,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
       longFormPreset: requestedLongFormPreset,
@@ -17506,6 +18198,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(verticalCaptionTextOverride === null ? {} : {
+        verticalCaptionText: verticalCaptionTextOverride,
+        vertical_caption_text: verticalCaptionTextOverride
+      }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
       longFormPreset: requestedLongFormPreset,
