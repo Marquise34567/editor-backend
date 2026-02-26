@@ -1025,13 +1025,25 @@ type VerticalRetentionCandidate = {
   reason: string
 }
 type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide'
-type VerticalCaptionPreset = 'basic_clean' | 'mrbeast_animated' | 'neon_glow'
+type VerticalCaptionPreset = 'basic_clean' | 'mrbeast_animated' | 'neon_glow' | 'bold_clean_box' | 'rage_mode' | 'ice_pop'
 type VerticalCaptionConfig = {
   enabled: boolean
   autoGenerate: boolean
   preset: VerticalCaptionPreset
+  fontId: SubtitleFontId
   fontSize: number | null
   text: string
+  textColor: string
+  accentColor: string
+  outlineColor: string
+  outlineWidth: number
+  shadowEnabled: boolean
+  shadowColor: string
+  shadowBlur: number
+  boxEnabled: boolean
+  boxColor: string
+  positionX: number
+  positionY: number
 }
 type VerticalClipCaptionOverlay = {
   text: string
@@ -1305,10 +1317,15 @@ const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
 const EFFECT_PREVIEW_TYPES: EffectPreviewType[] = ['transitions', 'swoosh', 'zooms', 'all', 'auto']
 const VIRAL_PREVIEW_MODES: ViralPreviewMode[] = ['none', 'youtube', 'tiktok']
-const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = ['basic_clean', 'mrbeast_animated', 'neon_glow']
+const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = ['basic_clean', 'mrbeast_animated', 'neon_glow', 'bold_clean_box', 'rage_mode', 'ice_pop']
+const VERTICAL_CAPTION_FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold']
 const VERTICAL_CAPTION_FONT_SIZE_MIN = 32
 const VERTICAL_CAPTION_FONT_SIZE_MAX = 220
 const VERTICAL_CAPTION_FONT_SIZE_DEFAULT = 110
+const VERTICAL_CAPTION_OUTLINE_WIDTH_MIN = 0
+const VERTICAL_CAPTION_OUTLINE_WIDTH_MAX = 24
+const VERTICAL_CAPTION_SHADOW_BLUR_MIN = 0
+const VERTICAL_CAPTION_SHADOW_BLUR_MAX = 42
 const EFFECT_PREVIEW_DURATION_DEFAULT_SEC = 12
 const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
 const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
@@ -3534,11 +3551,30 @@ const pickFirstDefinedValue = (...values: any[]) => {
   return undefined
 }
 
+const MAX_VERTICAL_CAPTION_WORDS = 5
+const normalizeVerticalCaptionPhraseInput = (value: any): string => {
+  const compact = String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 84)
+  if (!compact) return ''
+  return compact
+    .split(' ')
+    .filter(Boolean)
+    .slice(0, MAX_VERTICAL_CAPTION_WORDS)
+    .join(' ')
+}
+
 const normalizeVerticalCaptionTextInput = (value: any): string => {
   const normalized = String(value ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
+    .split('\n')
+    .map((line) => normalizeVerticalCaptionPhraseInput(line))
+    .filter(Boolean)
+    .slice(0, 18)
+    .join('\n')
     .trim()
   if (!normalized) return ''
   return normalized.slice(0, 1_800)
@@ -3556,6 +3592,37 @@ const parseVerticalCaptionFontSize = (value: any): number | null => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return null
   return Math.round(clamp(parsed, VERTICAL_CAPTION_FONT_SIZE_MIN, VERTICAL_CAPTION_FONT_SIZE_MAX))
+}
+
+const parseVerticalCaptionFontId = (value: any): SubtitleFontId | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (VERTICAL_CAPTION_FONT_IDS.includes(normalized as SubtitleFontId)) return normalized as SubtitleFontId
+  return null
+}
+
+const parseVerticalCaptionHexColor = (value: any): string | null => {
+  const normalized = String(value ?? '').trim().replace(/^#/, '').toUpperCase()
+  if (!/^[0-9A-F]{6}$/.test(normalized)) return null
+  return normalized
+}
+
+const parseVerticalCaptionOutlineWidth = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.round(clamp(parsed, VERTICAL_CAPTION_OUTLINE_WIDTH_MIN, VERTICAL_CAPTION_OUTLINE_WIDTH_MAX))
+}
+
+const parseVerticalCaptionShadowBlur = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.round(clamp(parsed, VERTICAL_CAPTION_SHADOW_BLUR_MIN, VERTICAL_CAPTION_SHADOW_BLUR_MAX))
+}
+
+const parseVerticalCaptionPosition = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Number(clamp(parsed, 0.02, 0.98).toFixed(4))
 }
 
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
@@ -3614,6 +3681,86 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.fontSize,
     nested?.font_size
   )
+  const fontIdCandidate = pickFirstDefinedValue(
+    (payload as any).fontId,
+    (payload as any).font_id,
+    (payload as any).verticalCaptionFontId,
+    (payload as any).vertical_caption_font_id,
+    nested?.fontId,
+    nested?.font_id
+  )
+  const textColorCandidate = pickFirstDefinedValue(
+    (payload as any).textColor,
+    (payload as any).text_color,
+    (payload as any).verticalCaptionTextColor,
+    (payload as any).vertical_caption_text_color,
+    nested?.textColor,
+    nested?.text_color
+  )
+  const accentColorCandidate = pickFirstDefinedValue(
+    (payload as any).accentColor,
+    (payload as any).accent_color,
+    (payload as any).verticalCaptionAccentColor,
+    (payload as any).vertical_caption_accent_color,
+    nested?.accentColor,
+    nested?.accent_color
+  )
+  const outlineColorCandidate = pickFirstDefinedValue(
+    (payload as any).outlineColor,
+    (payload as any).outline_color,
+    (payload as any).verticalCaptionOutlineColor,
+    (payload as any).vertical_caption_outline_color,
+    nested?.outlineColor,
+    nested?.outline_color
+  )
+  const outlineWidthCandidate = pickFirstDefinedValue(
+    (payload as any).outlineWidth,
+    (payload as any).outline_width,
+    (payload as any).verticalCaptionOutlineWidth,
+    (payload as any).vertical_caption_outline_width,
+    nested?.outlineWidth,
+    nested?.outline_width
+  )
+  const shadowColorCandidate = pickFirstDefinedValue(
+    (payload as any).shadowColor,
+    (payload as any).shadow_color,
+    (payload as any).verticalCaptionShadowColor,
+    (payload as any).vertical_caption_shadow_color,
+    nested?.shadowColor,
+    nested?.shadow_color
+  )
+  const shadowBlurCandidate = pickFirstDefinedValue(
+    (payload as any).shadowBlur,
+    (payload as any).shadow_blur,
+    (payload as any).verticalCaptionShadowBlur,
+    (payload as any).vertical_caption_shadow_blur,
+    nested?.shadowBlur,
+    nested?.shadow_blur
+  )
+  const boxColorCandidate = pickFirstDefinedValue(
+    (payload as any).boxColor,
+    (payload as any).box_color,
+    (payload as any).verticalCaptionBoxColor,
+    (payload as any).vertical_caption_box_color,
+    nested?.boxColor,
+    nested?.box_color
+  )
+  const positionXCandidate = pickFirstDefinedValue(
+    (payload as any).positionX,
+    (payload as any).position_x,
+    (payload as any).verticalCaptionPositionX,
+    (payload as any).vertical_caption_position_x,
+    nested?.positionX,
+    nested?.position_x
+  )
+  const positionYCandidate = pickFirstDefinedValue(
+    (payload as any).positionY,
+    (payload as any).position_y,
+    (payload as any).verticalCaptionPositionY,
+    (payload as any).vertical_caption_position_y,
+    nested?.positionY,
+    nested?.position_y
+  )
   const autoGenerateCandidate = parseBooleanFlag(
     pickFirstDefinedValue(
       (payload as any).autoGenerate,
@@ -3634,21 +3781,75 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
       nested?.enabled
     )
   )
+  const shadowEnabledCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).shadowEnabled,
+      (payload as any).shadow_enabled,
+      (payload as any).verticalCaptionShadowEnabled,
+      (payload as any).vertical_caption_shadow_enabled,
+      nested?.shadowEnabled,
+      nested?.shadow_enabled
+    )
+  )
+  const boxEnabledCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).boxEnabled,
+      (payload as any).box_enabled,
+      (payload as any).verticalCaptionBoxEnabled,
+      (payload as any).vertical_caption_box_enabled,
+      nested?.boxEnabled,
+      nested?.box_enabled
+    )
+  )
   if (
     textCandidate === undefined &&
     presetCandidate === undefined &&
     fontSizeCandidate === undefined &&
+    fontIdCandidate === undefined &&
+    textColorCandidate === undefined &&
+    accentColorCandidate === undefined &&
+    outlineColorCandidate === undefined &&
+    outlineWidthCandidate === undefined &&
+    shadowColorCandidate === undefined &&
+    shadowBlurCandidate === undefined &&
+    boxColorCandidate === undefined &&
+    positionXCandidate === undefined &&
+    positionYCandidate === undefined &&
     autoGenerateCandidate === null &&
-    enabledCandidate === null
+    enabledCandidate === null &&
+    shadowEnabledCandidate === null &&
+    boxEnabledCandidate === null
   ) {
     return null
   }
   const parsedPreset = parseVerticalCaptionPreset(presetCandidate)
   const parsedFontSize = parseVerticalCaptionFontSize(fontSizeCandidate)
+  const parsedFontId = parseVerticalCaptionFontId(fontIdCandidate)
+  const parsedTextColor = parseVerticalCaptionHexColor(textColorCandidate)
+  const parsedAccentColor = parseVerticalCaptionHexColor(accentColorCandidate)
+  const parsedOutlineColor = parseVerticalCaptionHexColor(outlineColorCandidate)
+  const parsedOutlineWidth = parseVerticalCaptionOutlineWidth(outlineWidthCandidate)
+  const parsedShadowColor = parseVerticalCaptionHexColor(shadowColorCandidate)
+  const parsedShadowBlur = parseVerticalCaptionShadowBlur(shadowBlurCandidate)
+  const parsedBoxColor = parseVerticalCaptionHexColor(boxColorCandidate)
+  const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
+  const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   return {
     ...(textCandidate === undefined ? {} : { text: normalizeVerticalCaptionTextInput(textCandidate) }),
     ...(parsedPreset ? { preset: parsedPreset } : {}),
     ...(parsedFontSize !== null ? { fontSize: parsedFontSize } : {}),
+    ...(parsedFontId ? { fontId: parsedFontId } : {}),
+    ...(parsedTextColor ? { textColor: parsedTextColor } : {}),
+    ...(parsedAccentColor ? { accentColor: parsedAccentColor } : {}),
+    ...(parsedOutlineColor ? { outlineColor: parsedOutlineColor } : {}),
+    ...(parsedOutlineWidth !== null ? { outlineWidth: parsedOutlineWidth } : {}),
+    ...(shadowEnabledCandidate === null ? {} : { shadowEnabled: shadowEnabledCandidate }),
+    ...(parsedShadowColor ? { shadowColor: parsedShadowColor } : {}),
+    ...(parsedShadowBlur !== null ? { shadowBlur: parsedShadowBlur } : {}),
+    ...(boxEnabledCandidate === null ? {} : { boxEnabled: boxEnabledCandidate }),
+    ...(parsedBoxColor ? { boxColor: parsedBoxColor } : {}),
+    ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
+    ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
     ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
     ...(enabledCandidate === null ? {} : { enabled: enabledCandidate })
   }
@@ -19957,6 +20158,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
+      fastMode: requestedFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -19965,8 +20167,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
-    if (req.body?.fastMode) {
-      options.fastMode = true
+    if (requestedFastMode !== null) {
+      options.fastMode = requestedFastMode
     }
     const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
@@ -20112,6 +20314,7 @@ router.post('/:id/process', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
+      fastMode: requestedFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -20141,9 +20344,9 @@ router.post('/:id/process', async (req: any, res) => {
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
-    // Allow client to request a fast-mode re-render (overrides user settings for this run)
-    if (req.body?.fastMode) {
-      options.fastMode = true
+    // Allow client to override fast-mode for this run.
+    if (requestedFastMode !== null) {
+      options.fastMode = requestedFastMode
     }
     await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
