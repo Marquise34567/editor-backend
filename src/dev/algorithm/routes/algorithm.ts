@@ -14,6 +14,11 @@ import {
 } from '../config/configService'
 import { getExperimentStatus, startExperiment, stopRunningExperiment } from '../experiments/experimentService'
 import {
+  getFeedbackLoopStatus,
+  runFeedbackLoop,
+  updateFeedbackLoopSettings
+} from '../feedbackLoop/feedbackLoopService'
+import {
   chooseConfigForJobCreation,
   listMetricsByRange,
   listRecentRenderMetrics
@@ -1784,6 +1789,117 @@ const autoOptimizeResponseSchema = z
   })
   .strict()
 
+const feedbackLoopSignalSchema = z
+  .object({
+    job_id: z.string(),
+    created_at: z.string(),
+    source_type: z.enum(['platform', 'internal']),
+    signal_outcome: z.number(),
+    watch_percent: z.number().nullable(),
+    hook_hold_percent: z.number().nullable(),
+    completion_percent: z.number().nullable(),
+    rewatch_rate: z.number().nullable(),
+    manual_score: z.number().nullable(),
+    first30_retention: z.number().nullable(),
+    click_through_rate: z.number().nullable(),
+    shares_per_view: z.number().nullable(),
+    likes_per_view: z.number().nullable(),
+    comments_per_view: z.number().nullable(),
+    editor_mode: z.string().nullable(),
+    strategy_profile: z.string().nullable(),
+    target_platform: z.string().nullable(),
+    hook_selection_mode: z.string().nullable(),
+    model_hook_score: z.number().nullable(),
+    model_pacing_score: z.number().nullable(),
+    model_jank_score: z.number().nullable(),
+    model_retention_score: z.number().nullable()
+  })
+  .strict()
+
+const feedbackLoopPerformanceRowSchema = z
+  .object({
+    key: z.string(),
+    count: z.number(),
+    avg_outcome: z.number()
+  })
+  .strict()
+
+const feedbackLoopSnapshotSchema = z
+  .object({
+    generated_at: z.string(),
+    sample_size: z.number(),
+    platform_feedback_share: z.number(),
+    avg_outcome: z.number(),
+    avg_hook_hold: z.number().nullable(),
+    avg_completion: z.number().nullable(),
+    avg_model_hook: z.number().nullable(),
+    avg_model_pacing: z.number().nullable(),
+    avg_model_jank: z.number().nullable(),
+    confidence: z.number(),
+    predicted_delta_score: z.number(),
+    recommended_editor_mode: z.string().nullable(),
+    recommended_strategy_profile: z.string().nullable(),
+    recommended_target_platform: z.string().nullable(),
+    rationale: z.array(z.string()),
+    proposed_param_deltas: z.record(z.string(), z.number()),
+    mode_performance: z.array(feedbackLoopPerformanceRowSchema),
+    strategy_performance: z.array(feedbackLoopPerformanceRowSchema),
+    platform_performance: z.array(feedbackLoopPerformanceRowSchema),
+    recent_signals: z.array(feedbackLoopSignalSchema)
+  })
+  .strict()
+
+const feedbackLoopSettingsSchema = z
+  .object({
+    enabled: z.boolean(),
+    auto_apply: z.boolean(),
+    min_feedback_samples: z.number(),
+    lookback_limit: z.number(),
+    cooldown_minutes: z.number(),
+    min_confidence: z.number(),
+    min_delta_score: z.number()
+  })
+  .strict()
+
+const feedbackLoopRuntimeSchema = z
+  .object({
+    last_run_at: z.string().nullable(),
+    last_run_reason: z.string().nullable(),
+    last_trigger: z.string().nullable(),
+    last_applied_at: z.string().nullable(),
+    last_applied_note: z.string().nullable(),
+    last_applied_config_version_id: z.string().nullable(),
+    last_apply_confidence: z.number().nullable(),
+    last_apply_delta_score: z.number().nullable()
+  })
+  .strict()
+
+const feedbackLoopStatusSchema = z
+  .object({
+    settings: feedbackLoopSettingsSchema,
+    runtime: feedbackLoopRuntimeSchema,
+    brain_snapshot: feedbackLoopSnapshotSchema
+  })
+  .strict()
+
+const feedbackLoopSettingsRequestSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    auto_apply: z.boolean().optional(),
+    min_feedback_samples: z.number().min(3).max(80).optional(),
+    lookback_limit: z.number().min(30).max(800).optional(),
+    cooldown_minutes: z.number().min(2).max(1_440).optional(),
+    min_confidence: z.number().min(0.2).max(0.99).optional(),
+    min_delta_score: z.number().min(0.001).max(0.2).optional()
+  })
+  .strict()
+
+const feedbackLoopRunRequestSchema = z
+  .object({
+    force_apply: z.boolean().optional()
+  })
+  .strict()
+
 router.use(requireAlgorithmDevAccess)
 
 router.get('/config', async (_req, res) => {
@@ -1996,6 +2112,66 @@ router.get('/suggestions', async (req, res) => {
       })
       .strict(),
     { suggestions: report.suggestions }
+  )
+})
+
+router.get('/feedback-loop/status', async (_req, res) => {
+  const status = await getFeedbackLoopStatus()
+  return sendValidated(
+    res,
+    z
+      .object({
+        status: feedbackLoopStatusSchema
+      })
+      .strict(),
+    { status }
+  )
+})
+
+router.post('/feedback-loop/settings', async (req, res) => {
+  const payload = parseWith(feedbackLoopSettingsRequestSchema, req.body || {}, res)
+  if (!payload) return
+  const status = await updateFeedbackLoopSettings(payload)
+  return sendValidated(
+    res,
+    z
+      .object({
+        status: feedbackLoopStatusSchema
+      })
+      .strict(),
+    { status }
+  )
+})
+
+router.post('/feedback-loop/run', async (req: any, res) => {
+  const payload = parseWith(feedbackLoopRunRequestSchema, req.body || {}, res)
+  if (!payload) return
+  const result = await runFeedbackLoop({
+    trigger: 'manual_run',
+    actorUserId: req.user?.id || null,
+    forceApply: Boolean(payload.force_apply)
+  })
+  return sendValidated(
+    res,
+    z
+      .object({
+        applied: z.boolean(),
+        reason: z.string(),
+        config: configVersionResponseSchema.nullable(),
+        status: feedbackLoopStatusSchema
+      })
+      .strict(),
+    {
+      applied: result.applied,
+      reason: result.reason,
+      config: result.config
+        ? {
+            ...result.config,
+            params: result.config.params
+          }
+        : null,
+      status: result.status
+    }
   )
 })
 
