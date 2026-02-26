@@ -15031,7 +15031,7 @@ const buildManualTimelineRenderPlan = ({
   const baseKeepRanges = keepRanges.length
     ? keepRanges
     : [{ start: 0, end: Number(durationSeconds.toFixed(3)) }]
-  let effectiveKeepSegments = baseKeepRanges.map((range) => ({ start: range.start, end: range.end, speed: 1 }))
+  let effectiveKeepSegments: Segment[] = baseKeepRanges.map((range) => ({ start: range.start, end: range.end, speed: 1 }))
   if (removeRanges.length) {
     effectiveKeepSegments = subtractRanges(effectiveKeepSegments, removeRanges)
   }
