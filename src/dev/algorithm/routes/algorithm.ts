@@ -321,6 +321,487 @@ const applyPromptPresetIntent = ({
   })
 }
 
+type PlatformModeSelection = 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'long_form'
+type ContentTypeModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education'
+type RetentionTiltSelection = 'safe' | 'balanced' | 'viral'
+type FormatSelection = 'short' | 'long'
+type OrientationSelection = 'vertical' | 'horizontal'
+
+const applyNumericTargets = ({
+  next,
+  changes,
+  targets,
+  source,
+  reasonPrefix
+}: {
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+  targets: Partial<Record<NumericParamKey, number>>
+  source: PromptChange['source']
+  reasonPrefix: string
+}) => {
+  for (const [rawKey, rawTarget] of Object.entries(targets)) {
+    if (!Object.prototype.hasOwnProperty.call(NUMERIC_PARAM_LIMITS, rawKey)) continue
+    const key = rawKey as NumericParamKey
+    const target = Number(rawTarget)
+    if (!Number.isFinite(target)) continue
+    applyNumericChange({
+      next,
+      changes,
+      key,
+      targetRaw: target,
+      source,
+      reason: `${reasonPrefix}: set ${key}`
+    })
+  }
+}
+
+const applyNumericDeltas = ({
+  next,
+  changes,
+  deltas,
+  source,
+  reasonPrefix
+}: {
+  next: AlgorithmConfigParams
+  changes: PromptChange[]
+  deltas: Partial<Record<NumericParamKey, number>>
+  source: PromptChange['source']
+  reasonPrefix: string
+}) => {
+  for (const [rawKey, rawDelta] of Object.entries(deltas)) {
+    if (!Object.prototype.hasOwnProperty.call(NUMERIC_PARAM_LIMITS, rawKey)) continue
+    const key = rawKey as NumericParamKey
+    const delta = Number(rawDelta)
+    if (!Number.isFinite(delta)) continue
+    applyNumericDelta({
+      next,
+      changes,
+      key,
+      delta,
+      source,
+      reason: `${reasonPrefix}: adjust ${key}`
+    })
+  }
+}
+
+const ADVANCED_MODE_SPEC_MARKERS: RegExp[] = [
+  /\bplatform\s+modes?\b/i,
+  /\bcontent(?:\s*-\s*|\s+)type\s+modes?\b/i,
+  /\bselected\s+modes?\b/i,
+  /\bbest\s+primary\s+hook\b/i,
+  /\bfull\s+edit\s+summary\b/i,
+  /\bfinal\s+recommendations\b/i
+]
+
+const isAdvancedModeSpecPrompt = (prompt: string) => {
+  const hitCount = ADVANCED_MODE_SPEC_MARKERS.reduce((count, marker) => (
+    count + (marker.test(prompt) ? 1 : 0)
+  ), 0)
+  return hitCount >= 2
+}
+
+const normalizePlatformModeSelection = (raw: string): PlatformModeSelection | null => {
+  const value = String(raw || '')
+    .toLowerCase()
+    .replace(/[\[\]{}()]/g, ' ')
+    .replace(/[^a-z0-9+ _-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!value) return null
+  const matches: PlatformModeSelection[] = []
+  if (/(^| )(tiktok|tik tok|tt)( |$)/.test(value)) matches.push('tiktok')
+  if (/(^| )(ig reels?|instagram reels?|reels?)( |$)/.test(value)) matches.push('instagram_reels')
+  if (/(^| )(youtube shorts?|yt shorts?)( |$)/.test(value)) matches.push('youtube_shorts')
+  if (/(^| )(long form|long-form|youtube long form|youtube style long)( |$)/.test(value)) matches.push('long_form')
+  return matches.length === 1 ? matches[0] : null
+}
+
+const normalizeContentTypeModeSelection = (raw: string): ContentTypeModeSelection | null => {
+  const value = String(raw || '')
+    .toLowerCase()
+    .replace(/[\[\]{}()]/g, ' ')
+    .replace(/[^a-z0-9+ _-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!value) return null
+  const matches: ContentTypeModeSelection[] = []
+  if (/(^| )auto( |$)/.test(value)) matches.push('auto')
+  if (/(^| )reaction( |$)/.test(value)) matches.push('reaction')
+  if (/(^| )commentary( |$)/.test(value)) matches.push('commentary')
+  if (/(^| )vlog( |$)/.test(value)) matches.push('vlog')
+  if (/(^| )gaming( |$)/.test(value)) matches.push('gaming')
+  if (/(^| )sports?( |$)/.test(value)) matches.push('sports')
+  if (/(^| )education(?:al)?( |$)/.test(value)) matches.push('education')
+  return matches.length === 1 ? matches[0] : null
+}
+
+const extractFirstMatchingMode = <T extends string>({
+  prompt,
+  patterns,
+  normalize
+}: {
+  prompt: string
+  patterns: RegExp[]
+  normalize: (value: string) => T | null
+}): T | null => {
+  for (const pattern of patterns) {
+    const match = prompt.match(pattern)
+    if (!match?.[1]) continue
+    const resolved = normalize(match[1])
+    if (resolved) return resolved
+  }
+  return null
+}
+
+const collectMentionedModes = <T extends string>({
+  prompt,
+  patterns
+}: {
+  prompt: string
+  patterns: Array<{ mode: T; pattern: RegExp }>
+}) => {
+  const found = new Set<T>()
+  for (const entry of patterns) {
+    if (entry.pattern.test(prompt)) found.add(entry.mode)
+  }
+  return Array.from(found)
+}
+
+const resolvePlatformModeFromPrompt = (prompt: string): PlatformModeSelection | null => {
+  const explicit = extractFirstMatchingMode<PlatformModeSelection>({
+    prompt,
+    normalize: normalizePlatformModeSelection,
+    patterns: [
+      /\bplatform(?:\s+mode)?\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\bselected\s+platform\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\bplatform\s*\[\s*([^\]]+)\s*\]/i
+    ]
+  })
+  if (explicit) return explicit
+  const mentions = collectMentionedModes<PlatformModeSelection>({
+    prompt,
+    patterns: [
+      { mode: 'tiktok', pattern: /\b(tiktok|tik\s*tok|tt)\b/i },
+      { mode: 'instagram_reels', pattern: /\b(ig\s*reels?|instagram\s*reels?|reels?)\b/i },
+      { mode: 'youtube_shorts', pattern: /\b(youtube\s*shorts?|yt\s*shorts?)\b/i },
+      { mode: 'long_form', pattern: /\b(long[\s-]?form|youtube-style|horizontal(?:\/original)?)\b/i }
+    ]
+  })
+  return mentions.length === 1 ? mentions[0] : null
+}
+
+const resolveContentTypeModeFromPrompt = (prompt: string): ContentTypeModeSelection | null => {
+  const explicit = extractFirstMatchingMode<ContentTypeModeSelection>({
+    prompt,
+    normalize: normalizeContentTypeModeSelection,
+    patterns: [
+      /\bcontent(?:\s*-\s*|\s+)type(?:\s+mode)?\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\beditor\s+mode\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\bcontent\s+mode\s*[:=]\s*([^\n\r|;,]+)/i,
+      /\bcontent(?:\s*-\s*|\s+)type\s*\[\s*([^\]]+)\s*\]/i
+    ]
+  })
+  if (explicit) return explicit
+  const mentions = collectMentionedModes<ContentTypeModeSelection>({
+    prompt,
+    patterns: [
+      { mode: 'auto', pattern: /\bauto\b/i },
+      { mode: 'reaction', pattern: /\breaction\b/i },
+      { mode: 'commentary', pattern: /\bcommentary\b/i },
+      { mode: 'vlog', pattern: /\bvlog\b/i },
+      { mode: 'gaming', pattern: /\bgaming\b/i },
+      { mode: 'sports', pattern: /\bsports?\b/i },
+      { mode: 'education', pattern: /\beducation(?:al)?\b/i }
+    ]
+  })
+  return mentions.length === 1 ? mentions[0] : null
+}
+
+const resolveRetentionTiltFromPrompt = (prompt: string): RetentionTiltSelection | null => {
+  const explicit = extractFirstMatchingMode<RetentionTiltSelection>({
+    prompt,
+    normalize: (value) => {
+      const normalized = String(value || '').toLowerCase()
+      if (/\bsafe\b/.test(normalized)) return 'safe'
+      if (/\bbalanced\b/.test(normalized)) return 'balanced'
+      if (/\bviral\b/.test(normalized)) return 'viral'
+      return null
+    },
+    patterns: [
+      /\b(?:tilt|slider|retention\s+profile)\s*[:=]\s*(safe|balanced|viral)\b/i,
+      /\b(?:safe|balanced|viral)\s+slider\s*[:=]\s*(safe|balanced|viral)\b/i
+    ]
+  })
+  if (explicit) return explicit
+  const mentions = collectMentionedModes<RetentionTiltSelection>({
+    prompt,
+    patterns: [
+      { mode: 'safe', pattern: /\bsafe\b/i },
+      { mode: 'balanced', pattern: /\bbalanced\b/i },
+      { mode: 'viral', pattern: /\bviral\b/i }
+    ]
+  })
+  return mentions.length === 1 ? mentions[0] : null
+}
+
+const resolveCaptionsPreferenceFromPrompt = (prompt: string): 'on' | 'off' | null => {
+  const off = (
+    /\bcaptions?\s*(?:=|:|to)?\s*(?:off|none|disabled?|no)\b/i.test(prompt) ||
+    /\bno\s+captions?\b/i.test(prompt)
+  )
+  const on = (
+    /\bcaptions?\s*(?:=|:|to)?\s*(?:on|enabled?|yes)\b/i.test(prompt) ||
+    /\bwith\s+captions?\b/i.test(prompt)
+  )
+  if (off && on) return null
+  if (off) return 'off'
+  if (on) return 'on'
+  return null
+}
+
+const resolveFormatFromPrompt = (prompt: string): FormatSelection | null => {
+  const match = prompt.match(/\bformat\s*[:=]\s*(short(?:[\s-]?form)?|long(?:[\s-]?form)?)\b/i)
+  if (!match?.[1]) return null
+  const normalized = match[1].toLowerCase()
+  if (normalized.includes('short')) return 'short'
+  if (normalized.includes('long')) return 'long'
+  return null
+}
+
+const resolveOrientationFromPrompt = (prompt: string): OrientationSelection | null => {
+  const match = prompt.match(/\b(?:orientation|layout|aspect)\s*[:=]\s*(vertical|horizontal)\b/i)
+  if (!match?.[1]) return null
+  const normalized = match[1].toLowerCase()
+  return normalized === 'vertical' ? 'vertical' : normalized === 'horizontal' ? 'horizontal' : null
+}
+
+const resolveHookAndCutOnlyFromPrompt = (prompt: string) => {
+  return (
+    /\b(?:setting|mode|option)\s*[:=]\s*(?:only\s*)?hook\s*(?:\+|and|&)\s*cut\b/i.test(prompt) ||
+    /\bhook\s*(?:\+|and|&)\s*cut\s*(?:mode|setting)\s*[:=]\s*(?:on|enabled|true)\b/i.test(prompt)
+  )
+}
+
+const resolveCutCountFromPrompt = (prompt: string): number | null => {
+  const match =
+    prompt.match(/\bcut\s*count\s*[:=]\s*(\d{1,2})\b/i) ||
+    prompt.match(/\b(?:cuts?|edits?)\s*(?:count\s*)?(?:=|:|to)\s*(\d{1,2})\b/i)
+  const value = Number(match?.[1] || NaN)
+  if (!Number.isFinite(value)) return null
+  return Math.round(clamp(value, 1, 15))
+}
+
+const PLATFORM_MODE_BASELINES: Record<PlatformModeSelection, {
+  numeric: Partial<Record<NumericParamKey, number>>
+  subtitleMode: string
+  reason: string
+}> = {
+  tiktok: {
+    numeric: {
+      cut_aggression: 92,
+      min_clip_len_ms: 280,
+      max_clip_len_ms: 3_900,
+      silence_db_threshold: -44,
+      silence_min_ms: 140,
+      filler_word_weight: 1.45,
+      redundancy_weight: 1.26,
+      energy_floor: 0.46,
+      spike_boost: 1.85,
+      pattern_interrupt_every_sec: 3.2,
+      hook_priority_weight: 2.35,
+      story_coherence_guard: 34,
+      jank_guard: 45,
+      pacing_multiplier: 1.62
+    },
+    subtitleMode: 'tiktok_kinetic_neon',
+    reason: 'TikTok platform baseline'
+  },
+  instagram_reels: {
+    numeric: {
+      cut_aggression: 70,
+      min_clip_len_ms: 520,
+      max_clip_len_ms: 6_500,
+      silence_db_threshold: -42,
+      silence_min_ms: 220,
+      filler_word_weight: 1.25,
+      redundancy_weight: 1.12,
+      energy_floor: 0.36,
+      spike_boost: 1.2,
+      pattern_interrupt_every_sec: 4.8,
+      hook_priority_weight: 1.72,
+      story_coherence_guard: 62,
+      jank_guard: 74,
+      pacing_multiplier: 1.2
+    },
+    subtitleMode: 'reels_polished',
+    reason: 'IG Reels platform baseline'
+  },
+  youtube_shorts: {
+    numeric: {
+      cut_aggression: 58,
+      min_clip_len_ms: 780,
+      max_clip_len_ms: 9_200,
+      silence_db_threshold: -41,
+      silence_min_ms: 250,
+      filler_word_weight: 1.2,
+      redundancy_weight: 1.08,
+      energy_floor: 0.31,
+      spike_boost: 0.98,
+      pattern_interrupt_every_sec: 6.8,
+      hook_priority_weight: 1.56,
+      story_coherence_guard: 74,
+      jank_guard: 82,
+      pacing_multiplier: 1.07
+    },
+    subtitleMode: 'shorts_value_clear',
+    reason: 'YouTube Shorts platform baseline'
+  },
+  long_form: {
+    numeric: {
+      cut_aggression: 34,
+      min_clip_len_ms: 1_300,
+      max_clip_len_ms: 18_000,
+      silence_db_threshold: -38,
+      silence_min_ms: 360,
+      filler_word_weight: 1.04,
+      redundancy_weight: 1.1,
+      energy_floor: 0.24,
+      spike_boost: 0.56,
+      pattern_interrupt_every_sec: 15.5,
+      hook_priority_weight: 1.2,
+      story_coherence_guard: 93,
+      jank_guard: 91,
+      pacing_multiplier: 0.84
+    },
+    subtitleMode: 'longform_accessible_clean',
+    reason: 'Long-form platform baseline'
+  }
+}
+
+const CONTENT_MODE_OVERLAYS: Record<ContentTypeModeSelection, {
+  delta: Partial<Record<NumericParamKey, number>>
+  subtitleMode?: string
+  reason: string
+}> = {
+  auto: {
+    delta: {},
+    reason: 'Auto content-type overlay'
+  },
+  reaction: {
+    delta: {
+      cut_aggression: 10,
+      pacing_multiplier: 0.14,
+      pattern_interrupt_every_sec: -1.3,
+      spike_boost: 0.34,
+      hook_priority_weight: 0.2,
+      story_coherence_guard: -5,
+      jank_guard: -6
+    },
+    subtitleMode: 'reaction_expressive',
+    reason: 'Reaction overlay'
+  },
+  commentary: {
+    delta: {
+      cut_aggression: 2,
+      pacing_multiplier: -0.02,
+      pattern_interrupt_every_sec: 1.4,
+      story_coherence_guard: 10,
+      jank_guard: 8,
+      filler_word_weight: 0.14,
+      redundancy_weight: 0.22,
+      spike_boost: -0.06
+    },
+    subtitleMode: 'commentary_transcriptive',
+    reason: 'Commentary overlay'
+  },
+  vlog: {
+    delta: {
+      cut_aggression: -4,
+      pacing_multiplier: -0.05,
+      pattern_interrupt_every_sec: 1.8,
+      story_coherence_guard: 8,
+      jank_guard: 6,
+      spike_boost: -0.04
+    },
+    subtitleMode: 'vlog_narrative',
+    reason: 'Vlog overlay'
+  },
+  gaming: {
+    delta: {
+      cut_aggression: 12,
+      pacing_multiplier: 0.18,
+      pattern_interrupt_every_sec: -2,
+      spike_boost: 0.42,
+      energy_floor: 0.08,
+      hook_priority_weight: 0.14,
+      story_coherence_guard: -8,
+      jank_guard: -8
+    },
+    subtitleMode: 'gaming_hud_pop',
+    reason: 'Gaming overlay'
+  },
+  sports: {
+    delta: {
+      cut_aggression: 14,
+      pacing_multiplier: 0.22,
+      pattern_interrupt_every_sec: -2.2,
+      spike_boost: 0.5,
+      energy_floor: 0.1,
+      hook_priority_weight: 0.2,
+      story_coherence_guard: -10,
+      jank_guard: -10
+    },
+    subtitleMode: 'sports_score_overlay',
+    reason: 'Sports overlay'
+  },
+  education: {
+    delta: {
+      cut_aggression: -12,
+      pacing_multiplier: -0.14,
+      pattern_interrupt_every_sec: 3.2,
+      story_coherence_guard: 12,
+      jank_guard: 10,
+      filler_word_weight: 0.36,
+      redundancy_weight: 0.42,
+      spike_boost: -0.18,
+      energy_floor: -0.06
+    },
+    subtitleMode: 'education_key_terms',
+    reason: 'Education overlay'
+  }
+}
+
+const RETENTION_TILT_OVERLAYS: Record<RetentionTiltSelection, Partial<Record<NumericParamKey, number>>> = {
+  safe: {
+    cut_aggression: -8,
+    pacing_multiplier: -0.08,
+    pattern_interrupt_every_sec: 2.1,
+    story_coherence_guard: 8,
+    jank_guard: 7,
+    hook_priority_weight: -0.05,
+    spike_boost: -0.08,
+    energy_floor: -0.04
+  },
+  balanced: {
+    cut_aggression: 0,
+    pacing_multiplier: 0,
+    pattern_interrupt_every_sec: 0,
+    story_coherence_guard: 0,
+    jank_guard: 0
+  },
+  viral: {
+    cut_aggression: 10,
+    pacing_multiplier: 0.14,
+    pattern_interrupt_every_sec: -1.8,
+    hook_priority_weight: 0.2,
+    story_coherence_guard: -8,
+    jank_guard: -8,
+    spike_boost: 0.24,
+    energy_floor: 0.06
+  }
+}
+
 const parsePromptIntoParams = async ({
   prompt,
   base,
@@ -404,6 +885,175 @@ const parsePromptIntoParams = async ({
       source: strategy === 'prompt_directive' ? 'prompt_directive' : 'prompt_intent',
       reason: 'Subtitle style instruction in prompt'
     })
+  }
+
+  const advancedModeSpec = isAdvancedModeSpecPrompt(normalizedPrompt)
+  const requestedPlatformMode = resolvePlatformModeFromPrompt(normalizedPrompt)
+  const requestedContentMode = resolveContentTypeModeFromPrompt(normalizedPrompt)
+  const requestedTilt = resolveRetentionTiltFromPrompt(normalizedPrompt)
+  const requestedFormat = resolveFormatFromPrompt(normalizedPrompt)
+  const requestedOrientation = resolveOrientationFromPrompt(normalizedPrompt)
+  const requestedCutCount = resolveCutCountFromPrompt(normalizedPrompt)
+  const captionsPreference = resolveCaptionsPreferenceFromPrompt(normalizedPrompt)
+  const hookAndCutOnly = resolveHookAndCutOnlyFromPrompt(normalizedPrompt)
+
+  const hasModeSelectionSignal = Boolean(
+    advancedModeSpec ||
+    requestedPlatformMode ||
+    requestedContentMode ||
+    requestedFormat ||
+    requestedOrientation
+  )
+
+  if (hasModeSelectionSignal) {
+    let resolvedPlatformMode = requestedPlatformMode
+    if (!resolvedPlatformMode) {
+      if (requestedFormat === 'short' || requestedOrientation === 'vertical') resolvedPlatformMode = 'youtube_shorts'
+      else resolvedPlatformMode = 'long_form'
+    }
+    const resolvedContentMode = requestedContentMode || 'auto'
+    const platformBaseline = PLATFORM_MODE_BASELINES[resolvedPlatformMode]
+    const contentOverlay = CONTENT_MODE_OVERLAYS[resolvedContentMode]
+    const hasExplicitSubtitleInstruction = Boolean(subtitleModeMatch?.[1])
+
+    applyNumericTargets({
+      next,
+      changes,
+      targets: platformBaseline.numeric,
+      source: strategy === 'prompt_directive' ? 'prompt_directive' : 'prompt_intent',
+      reasonPrefix: platformBaseline.reason
+    })
+
+    if (!hasExplicitSubtitleInstruction) {
+      applySubtitleModeChange({
+        next,
+        changes,
+        nextModeRaw: platformBaseline.subtitleMode,
+        source: 'prompt_intent',
+        reason: `${platformBaseline.reason}: subtitle baseline`
+      })
+    }
+
+    applyNumericDeltas({
+      next,
+      changes,
+      deltas: contentOverlay.delta,
+      source: 'prompt_intent',
+      reasonPrefix: contentOverlay.reason
+    })
+
+    if (!hasExplicitSubtitleInstruction && contentOverlay.subtitleMode) {
+      applySubtitleModeChange({
+        next,
+        changes,
+        nextModeRaw: contentOverlay.subtitleMode,
+        source: 'prompt_intent',
+        reason: `${contentOverlay.reason}: subtitle overlay`
+      })
+    }
+
+    if (requestedTilt) {
+      applyNumericDeltas({
+        next,
+        changes,
+        deltas: RETENTION_TILT_OVERLAYS[requestedTilt],
+        source: 'prompt_intent',
+        reasonPrefix: `Retention tilt ${requestedTilt}`
+      })
+    }
+
+    if (hookAndCutOnly) {
+      applyNumericDeltas({
+        next,
+        changes,
+        deltas: {
+          cut_aggression: -10,
+          pattern_interrupt_every_sec: 2.4,
+          hook_priority_weight: 0.28,
+          story_coherence_guard: 6,
+          jank_guard: 6,
+          pacing_multiplier: -0.06
+        },
+        source: 'prompt_intent',
+        reasonPrefix: 'Hook + Cut only mode'
+      })
+    }
+
+    if (requestedCutCount !== null) {
+      const boundedCount = Math.round(clamp(requestedCutCount, 1, 15))
+      const longFormMode = resolvedPlatformMode === 'long_form'
+      const effectiveCount = longFormMode
+        ? Math.max(1, Math.round(boundedCount * 0.6))
+        : boundedCount
+      const targetInterruptSec = longFormMode
+        ? clamp(60 / Math.max(1, effectiveCount), 6, 28)
+        : clamp(60 / Math.max(1, effectiveCount), 2.4, 20)
+      const targetAggression = longFormMode
+        ? clamp(22 + effectiveCount * 2.2, 24, 58)
+        : clamp(28 + effectiveCount * 4.6, 30, 95)
+      const targetPacing = longFormMode
+        ? clamp(0.78 + effectiveCount * 0.018, 0.72, 1.14)
+        : clamp(0.88 + effectiveCount * 0.055, 0.9, 1.95)
+      applyNumericChange({
+        next,
+        changes,
+        key: 'pattern_interrupt_every_sec',
+        targetRaw: targetInterruptSec,
+        source: 'prompt_intent',
+        reason: `Cut-count instruction (${boundedCount})`
+      })
+      applyNumericChange({
+        next,
+        changes,
+        key: 'cut_aggression',
+        targetRaw: targetAggression,
+        source: 'prompt_intent',
+        reason: `Cut-count instruction (${boundedCount})`
+      })
+      applyNumericChange({
+        next,
+        changes,
+        key: 'pacing_multiplier',
+        targetRaw: targetPacing,
+        source: 'prompt_intent',
+        reason: `Cut-count instruction (${boundedCount})`
+      })
+    }
+
+    if (captionsPreference === 'off') {
+      applySubtitleModeChange({
+        next,
+        changes,
+        nextModeRaw: 'captions_off_requested',
+        source: 'prompt_intent',
+        reason: 'Caption preference explicitly disabled'
+      })
+      warnings.push('Caption on/off is mapped to subtitle_style_mode in algorithm tuning; runtime caption toggle remains a render setting.')
+    } else if (captionsPreference === 'on' && !hasExplicitSubtitleInstruction) {
+      applySubtitleModeChange({
+        next,
+        changes,
+        nextModeRaw: contentOverlay.subtitleMode || platformBaseline.subtitleMode,
+        source: 'prompt_intent',
+        reason: 'Caption preference explicitly enabled'
+      })
+    }
+
+    if (!requestedPlatformMode && advancedModeSpec) {
+      warnings.push('Platform mode was not explicitly selected; defaulted to Long-Form baseline for deterministic tuning.')
+    }
+    if (!requestedContentMode && advancedModeSpec) {
+      warnings.push('Content-Type mode was not explicitly selected; defaulted to Auto overlay.')
+    }
+
+    strategy = strategy === 'prompt_directive' ? 'prompt_directive' : 'prompt_intent'
+    const parsed = parseConfigParams(next)
+    return {
+      strategy,
+      params: parsed,
+      changes,
+      warnings
+    }
   }
 
   if (/\bultra\b/.test(lower)) {
