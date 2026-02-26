@@ -4854,6 +4854,146 @@ const normalizeEnergy = (rmsDb: number) => {
 
 const clamp01 = (value: number) => Math.max(0, Math.min(1, value))
 
+type HookSignalStats = {
+  mean: number
+  std: number
+  p50: number
+  p75: number
+  p90: number
+}
+
+type HookDynamicBaseline = {
+  hook: HookSignalStats
+  emotion: HookSignalStats
+  curiosity: HookSignalStats
+  scene: HookSignalStats
+  vocal: HookSignalStats
+  action: HookSignalStats
+  composite: HookSignalStats
+}
+
+type HookDynamicLift = {
+  score: number
+  peakDensity: number
+}
+
+const computePercentile = (values: number[], percentile: number) => {
+  const safe = values.filter((value) => Number.isFinite(value)).map((value) => clamp01(value))
+  if (!safe.length) return 0
+  const sorted = safe.slice().sort((a, b) => a - b)
+  const rank = clamp01(percentile) * (sorted.length - 1)
+  const low = Math.floor(rank)
+  const high = Math.ceil(rank)
+  if (low === high) return sorted[low]
+  const weight = rank - low
+  return sorted[low] * (1 - weight) + sorted[high] * weight
+}
+
+const computeHookSignalStats = (values: number[]): HookSignalStats => {
+  const safe = values.filter((value) => Number.isFinite(value)).map((value) => clamp01(value))
+  if (!safe.length) {
+    return {
+      mean: 0,
+      std: 0,
+      p50: 0,
+      p75: 0,
+      p90: 0
+    }
+  }
+  const mean = safe.reduce((sum, value) => sum + value, 0) / safe.length
+  const variance = safe.reduce((sum, value) => sum + (value - mean) ** 2, 0) / safe.length
+  return {
+    mean: Number(mean.toFixed(4)),
+    std: Number(Math.sqrt(Math.max(0, variance)).toFixed(4)),
+    p50: Number(computePercentile(safe, 0.5).toFixed(4)),
+    p75: Number(computePercentile(safe, 0.75).toFixed(4)),
+    p90: Number(computePercentile(safe, 0.9).toFixed(4))
+  }
+}
+
+const computeWindowHookImpactComposite = (window: EngagementWindow) => {
+  return clamp01(
+    0.28 * (window.hookScore ?? window.score) +
+    0.18 * window.emotionIntensity +
+    0.14 * window.vocalExcitement +
+    0.13 * (window.actionSpike ?? 0) +
+    0.11 * window.motionScore +
+    0.1 * (window.curiosityTrigger ?? 0) +
+    0.06 * window.sceneChangeRate
+  )
+}
+
+const computeHookDynamicBaseline = (windows: EngagementWindow[]): HookDynamicBaseline => {
+  if (!windows.length) {
+    const zero = computeHookSignalStats([])
+    return {
+      hook: zero,
+      emotion: zero,
+      curiosity: zero,
+      scene: zero,
+      vocal: zero,
+      action: zero,
+      composite: zero
+    }
+  }
+  return {
+    hook: computeHookSignalStats(windows.map((window) => window.hookScore ?? window.score)),
+    emotion: computeHookSignalStats(windows.map((window) => window.emotionIntensity)),
+    curiosity: computeHookSignalStats(windows.map((window) => window.curiosityTrigger ?? 0)),
+    scene: computeHookSignalStats(windows.map((window) => window.sceneChangeRate)),
+    vocal: computeHookSignalStats(windows.map((window) => window.vocalExcitement)),
+    action: computeHookSignalStats(windows.map((window) => window.actionSpike ?? 0)),
+    composite: computeHookSignalStats(windows.map((window) => computeWindowHookImpactComposite(window)))
+  }
+}
+
+const normalizeMetricLift = (value: number, stats: HookSignalStats) => {
+  const span = Math.max(0.001, stats.p90 - stats.p50)
+  return clamp01((value - stats.p50) / span)
+}
+
+const computeDynamicHookLiftForRange = ({
+  start,
+  end,
+  windows,
+  baseline
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  baseline: HookDynamicBaseline
+}): HookDynamicLift => {
+  const relevant = windows.filter((window) => window.time >= start && window.time < end)
+  if (!relevant.length) {
+    return {
+      score: 0,
+      peakDensity: 0
+    }
+  }
+  const average = (metric: (window: EngagementWindow) => number) => (
+    relevant.reduce((sum, window) => sum + metric(window), 0) / relevant.length
+  )
+  const hookLift = normalizeMetricLift(average((window) => window.hookScore ?? window.score), baseline.hook)
+  const emotionLift = normalizeMetricLift(average((window) => window.emotionIntensity), baseline.emotion)
+  const curiosityLift = normalizeMetricLift(average((window) => window.curiosityTrigger ?? 0), baseline.curiosity)
+  const sceneLift = normalizeMetricLift(average((window) => window.sceneChangeRate), baseline.scene)
+  const vocalLift = normalizeMetricLift(average((window) => window.vocalExcitement), baseline.vocal)
+  const actionLift = normalizeMetricLift(average((window) => window.actionSpike ?? 0), baseline.action)
+  const peakDensity = relevant.filter((window) => computeWindowHookImpactComposite(window) >= baseline.composite.p90).length / relevant.length
+  const score = clamp01(
+    0.3 * hookLift +
+    0.2 * emotionLift +
+    0.16 * curiosityLift +
+    0.12 * sceneLift +
+    0.11 * vocalLift +
+    0.11 * actionLift
+  )
+  return {
+    score: Number(score.toFixed(4)),
+    peakDensity: Number(clamp01(peakDensity).toFixed(4))
+  }
+}
+
 const getHookCandidateConfidence = (hook: Pick<HookCandidate, 'score' | 'auditScore'>) => {
   return clamp01(0.7 * (hook.score ?? 0) + 0.3 * (hook.auditScore ?? 0))
 }
@@ -5607,8 +5747,8 @@ const selectRenderableHookCandidate = ({
       threshold,
       usedFallback: true,
       reason: hasTranscript
-        ? 'Hook fallback selected after strict audit miss, using strongest near-threshold candidate.'
-        : 'Hook fallback selected from strongest non-verbal peak due missing transcript context.'
+        ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment (no fixed timestamp).'
+        : 'Hook fallback selected from this video\'s strongest non-verbal peak due missing transcript context (no fixed timestamp).'
     }
   }
   return null
@@ -5703,6 +5843,7 @@ const buildFallbackHookCandidateFromStorySegments = ({
   silences: TimeRange[]
   durationSeconds: number
 }) => {
+  const dynamicBaseline = computeHookDynamicBaseline(windows)
   const scored = segments
     .map((segment) => {
       const segmentStart = clamp(segment.start, 0, Math.max(0, durationSeconds - 0.5))
@@ -5758,6 +5899,12 @@ const buildFallbackHookCandidateFromStorySegments = ({
             (window.hookScore ?? window.score) >= 0.78
           )).length / windowCount
         : 0
+      const dynamicLift = computeDynamicHookLiftForRange({
+        start: hookStart,
+        end: hookEnd,
+        windows,
+        baseline: dynamicBaseline
+      })
       const peakImpact = peakWindow?.impact ?? clamp01(
         0.36 * hookSignal +
         0.24 * energy +
@@ -5766,19 +5913,19 @@ const buildFallbackHookCandidateFromStorySegments = ({
         0.07 * action +
         0.05 * curiosity
       )
-      const earlyBias = 1 - clamp01(hookStart / Math.max(45, durationSeconds * 0.42))
       const score = clamp01(
-        0.22 * hookSignal +
-        0.24 * energy +
+        0.2 * hookSignal +
+        0.19 * energy +
         0.12 * emotion +
         0.1 * vocal +
         0.08 * action +
         0.06 * curiosity +
         0.04 * speech +
         0.04 * scene +
-        0.22 * peakImpact +
+        0.19 * peakImpact +
         0.1 * spikeDensity +
-        0.03 * earlyBias -
+        0.1 * dynamicLift.score +
+        0.07 * dynamicLift.peakDensity -
         0.05 * silenceRatio
       )
       return {
@@ -5807,7 +5954,7 @@ const buildFallbackHookCandidateFromStorySegments = ({
     auditScore: Number(clamp01(confidence - 0.02).toFixed(4)),
     auditPassed: false,
     text: '',
-    reason: 'Fallback hook selected from the highest-impact energy peak after weak candidate pool.',
+    reason: 'Fallback hook selected from this video\'s highest-impact energy peak after weak candidate pool (no fixed timestamp).',
     synthetic: true
   } as HookCandidate
 }
@@ -6682,7 +6829,7 @@ const buildSyntheticHookCandidate = ({
     auditPassed: finalAudit.passed,
     text,
     reason: finalAudit.passed
-      ? 'Synthetic hook built from strongest payoff moment with teaser context.'
+      ? 'Synthetic hook built from this video\'s strongest payoff moment with teaser context.'
       : `Synthetic hook failed audit: ${finalAudit.reasons.join('; ') || 'unknown reason'}`,
     synthetic: true
   }
@@ -6798,12 +6945,15 @@ const pickTopHookCandidates = ({
   nicheProfile?: VideoNicheProfile | null
   aggressionLevel?: RetentionAggressionLevel
 }) => {
+  // Analyze each uploaded video independently and choose the strongest hook from
+  // that video's own pacing/signal profile (never a predetermined timestamp).
   const emotionalTuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
     aggressionLevel
   })
   const hookCandidateTarget = resolveHookCandidateTarget(durationSeconds)
+  const dynamicBaseline = computeHookDynamicBaseline(windows)
   const starts = new Set<number>()
   segments.forEach((segment) => starts.add(Number(segment.start.toFixed(2))))
   windows
@@ -6849,6 +6999,12 @@ const pickTopHookCandidates = ({
         0.1 * (window.curiosityTrigger ?? 0) +
         0.1 * window.sceneChangeRate
       ))
+      const dynamicLift = computeDynamicHookLiftForRange({
+        start: aligned.start,
+        end: aligned.end,
+        windows,
+        baseline: dynamicBaseline
+      })
       const durationSecondsActual = aligned.end - aligned.start
       const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 8) / 3))
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
@@ -6867,17 +7023,19 @@ const pickTopHookCandidates = ({
         windows
       })
       const totalScore = clamp01(
-        0.2 * baseHookScore +
-        0.16 * speechImpact +
-        0.13 * transcriptImpact +
-        0.11 * visualImpact +
-        0.14 * emotionImpact +
-        0.14 * emotionalHookPull +
-        0.06 * boostedCuriosityAcceleration +
-        0.06 * openLoopSignal +
-        0.06 * durationAlignment +
-        0.16 * audit.auditScore -
-        0.18 * tunedContextPenalty
+        0.17 * baseHookScore +
+        0.14 * speechImpact +
+        0.11 * transcriptImpact +
+        0.1 * visualImpact +
+        0.12 * emotionImpact +
+        0.12 * emotionalHookPull +
+        0.07 * boostedCuriosityAcceleration +
+        0.07 * openLoopSignal +
+        0.05 * durationAlignment +
+        0.14 * audit.auditScore +
+        0.07 * dynamicLift.score +
+        0.06 * dynamicLift.peakDensity -
+        0.16 * tunedContextPenalty
       )
       evaluated.push({
         start: aligned.start,
@@ -6887,7 +7045,9 @@ const pickTopHookCandidates = ({
         auditScore: audit.auditScore,
         auditPassed: audit.passed,
         text: hookText,
-        reason: audit.passed ? 'Best-moment candidate passed hook audit.' : audit.reasons.join('; ')
+        reason: audit.passed
+          ? 'Best-moment candidate passed hook audit after video-specific timeline scoring.'
+          : `${audit.reasons.join('; ')} Evaluated against this video timeline (no fixed timestamp).`
       })
     }
   }
@@ -6958,9 +7118,7 @@ const pickTopHookCandidates = ({
       Math.max(hookCandidateTarget, 12)
     )
     if (!partitionPool.length) continue
-    const nearEightPool = partitionPool.filter((candidate) => candidate.duration >= 7.4)
-    const pool = nearEightPool.length ? nearEightPool : partitionPool
-    const best = pool
+    const best = partitionPool
       .slice()
       .sort((a, b) => (
         getFaceoffScore(b) - getFaceoffScore(a) ||
@@ -14124,7 +14282,7 @@ const processJob = async (
           auditScore: 0.44,
           auditPassed: false,
           text: '',
-          reason: 'Fallback hook generated from strongest high-energy moment due weak candidate pool.',
+          reason: 'Fallback hook generated from this video\'s strongest high-energy moment due weak candidate pool (no fixed timestamp).',
           synthetic: true
         }
         resolvedHookDecision = {
@@ -14139,7 +14297,7 @@ const processJob = async (
           usedFallback: true,
           reason: fallbackHook.reason
         }
-        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected highest-impact energy peak.')
+        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected this video\'s highest-impact timeline peak.')
       }
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
