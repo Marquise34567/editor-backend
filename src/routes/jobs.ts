@@ -914,6 +914,9 @@ type EditPlan = {
   autoEscalationEvents?: AutoEscalationEvent[]
   editDecisionTimeline?: EditDecisionTimeline | null
   styleFeatureSnapshot?: TimelineFeatureSnapshot | null
+  boredomActions?: Array<{ type: 'hard_cut' | 'micro_cut' | 'compress' | 'bridge'; start: number; end: number; score: number; reason: string }>
+  pacingGovernorAdjustments?: number
+  redundancyPrunedSeconds?: number
 }
 type EditOptions = {
   autoHookMove: boolean
@@ -933,12 +936,19 @@ type EditOptions = {
   retentionStrategyProfile: RetentionStrategyProfile
   maxCutsRequested?: number | null
   editorMode?: EditorModeSelection | null
+  hookSelectionMode?: HookSelectionMode | null
   preferredHookCandidate?: HookCandidate | null
   styleArchetypeBlend?: Partial<StyleArchetypeBlend> | null
   fastMode?: boolean
+  longFormPreset: LongFormPreset
+  longFormAggression: number
+  longFormClarityVsSpeed: number
+  tangentKiller: boolean
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'vlog' | 'gaming' | 'sports' | 'education'
+type HookSelectionMode = 'manual' | 'auto'
+type LongFormPreset = 'balanced' | 'aggressive' | 'ultra'
 type ContentStyleProfile = {
   style: ContentStyle
   confidence: number
@@ -983,7 +993,13 @@ const HOOK_SELECTION_WAIT_MS = EDITOR_RETENTION_CONFIG.hookSelectionWaitMs
 const HOOK_SELECTION_POLL_MS = EDITOR_RETENTION_CONFIG.hookSelectionPollMs
 const USER_MAX_CUTS_MIN = 1
 const USER_MAX_CUTS_MAX = 15
+const LONG_FORM_AGGRESSION_MIN = 0
+const LONG_FORM_AGGRESSION_MAX = 100
+const LONG_FORM_CLARITY_MIN = 0
+const LONG_FORM_CLARITY_MAX = 100
 const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'vlog', 'gaming', 'sports', 'education']
+const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
+const LONG_FORM_PRESET_VALUES: LongFormPreset[] = ['balanced', 'aggressive', 'ultra']
 const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, ContentStyle> = {
   reaction: 'reaction',
   commentary: 'vlog',
@@ -2079,6 +2095,156 @@ const RETENTION_AGGRESSION_PRESET: Record<RetentionAggressionLevel, {
     boredomThreshold: 0.52
   }
 }
+type LongFormPresetConfig = {
+  maxSilenceSeconds: number
+  maxGapBetweenMeaningfulMoments: number
+  boredomCandidateThreshold: number
+  boredomHardCutThreshold: number
+  targetCutsPerMinute: { min: number; max: number }
+  compressionSpeed: { min: number; max: number }
+  compressionIntensity: 'rare' | 'moderate' | 'heavy'
+  maxTalkingHeadShotSeconds: number
+  enforceFillerRemoval: boolean
+  sentenceTightening: boolean
+}
+const LONG_FORM_PRESET_CONFIG: Record<LongFormPreset, LongFormPresetConfig> = {
+  balanced: {
+    maxSilenceSeconds: 0.28,
+    maxGapBetweenMeaningfulMoments: 4,
+    boredomCandidateThreshold: 0.75,
+    boredomHardCutThreshold: 0.86,
+    targetCutsPerMinute: { min: 10, max: 18 },
+    compressionSpeed: { min: 1.03, max: 1.1 },
+    compressionIntensity: 'rare',
+    maxTalkingHeadShotSeconds: 6,
+    enforceFillerRemoval: true,
+    sentenceTightening: true
+  },
+  aggressive: {
+    maxSilenceSeconds: 0.18,
+    maxGapBetweenMeaningfulMoments: 3,
+    boredomCandidateThreshold: 0.65,
+    boredomHardCutThreshold: 0.8,
+    targetCutsPerMinute: { min: 18, max: 28 },
+    compressionSpeed: { min: 1.07, max: 1.15 },
+    compressionIntensity: 'moderate',
+    maxTalkingHeadShotSeconds: 4.5,
+    enforceFillerRemoval: true,
+    sentenceTightening: true
+  },
+  ultra: {
+    maxSilenceSeconds: 0.12,
+    maxGapBetweenMeaningfulMoments: 2.4,
+    boredomCandidateThreshold: 0.55,
+    boredomHardCutThreshold: 0.74,
+    targetCutsPerMinute: { min: 28, max: 40 },
+    compressionSpeed: { min: 1.12, max: 1.2 },
+    compressionIntensity: 'heavy',
+    maxTalkingHeadShotSeconds: 3.2,
+    enforceFillerRemoval: true,
+    sentenceTightening: true
+  }
+}
+type LongFormRuntimeTuning = LongFormPresetConfig & {
+  preset: LongFormPreset
+  aggression: number
+  clarityVsSpeed: number
+  tangentKiller: boolean
+  isLongForm: boolean
+}
+const parseLongFormPreset = (value?: any): LongFormPreset => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'aggressive') return 'aggressive'
+  if (raw === 'ultra') return 'ultra'
+  return 'balanced'
+}
+const parseLongFormAggression = (value?: any): number | null => {
+  if (value === undefined || value === null || value === '') return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return Math.round(clamp(numeric, LONG_FORM_AGGRESSION_MIN, LONG_FORM_AGGRESSION_MAX))
+}
+const parseLongFormClarityVsSpeed = (value?: any): number | null => {
+  if (value === undefined || value === null || value === '') return null
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return Math.round(clamp(numeric, LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX))
+}
+const resolveLongFormPresetByAggression = (aggression: number): LongFormPreset => {
+  if (aggression >= 85) return 'ultra'
+  if (aggression >= 55) return 'aggressive'
+  return 'balanced'
+}
+const resolveLongFormRuntimeTuning = ({
+  durationSeconds,
+  preset,
+  aggression,
+  clarityVsSpeed,
+  tangentKiller
+}: {
+  durationSeconds: number
+  preset: LongFormPreset
+  aggression: number
+  clarityVsSpeed: number
+  tangentKiller: boolean
+}): LongFormRuntimeTuning => {
+  const safeAggression = clamp(Math.round(aggression), LONG_FORM_AGGRESSION_MIN, LONG_FORM_AGGRESSION_MAX)
+  const safeClarity = clamp(Math.round(clarityVsSpeed), LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX)
+  const presetConfig = LONG_FORM_PRESET_CONFIG[preset]
+  const speedBias = clamp01(1 - safeClarity / 100)
+  const aggressionBias = clamp01(safeAggression / 100)
+  const blendedThresholdDrop = 0.18 * aggressionBias + 0.08 * speedBias
+  const blendedHardCutDrop = 0.12 * aggressionBias + 0.05 * speedBias
+  const blendedSilence = clamp(
+    presetConfig.maxSilenceSeconds - 0.06 * aggressionBias - 0.03 * speedBias,
+    0.08,
+    0.4
+  )
+  const blendedGap = clamp(
+    presetConfig.maxGapBetweenMeaningfulMoments - 0.75 * aggressionBias - 0.45 * speedBias,
+    2.1,
+    5.2
+  )
+  const compressionMin = clamp(
+    presetConfig.compressionSpeed.min + 0.05 * aggressionBias - 0.03 * (safeClarity / 100),
+    1,
+    1.3
+  )
+  const compressionMax = clamp(
+    presetConfig.compressionSpeed.max + 0.06 * aggressionBias - 0.02 * (safeClarity / 100),
+    Math.max(compressionMin + 0.01, 1.02),
+    1.34
+  )
+  return {
+    ...presetConfig,
+    preset,
+    aggression: safeAggression,
+    clarityVsSpeed: safeClarity,
+    tangentKiller: Boolean(tangentKiller),
+    isLongForm: Number(durationSeconds || 0) >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS,
+    maxSilenceSeconds: Number(blendedSilence.toFixed(3)),
+    maxGapBetweenMeaningfulMoments: Number(blendedGap.toFixed(3)),
+    boredomCandidateThreshold: Number(clamp(
+      presetConfig.boredomCandidateThreshold - blendedThresholdDrop,
+      0.45,
+      0.88
+    ).toFixed(3)),
+    boredomHardCutThreshold: Number(clamp(
+      presetConfig.boredomHardCutThreshold - blendedHardCutDrop,
+      0.58,
+      0.93
+    ).toFixed(3)),
+    compressionSpeed: {
+      min: Number(compressionMin.toFixed(3)),
+      max: Number(compressionMax.toFixed(3))
+    },
+    maxTalkingHeadShotSeconds: Number(clamp(
+      presetConfig.maxTalkingHeadShotSeconds - 1.3 * aggressionBias + 0.5 * (safeClarity / 100),
+      2.6,
+      6.4
+    ).toFixed(3))
+  }
+}
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -2096,7 +2262,11 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   retentionAggressionLevel: 'medium',
   retentionStrategyProfile: 'balanced',
   maxCutsRequested: null,
-  editorMode: null
+  editorMode: null,
+  longFormPreset: 'balanced',
+  longFormAggression: 55,
+  longFormClarityVsSpeed: 60,
+  tangentKiller: false
 }
 
 const applyRetentionStyleReferencePreset = ({
@@ -2374,6 +2544,20 @@ const parseEditorModeSelection = (value: any): EditorModeSelection | null => {
     : null
 }
 
+const parseHookSelectionMode = (
+  value: any,
+  fallback: HookSelectionMode | null = null
+): HookSelectionMode | null => {
+  if (value === null || value === undefined) return fallback
+  const normalized = String(value).trim().toLowerCase()
+  if (!normalized) return fallback
+  if (normalized === 'auto' || normalized === 'automatic' || normalized === 'editor') return 'auto'
+  if (normalized === 'manual' || normalized === 'user' || normalized === 'user_selected') return 'manual'
+  return (HOOK_SELECTION_MODE_VALUES as string[]).includes(normalized)
+    ? (normalized as HookSelectionMode)
+    : fallback
+}
+
 const parseBooleanFlag = (value: any): boolean | null => {
   if (value === true) return true
   if (value === false) return false
@@ -2606,6 +2790,67 @@ const getEditorModeFromPayload = (payload?: any): EditorModeSelection | null => 
   )
 }
 
+const getHookSelectionModeFromPayload = (payload?: any): HookSelectionMode | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const manualFlag = (
+    parseBooleanFlag((payload as any).manualHookSelection) ??
+    parseBooleanFlag((payload as any).manual_hook_selection)
+  )
+  if (manualFlag === true) return 'manual'
+  if (manualFlag === false) return 'auto'
+  return (
+    parseHookSelectionMode((payload as any).hookSelectionMode) ??
+    parseHookSelectionMode((payload as any).hook_selection_mode) ??
+    parseHookSelectionMode((payload as any).hookMode) ??
+    parseHookSelectionMode((payload as any).hook_mode) ??
+    parseHookSelectionMode((payload as any).mode) ??
+    null
+  )
+}
+
+const getLongFormPresetFromPayload = (payload?: any): LongFormPreset | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const explicit = (
+    (payload as any).longFormPreset ??
+    (payload as any).longformPreset ??
+    (payload as any).longform_preset ??
+    (payload as any).longFormProfile
+  )
+  if (explicit === undefined || explicit === null || String(explicit).trim().length === 0) return null
+  return parseLongFormPreset(explicit)
+}
+
+const getLongFormAggressionFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseLongFormAggression((payload as any).longFormAggression) ??
+    parseLongFormAggression((payload as any).longformAggression) ??
+    parseLongFormAggression((payload as any).long_form_aggression) ??
+    null
+  )
+}
+
+const getLongFormClarityVsSpeedFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseLongFormClarityVsSpeed((payload as any).longFormClarityVsSpeed) ??
+    parseLongFormClarityVsSpeed((payload as any).longformClarityVsSpeed) ??
+    parseLongFormClarityVsSpeed((payload as any).long_form_clarity_vs_speed) ??
+    parseLongFormClarityVsSpeed((payload as any).clarityVsSpeed) ??
+    null
+  )
+}
+
+const getTangentKillerFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).tangentKiller) ??
+    parseBooleanFlag((payload as any).tangent_killer) ??
+    parseBooleanFlag((payload as any).removeTangents) ??
+    null
+  )
+}
+
 const getAutoCaptionsFromPayload = (payload?: any): boolean | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).subtitles
@@ -2765,6 +3010,79 @@ const getEditorModeFromJob = (job?: any): EditorModeSelection | null => {
   )
 }
 
+const getHookSelectionModeFromJob = (job?: any): HookSelectionMode | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseHookSelectionMode(settings?.hookSelectionMode) ??
+    parseHookSelectionMode(settings?.hook_selection_mode) ??
+    parseHookSelectionMode(analysis?.hookSelectionMode) ??
+    parseHookSelectionMode(analysis?.hook_selection_mode) ??
+    parseHookSelectionMode(analysis?.hookMode) ??
+    parseHookSelectionMode(analysis?.hook_mode) ??
+    null
+  )
+}
+
+const getLongFormAggressionFromJob = (job?: any): number => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return parseLongFormAggression(
+    settings?.longFormAggression ??
+    settings?.longformAggression ??
+    settings?.long_form_aggression ??
+    analysis?.longFormAggression ??
+    analysis?.longformAggression ??
+    analysis?.long_form_aggression
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+}
+
+const getLongFormClarityVsSpeedFromJob = (job?: any): number => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return parseLongFormClarityVsSpeed(
+    settings?.longFormClarityVsSpeed ??
+    settings?.longformClarityVsSpeed ??
+    settings?.long_form_clarity_vs_speed ??
+    settings?.clarityVsSpeed ??
+    analysis?.longFormClarityVsSpeed ??
+    analysis?.longformClarityVsSpeed ??
+    analysis?.long_form_clarity_vs_speed ??
+    analysis?.clarityVsSpeed
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+}
+
+const getLongFormPresetFromJob = (job?: any): LongFormPreset => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const explicit = (
+    settings?.longFormPreset ??
+    settings?.longformPreset ??
+    settings?.longform_preset ??
+    analysis?.longFormPreset ??
+    analysis?.longformPreset ??
+    analysis?.longform_preset
+  )
+  if (explicit !== undefined && explicit !== null && String(explicit).trim().length > 0) {
+    return parseLongFormPreset(explicit)
+  }
+  return parseLongFormPreset(resolveLongFormPresetByAggression(getLongFormAggressionFromJob(job)))
+}
+
+const getTangentKillerFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.tangentKiller) ??
+    parseBooleanFlag(settings?.tangent_killer) ??
+    parseBooleanFlag(settings?.removeTangents) ??
+    parseBooleanFlag(analysis?.tangentKiller) ??
+    parseBooleanFlag(analysis?.tangent_killer) ??
+    parseBooleanFlag(analysis?.removeTangents) ??
+    DEFAULT_EDIT_OPTIONS.tangentKiller
+  )
+}
+
 const getRetentionStrategyFromJob = (job?: any): RetentionStrategyProfile => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -2877,6 +3195,11 @@ const buildPersistedRenderSettings = (
     onlyCuts?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
+    hookSelectionMode?: HookSelectionMode | null
+    longFormPreset?: LongFormPreset | null
+    longFormAggression?: number | null
+    longFormClarityVsSpeed?: number | null
+    tangentKiller?: boolean | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -2890,6 +3213,11 @@ const buildPersistedRenderSettings = (
   const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
   const maxCuts = parseMaxCutsPreference(opts?.maxCuts)
   const editorMode = parseEditorModeSelection(opts?.editorMode)
+  const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'manual') || 'manual'
+  const longFormAggression = parseLongFormAggression(opts?.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
+  const tangentKiller = typeof opts?.tangentKiller === 'boolean' ? opts.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
   return {
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
@@ -2904,6 +3232,19 @@ const buildPersistedRenderSettings = (
     targetPlatform: retentionTargetPlatform,
     platformProfile,
     platform_profile: platformProfile,
+    hookSelectionMode,
+    hook_selection_mode: hookSelectionMode,
+    longFormPreset,
+    longformPreset: longFormPreset,
+    longform_preset: longFormPreset,
+    longFormAggression,
+    longformAggression: longFormAggression,
+    long_form_aggression: longFormAggression,
+    longFormClarityVsSpeed,
+    longformClarityVsSpeed: longFormClarityVsSpeed,
+    long_form_clarity_vs_speed: longFormClarityVsSpeed,
+    tangentKiller,
+    tangent_killer: tangentKiller,
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
     ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts }),
     ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode })
@@ -2917,6 +3258,11 @@ const buildPersistedRenderAnalysis = ({
   onlyCuts,
   maxCuts,
   editorMode,
+  hookSelectionMode,
+  longFormPreset,
+  longFormAggression,
+  longFormClarityVsSpeed,
+  tangentKiller,
   retentionTargetPlatform,
   platformProfile
 }: {
@@ -2926,6 +3272,11 @@ const buildPersistedRenderAnalysis = ({
   onlyCuts?: boolean | null
   maxCuts?: number | null
   editorMode?: EditorModeSelection | null
+  hookSelectionMode?: HookSelectionMode | null
+  longFormPreset?: LongFormPreset | null
+  longFormAggression?: number | null
+  longFormClarityVsSpeed?: number | null
+  tangentKiller?: boolean | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
   platformProfile?: PlatformProfile | null
 }) => {
@@ -2948,6 +3299,43 @@ const buildPersistedRenderAnalysis = ({
     (existing as any)?.editor_mode ??
     (existing as any)?.contentMode
   )
+  const resolvedHookSelectionMode = parseHookSelectionMode(
+    hookSelectionMode ??
+    (existing as any)?.hookSelectionMode ??
+    (existing as any)?.hook_selection_mode ??
+    (existing as any)?.hookMode ??
+    (existing as any)?.hook_mode,
+    'manual'
+  ) || 'manual'
+  const resolvedLongFormAggression = parseLongFormAggression(
+    longFormAggression ??
+    (existing as any)?.longFormAggression ??
+    (existing as any)?.longformAggression ??
+    (existing as any)?.long_form_aggression
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const resolvedLongFormClarityVsSpeed = parseLongFormClarityVsSpeed(
+    longFormClarityVsSpeed ??
+    (existing as any)?.longFormClarityVsSpeed ??
+    (existing as any)?.longformClarityVsSpeed ??
+    (existing as any)?.long_form_clarity_vs_speed ??
+    (existing as any)?.clarityVsSpeed
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const resolvedLongFormPreset = parseLongFormPreset(
+    longFormPreset ??
+    (existing as any)?.longFormPreset ??
+    (existing as any)?.longformPreset ??
+    (existing as any)?.longform_preset ??
+    resolveLongFormPresetByAggression(resolvedLongFormAggression)
+  )
+  const resolvedTangentKiller = (
+    typeof tangentKiller === 'boolean'
+      ? tangentKiller
+      : (
+        parseBooleanFlag((existing as any)?.tangentKiller) ??
+        parseBooleanFlag((existing as any)?.tangent_killer) ??
+        parseBooleanFlag((existing as any)?.removeTangents)
+      )
+  ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
   const verticalCrop = renderConfig.verticalMode?.webcamCrop
     ? {
         x: renderConfig.verticalMode.webcamCrop.x,
@@ -2999,6 +3387,8 @@ const buildPersistedRenderAnalysis = ({
       )
   payload.platformProfile = resolvedPlatformProfile
   payload.platform_profile = resolvedPlatformProfile
+  payload.hookSelectionMode = resolvedHookSelectionMode
+  payload.hook_selection_mode = resolvedHookSelectionMode
   if (resolvedOnlyCuts !== null) {
     payload.onlyCuts = resolvedOnlyCuts
     payload.onlyHookAndCut = resolvedOnlyCuts
@@ -3013,6 +3403,17 @@ const buildPersistedRenderAnalysis = ({
     payload.editor_mode = resolvedEditorMode
     payload.contentMode = resolvedEditorMode
   }
+  payload.longFormPreset = resolvedLongFormPreset
+  payload.longformPreset = resolvedLongFormPreset
+  payload.longform_preset = resolvedLongFormPreset
+  payload.longFormAggression = resolvedLongFormAggression
+  payload.longformAggression = resolvedLongFormAggression
+  payload.long_form_aggression = resolvedLongFormAggression
+  payload.longFormClarityVsSpeed = resolvedLongFormClarityVsSpeed
+  payload.longformClarityVsSpeed = resolvedLongFormClarityVsSpeed
+  payload.long_form_clarity_vs_speed = resolvedLongFormClarityVsSpeed
+  payload.tangentKiller = resolvedTangentKiller
+  payload.tangent_killer = resolvedTangentKiller
   return normalizeAnalysisPayload(payload)
 }
 
@@ -5802,6 +6203,93 @@ const buildTranscriptSignalBuckets = (durationSeconds: number, cues: TranscriptC
   return buckets
 }
 
+const REDUNDANCY_STOP_WORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'but', 'so', 'to', 'for', 'of', 'in', 'on', 'at', 'it', 'is', 'was', 'are', 'be', 'this', 'that'
+])
+
+const tokenizeForRedundancy = (text: string) => (
+  String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !REDUNDANCY_STOP_WORDS.has(token))
+)
+
+const computeTranscriptSimilarity = (leftText: string, rightText: string) => {
+  const left = tokenizeForRedundancy(leftText)
+  const right = tokenizeForRedundancy(rightText)
+  if (!left.length || !right.length) return 0
+  const leftSet = new Set(left)
+  const rightSet = new Set(right)
+  let overlap = 0
+  for (const token of leftSet) {
+    if (rightSet.has(token)) overlap += 1
+  }
+  return clamp01(overlap / Math.max(1, Math.max(leftSet.size, rightSet.size)))
+}
+
+const buildTranscriptRedundancyCuts = ({
+  transcriptCues,
+  windows,
+  durationSeconds,
+  tangentKiller,
+  clarityVsSpeed,
+  sentenceTightening
+}: {
+  transcriptCues: TranscriptCue[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  tangentKiller: boolean
+  clarityVsSpeed: number
+  sentenceTightening: boolean
+}) => {
+  if (!sentenceTightening || !transcriptCues.length || durationSeconds <= 0) {
+    return { cuts: [] as TimeRange[], prunedSeconds: 0 }
+  }
+  const clarityWeight = clamp01(clamp(clarityVsSpeed, 0, 100) / 100)
+  const similarityThreshold = tangentKiller ? 0.72 : 0.84 - 0.08 * (1 - clarityWeight)
+  const lowEnergyThreshold = tangentKiller ? 0.57 : 0.52
+  const candidateCuts: TimeRange[] = []
+  const lookbackWindow = tangentKiller ? 6 : 4
+  for (let index = 0; index < transcriptCues.length; index += 1) {
+    const cue = transcriptCues[index]
+    if (cue.start < 1.2 || cue.end > durationSeconds - 0.8) continue
+    const cueDuration = cue.end - cue.start
+    if (cueDuration < 0.22) continue
+    const cueText = String(cue.text || '').trim()
+    if (!cueText) continue
+    const cueEnergy = averageWindowMetric(
+      windows,
+      cue.start,
+      cue.end,
+      (window) => (
+        0.46 * (window.hookScore ?? window.score) +
+        0.24 * window.speechIntensity +
+        0.18 * window.emotionIntensity +
+        0.12 * (window.curiosityTrigger ?? 0)
+      )
+    )
+    const recent = transcriptCues.slice(Math.max(0, index - lookbackWindow), index)
+    const maxSimilarity = recent.reduce((max, prevCue) => (
+      Math.max(max, computeTranscriptSimilarity(prevCue.text, cueText))
+    ), 0)
+    const repeatedIdea = maxSimilarity >= similarityThreshold
+    const fillerHeavy = cue.fillerDensity >= (tangentKiller ? 0.12 : 0.16)
+    const lowValue = cueEnergy < lowEnergyThreshold && cue.keywordIntensity < 0.32 && cue.curiosityTrigger < 0.32
+    const removeCue = repeatedIdea && (tangentKiller || lowValue || fillerHeavy)
+    if (!removeCue) continue
+    const headTrim = tangentKiller ? 0.06 : 0.03
+    const tailTrim = tangentKiller ? 0.08 : 0.04
+    const start = Number(clamp(cue.start + headTrim, 0, durationSeconds).toFixed(3))
+    const end = Number(clamp(cue.end - tailTrim, start + 0.12, durationSeconds).toFixed(3))
+    if (end - start < 0.12) continue
+    candidateCuts.push({ start, end })
+  }
+  const cuts = mergeRanges(candidateCuts)
+  const prunedSeconds = Number(getRangesDurationSeconds(cuts).toFixed(3))
+  return { cuts, prunedSeconds }
+}
+
 const enrichWindowsWithCognitiveScores = ({
   windows,
   durationSeconds,
@@ -6494,23 +6982,98 @@ const buildBoredomRangesFromScores = (
   }
 }
 
+type BoredomEditAction = {
+  type: 'hard_cut' | 'micro_cut' | 'compress' | 'bridge'
+  start: number
+  end: number
+  score: number
+  reason: string
+}
+
+const getBoredomScoreForRange = (windows: EngagementWindow[], range: TimeRange) => (
+  clamp01(
+    averageWindowMetric(
+      windows,
+      range.start,
+      range.end,
+      (window) => (window.boredomScore ?? 0)
+    )
+  )
+)
+
+const buildMicroCutRangesFromSilences = ({
+  silences,
+  durationSeconds,
+  maxSilenceSeconds,
+  protectedRanges,
+  windows
+}: {
+  silences: TimeRange[]
+  durationSeconds: number
+  maxSilenceSeconds: number
+  protectedRanges: TimeRange[]
+  windows: EngagementWindow[]
+}): { ranges: TimeRange[]; actions: BoredomEditAction[] } => {
+  if (!silences.length || durationSeconds <= 0) return { ranges: [], actions: [] }
+  const safeMaxSilence = clamp(maxSilenceSeconds, 0.08, 0.45)
+  const ranges: TimeRange[] = []
+  const actions: BoredomEditAction[] = []
+  for (const silence of silences) {
+    const start = clamp(silence.start, 0, durationSeconds)
+    const end = clamp(silence.end, 0, durationSeconds)
+    const len = Math.max(0, end - start)
+    if (len <= safeMaxSilence + 0.015) continue
+    const removeDuration = len - safeMaxSilence
+    const trimStart = Number((start + (len - removeDuration) / 2).toFixed(3))
+    const trimEnd = Number((trimStart + removeDuration).toFixed(3))
+    const candidate = { start: trimStart, end: trimEnd }
+    if (candidate.end - candidate.start < 0.06) continue
+    if (protectedRanges.some((guard) => overlapsRange(candidate, guard))) continue
+    const boredomScore = getBoredomScoreForRange(windows, { start, end })
+    ranges.push(candidate)
+    actions.push({
+      type: 'micro_cut',
+      start: candidate.start,
+      end: candidate.end,
+      score: Number((boredomScore * 100).toFixed(2)),
+      reason: `Silence exceeded max ${safeMaxSilence.toFixed(2)}s threshold.`
+    })
+  }
+  return { ranges: mergeRanges(ranges), actions }
+}
+
 const applyBoredomModelToSegments = ({
   segments,
   windows,
   aggressionLevel,
-  hookRange
+  hookRange,
+  silences,
+  tuning
 }: {
   segments: Segment[]
   windows: EngagementWindow[]
   aggressionLevel: RetentionAggressionLevel
   hookRange: TimeRange | null
+  silences: TimeRange[]
+  tuning: LongFormRuntimeTuning
 }) => {
-  if (!segments.length || !windows.length) return { segments, removedRanges: [] as TimeRange[] }
+  if (!segments.length || !windows.length) {
+    return {
+      segments,
+      removedRanges: [] as TimeRange[],
+      compressedRanges: [] as TimeRange[],
+      actions: [] as BoredomEditAction[]
+    }
+  }
   const preset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
+  const candidateThreshold = tuning.isLongForm ? tuning.boredomCandidateThreshold : preset.boredomThreshold
+  const hardCutThreshold = tuning.isLongForm
+    ? Math.max(candidateThreshold + 0.08, tuning.boredomHardCutThreshold)
+    : Math.min(0.92, preset.boredomThreshold + 0.16)
   const boredom = buildBoredomRangesFromScores(
     windows,
-    preset.boredomThreshold,
-    Math.min(0.92, preset.boredomThreshold + 0.16)
+    candidateThreshold,
+    hardCutThreshold
   )
   const protectedRanges: TimeRange[] = []
   if (hookRange) protectedRanges.push(hookRange)
@@ -6522,18 +7085,98 @@ const applyBoredomModelToSegments = ({
       end: window.time + 1.2
     })
   }
-  const safeSevereCuts = boredom.severe.filter((range) => !protectedRanges.some((guard) => overlapsRange(range, guard)))
-  const afterCuts = safeSevereCuts.length ? subtractRanges(segments, safeSevereCuts) : segments.map((segment) => ({ ...segment }))
+  const severeForHardCut = boredom.severe
+    .filter((range) => range.end - range.start >= 1.5)
+    .filter((range) => !protectedRanges.some((guard) => overlapsRange(range, guard)))
+  const hardCutActions: BoredomEditAction[] = severeForHardCut.map((range) => ({
+    type: 'hard_cut',
+    start: Number(range.start.toFixed(3)),
+    end: Number(range.end.toFixed(3)),
+    score: Number((getBoredomScoreForRange(windows, range) * 100).toFixed(2)),
+    reason: 'Boredom score remained above hard-cut threshold for >1.5s.'
+  }))
+  const microCuts = buildMicroCutRangesFromSilences({
+    silences,
+    durationSeconds: Math.max(0, windows[windows.length - 1]?.time ?? 0) + 1,
+    maxSilenceSeconds: tuning.maxSilenceSeconds,
+    protectedRanges,
+    windows
+  })
+  const removedRanges = mergeRanges([
+    ...severeForHardCut,
+    ...microCuts.ranges
+  ])
+  const afterCuts = removedRanges.length
+    ? subtractRanges(segments, removedRanges)
+    : segments.map((segment) => ({ ...segment }))
+  const compressionThresholdByIntensity = tuning.compressionIntensity === 'heavy'
+    ? 0.22
+    : tuning.compressionIntensity === 'moderate'
+      ? 0.34
+      : 0.5
+  const compressedRanges: TimeRange[] = []
+  const compressActions: BoredomEditAction[] = []
   const spedUp = afterCuts.map((segment) => {
     const overlapMild = boredom.mild.some((range) => overlapsRange(range, { start: segment.start, end: segment.end }))
     if (!overlapMild) return { ...segment }
+    const segmentRange = { start: segment.start, end: segment.end }
+    const overlapDuration = boredom.mild.reduce((sum, range) => sum + getRangeOverlapSeconds(segmentRange, range), 0)
+    const overlapRatio = clamp01(overlapDuration / Math.max(0.1, segment.end - segment.start))
+    if (overlapRatio < compressionThresholdByIntensity) return { ...segment }
     const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
-    const targetSpeed = clamp(baseSpeed * (1.12 * preset.cutMultiplier), 1, aggressionLevel === 'viral' ? 1.62 : 1.45)
+    const overlapBoredom = getBoredomScoreForRange(windows, segmentRange)
+    const compressionNudge = 0.04 * clamp01(overlapRatio * 1.25) + 0.05 * clamp01(overlapBoredom)
+    const targetSpeed = clamp(
+      baseSpeed + compressionNudge * preset.cutMultiplier,
+      tuning.compressionSpeed.min,
+      tuning.compressionSpeed.max
+    )
+    if (targetSpeed <= baseSpeed + 0.01) return { ...segment }
+    compressedRanges.push({
+      start: Number(segment.start.toFixed(3)),
+      end: Number(segment.end.toFixed(3))
+    })
+    compressActions.push({
+      type: 'compress',
+      start: Number(segment.start.toFixed(3)),
+      end: Number(segment.end.toFixed(3)),
+      score: Number((overlapBoredom * 100).toFixed(2)),
+      reason: 'Content kept for context but compressed to remove pacing drag.'
+    })
     return { ...segment, speed: Number(targetSpeed.toFixed(3)) }
   })
+  const bridgeActions: BoredomEditAction[] = []
+  const bridged = spedUp.map((segment) => ({ ...segment }))
+  for (const removed of severeForHardCut) {
+    const previousIndex = bridged.findIndex((segment, index) => (
+      segment.end <= removed.start + 0.06 &&
+      (index === bridged.length - 1 || bridged[index + 1].start >= removed.end - 0.06)
+    ))
+    if (previousIndex < 0) continue
+    const nextIndex = previousIndex + 1
+    if (nextIndex >= bridged.length) continue
+    const prev = bridged[previousIndex]
+    const next = bridged[nextIndex]
+    prev.audioGain = Number(clamp((prev.audioGain ?? 1) + 0.03, 0.8, 1.24).toFixed(3))
+    next.audioGain = Number(clamp((next.audioGain ?? 1) + 0.02, 0.8, 1.24).toFixed(3))
+    bridgeActions.push({
+      type: 'bridge',
+      start: Number(removed.start.toFixed(3)),
+      end: Number(removed.end.toFixed(3)),
+      score: Number((getBoredomScoreForRange(windows, removed) * 100).toFixed(2)),
+      reason: 'Added transition bridge around hard-cut jump.'
+    })
+  }
   return {
-    segments: spedUp.filter((segment) => segment.end - segment.start > 0.18),
-    removedRanges: safeSevereCuts
+    segments: bridged.filter((segment) => segment.end - segment.start > 0.18),
+    removedRanges,
+    compressedRanges: mergeRanges(compressedRanges),
+    actions: [
+      ...microCuts.actions,
+      ...hardCutActions,
+      ...compressActions,
+      ...bridgeActions
+    ].slice(0, 220)
   }
 }
 
@@ -6642,13 +7285,18 @@ const enforceEndingSpike = ({
   return out
 }
 
-const detectSilences = async (filePath: string, durationSeconds: number) => {
+const detectSilences = async (
+  filePath: string,
+  durationSeconds: number,
+  minimumSilenceSeconds = SILENCE_MIN
+) => {
   if (!hasFfmpeg()) return [] as TimeRange[]
+  const silenceMinSeconds = Number(clamp(minimumSilenceSeconds, 0.08, 2).toFixed(3))
   const args = [
     '-hide_banner',
     '-nostdin',
     '-i', filePath,
-    '-af', `silencedetect=noise=${SILENCE_DB}dB:d=${SILENCE_MIN}`,
+    '-af', `silencedetect=noise=${SILENCE_DB}dB:d=${silenceMinSeconds}`,
     '-f', 'null',
     '-'
   ]
@@ -8006,18 +8654,39 @@ const buildRangesFromFlags = (flags: boolean[], minDurationSeconds = 1) => {
   return out
 }
 
-const buildSilenceTrimCuts = (silences: TimeRange[], durationSeconds: number, aggressiveMode = false) => {
+const buildSilenceTrimCuts = (
+  silences: TimeRange[],
+  durationSeconds: number,
+  aggressiveMode = false,
+  opts?: {
+    maxSilenceSeconds?: number | null
+    clarityVsSpeed?: number | null
+  }
+) => {
   if (!silences.length || durationSeconds <= 0) return [] as TimeRange[]
-  const keepPadding = aggressiveMode ? 0.08 : 0.12
-  const minTrim = aggressiveMode ? 0.22 : 0.28
+  const clarityVsSpeed = parseLongFormClarityVsSpeed(opts?.clarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const clarityWeight = clamp01(clarityVsSpeed / 100)
+  const keepPadding = clamp((aggressiveMode ? 0.06 : 0.1) + 0.05 * clarityWeight, 0.04, 0.2)
+  const maxSilenceSeconds = clamp(
+    Number.isFinite(Number(opts?.maxSilenceSeconds))
+      ? Number(opts?.maxSilenceSeconds)
+      : (aggressiveMode ? 0.18 : 0.28),
+    0.08,
+    0.45
+  )
+  const minTrim = clamp((aggressiveMode ? 0.08 : 0.12) + 0.08 * (1 - clarityWeight), 0.06, 0.26)
   const edgePadding = aggressiveMode ? 0.14 : 0.18
   const trims: TimeRange[] = []
   for (const silence of silences) {
     const rawStart = clamp(silence.start, 0, durationSeconds)
     const rawEnd = clamp(silence.end, 0, durationSeconds)
-    if (rawEnd - rawStart < SILENCE_MIN) continue
-    let start = rawStart + keepPadding
-    let end = rawEnd - keepPadding
+    const silenceDuration = rawEnd - rawStart
+    if (silenceDuration <= maxSilenceSeconds + 0.01) continue
+    const removeDuration = silenceDuration - maxSilenceSeconds
+    let start = rawStart + (silenceDuration - removeDuration) / 2
+    let end = start + removeDuration
+    start += keepPadding * 0.25
+    end -= keepPadding * 0.25
     if (start < edgePadding) start = edgePadding
     if (end > durationSeconds - edgePadding) end = durationSeconds - edgePadding
     if (end - start < minTrim) continue
@@ -8464,6 +9133,24 @@ const buildEditPlan = async (
     DEFAULT_EDIT_OPTIONS.retentionAggressionLevel
   )
   const aggressionPreset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
+  const longFormAggression = parseLongFormAggression(options.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(options.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const longFormPreset = parseLongFormPreset(
+    options.longFormPreset || resolveLongFormPresetByAggression(longFormAggression)
+  )
+  const tangentKiller = typeof options.tangentKiller === 'boolean'
+    ? options.tangentKiller
+    : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const longFormRuntimeTuning = resolveLongFormRuntimeTuning({
+    durationSeconds,
+    preset: longFormPreset,
+    aggression: longFormAggression,
+    clarityVsSpeed: longFormClarityVsSpeed,
+    tangentKiller
+  })
+  const silenceDetectionMinimum = longFormRuntimeTuning.isLongForm
+    ? clamp(longFormRuntimeTuning.maxSilenceSeconds * 0.85, 0.08, 0.45)
+    : SILENCE_MIN
   if (onStage) await onStage('cutting')
   // Run independent analysis tasks in parallel to save wall-clock time.
   const fastMode = Boolean(options.fastMode)
@@ -8471,7 +9158,7 @@ const buildEditPlan = async (
   const skipTextDensity = fastMode || ANALYSIS_DISABLE_TEXT_DENSITY
   const skipEmotionModel = fastMode || ANALYSIS_DISABLE_EMOTION_MODEL
   const tasks: Array<Promise<any>> = []
-  tasks.push(detectSilences(filePath, durationSeconds).catch(() => []))
+  tasks.push(detectSilences(filePath, durationSeconds, silenceDetectionMinimum).catch(() => []))
   tasks.push(detectAudioEnergy(filePath, durationSeconds).catch(() => []))
   tasks.push(detectSceneChanges(filePath, durationSeconds).catch(() => []))
   // Face detection can be skipped in fast mode to cut analysis latency.
@@ -8527,7 +9214,15 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel
   })
   const silenceTrimCuts = options.removeBoring
-    ? buildSilenceTrimCuts(silences, durationSeconds, options.aggressiveMode)
+    ? buildSilenceTrimCuts(
+        silences,
+        durationSeconds,
+        options.aggressiveMode,
+        {
+          maxSilenceSeconds: longFormRuntimeTuning.maxSilenceSeconds,
+          clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed
+        }
+      )
     : []
 
   const boringFlags = options.removeBoring
@@ -8539,8 +9234,21 @@ const buildEditPlan = async (
   const fallbackRemovedSegments = options.removeBoring && !detectedRemovedSegments.length
     ? buildStrategicFallbackCuts(windows, durationSeconds, options.aggressiveMode)
     : []
+  const redundancyCuts = options.removeBoring && longFormRuntimeTuning.isLongForm
+    ? buildTranscriptRedundancyCuts({
+        transcriptCues,
+        windows,
+        durationSeconds,
+        tangentKiller: longFormRuntimeTuning.tangentKiller,
+        clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
+        sentenceTightening: longFormRuntimeTuning.sentenceTightening
+      })
+    : { cuts: [] as TimeRange[], prunedSeconds: 0 }
   let contentRemovedCandidates = mergeRanges(
-    detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments
+    [
+      ...(detectedRemovedSegments.length ? detectedRemovedSegments : fallbackRemovedSegments),
+      ...redundancyCuts.cuts
+    ]
   )
   let candidateRemovedSegments = mergeRanges([
     ...contentRemovedCandidates,
@@ -8578,6 +9286,7 @@ const buildEditPlan = async (
     }
   }
   const compressedSegments: TimeRange[] = []
+  const redundancyPrunedSeconds = redundancyCuts.prunedSeconds
 
   const baseSegments = [{ start: 0, end: durationSeconds, speed: 1 }]
   const keepSegments = removedSegments.length ? subtractRanges(baseSegments, removedSegments) : baseSegments
@@ -8637,7 +9346,9 @@ const buildEditPlan = async (
     segments: speechBalancedSegments,
     windows,
     aggressionLevel: styleAdjustedAggressionLevel,
-    hookRange
+    hookRange,
+    silences,
+    tuning: longFormRuntimeTuning
   })
   const emotionalBeatAdjusted = applyEmotionalBeatCuts({
     segments: boredomApplied.segments,
@@ -8705,12 +9416,23 @@ const buildEditPlan = async (
         lowEnergyThreshold,
         maxSpeed: clamp(pacingProfile.speedCap + 0.04, 1.18, 1.34)
       })
-  const finalTimelineSegments = applyDurationBandSpeedTuning({
+  const durationBandSegments = applyDurationBandSpeedTuning({
     segments: autoEscalationResult.segments,
     windows,
     durationSeconds,
     editorMode: options.editorMode
   })
+  const pacingGoverned = applyPacingGovernor({
+    segments: durationBandSegments,
+    windows,
+    transcriptCues,
+    durationSeconds,
+    maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
+    maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds,
+    clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
+    enabled: longFormRuntimeTuning.isLongForm
+  })
+  const finalTimelineSegments = pacingGoverned.segments
   const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
   const totalPatternInterruptDensity = Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
@@ -8739,7 +9461,7 @@ const buildEditPlan = async (
     segments: finalTimelineSegments,
     silences,
     removedSegments: mergeRanges([...removedSegments, ...boredomApplied.removedRanges]),
-    compressedSegments,
+    compressedSegments: mergeRanges([...compressedSegments, ...(boredomApplied.compressedRanges ?? [])]),
     engagementWindows: windows
       .map((window) => ({
         ...window,
@@ -8748,9 +9470,12 @@ const buildEditPlan = async (
       })),
     hookCandidates: hookVariants,
     boredomRanges: boredomApplied.removedRanges,
+    boredomActions: boredomApplied.actions,
     patternInterruptCount: totalPatternInterruptCount,
     patternInterruptDensity: totalPatternInterruptDensity,
     boredomRemovedRatio: Number(clamp01(getRangesDurationSeconds(boredomApplied.removedRanges) / Math.max(0.1, durationSeconds)).toFixed(4)),
+    pacingGovernorAdjustments: pacingGoverned.adjustments,
+    redundancyPrunedSeconds,
     storyReorderMap: finalTimelineSegments.map((segment, orderedIndex) => ({
       sourceStart: Number(segment.start.toFixed(3)),
       sourceEnd: Number(segment.end.toFixed(3)),
@@ -9120,6 +9845,103 @@ const enforceLongFormComprehensionFloor = ({
     { start: contextStart, end: contextSeedEnd, speed: 1 }
   ].sort((left, right) => left.start - right.start || left.end - right.end)
   return seeded
+}
+
+const applyPacingGovernor = ({
+  segments,
+  windows,
+  transcriptCues,
+  durationSeconds,
+  maxGapSeconds,
+  maxTalkingHeadShotSeconds,
+  clarityVsSpeed,
+  enabled
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+  maxGapSeconds: number
+  maxTalkingHeadShotSeconds: number
+  clarityVsSpeed: number
+  enabled: boolean
+}) => {
+  if (!enabled || !segments.length || durationSeconds <= 0) {
+    return { segments: segments.map((segment) => ({ ...segment })), adjustments: 0 }
+  }
+  const maxSpan = clamp(
+    Math.min(maxGapSeconds, maxTalkingHeadShotSeconds),
+    2,
+    6.4
+  )
+  const clarityWeight = clamp01(clamp(clarityVsSpeed, 0, 100) / 100)
+  const maxSpeedCap = clamp(1.16 + 0.12 * (1 - clarityWeight), 1.12, 1.34)
+  let adjustments = 0
+  const governed: Segment[] = []
+  for (const segment of segments) {
+    const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
+    const runtime = Math.max(0.001, (segment.end - segment.start) / baseSpeed)
+    if (runtime <= maxSpan + 0.04) {
+      governed.push({ ...segment })
+      continue
+    }
+    const lowValue = averageWindowMetric(
+      windows,
+      segment.start,
+      segment.end,
+      (window) => (
+        0.5 * (window.boredomScore ?? 0) +
+        0.22 * (1 - window.speechIntensity) +
+        0.16 * (1 - (window.curiosityTrigger ?? 0)) +
+        0.12 * (1 - window.motionScore)
+      )
+    ) > 0.58
+    if (lowValue && baseSpeed < maxSpeedCap) {
+      const neededSpeed = (segment.end - segment.start) / maxSpan
+      const boosted = clamp(Math.max(baseSpeed, neededSpeed), 1, maxSpeedCap)
+      governed.push({ ...segment, speed: Number(boosted.toFixed(3)), emphasize: true })
+      adjustments += 1
+      continue
+    }
+    const meaningfulBoundaries = transcriptCues
+      .filter((cue) => cue.start > segment.start + 0.2 && cue.end < segment.end - 0.2)
+      .filter((cue) => (
+        cue.keywordIntensity >= 0.3 ||
+        cue.curiosityTrigger >= 0.3 ||
+        cue.fillerDensity <= 0.09
+      ))
+      .map((cue) => Number(cue.start.toFixed(3)))
+      .sort((a, b) => a - b)
+    const desiredPieces = Math.max(2, Math.ceil(runtime / maxSpan))
+    const forcedSpacing = (segment.end - segment.start) / desiredPieces
+    const splitPoints: number[] = []
+    for (let idx = 1; idx < desiredPieces; idx += 1) {
+      const target = segment.start + forcedSpacing * idx
+      const nearest = meaningfulBoundaries
+        .filter((point) => point > segment.start + 0.16 && point < segment.end - 0.16)
+        .sort((a, b) => Math.abs(a - target) - Math.abs(b - target))[0]
+      const chosen = Number(clamp(nearest ?? target, segment.start + 0.16, segment.end - 0.16).toFixed(3))
+      if (splitPoints.some((point) => Math.abs(point - chosen) < 0.14)) continue
+      splitPoints.push(chosen)
+    }
+    const boundaries = [segment.start, ...splitPoints.sort((a, b) => a - b), segment.end]
+    for (let idx = 0; idx < boundaries.length - 1; idx += 1) {
+      const start = Number(boundaries[idx].toFixed(3))
+      const end = Number(boundaries[idx + 1].toFixed(3))
+      if (end - start < 0.14) continue
+      governed.push({
+        ...segment,
+        start,
+        end,
+        emphasize: segment.emphasize || idx > 0
+      })
+    }
+    adjustments += 1
+  }
+  return {
+    segments: governed.filter((segment) => segment.end - segment.start > 0.12),
+    adjustments
+  }
 }
 
 const prepareSegmentsForRender = (segments: Segment[], durationSeconds: number) => {
@@ -9822,6 +10644,14 @@ const waitForPreferredHookSelection = async ({
     const status = String(snapshot.status || '').toLowerCase()
     if (status === 'failed' || status === 'completed') break
     const analysis = ((snapshot.analysis as any) || {}) as Record<string, any>
+    const hookSelectionMode = parseHookSelectionMode(
+      analysis.hook_selection_mode ??
+      analysis.hookSelectionMode ??
+      analysis.hook_mode ??
+      analysis.hookMode,
+      'manual'
+    )
+    if (hookSelectionMode === 'auto') return null
     const preferred = parsePreferredHookCandidateFromPayload(analysis.preferred_hook)
     const matched = matchPreferredHookCandidate({
       preferred,
@@ -11677,8 +12507,13 @@ const getEditOptionsForUser = async (
     onlyCuts?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
+    hookSelectionMode?: HookSelectionMode | null
     autoCaptions?: boolean | null
     subtitleStyle?: string | null
+    longFormPreset?: LongFormPreset | null
+    longFormAggression?: number | null
+    longFormClarityVsSpeed?: number | null
+    tangentKiller?: boolean | null
   }
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
@@ -11705,6 +12540,41 @@ const getEditOptionsForUser = async (
     (settings as any)?.editor_mode ??
     (settings as any)?.contentMode
   )
+  const hookSelectionMode = parseHookSelectionMode(
+    overrides?.hookSelectionMode ??
+    (settings as any)?.hookSelectionMode ??
+    (settings as any)?.hook_selection_mode,
+    'manual'
+  ) || 'manual'
+  const longFormAggression = parseLongFormAggression(
+    overrides?.longFormAggression ??
+    (settings as any)?.longFormAggression ??
+    (settings as any)?.longformAggression ??
+    (settings as any)?.long_form_aggression
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(
+    overrides?.longFormClarityVsSpeed ??
+    (settings as any)?.longFormClarityVsSpeed ??
+    (settings as any)?.longformClarityVsSpeed ??
+    (settings as any)?.long_form_clarity_vs_speed ??
+    (settings as any)?.clarityVsSpeed
+  ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const longFormPreset = parseLongFormPreset(
+    overrides?.longFormPreset ??
+    (settings as any)?.longFormPreset ??
+    (settings as any)?.longformPreset ??
+    (settings as any)?.longform_preset ??
+    resolveLongFormPresetByAggression(longFormAggression)
+  )
+  const tangentKiller = (
+    typeof overrides?.tangentKiller === 'boolean'
+      ? overrides.tangentKiller
+      : (
+        parseBooleanFlag((settings as any)?.tangentKiller) ??
+        parseBooleanFlag((settings as any)?.tangent_killer) ??
+        parseBooleanFlag((settings as any)?.removeTangents)
+      )
+  ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   const requestedStrategy = parseRetentionStrategyProfile(
     overrides?.retentionStrategyProfile ??
@@ -11741,7 +12611,12 @@ const getEditOptionsForUser = async (
     retentionAggressionLevel: allowedAggression,
     retentionStrategyProfile: allowedStrategy,
     maxCutsRequested,
-    editorMode
+    editorMode,
+    hookSelectionMode,
+    longFormPreset,
+    longFormAggression,
+    longFormClarityVsSpeed,
+    tangentKiller
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
@@ -12140,7 +13015,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       platformProfile: resolvedPlatformProfile,
       onlyCuts: options.onlyCuts,
       maxCuts: options.maxCutsRequested,
-      editorMode: options.editorMode
+      editorMode: options.editorMode,
+      longFormPreset: options.longFormPreset,
+      longFormAggression: options.longFormAggression,
+      longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+      tangentKiller: options.tangentKiller
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -12159,7 +13038,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         platformProfile: resolvedPlatformProfile,
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
-        editorMode: options.editorMode
+        editorMode: options.editorMode,
+        hookSelectionMode: options.hookSelectionMode,
+        longFormPreset: options.longFormPreset,
+        longFormAggression: options.longFormAggression,
+        longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+        tangentKiller: options.tangentKiller
       }),
       analysis: analysis
     })
@@ -12218,6 +13102,10 @@ const processJob = async (
   let platformProfileId = requestedPlatformProfileId
   const requestedEditorModeRaw = parseEditorModeSelection(options.editorMode ?? getEditorModeFromJob(job) ?? 'auto')
   let requestedEditorMode: EditorModeSelection | null = requestedEditorModeRaw
+  const requestedHookSelectionMode = parseHookSelectionMode(
+    options.hookSelectionMode ?? getHookSelectionModeFromJob(job),
+    'manual'
+  ) || 'manual'
   const outcomeMenuProfile = await loadOutcomeMenuProfile(user.id, {
     requestedStrategy: requestedStrategyProfile,
     requestedTargetPlatform: retentionTargetPlatform,
@@ -12262,6 +13150,8 @@ const processJob = async (
     }
   }
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
+  const hookSelectionModeForRender: HookSelectionMode = requestedHookSelectionMode
+  options.hookSelectionMode = hookSelectionModeForRender
   requestedAggressionLevel = parseRetentionAggressionLevel(
     STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel
   )
@@ -12389,6 +13279,17 @@ const processJob = async (
     strategyProfile = runtimeRetentionProfile.strategy
     aggressionLevel = runtimeRetentionProfile.aggression
     const runtimeRetentionNotes = runtimeRetentionProfile.notes
+    const longFormRuntimeTuning = resolveLongFormRuntimeTuning({
+      durationSeconds,
+      preset: parseLongFormPreset(
+        options.longFormPreset || resolveLongFormPresetByAggression(
+          parseLongFormAggression(options.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+        )
+      ),
+      aggression: parseLongFormAggression(options.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression,
+      clarityVsSpeed: parseLongFormClarityVsSpeed(options.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed,
+      tangentKiller: typeof options.tangentKiller === 'boolean' ? options.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+    })
 
     await ensureUsageWithinLimits(user.id, user.email, durationMinutes, tier, plan, renderConfig.mode)
 
@@ -12699,6 +13600,10 @@ const processJob = async (
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
         editorMode: editorModeForRender,
+        longFormPreset: options.longFormPreset,
+        longFormAggression: options.longFormAggression,
+        longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+        tangentKiller: options.tangentKiller,
         outputPaths
       })
 
@@ -12747,7 +13652,12 @@ const processJob = async (
           platformProfile: platformProfileId,
           onlyCuts: options.onlyCuts,
           maxCuts: options.maxCutsRequested,
-          editorMode: editorModeForRender
+          editorMode: editorModeForRender,
+          hookSelectionMode: options.hookSelectionMode,
+          longFormPreset: options.longFormPreset,
+          longFormAggression: options.longFormAggression,
+          longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+          tangentKiller: options.tangentKiller
         }),
         analysis: nextAnalysis
       })
@@ -12961,9 +13871,12 @@ const processJob = async (
         (job.analysis as any) ||
         {}
       ) as Record<string, any>
-      const preferredHookCandidateRaw =
-        options.preferredHookCandidate ||
-        parsePreferredHookCandidateFromPayload(latestAnalysisForHook.preferred_hook)
+      const preferredHookCandidateRaw = hookSelectionModeForRender === 'manual'
+        ? (
+            options.preferredHookCandidate ||
+            parsePreferredHookCandidateFromPayload(latestAnalysisForHook.preferred_hook)
+          )
+        : null
       const hookCandidatesFromStoredAnalysis = getHookCandidatesFromAnalysis(latestAnalysisForHook)
       const hookCandidates = (
         editPlan?.hookCandidates?.length
@@ -13027,7 +13940,7 @@ const processJob = async (
         preferredHookCandidate = preferredHookCandidateRaw
         optimizationNotes.push('Preferred hook did not map to regenerated candidates; using user-selected hook directly.')
       }
-      if (!preferredHookCandidate && hookCandidates.length > 1 && HOOK_SELECTION_WAIT_MS > 0) {
+      if (hookSelectionModeForRender === 'manual' && !preferredHookCandidate && hookCandidates.length > 1 && HOOK_SELECTION_WAIT_MS > 0) {
         const selectionWindowEndsAt = new Date(Date.now() + HOOK_SELECTION_WAIT_MS).toISOString()
         await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
           status: 'running',
@@ -13060,6 +13973,9 @@ const processJob = async (
           )
         }
         await updateJob(jobId, { status: 'story', progress: 55 })
+      }
+      if (hookSelectionModeForRender === 'auto') {
+        optimizationNotes.push('Auto hook mode enabled: editor-selected hook used for opening.')
       }
       const initialHook = preferredHookCandidate || resolvedHookDecision.candidate
       selectedHookSelectionSource = preferredHookCandidate
@@ -13096,6 +14012,7 @@ const processJob = async (
           threshold: resolvedHookDecision.threshold,
           usedFallback: resolvedHookDecision.usedFallback,
           reason: resolvedHookDecision.reason,
+          hookSelectionMode: hookSelectionModeForRender,
           hookSelectionSource: selectedHookSelectionSource,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4))
@@ -13311,12 +14228,23 @@ const processJob = async (
           durationSeconds,
           editorMode: editorModeForRender
         })
+        const pacingGovernedAttempt = applyPacingGovernor({
+          segments: runtimeBandAdjustedSegments,
+          windows: editPlan?.engagementWindows ?? [],
+          transcriptCues: [],
+          durationSeconds,
+          maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
+          maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds,
+          clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
+          enabled: longFormRuntimeTuning.isLongForm
+        })
+        const governedAttemptSegments = pacingGovernedAttempt.segments
         const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
-        const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(runtimeBandAdjustedSegments))
+        const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(governedAttemptSegments))
         return {
           hook: effectiveHookCandidate,
           hookRange,
-          segments: runtimeBandAdjustedSegments,
+          segments: governedAttemptSegments,
           autoEscalationEvents: autoEscalationResult.events,
           patternInterruptCount: totalPatternInterruptCount,
           patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
@@ -14386,6 +15314,8 @@ const processJob = async (
         hook_text: selectedHook?.text ?? (job.analysis as any)?.hook_text ?? null,
         hook_reason: selectedHook?.reason ?? (job.analysis as any)?.hook_reason ?? null,
         hook_synthetic: selectedHook?.synthetic ?? (job.analysis as any)?.hook_synthetic ?? false,
+        hookSelectionMode: hookSelectionModeForRender,
+        hook_selection_mode: hookSelectionModeForRender,
         hook_selection_source: selectedHookSelectionSource,
         selected_strategy: selectedStrategy,
         retention_attempts: retentionAttempts,
@@ -14468,6 +15398,11 @@ const processJob = async (
       onlyCuts: options.onlyCuts,
       maxCuts: options.maxCutsRequested,
       editorMode: editorModeForRender,
+      hookSelectionMode: hookSelectionModeForRender,
+      longFormPreset: options.longFormPreset,
+      longFormAggression: options.longFormAggression,
+      longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+      tangentKiller: options.tangentKiller,
       outputPaths
     })
 
@@ -14492,7 +15427,12 @@ const processJob = async (
         platformProfile: platformProfileId,
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
-        editorMode: editorModeForRender
+        editorMode: editorModeForRender,
+        hookSelectionMode: options.hookSelectionMode,
+        longFormPreset: options.longFormPreset,
+        longFormAggression: options.longFormAggression,
+        longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+        tangentKiller: options.tangentKiller
       }),
       analysis: nextAnalysis
     })
@@ -14546,6 +15486,11 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         onlyCuts: getOnlyCutsFromJob(existing),
         maxCuts: getMaxCutsFromJob(existing),
         editorMode: getEditorModeFromJob(existing),
+        hookSelectionMode: getHookSelectionModeFromJob(existing),
+        longFormPreset: getLongFormPresetFromJob(existing),
+        longFormAggression: getLongFormAggressionFromJob(existing),
+        longFormClarityVsSpeed: getLongFormClarityVsSpeedFromJob(existing),
+        tangentKiller: getTangentKillerFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       })
@@ -14889,6 +15834,11 @@ const handleCreateJob = async (req: any, res: any) => {
     const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
     const maxCutsOverride = getMaxCutsFromPayload(req.body)
     const editorModeOverride = getEditorModeFromPayload(req.body)
+    const hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
+    const longFormPresetOverride = getLongFormPresetFromPayload(req.body)
+    const longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
+    const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
+    const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -14981,7 +15931,12 @@ const handleCreateJob = async (req: any, res: any) => {
             platformProfile,
             onlyCuts: onlyCutsOverride,
             maxCuts: maxCutsOverride,
-            editorMode: editorModeOverride
+            editorMode: editorModeOverride,
+            hookSelectionMode: hookSelectionModeOverride,
+            longFormPreset: longFormPresetOverride,
+            longFormAggression: longFormAggressionOverride,
+            longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
+            tangentKiller: tangentKillerOverride
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
@@ -15009,7 +15964,12 @@ const handleCreateJob = async (req: any, res: any) => {
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride }),
             ...(maxCutsOverride === null ? {} : { maxCuts: maxCutsOverride, max_cuts: maxCutsOverride, maxCutsRequested: maxCutsOverride }),
-            ...(editorModeOverride === null ? {} : { editorMode: editorModeOverride, editor_mode: editorModeOverride, contentMode: editorModeOverride })
+            ...(editorModeOverride === null ? {} : { editorMode: editorModeOverride, editor_mode: editorModeOverride, contentMode: editorModeOverride }),
+            ...(hookSelectionModeOverride === null ? {} : { hookSelectionMode: hookSelectionModeOverride, hook_selection_mode: hookSelectionModeOverride }),
+            ...(longFormPresetOverride === null ? {} : { longFormPreset: longFormPresetOverride, longformPreset: longFormPresetOverride, longform_preset: longFormPresetOverride }),
+            ...(longFormAggressionOverride === null ? {} : { longFormAggression: longFormAggressionOverride, longformAggression: longFormAggressionOverride, long_form_aggression: longFormAggressionOverride }),
+            ...(longFormClarityVsSpeedOverride === null ? {} : { longFormClarityVsSpeed: longFormClarityVsSpeedOverride, longformClarityVsSpeed: longFormClarityVsSpeedOverride, long_form_clarity_vs_speed: longFormClarityVsSpeedOverride }),
+            ...(tangentKillerOverride === null ? {} : { tangentKiller: tangentKillerOverride, tangent_killer: tangentKillerOverride })
           },
           renderConfig,
           retentionTargetPlatform,
@@ -15017,6 +15977,11 @@ const handleCreateJob = async (req: any, res: any) => {
           onlyCuts: onlyCutsOverride,
           maxCuts: maxCutsOverride,
           editorMode: editorModeOverride,
+          hookSelectionMode: hookSelectionModeOverride,
+          longFormPreset: longFormPresetOverride,
+          longFormAggression: longFormAggressionOverride,
+          longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
+          tangentKiller: tangentKillerOverride,
           outputPaths: null
         })
       }
@@ -15426,9 +16391,19 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
     const maxCutsOverride = getMaxCutsFromPayload(req.body)
     const editorModeOverride = getEditorModeFromPayload(req.body)
+    const hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
+    const longFormPresetOverride = getLongFormPresetFromPayload(req.body)
+    const longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
+    const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
+    const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const resolvedEditorMode = editorModeOverride ?? getEditorModeFromJob(job)
+    const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
+    const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
+    const resolvedLongFormClarityVsSpeed = longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job)
+    const resolvedTangentKiller = tangentKillerOverride ?? getTangentKillerFromJob(job)
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -15466,9 +16441,22 @@ const handleCompleteUpload = async (req: any, res: any) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: resolvedHookSelectionMode,
+      hook_selection_mode: resolvedHookSelectionMode,
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
-      ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode })
+      ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
+      longFormPreset: resolvedLongFormPreset,
+      longformPreset: resolvedLongFormPreset,
+      longform_preset: resolvedLongFormPreset,
+      longFormAggression: resolvedLongFormAggression,
+      longformAggression: resolvedLongFormAggression,
+      long_form_aggression: resolvedLongFormAggression,
+      longFormClarityVsSpeed: resolvedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: resolvedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
+      tangentKiller: resolvedTangentKiller,
+      tangent_killer: resolvedTangentKiller
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -15483,12 +16471,25 @@ const handleCompleteUpload = async (req: any, res: any) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: resolvedHookSelectionMode,
+      hook_selection_mode: resolvedHookSelectionMode,
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
-      ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode })
+      ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
+      longFormPreset: resolvedLongFormPreset,
+      longformPreset: resolvedLongFormPreset,
+      longform_preset: resolvedLongFormPreset,
+      longFormAggression: resolvedLongFormAggression,
+      longformAggression: resolvedLongFormAggression,
+      long_form_aggression: resolvedLongFormAggression,
+      longFormClarityVsSpeed: resolvedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: resolvedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
+      tangentKiller: resolvedTangentKiller,
+      tangent_killer: resolvedTangentKiller
     }
 
     const { plan, tier } = await getUserPlan(req.user.id)
@@ -15564,6 +16565,11 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -15575,9 +16581,22 @@ router.post('/:id/analyze', async (req: any, res) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
-      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode })
+      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -15592,12 +16611,25 @@ router.post('/:id/analyze', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
-      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode })
+      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -15609,6 +16641,11 @@ router.post('/:id/analyze', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      hookSelectionMode: requestedHookSelectionMode,
+      longFormPreset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -15669,6 +16706,11 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -15680,9 +16722,22 @@ router.post('/:id/process', async (req: any, res) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
-      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode })
+      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -15697,12 +16752,25 @@ router.post('/:id/process', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
-      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode })
+      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -15714,6 +16782,11 @@ router.post('/:id/process', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      hookSelectionMode: requestedHookSelectionMode,
+      longFormPreset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     })
@@ -15723,17 +16796,21 @@ router.post('/:id/process', async (req: any, res) => {
     const preferredHookPayload = parsePreferredHookCandidateFromPayload(
       req.body?.preferredHook ?? req.body?.selectedHook
     )
-    const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
-    const preferredHookCandidate = matchPreferredHookCandidate({
-      preferred: preferredHookPayload,
-      candidates: availableHookCandidates
-    })
-    if (hasPreferredHookPayload && !preferredHookCandidate) {
-      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    let preferredHookCandidate: HookCandidate | null = null
+    if (requestedHookSelectionMode !== 'auto') {
+      const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
+      preferredHookCandidate = matchPreferredHookCandidate({
+        preferred: preferredHookPayload,
+        candidates: availableHookCandidates
+      })
+      if (hasPreferredHookPayload && !preferredHookCandidate) {
+        return res.status(400).json({ error: 'invalid_preferred_hook' })
+      }
     }
     if (preferredHookCandidate) {
       options.preferredHookCandidate = preferredHookCandidate
     }
+    options.hookSelectionMode = requestedHookSelectionMode
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
@@ -15926,6 +17003,11 @@ router.post('/:id/reprocess', async (req: any, res) => {
     )
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'manual'
+    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -15933,13 +17015,16 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const preferredHookPayload = parsePreferredHookCandidateFromPayload(
       req.body?.preferredHook ?? req.body?.selectedHook
     )
-    const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
-    const preferredHookCandidate = matchPreferredHookCandidate({
-      preferred: preferredHookPayload,
-      candidates: availableHookCandidates
-    })
-    if (hasPreferredHookPayload && !preferredHookCandidate) {
-      return res.status(400).json({ error: 'invalid_preferred_hook' })
+    let preferredHookCandidate: HookCandidate | null = null
+    if (requestedHookSelectionMode !== 'auto') {
+      const availableHookCandidates = getHookCandidatesFromAnalysis(job.analysis as any)
+      preferredHookCandidate = matchPreferredHookCandidate({
+        preferred: preferredHookPayload,
+        candidates: availableHookCandidates
+      })
+      if (hasPreferredHookPayload && !preferredHookCandidate) {
+        return res.status(400).json({ error: 'invalid_preferred_hook' })
+      }
     }
 
     const nextRenderSettings = {
@@ -15953,10 +17038,23 @@ router.post('/:id/reprocess', async (req: any, res) => {
       targetPlatform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
-      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode })
+      ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -15971,11 +17069,24 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platform: requestedTargetPlatform,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      hookSelectionMode: requestedHookSelectionMode,
+      hook_selection_mode: requestedHookSelectionMode,
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      longFormPreset: requestedLongFormPreset,
+      longformPreset: requestedLongFormPreset,
+      longform_preset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longformAggression: requestedLongFormAggression,
+      long_form_aggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      tangent_killer: requestedTangentKiller,
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
     }
