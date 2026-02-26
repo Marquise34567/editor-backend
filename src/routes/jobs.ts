@@ -3581,9 +3581,32 @@ const normalizeVerticalCaptionTextInput = (value: any): string => {
 }
 
 const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null => {
-  const normalized = normalizeSubtitlePreset(value)
-  if (normalized && VERTICAL_CAPTION_PRESETS.includes(normalized as VerticalCaptionPreset)) {
-    return normalized as VerticalCaptionPreset
+  const raw = String(value ?? '').trim().toLowerCase()
+  if (!raw) return null
+  const token = raw.split('::')[0].trim()
+  const compact = token.replace(/\s+/g, '_')
+  const aliases: Record<string, VerticalCaptionPreset> = {
+    basic_clean: 'basic_clean',
+    basic: 'basic_clean',
+    clean: 'basic_clean',
+    mrbeast_animated: 'mrbeast_animated',
+    mrbeast: 'mrbeast_animated',
+    beast: 'mrbeast_animated',
+    viral_beast: 'mrbeast_animated',
+    neon_glow: 'neon_glow',
+    neon: 'neon_glow',
+    bold_clean_box: 'bold_clean_box',
+    solid_box: 'bold_clean_box',
+    caption_box: 'bold_clean_box',
+    rage_mode: 'rage_mode',
+    rage: 'rage_mode',
+    ice_pop: 'ice_pop',
+    ice: 'ice_pop'
+  }
+  if (aliases[compact]) return aliases[compact]
+  const normalizedSubtitle = normalizeSubtitlePreset(token)
+  if (normalizedSubtitle && VERTICAL_CAPTION_PRESETS.includes(normalizedSubtitle as VerticalCaptionPreset)) {
+    return normalizedSubtitle as VerticalCaptionPreset
   }
   return null
 }
@@ -3860,28 +3883,159 @@ const resolveVerticalCaptionConfig = (
   defaults?: Partial<VerticalCaptionConfig>
 ): VerticalCaptionConfig => {
   const override = getVerticalCaptionConfigFromPayload(payload) || {}
+  const getPresetStyleDefaults = (preset: VerticalCaptionPreset) => {
+    if (preset === 'basic_clean') {
+      return {
+        fontId: 'sans_bold' as SubtitleFontId,
+        textColor: 'F8FAFC',
+        accentColor: 'F8FAFC',
+        outlineColor: '0F172A',
+        outlineWidth: 3,
+        shadowEnabled: false,
+        shadowColor: '020617',
+        shadowBlur: 0,
+        boxEnabled: true,
+        boxColor: '020617'
+      }
+    }
+    if (preset === 'neon_glow') {
+      return {
+        fontId: 'condensed' as SubtitleFontId,
+        textColor: '2DF6FF',
+        accentColor: 'FF4FD8',
+        outlineColor: '071E28',
+        outlineWidth: 6,
+        shadowEnabled: true,
+        shadowColor: '2DF6FF',
+        shadowBlur: 26,
+        boxEnabled: false,
+        boxColor: '0A0F1E'
+      }
+    }
+    if (preset === 'bold_clean_box') {
+      return {
+        fontId: 'sans_bold' as SubtitleFontId,
+        textColor: 'FFFFFF',
+        accentColor: 'FFE047',
+        outlineColor: '000000',
+        outlineWidth: 6,
+        shadowEnabled: true,
+        shadowColor: '000000',
+        shadowBlur: 10,
+        boxEnabled: true,
+        boxColor: '111827'
+      }
+    }
+    if (preset === 'rage_mode') {
+      return {
+        fontId: 'impact' as SubtitleFontId,
+        textColor: 'FF4D4D',
+        accentColor: 'FFD74A',
+        outlineColor: '1A0202',
+        outlineWidth: 14,
+        shadowEnabled: true,
+        shadowColor: '120000',
+        shadowBlur: 18,
+        boxEnabled: false,
+        boxColor: '240202'
+      }
+    }
+    if (preset === 'ice_pop') {
+      return {
+        fontId: 'condensed' as SubtitleFontId,
+        textColor: 'DDF6FF',
+        accentColor: '49DEFF',
+        outlineColor: '041426',
+        outlineWidth: 10,
+        shadowEnabled: true,
+        shadowColor: '49DEFF',
+        shadowBlur: 18,
+        boxEnabled: false,
+        boxColor: '041426'
+      }
+    }
+    return {
+      fontId: 'impact' as SubtitleFontId,
+      textColor: 'FFE500',
+      accentColor: 'FFF173',
+      outlineColor: '050505',
+      outlineWidth: 18,
+      shadowEnabled: true,
+      shadowColor: '050505',
+      shadowBlur: 8,
+      boxEnabled: false,
+      boxColor: '000000'
+    }
+  }
   const fallbackPreset = parseVerticalCaptionPreset(defaults?.preset) || 'mrbeast_animated'
+  const requestedPreset = parseVerticalCaptionPreset(override.preset)
+  const resolvedPreset = requestedPreset || fallbackPreset
+  const fallbackPresetStyle = getPresetStyleDefaults(fallbackPreset)
+  const fallbackStyle = {
+    fontId: parseVerticalCaptionFontId(defaults?.fontId) || fallbackPresetStyle.fontId,
+    textColor: parseVerticalCaptionHexColor(defaults?.textColor) || fallbackPresetStyle.textColor,
+    accentColor: parseVerticalCaptionHexColor(defaults?.accentColor) || fallbackPresetStyle.accentColor,
+    outlineColor: parseVerticalCaptionHexColor(defaults?.outlineColor) || fallbackPresetStyle.outlineColor,
+    outlineWidth: parseVerticalCaptionOutlineWidth(defaults?.outlineWidth) ?? fallbackPresetStyle.outlineWidth,
+    shadowEnabled: typeof defaults?.shadowEnabled === 'boolean' ? defaults.shadowEnabled : fallbackPresetStyle.shadowEnabled,
+    shadowColor: parseVerticalCaptionHexColor(defaults?.shadowColor) || fallbackPresetStyle.shadowColor,
+    shadowBlur: parseVerticalCaptionShadowBlur(defaults?.shadowBlur) ?? fallbackPresetStyle.shadowBlur,
+    boxEnabled: typeof defaults?.boxEnabled === 'boolean' ? defaults.boxEnabled : fallbackPresetStyle.boxEnabled,
+    boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor
+  }
+  const styleBaseline = requestedPreset && requestedPreset !== fallbackPreset
+    ? getPresetStyleDefaults(requestedPreset)
+    : fallbackStyle
   const fallbackFontSize = parseVerticalCaptionFontSize(defaults?.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
   const fallbackAutoGenerate = typeof defaults?.autoGenerate === 'boolean' ? defaults.autoGenerate : true
   const fallbackEnabled = typeof defaults?.enabled === 'boolean' ? defaults.enabled : true
   const fallbackText = normalizeVerticalCaptionTextInput(defaults?.text ?? '')
+  const fallbackPositionX = parseVerticalCaptionPosition(defaults?.positionX) ?? 0.5
+  const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? 0.84
 
   return {
     enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
     autoGenerate: typeof override.autoGenerate === 'boolean' ? override.autoGenerate : fallbackAutoGenerate,
-    preset: parseVerticalCaptionPreset(override.preset) || fallbackPreset,
+    preset: resolvedPreset,
+    fontId: parseVerticalCaptionFontId(override.fontId) || styleBaseline.fontId,
     fontSize: parseVerticalCaptionFontSize(override.fontSize) ?? fallbackFontSize,
-    text: typeof override.text === 'string' ? override.text : fallbackText
+    text: typeof override.text === 'string' ? override.text : fallbackText,
+    textColor: parseVerticalCaptionHexColor(override.textColor) || styleBaseline.textColor,
+    accentColor: parseVerticalCaptionHexColor(override.accentColor) || styleBaseline.accentColor,
+    outlineColor: parseVerticalCaptionHexColor(override.outlineColor) || styleBaseline.outlineColor,
+    outlineWidth: parseVerticalCaptionOutlineWidth(override.outlineWidth) ?? styleBaseline.outlineWidth,
+    shadowEnabled: typeof override.shadowEnabled === 'boolean' ? override.shadowEnabled : styleBaseline.shadowEnabled,
+    shadowColor: parseVerticalCaptionHexColor(override.shadowColor) || styleBaseline.shadowColor,
+    shadowBlur: parseVerticalCaptionShadowBlur(override.shadowBlur) ?? styleBaseline.shadowBlur,
+    boxEnabled: typeof override.boxEnabled === 'boolean' ? override.boxEnabled : styleBaseline.boxEnabled,
+    boxColor: parseVerticalCaptionHexColor(override.boxColor) || styleBaseline.boxColor,
+    positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
+    positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY
   }
 }
 
-const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => ({
-  enabled: true,
-  autoGenerate: true,
-  preset: 'mrbeast_animated',
-  fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
-  text: ''
-})
+const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
+  const preset = 'mrbeast_animated' as VerticalCaptionPreset
+  return resolveVerticalCaptionConfig({ preset }, {
+    enabled: true,
+    autoGenerate: true,
+    preset,
+    fontId: 'impact',
+    fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
+    text: '',
+    textColor: 'FFE500',
+    accentColor: 'FFF173',
+    outlineColor: '050505',
+    outlineWidth: 18,
+    shadowEnabled: true,
+    shadowColor: '050505',
+    shadowBlur: 8,
+    boxEnabled: false,
+    boxColor: '000000',
+    positionX: 0.5,
+    positionY: 0.84
+  })
+}
 
 const resolveVerticalCaptionConfigForState = ({
   analysis,
@@ -3902,23 +4056,49 @@ const resolveVerticalCaptionConfigForState = ({
 }
 
 const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) => {
+  const preset = parseVerticalCaptionPreset(config.preset) || 'mrbeast_animated'
+  const defaults = resolveVerticalCaptionConfig({ preset }, getDefaultVerticalCaptionConfig())
   const fontSize = parseVerticalCaptionFontSize(config.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
   const text = normalizeVerticalCaptionTextInput(config.text)
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
-    preset: parseVerticalCaptionPreset(config.preset) || 'mrbeast_animated',
+    preset,
+    fontId: parseVerticalCaptionFontId(config.fontId) || defaults.fontId,
     fontSize,
-    text
+    text,
+    textColor: parseVerticalCaptionHexColor(config.textColor) || defaults.textColor,
+    accentColor: parseVerticalCaptionHexColor(config.accentColor) || defaults.accentColor,
+    outlineColor: parseVerticalCaptionHexColor(config.outlineColor) || defaults.outlineColor,
+    outlineWidth: parseVerticalCaptionOutlineWidth(config.outlineWidth) ?? defaults.outlineWidth,
+    shadowEnabled: typeof config.shadowEnabled === 'boolean' ? config.shadowEnabled : defaults.shadowEnabled,
+    shadowColor: parseVerticalCaptionHexColor(config.shadowColor) || defaults.shadowColor,
+    shadowBlur: parseVerticalCaptionShadowBlur(config.shadowBlur) ?? defaults.shadowBlur,
+    boxEnabled: typeof config.boxEnabled === 'boolean' ? config.boxEnabled : defaults.boxEnabled,
+    boxColor: parseVerticalCaptionHexColor(config.boxColor) || defaults.boxColor,
+    positionX: parseVerticalCaptionPosition(config.positionX) ?? defaults.positionX,
+    positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY
   }
   return {
     verticalCaptions: {
       enabled: normalized.enabled,
       autoGenerate: normalized.autoGenerate,
       preset: normalized.preset,
+      fontId: normalized.fontId,
       fontSize,
       text,
-      captionText: text
+      captionText: text,
+      textColor: normalized.textColor,
+      accentColor: normalized.accentColor,
+      outlineColor: normalized.outlineColor,
+      outlineWidth: normalized.outlineWidth,
+      shadowEnabled: normalized.shadowEnabled,
+      shadowColor: normalized.shadowColor,
+      shadowBlur: normalized.shadowBlur,
+      boxEnabled: normalized.boxEnabled,
+      boxColor: normalized.boxColor,
+      positionX: normalized.positionX,
+      positionY: normalized.positionY
     },
     verticalCaptionEnabled: normalized.enabled,
     vertical_caption_enabled: normalized.enabled,
@@ -3926,10 +4106,34 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     vertical_caption_auto_generate: normalized.autoGenerate,
     verticalCaptionPreset: normalized.preset,
     vertical_caption_preset: normalized.preset,
+    verticalCaptionFontId: normalized.fontId,
+    vertical_caption_font_id: normalized.fontId,
     verticalCaptionFontSize: fontSize,
     vertical_caption_font_size: fontSize,
     verticalCaptionText: text,
-    vertical_caption_text: text
+    vertical_caption_text: text,
+    verticalCaptionTextColor: normalized.textColor,
+    vertical_caption_text_color: normalized.textColor,
+    verticalCaptionAccentColor: normalized.accentColor,
+    vertical_caption_accent_color: normalized.accentColor,
+    verticalCaptionOutlineColor: normalized.outlineColor,
+    vertical_caption_outline_color: normalized.outlineColor,
+    verticalCaptionOutlineWidth: normalized.outlineWidth,
+    vertical_caption_outline_width: normalized.outlineWidth,
+    verticalCaptionShadowEnabled: normalized.shadowEnabled,
+    vertical_caption_shadow_enabled: normalized.shadowEnabled,
+    verticalCaptionShadowColor: normalized.shadowColor,
+    vertical_caption_shadow_color: normalized.shadowColor,
+    verticalCaptionShadowBlur: normalized.shadowBlur,
+    vertical_caption_shadow_blur: normalized.shadowBlur,
+    verticalCaptionBoxEnabled: normalized.boxEnabled,
+    vertical_caption_box_enabled: normalized.boxEnabled,
+    verticalCaptionBoxColor: normalized.boxColor,
+    vertical_caption_box_color: normalized.boxColor,
+    verticalCaptionPositionX: normalized.positionX,
+    vertical_caption_position_x: normalized.positionX,
+    verticalCaptionPositionY: normalized.positionY,
+    vertical_caption_position_y: normalized.positionY
   }
 }
 
@@ -7702,10 +7906,12 @@ const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯', '⚡']
 const VIRAL_KEYWORD_PATTERN = /\b(crazy|insane|what|no way|can't believe|cant believe|bro|wild|shocking|wtf)\b/i
 
 const sanitizeCaptionPhrase = (value: string) => (
-  String(value || '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 84)
+  normalizeVerticalCaptionPhraseInput(
+    String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 84)
+  )
 )
 
 const splitVerticalCaptionPhrases = (rawText: string): string[] => {
@@ -12210,44 +12416,176 @@ const buildMrBeastAnimatedAss = ({
 
 const buildVerticalCaptionSubtitleStyle = ({
   preset,
+  fontId,
   fontSize,
+  textColor,
+  accentColor,
+  outlineColor,
+  outlineWidth,
   fallbackStyle
 }: {
   preset: VerticalCaptionPreset
+  fontId?: SubtitleFontId | null
   fontSize: number | null
+  textColor?: string | null
+  accentColor?: string | null
+  outlineColor?: string | null
+  outlineWidth?: number | null
   fallbackStyle?: string | null
 }) => {
   const resolvedFontSize = parseVerticalCaptionFontSize(fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
-  if (preset === 'basic_clean') {
-    return 'basic_clean'
-  }
-
-  if (preset === 'neon_glow') {
-    const fallback = parseSubtitleStyleConfig(fallbackStyle)
-    const base = fallback.preset === 'neon_glow' ? fallback : parseSubtitleStyleConfig('neon_glow')
-    return serializeSubtitleStyleConfig({
-      ...base,
-      preset: 'neon_glow',
-      fontSize: resolvedFontSize,
-      textColor: base.textColor || '00FFFF',
-      accentColor: base.accentColor || 'FF00FF',
-      outlineColor: base.outlineColor || '101018',
-      outlineWidth: Math.max(2, Math.min(10, Number(base.outlineWidth || 4))),
-      animation: 'pop'
-    })
-  }
-
+  const prefersNeonBase = preset === 'neon_glow' || preset === 'ice_pop'
+  const stylePreset = prefersNeonBase ? 'neon_glow' : 'mrbeast_animated'
   const fallback = parseSubtitleStyleConfig(fallbackStyle)
-  const base = fallback.preset === 'mrbeast_animated' ? fallback : parseSubtitleStyleConfig('mrbeast_animated')
+  const base = fallback.preset === stylePreset ? fallback : parseSubtitleStyleConfig(stylePreset)
+  const defaultStyleByPreset = (() => {
+    if (preset === 'basic_clean') {
+      return {
+        textColor: 'F8FAFC',
+        accentColor: 'F8FAFC',
+        outlineColor: '0F172A',
+        outlineWidth: 3,
+        animation: 'none' as const
+      }
+    }
+    if (preset === 'neon_glow') {
+      return {
+        textColor: '2DF6FF',
+        accentColor: 'FF4FD8',
+        outlineColor: '071E28',
+        outlineWidth: 6,
+        animation: 'pop' as const
+      }
+    }
+    if (preset === 'bold_clean_box') {
+      return {
+        textColor: 'FFFFFF',
+        accentColor: 'FFE047',
+        outlineColor: '000000',
+        outlineWidth: 6,
+        animation: 'none' as const
+      }
+    }
+    if (preset === 'rage_mode') {
+      return {
+        textColor: 'FF4D4D',
+        accentColor: 'FFD74A',
+        outlineColor: '1A0202',
+        outlineWidth: 14,
+        animation: 'pop' as const
+      }
+    }
+    if (preset === 'ice_pop') {
+      return {
+        textColor: 'DDF6FF',
+        accentColor: '49DEFF',
+        outlineColor: '041426',
+        outlineWidth: 10,
+        animation: 'pop' as const
+      }
+    }
+    return {
+      textColor: 'FFE500',
+      accentColor: 'FFF173',
+      outlineColor: '050505',
+      outlineWidth: 18,
+      animation: 'pop' as const
+    }
+  })()
+  const resolvedFontId = parseVerticalCaptionFontId(fontId) || base.fontId
+  const resolvedTextColor = parseVerticalCaptionHexColor(textColor) || defaultStyleByPreset.textColor
+  const resolvedAccentColor = parseVerticalCaptionHexColor(accentColor) || defaultStyleByPreset.accentColor
+  const resolvedOutlineColor = parseVerticalCaptionHexColor(outlineColor) || defaultStyleByPreset.outlineColor
+  const resolvedOutlineWidth = parseVerticalCaptionOutlineWidth(outlineWidth) ?? defaultStyleByPreset.outlineWidth
   return serializeSubtitleStyleConfig({
     ...base,
-    preset: 'mrbeast_animated',
+    preset: stylePreset,
+    fontId: resolvedFontId,
     fontSize: resolvedFontSize,
-    textColor: base.textColor || 'FFFF00',
-    outlineColor: base.outlineColor || '000000',
-    outlineWidth: Math.max(12, Math.min(24, Number(base.outlineWidth || 20))),
-    animation: 'pop'
+    textColor: resolvedTextColor,
+    accentColor: resolvedAccentColor,
+    outlineColor: resolvedOutlineColor,
+    outlineWidth: Math.max(1, Math.min(24, resolvedOutlineWidth || 1)),
+    animation: defaultStyleByPreset.animation
   })
+}
+
+const toAssColorFromHexWithAlpha = (value?: string | null, alpha = 0x00) => {
+  const compact = String(value || '').trim().replace(/^#/, '').toUpperCase()
+  const normalized = /^[0-9A-F]{6}$/.test(compact) ? compact : '000000'
+  const rr = normalized.slice(0, 2)
+  const gg = normalized.slice(2, 4)
+  const bb = normalized.slice(4, 6)
+  const aa = Math.max(0, Math.min(255, Math.round(alpha)))
+  return `&H${aa.toString(16).padStart(2, '0').toUpperCase()}${bb}${gg}${rr}`
+}
+
+const buildVerticalCaptionAss = ({
+  cues,
+  workingDir,
+  basename,
+  style,
+  config
+}: {
+  cues: TranscriptCue[]
+  workingDir: string
+  basename: string
+  style?: string | null
+  config: VerticalCaptionConfig
+}) => {
+  if (!Array.isArray(cues) || !cues.length) return null
+  const styleConfig = parseSubtitleStyleConfig(style)
+  const fontName = resolveSubtitleFontName(config.fontId || styleConfig.fontId)
+  const fontSize = Math.max(30, Math.min(220, Math.round(Number(config.fontSize || styleConfig.fontSize || 96))))
+  const primaryColor = toAssColorFromHex(config.textColor || styleConfig.textColor)
+  const secondaryColor = toAssColorFromHex(config.accentColor || styleConfig.accentColor)
+  const outlineColor = toAssColorFromHex(config.outlineColor || styleConfig.outlineColor)
+  const outlineWidth = Math.max(0, Math.min(24, Math.round(Number(config.outlineWidth ?? styleConfig.outlineWidth ?? 6))))
+  const shadowBlur = Math.max(0, Math.min(12, Number((Number(config.shadowBlur || 0) / 5).toFixed(2))))
+  const shadowEnabled = Boolean(config.shadowEnabled && shadowBlur > 0)
+  const boxEnabled = Boolean(config.boxEnabled)
+  const boxColor = toAssColorFromHexWithAlpha(config.boxColor || '000000', 0)
+  const shadowColor = toAssColorFromHexWithAlpha(config.shadowColor || '000000', 0)
+  const borderStyle = boxEnabled ? 3 : 1
+  const backColor = boxEnabled ? boxColor : shadowColor
+  const posX = Math.round(clamp(config.positionX || 0.5, 0.02, 0.98) * 1080)
+  const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
+  const usePop = config.preset !== 'basic_clean' && config.preset !== 'bold_clean_box'
+  const useUppercase = config.preset !== 'basic_clean' && config.preset !== 'bold_clean_box'
+  const assLines: string[] = [
+    '[Script Info]',
+    'ScriptType: v4.00+',
+    'PlayResX: 1080',
+    'PlayResY: 1920',
+    'WrapStyle: 2',
+    'ScaledBorderAndShadow: yes',
+    '',
+    '[V4+ Styles]',
+    'Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding',
+    `Style: Viral,${fontName},${fontSize},${primaryColor},${secondaryColor},${outlineColor},${backColor},-1,0,0,0,100,100,1,0,${borderStyle},${outlineWidth},${shadowEnabled ? shadowBlur : 0},5,20,20,20,1`,
+    '',
+    '[Events]',
+    'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text'
+  ]
+
+  for (const cue of cues) {
+    const start = Number.isFinite(cue.start) ? cue.start : 0
+    const end = Number.isFinite(cue.end) ? cue.end : start + 0.8
+    if (end <= start + 0.03) continue
+    const phrase = sanitizeCaptionPhrase(String(cue.text || ''))
+    if (!phrase) continue
+    const text = escapeAssDialogueText(useUppercase ? phrase.toUpperCase() : phrase)
+    const animationTag = usePop
+      ? `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,120,\\fscx100\\fscy100)}`
+      : `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
+    assLines.push(
+      `Dialogue: 0,${toAssTimestamp(start)},${toAssTimestamp(end)},Viral,,0,0,0,,${animationTag}${text}`
+    )
+  }
+  if (assLines.length <= 13) return null
+  const assPath = path.join(workingDir, `${basename}.ass`)
+  fs.writeFileSync(assPath, assLines.join('\n'))
+  return assPath
 }
 
 const buildSubtitleStyle = (style?: string | null) => {
@@ -16402,7 +16740,12 @@ const processJob = async (
       const shouldApplyVerticalCaptionOverlays = Boolean(verticalCaptionConfig.enabled)
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
         preset: verticalCaptionConfig.preset,
+        fontId: verticalCaptionConfig.fontId,
         fontSize: verticalCaptionConfig.fontSize,
+        textColor: verticalCaptionConfig.textColor,
+        accentColor: verticalCaptionConfig.accentColor,
+        outlineColor: verticalCaptionConfig.outlineColor,
+        outlineWidth: verticalCaptionConfig.outlineWidth,
         fallbackStyle: subtitleStyle
       })
       await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: false })
@@ -16503,7 +16846,7 @@ const processJob = async (
 
         const clipOverlayCues = overlaysToTranscriptCues(clipCaptionOverlays)
         const clipCueLayers: TranscriptCue[][] = []
-        if (options.autoCaptions && verticalSourceCues.length) {
+        if (options.autoCaptions && verticalSourceCues.length && !shouldApplyVerticalCaptionOverlays) {
           const remappedClipCues = remapTranscriptCuesToEditedTimeline(verticalSourceCues, [clipSegment])
           if (remappedClipCues.length) {
             clipCueLayers.push(remappedClipCues)
@@ -16515,19 +16858,39 @@ const processJob = async (
         }
         const mergedClipCues = mergeTranscriptCueLayers(clipCueLayers)
         if (mergedClipCues.length) {
-          const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
-          const writtenClipSrt = writeTranscriptCuesToSrt(mergedClipCues, clipSrtPath)
-          if (writtenClipSrt) {
-            clipSubtitlePath = writtenClipSrt
-            if (normalizeSubtitlePreset(clipSubtitleStyle) === 'mrbeast_animated') {
-              const clipAssPath = buildMrBeastAnimatedAss({
-                srtPath: clipSubtitlePath,
-                workingDir: workDir,
-                style: clipSubtitleStyle
-              })
-              if (clipAssPath) {
-                clipSubtitlePath = clipAssPath
-                clipSubtitleIsAss = true
+          if (clipOverlayCues.length && shouldApplyVerticalCaptionOverlays) {
+            const clipAssPath = buildVerticalCaptionAss({
+              cues: mergedClipCues,
+              workingDir: workDir,
+              basename: `vertical-clip-${idx + 1}-captions`,
+              style: clipSubtitleStyle,
+              config: verticalCaptionConfig
+            })
+            if (clipAssPath) {
+              clipSubtitlePath = clipAssPath
+              clipSubtitleIsAss = true
+            } else {
+              const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
+              const writtenClipSrt = writeTranscriptCuesToSrt(mergedClipCues, clipSrtPath)
+              if (writtenClipSrt) {
+                clipSubtitlePath = writtenClipSrt
+              }
+            }
+          } else {
+            const clipSrtPath = path.join(workDir, `vertical-clip-${idx + 1}-captions.srt`)
+            const writtenClipSrt = writeTranscriptCuesToSrt(mergedClipCues, clipSrtPath)
+            if (writtenClipSrt) {
+              clipSubtitlePath = writtenClipSrt
+              if (normalizeSubtitlePreset(clipSubtitleStyle) === 'mrbeast_animated') {
+                const clipAssPath = buildMrBeastAnimatedAss({
+                  srtPath: clipSubtitlePath,
+                  workingDir: workDir,
+                  style: clipSubtitleStyle
+                })
+                if (clipAssPath) {
+                  clipSubtitlePath = clipAssPath
+                  clipSubtitleIsAss = true
+                }
               }
             }
           }
@@ -20075,7 +20438,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
-    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -20103,7 +20466,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(analyzeRequestedFastMode === null ? {} : { fastMode: analyzeRequestedFastMode, fast_mode: analyzeRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -20140,7 +20503,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(analyzeRequestedFastMode === null ? {} : { fastMode: analyzeRequestedFastMode, fast_mode: analyzeRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -20158,7 +20521,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      fastMode: requestedFastMode,
+      fastMode: analyzeRequestedFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -20167,8 +20530,8 @@ router.post('/:id/analyze', async (req: any, res) => {
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
-    if (requestedFastMode !== null) {
-      options.fastMode = requestedFastMode
+    if (analyzeRequestedFastMode !== null) {
+      options.fastMode = analyzeRequestedFastMode
     }
     const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
@@ -20231,7 +20594,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
-    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -20259,7 +20622,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(processRequestedFastMode === null ? {} : { fastMode: processRequestedFastMode, fast_mode: processRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -20296,7 +20659,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(processRequestedFastMode === null ? {} : { fastMode: processRequestedFastMode, fast_mode: processRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -20314,7 +20677,7 @@ router.post('/:id/process', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      fastMode: requestedFastMode,
+      fastMode: processRequestedFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -20345,8 +20708,8 @@ router.post('/:id/process', async (req: any, res) => {
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
     // Allow client to override fast-mode for this run.
-    if (requestedFastMode !== null) {
-      options.fastMode = requestedFastMode
+    if (processRequestedFastMode !== null) {
+      options.fastMode = processRequestedFastMode
     }
     await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
@@ -20583,7 +20946,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
-    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const reprocessRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -20635,7 +20998,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(reprocessRequestedFastMode === null ? {} : { fastMode: reprocessRequestedFastMode, fast_mode: reprocessRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     const nextAnalysis = {
@@ -20673,7 +21036,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode }),
+      ...(reprocessRequestedFastMode === null ? {} : { fastMode: reprocessRequestedFastMode, fast_mode: reprocessRequestedFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
