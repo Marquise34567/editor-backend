@@ -17,6 +17,16 @@ if (!secretKey || String(secretKey).includes('placeholder')) {
 export const stripe = stripeClient
 export const isStripeEnabled = () => !useMock && !!stripeClient
 
+const normalizeStatementDescriptor = (value?: string | null) => {
+  const raw = String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9 ]+/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!raw) return undefined
+  return raw.slice(0, 22)
+}
+
 export const createCheckoutSession = async (args: {
   customerId?: string | null
   customerEmail?: string | null
@@ -25,6 +35,8 @@ export const createCheckoutSession = async (args: {
   cancelUrl: string
   mode?: 'subscription' | 'payment'
   metadata?: Record<string,string>
+  allowPromotionCodes?: boolean
+  statementDescriptor?: string
 }) => {
   if (useMock) {
     return { id: `sess_${Math.random().toString(36).slice(2,9)}`, url: `${args.successUrl}?mock_session=1` }
@@ -33,7 +45,7 @@ export const createCheckoutSession = async (args: {
     throw new Error('missing_price_id')
   }
   const mode = args.mode || 'subscription'
-  const session = await stripeClient.checkout.sessions.create({
+  const sessionPayload: Record<string, any> = {
     mode,
     payment_method_types: ['card'],
     customer: args.customerId ?? undefined,
@@ -42,7 +54,17 @@ export const createCheckoutSession = async (args: {
     success_url: args.successUrl,
     cancel_url: args.cancelUrl,
     metadata: args.metadata,
-  })
+  }
+  if (typeof args.allowPromotionCodes === 'boolean') {
+    sessionPayload.allow_promotion_codes = args.allowPromotionCodes
+  }
+  if (mode === 'payment') {
+    const statementDescriptor = normalizeStatementDescriptor(args.statementDescriptor)
+    if (statementDescriptor) {
+      sessionPayload.payment_intent_data = { statement_descriptor: statementDescriptor }
+    }
+  }
+  const session = await stripeClient.checkout.sessions.create(sessionPayload)
   return session
 }
 

@@ -7,6 +7,13 @@ import { type PlanTier } from '../shared/planConfig'
 import { resolvePlanFromPriceId } from '../lib/stripePlans'
 
 const env = getEnv()
+const DEFAULT_APP_URL = 'https://www.autoeditor.app'
+
+const trimTrailingSlash = (value: string) => value.replace(/\/+$/, '')
+const resolveAppBaseUrl = () =>
+  trimTrailingSlash(process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || DEFAULT_APP_URL)
+
+const getCheckoutMode = (tier: PlanTier) => (tier === 'founder' ? 'payment' : 'subscription')
 
 export const ensureStripeCustomer = async (userId: string, email?: string | null) => {
   const user = await getOrCreateUser(userId, email)
@@ -86,16 +93,19 @@ export const createCheckoutUrlForUser = async (
 ) => {
   const priceId = await resolveCheckoutPriceId(tier, interval, useTrial)
   if (!priceId) return null
-  const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
+  const baseUrl = resolveAppBaseUrl()
   const customerId = await ensureStripeCustomer(userId, email)
-  const mode = tier === 'founder' ? 'payment' : 'subscription'
+  const mode = getCheckoutMode(tier)
+  const successUrl = `${baseUrl}/editor?success=true&tier=${encodeURIComponent(tier)}&session_id={CHECKOUT_SESSION_ID}`
   const session = await createCheckoutSession({
     customerId,
     customerEmail: email,
     priceId,
     mode,
-    successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+    successUrl,
     cancelUrl: `${baseUrl}/pricing`,
+    allowPromotionCodes: mode === 'subscription',
+    statementDescriptor: mode === 'payment' ? 'AUTOEDITOR' : undefined,
     metadata: { userId, plan: tier, planType: tier, interval, trial: useTrial ? 'true' : 'false' }
   })
   return session?.url ?? null
@@ -108,16 +118,19 @@ export const createCheckoutUrlForPrice = async (
 ) => {
   const plan = resolvePlanFromPriceId(priceId)
   if (!plan || plan === 'free') return null
-  const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000'
+  const baseUrl = resolveAppBaseUrl()
   const customerId = await ensureStripeCustomer(userId, email)
-  const mode = plan === 'founder' ? 'payment' : 'subscription'
+  const mode = getCheckoutMode(plan)
+  const successUrl = `${baseUrl}/editor?success=true&tier=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}`
   const session = await createCheckoutSession({
     customerId,
     customerEmail: email,
     priceId,
     mode,
-    successUrl: `${baseUrl}/billing/success?session_id={CHECKOUT_SESSION_ID}`,
+    successUrl,
     cancelUrl: `${baseUrl}/pricing`,
+    allowPromotionCodes: mode === 'subscription',
+    statementDescriptor: mode === 'payment' ? 'AUTOEDITOR' : undefined,
     metadata: { userId, plan, planType: plan }
   })
   return session?.url ?? null
@@ -126,7 +139,7 @@ export const createCheckoutUrlForPrice = async (
 export const createPortalUrlForUser = async (userId: string) => {
   const user = await prisma.user.findUnique({ where: { id: userId } })
   if (!user?.stripeCustomerId) return null
-  const returnUrl = process.env.APP_URL || process.env.FRONTEND_URL || env.FRONTEND_URL || 'http://localhost:3000/'
+  const returnUrl = `${resolveAppBaseUrl()}/`
   const session = await createPortalSession(user.stripeCustomerId, returnUrl)
   return session?.url ?? null
 }
