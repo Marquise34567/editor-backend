@@ -13,6 +13,7 @@ import {
 } from '../lib/planFeatures'
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
 import { getCaptionEngineStatus } from '../lib/captionEngine'
+import { resolveDevAdminAccess } from '../lib/devAccounts'
 
 const router = express.Router()
 
@@ -75,7 +76,9 @@ router.get('/', async (req: any, res) => {
 
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
-    const features = getPlanFeatures(tier)
+    const devAccess = await resolveDevAdminAccess(userId, req.user?.email)
+    const effectiveTier = devAccess.emailAuthorized ? 'studio' : tier
+    const features = getPlanFeatures(effectiveTier)
     const subtitlesEnabled = features.subtitles.enabled
     let settings = await prisma.userSettings.findUnique({ where: { userId } })
 
@@ -107,11 +110,11 @@ router.get('/', async (req: any, res) => {
       }
     }
 
-    const normalizedQuality = clampQualityForTier(normalizeQuality(settings?.exportQuality), tier)
+    const normalizedQuality = clampQualityForTier(normalizeQuality(settings?.exportQuality), effectiveTier)
     const rawSubtitle = settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET
     const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
     const enforcedSubtitle =
-      subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+      subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, effectiveTier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
     const enforcedAutoZoomMax = coerceAutoZoomMax(settings?.autoZoomMax ?? features.autoZoomMax, features.autoZoomMax)
     const enforced = {
       userId,
@@ -146,7 +149,9 @@ router.patch('/', async (req: any, res) => {
     const capabilities = getCaptionCapabilities()
     await getOrCreateUser(userId, req.user?.email)
     const { tier } = await getUserPlan(userId)
-    const features = getPlanFeatures(tier)
+    const devAccess = await resolveDevAdminAccess(userId, req.user?.email)
+    const effectiveTier = devAccess.emailAuthorized ? 'studio' : tier
+    const features = getPlanFeatures(effectiveTier)
     const subtitlesEnabled = features.subtitles.enabled
     const existing = await prisma.userSettings.findUnique({ where: { userId } })
     const requestedQuality = payload.exportQuality ? normalizeQuality(payload.exportQuality) : normalizeQuality(existing?.exportQuality)
@@ -158,14 +163,14 @@ router.patch('/', async (req: any, res) => {
     if (features.watermark && payload.watermarkEnabled === false) {
       return sendPlanLimit(res, 'starter', 'watermark', 'Upgrade to remove watermark')
     }
-    if (payload.exportQuality && requestedQuality !== clampQualityForTier(requestedQuality, tier)) {
+    if (payload.exportQuality && requestedQuality !== clampQualityForTier(requestedQuality, effectiveTier)) {
       const requiredPlan = getRequiredPlanForQuality(requestedQuality)
       return sendPlanLimit(res, requiredPlan, 'quality', 'Upgrade to export higher quality')
     }
     if (payload.subtitleStyle && !requestedSubtitle) {
       return res.status(400).json({ error: 'invalid_subtitle_preset' })
     }
-    if (subtitlesEnabled && payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, tier)) {
+    if (subtitlesEnabled && payload.subtitleStyle && !isSubtitlePresetAllowed(requestedSubtitle, effectiveTier)) {
       const requiredPlan = getRequiredPlanForSubtitlePreset(requestedSubtitle)
       return sendPlanLimit(res, requiredPlan, 'subtitles', 'Upgrade to unlock subtitle styles')
     }
@@ -183,7 +188,7 @@ router.patch('/', async (req: any, res) => {
     const sanitizedAutoZoom = coerceAutoZoomMax(nextAutoZoom, features.autoZoomMax)
     const sanitized = {
       watermarkEnabled: features.watermark,
-      exportQuality: clampQualityForTier(requestedQuality, tier),
+      exportQuality: clampQualityForTier(requestedQuality, effectiveTier),
       autoCaptions: subtitlesEnabled
         ? (payload.autoCaptions ?? existing?.autoCaptions ?? false)
         : false,

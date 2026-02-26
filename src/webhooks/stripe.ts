@@ -6,8 +6,26 @@ import { getStripeConfig } from '../lib/stripeConfig'
 import { resolvePlanFromPriceId } from '../lib/stripePlans'
 import { incrementFounderPurchase } from '../services/founder'
 import { storeStripeWebhookEvent } from '../services/adminTelemetry'
+import { getMonthKey } from '../shared/planConfig'
 
 const router = express.Router()
+
+const resetMonthlyUsageForUser = async (userId: string) => {
+  const month = getMonthKey()
+  await prisma.usageMonthly.upsert({
+    where: { userId_month: { userId, month } },
+    create: {
+      userId,
+      month,
+      rendersUsed: 0,
+      minutesUsed: 0
+    },
+    update: {
+      rendersUsed: 0,
+      minutesUsed: 0
+    }
+  })
+}
 
 // raw body is handled in index.ts for this route
 router.post('/', async (req: any, res) => {
@@ -63,6 +81,8 @@ router.post('/', async (req: any, res) => {
               data: {
                 stripeCustomerId: String(customer),
                 stripeSubscriptionId: subscription ? String(subscription) : null,
+                stripePriceId: priceId,
+                currentPeriodEnd,
                 planStatus: 'active'
               }
             })
@@ -74,6 +94,8 @@ router.post('/', async (req: any, res) => {
                 email,
                 stripeCustomerId: String(customer),
                 stripeSubscriptionId: subscription ? String(subscription) : null,
+                stripePriceId: priceId,
+                currentPeriodEnd,
                 planStatus: 'active'
               }
             })
@@ -96,9 +118,11 @@ router.post('/', async (req: any, res) => {
               status,
               planTier: tier,
               priceId,
-              currentPeriodEnd
+              currentPeriodEnd,
+              cancelAtPeriodEnd: false
             }
           })
+          await resetMonthlyUsageForUser(userId)
           if (tier === 'founder') {
             await incrementFounderPurchase()
           }

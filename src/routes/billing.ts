@@ -3,8 +3,9 @@ import { createCheckoutUrlForUser, createPortalUrlForUser, type BillingInterval 
 import { getOrCreateUser } from '../services/users'
 import { activateManualFreeTrial, getSubscriptionForUser, getUserPlan } from '../services/plans'
 import { ensureFounderAvailable, FounderSoldOutError } from '../services/founder'
-import { PLAN_TIERS, type PlanTier } from '../shared/planConfig'
+import { PLAN_CONFIG, PLAN_TIERS, type PlanTier } from '../shared/planConfig'
 import { isPaidTier, getPlanFeatures } from '../shared/planConfig'
+import { resolveDevAdminAccess } from '../lib/devAccounts'
 
 const router = express.Router()
 
@@ -69,7 +70,8 @@ const handleCheckout = async (req: any, res: any) => {
       }
       const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'http://localhost:3000'
       const trialStatus = activated.alreadyActive ? 'active' : 'started'
-      const trialUrl = new URL('/billing/success', baseUrl)
+      const trialUrl = new URL('/editor', baseUrl)
+      trialUrl.searchParams.set('success', 'true')
       trialUrl.searchParams.set('source', 'trial')
       trialUrl.searchParams.set('trial', trialStatus)
       trialUrl.searchParams.set('tier', activated.tier)
@@ -147,17 +149,20 @@ router.get('/entitlements', async (req: any, res) => {
     const user = req.user
     if (!user) return res.status(401).json({ error: 'Unauthorized' })
     const { tier, plan } = await getUserPlan(user.id)
-    const planKey = tier
-    const isPaid = isPaidTier(tier)
-    const features = getPlanFeatures(plan)
+    const devAccess = await resolveDevAdminAccess(user.id, user.email)
+    const isDev = devAccess.emailAuthorized
+    const effectiveTier = isDev ? 'studio' : tier
+    const planKey = effectiveTier
+    const isPaid = isDev || isPaidTier(tier)
+    const features = getPlanFeatures(isDev ? PLAN_CONFIG.studio : plan)
     const entitlements = {
       autoDownloadAllowed: isPaid,
       canExport4k: features.resolution === '4K',
       watermark: features.watermark,
       priorityQueue: features.queuePriority === 'priority',
-      rendersPerMonth: features.rendersPerMonth
+      rendersPerMonth: isDev ? null : features.rendersPerMonth
     }
-    res.json({ planKey, isPaid, entitlements })
+    res.json({ planKey, isPaid, entitlements, devOverride: isDev })
   } catch (err) {
     console.error('entitlements', err)
     res.status(500).json({ error: 'server_error' })

@@ -15291,16 +15291,20 @@ const getEditOptionsForUser = async (
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
     manualTimestampConfig?: ManualTimestampConfig | null
-  }
+  },
+  userEmail?: string | null
 ) => {
   const settings = await prisma.userSettings.findUnique({ where: { userId } })
   const { tier, plan } = await getUserPlan(userId)
-  const features = getPlanFeatures(tier)
+  const devBypass = isDevAccount(userId, userEmail)
+  const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+  const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
+  const features = getPlanFeatures(effectiveTier)
   const subtitlesEnabled = features.subtitles.enabled
   const rawSubtitle = String(overrides?.subtitleStyle ?? settings?.subtitleStyle ?? DEFAULT_SUBTITLE_PRESET)
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
   const subtitleStyle =
-    subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
+    subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, effectiveTier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
   const autoCaptionsOverride = typeof overrides?.autoCaptions === 'boolean' ? overrides.autoCaptions : null
   const smartZoomOverride = typeof overrides?.smartZoom === 'boolean' ? overrides.smartZoom : null
   const transitionsOverride = typeof overrides?.transitions === 'boolean' ? overrides.transitions : null
@@ -15391,7 +15395,7 @@ const getEditOptionsForUser = async (
       : false,
     musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
     subtitleStyle,
-    autoZoomMax: settings?.autoZoomMax ?? plan.autoZoomMax,
+    autoZoomMax: settings?.autoZoomMax ?? effectivePlan.autoZoomMax,
     retentionAggressionLevel: allowedAggression,
     retentionStrategyProfile: allowedStrategy,
     maxCutsRequested,
@@ -15410,8 +15414,8 @@ const getEditOptionsForUser = async (
   })
   return {
     options,
-    plan,
-    tier
+    plan: effectivePlan,
+    tier: effectiveTier
   }
 }
 
@@ -15871,9 +15875,12 @@ const processJob = async (
 
   const settings = await prisma.userSettings.findUnique({ where: { userId: user.id } })
   const { tier, plan } = await getUserPlan(user.id)
-  const features = getPlanFeatures(tier)
+  const devBypass = isDevAccount(user.id, user.email)
+  const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+  const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
+  const features = getPlanFeatures(effectiveTier)
   const desiredQuality = requestedQuality ?? getRequestedQuality(job.requestedQuality, settings?.exportQuality)
-  const finalQuality = clampQualityForTier(desiredQuality, tier)
+  const finalQuality = clampQualityForTier(desiredQuality, effectiveTier)
   if (finalQuality !== desiredQuality) {
     const requiredPlan = getRequiredPlanForQuality(desiredQuality)
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
@@ -15979,7 +15986,7 @@ const processJob = async (
   let subtitleStyleSource: 'user' | 'platform' | 'default' = hasExplicitSubtitleOverride ? 'user' : 'default'
   if (!hasExplicitSubtitleOverride) {
     const preferredPlatformPreset = platformProfile.defaultSubtitlePreset
-    const canUsePlatformPreset = features.subtitles.enabled && isSubtitlePresetAllowed(preferredPlatformPreset, tier)
+    const canUsePlatformPreset = features.subtitles.enabled && isSubtitlePresetAllowed(preferredPlatformPreset, effectiveTier)
     subtitleStyle = canUsePlatformPreset ? preferredPlatformPreset : DEFAULT_SUBTITLE_PRESET
     subtitleStyleSource = canUsePlatformPreset ? 'platform' : 'default'
   }
@@ -16001,7 +16008,7 @@ const processJob = async (
       if (!features.subtitles.enabled) {
         throw new PlanLimitError('Subtitles are temporarily disabled.', 'subtitles', 'creator')
       }
-      if (!isSubtitlePresetAllowed(normalizedSubtitle, tier)) {
+      if (!isSubtitlePresetAllowed(normalizedSubtitle, effectiveTier)) {
         const requiredPlan = getRequiredPlanForSubtitlePreset(normalizedSubtitle)
         throw new PlanLimitError('Upgrade to unlock subtitle styles.', 'subtitles', requiredPlan)
       }
@@ -16095,7 +16102,7 @@ const processJob = async (
       tangentKiller: typeof options.tangentKiller === 'boolean' ? options.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
     })
 
-    await ensureUsageWithinLimits(user.id, user.email, durationMinutes, tier, plan, renderConfig.mode)
+    await ensureUsageWithinLimits(user.id, user.email, durationMinutes, effectiveTier, effectivePlan, renderConfig.mode)
 
     if (renderConfig.mode === 'vertical') {
       const sourceStream = probeVideoStream(tmpIn)
@@ -18556,7 +18563,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         manualTimestampConfig: getManualTimestampConfigFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
-      })
+      }, user.email)
       const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
       if (styleBlendOverride) options.styleArchetypeBlend = styleBlendOverride
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
@@ -18943,11 +18950,14 @@ const handleCreateJob = async (req: any, res: any) => {
 
     await getOrCreateUser(userId, req.user?.email)
     const { plan, tier } = await getUserPlan(userId)
+    const devBypass = isDevAccount(userId, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+    const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
     const renderLimitViolation = await getRenderLimitViolation({
       userId,
       email: req.user?.email,
-      tier,
-      plan,
+      tier: effectiveTier,
+      plan: effectivePlan,
       renderMode: renderConfig.mode
     })
     if (renderLimitViolation) {
@@ -18955,7 +18965,7 @@ const handleCreateJob = async (req: any, res: any) => {
     }
     const subtitleRequest = req.body?.subtitles
     if (subtitleRequest?.enabled) {
-      const features = getPlanFeatures(tier)
+      const features = getPlanFeatures(effectiveTier)
       if (!features.subtitles.enabled) {
         return res.status(403).json({
           error: 'PLAN_LIMIT_EXCEEDED',
@@ -18995,7 +19005,7 @@ const handleCreateJob = async (req: any, res: any) => {
         inputPath,
         progress: 0,
         requestedQuality: desiredQuality,
-        priorityLevel: plan.priority ? 1 : 2,
+        priorityLevel: effectivePlan.priority ? 1 : 2,
         renderSettings: {
           ...buildPersistedRenderSettings(renderConfig, {
             retentionAggressionLevel,
@@ -19867,7 +19877,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
-    })
+    }, req.user?.email)
     options.retentionAggressionLevel = tuning.aggression
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
@@ -20019,7 +20029,7 @@ router.post('/:id/process', async (req: any, res) => {
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
-    })
+    }, req.user?.email)
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
       req.body?.selectedHook !== undefined

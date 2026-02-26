@@ -10,6 +10,7 @@ import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
 
 const router = express.Router()
+const FREE_MINUTES_WARNING_THRESHOLD = 40
 
 const resolveEffectiveSubscriptionStatus = (rawStatus?: string | null, trialActive?: boolean) => {
   if (trialActive) return 'trial'
@@ -30,20 +31,32 @@ router.get('/', async (req: any, res) => {
   const rerenderUsageDaily = await getRerenderUsageForDay(id)
   const devAccess = await resolveDevAdminAccess(user.id, user.email)
   const isDev = devAccess.emailAuthorized
+  const clientTier = isDev ? 'studio' : tier
   const rendersUsed = usage?.rendersUsed ?? 0
+  const minutesUsed = usage?.minutesUsed ?? 0
+  const maxMinutesPerMonth = isDev ? null : plan.maxMinutesPerMonth
+  const freeMinutesWarning = !isDev && tier === 'free' && maxMinutesPerMonth !== null
+    ? {
+        threshold: FREE_MINUTES_WARNING_THRESHOLD,
+        limit: maxMinutesPerMonth,
+        used: minutesUsed,
+        reached: minutesUsed >= FREE_MINUTES_WARNING_THRESHOLD,
+        blocked: minutesUsed >= maxMinutesPerMonth
+      }
+    : null
 
   res.json({
     user: { id: user.id, email: user.email, createdAt: user.createdAt },
     subscription: subscription
       ? {
-          tier,
+          tier: clientTier,
           status: effectiveStatus,
           currentPeriodEnd: trial?.active ? trial.endsAt : subscription.currentPeriodEnd,
           cancelAtPeriodEnd: subscription.cancelAtPeriodEnd,
           trial
         }
       : {
-          tier,
+          tier: clientTier,
           status: trial?.active ? 'trial' : 'free',
           currentPeriodEnd: trial?.active ? trial.endsAt : null,
           cancelAtPeriodEnd: false,
@@ -57,7 +70,10 @@ router.get('/', async (req: any, res) => {
     usage: {
       month,
       rendersUsed,
-      minutesUsed: usage?.minutesUsed ?? 0
+      minutesUsed
+    },
+    usageWarnings: {
+      freeMinutes: freeMinutesWarning
     },
     usageByMode: {
       month,
@@ -76,10 +92,10 @@ router.get('/', async (req: any, res) => {
       maxRendersPerDay: null,
       maxRerendersPerDay: isDev ? null : plan.maxRerendersPerDay,
       maxVerticalRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
-      maxMinutesPerMonth: plan.maxMinutesPerMonth,
-      exportQuality: plan.exportQuality,
-      watermark: plan.watermark,
-      priority: plan.priority
+      maxMinutesPerMonth,
+      exportQuality: isDev ? '4k' : plan.exportQuality,
+      watermark: isDev ? false : plan.watermark,
+      priority: isDev ? true : plan.priority
     }
   })
 })
@@ -104,15 +120,19 @@ router.get('/subscription', async (req: any, res) => {
   const id = req.user?.id
   if (!id) return res.status(401).json({ error: 'unauthenticated' })
   const { subscription, tier, trial } = await getUserPlan(id)
+  const devAccess = await resolveDevAdminAccess(id, req.user?.email)
+  const isDev = devAccess.emailAuthorized
+  const featureTier = isDev ? 'studio' : tier
   const effectiveStatus = resolveEffectiveSubscriptionStatus(subscription?.status, trial?.active)
-  const features = getPlanFeatures(tier)
+  const features = getPlanFeatures(featureTier)
   res.json({
     plan: tier,
     status: effectiveStatus,
     currentPeriodEnd: trial?.active ? trial.endsAt : subscription?.currentPeriodEnd ?? null,
     features,
     subtitlePresets: SUBTITLE_PRESET_REGISTRY,
-    trial
+    trial,
+    devOverride: isDev
   })
 })
 
