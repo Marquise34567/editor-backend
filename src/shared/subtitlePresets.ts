@@ -38,6 +38,7 @@ export const DEFAULT_SUBTITLE_PRESET: SubtitlePresetId = 'basic_clean'
 export type SubtitleStyleConfig = {
   preset: SubtitlePresetId
   fontId: SubtitleFontId
+  fontSize: number
   textColor: string
   accentColor: string
   outlineColor: string
@@ -49,6 +50,7 @@ const STYLE_CONFIG_DELIMITER = '::'
 const STYLE_CONFIG_MAX_LENGTH = 320
 const DEFAULT_MRBEAST_STYLE: Omit<SubtitleStyleConfig, 'preset'> = {
   fontId: 'impact',
+  fontSize: 58,
   textColor: 'FFFFFF',
   accentColor: '00E5FF',
   outlineColor: '111111',
@@ -141,7 +143,13 @@ const normalizeAnimationId = (value?: string | null): SubtitleAnimationId => {
 const normalizeOutlineWidth = (value?: string | number | null) => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return DEFAULT_MRBEAST_STYLE.outlineWidth
-  return Math.max(1, Math.min(12, Math.round(parsed)))
+  return Math.max(1, Math.min(24, Math.round(parsed)))
+}
+
+const normalizeFontSize = (value?: string | number | null) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return DEFAULT_MRBEAST_STYLE.fontSize
+  return Math.max(32, Math.min(220, Math.round(parsed)))
 }
 
 export const parseSubtitleStyleConfig = (value?: string | null): SubtitleStyleConfig => {
@@ -161,6 +169,7 @@ export const parseSubtitleStyleConfig = (value?: string | null): SubtitleStyleCo
   return {
     ...defaults,
     fontId: normalizeFontId(parsed.font ?? parsed.fontid),
+    fontSize: normalizeFontSize(parsed.fontsize ?? parsed.size),
     textColor,
     accentColor,
     outlineColor,
@@ -171,10 +180,12 @@ export const parseSubtitleStyleConfig = (value?: string | null): SubtitleStyleCo
 
 export const serializeSubtitleStyleConfig = (config: SubtitleStyleConfig) => {
   const preset = normalizeSubtitlePreset(config.preset) ?? DEFAULT_SUBTITLE_PRESET
-  if (preset !== 'mrbeast_animated') return preset
+  const supportsExtendedConfig = preset === 'mrbeast_animated' || preset === 'neon_glow'
+  if (!supportsExtendedConfig) return preset
   const normalized = parseSubtitleStyleConfig(
     `${preset}${STYLE_CONFIG_DELIMITER}` +
     `font=${String(config.fontId || '')};` +
+    `fontSize=${String(config.fontSize || '')};` +
     `text=${String(config.textColor || '')};` +
     `accent=${String(config.accentColor || '')};` +
     `outline=${String(config.outlineColor || '')};` +
@@ -183,6 +194,7 @@ export const serializeSubtitleStyleConfig = (config: SubtitleStyleConfig) => {
   )
   return `${preset}${STYLE_CONFIG_DELIMITER}` +
     `font=${normalized.fontId};` +
+    `fontSize=${normalized.fontSize};` +
     `text=${normalized.textColor};` +
     `accent=${normalized.accentColor};` +
     `outline=${normalized.outlineColor};` +

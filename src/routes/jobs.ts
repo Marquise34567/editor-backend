@@ -41,6 +41,7 @@ import {
   DEFAULT_SUBTITLE_PRESET,
   normalizeSubtitlePreset,
   parseSubtitleStyleConfig,
+  serializeSubtitleStyleConfig,
   type SubtitleFontId
 } from '../shared/subtitlePresets'
 import {
@@ -996,6 +997,14 @@ type VerticalRetentionCandidate = {
   reason: string
 }
 type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide'
+type VerticalCaptionPreset = 'basic_clean' | 'mrbeast_animated' | 'neon_glow'
+type VerticalCaptionConfig = {
+  enabled: boolean
+  autoGenerate: boolean
+  preset: VerticalCaptionPreset
+  fontSize: number | null
+  text: string
+}
 type VerticalClipCaptionOverlay = {
   text: string
   start: number
@@ -1267,6 +1276,10 @@ const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
 const EFFECT_PREVIEW_TYPES: EffectPreviewType[] = ['transitions', 'swoosh', 'zooms', 'all', 'auto']
 const VIRAL_PREVIEW_MODES: ViralPreviewMode[] = ['none', 'youtube', 'tiktok']
+const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = ['basic_clean', 'mrbeast_animated', 'neon_glow']
+const VERTICAL_CAPTION_FONT_SIZE_MIN = 32
+const VERTICAL_CAPTION_FONT_SIZE_MAX = 220
+const VERTICAL_CAPTION_FONT_SIZE_DEFAULT = 110
 const EFFECT_PREVIEW_DURATION_DEFAULT_SEC = 12
 const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
 const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
@@ -3257,6 +3270,20 @@ const normalizeVerticalCaptionTextInput = (value: any): string => {
   return normalized.slice(0, 1_800)
 }
 
+const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null => {
+  const normalized = normalizeSubtitlePreset(value)
+  if (normalized && VERTICAL_CAPTION_PRESETS.includes(normalized as VerticalCaptionPreset)) {
+    return normalized as VerticalCaptionPreset
+  }
+  return null
+}
+
+const parseVerticalCaptionFontSize = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.round(clamp(parsed, VERTICAL_CAPTION_FONT_SIZE_MIN, VERTICAL_CAPTION_FONT_SIZE_MAX))
+}
+
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).verticalCaptions
@@ -3273,6 +3300,162 @@ const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   )
   if (candidate === undefined) return null
   return normalizeVerticalCaptionTextInput(candidate)
+}
+
+const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCaptionConfig> | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const nested = (payload as any).verticalCaptions
+  const textCandidate = pickFirstDefinedValue(
+    (payload as any).text,
+    (payload as any).verticalCaptionText,
+    (payload as any).vertical_caption_text,
+    (payload as any).clipBuilderCaptionText,
+    (payload as any).clip_builder_caption_text,
+    (payload as any).captionText,
+    (payload as any).caption_text,
+    nested?.text,
+    nested?.captionText,
+    nested?.caption_text,
+    nested?.phrases,
+    nested?.customPhrases,
+    nested?.custom_phrases
+  )
+  const presetCandidate = pickFirstDefinedValue(
+    (payload as any).preset,
+    (payload as any).captionPreset,
+    (payload as any).caption_preset,
+    (payload as any).style,
+    (payload as any).verticalCaptionPreset,
+    (payload as any).vertical_caption_preset,
+    nested?.preset,
+    nested?.style,
+    nested?.captionPreset,
+    nested?.caption_preset
+  )
+  const fontSizeCandidate = pickFirstDefinedValue(
+    (payload as any).fontSize,
+    (payload as any).font_size,
+    (payload as any).verticalCaptionFontSize,
+    (payload as any).vertical_caption_font_size,
+    nested?.fontSize,
+    nested?.font_size
+  )
+  const autoGenerateCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).autoGenerate,
+      (payload as any).auto_generate,
+      (payload as any).auto,
+      (payload as any).verticalCaptionAutoGenerate,
+      (payload as any).vertical_caption_auto_generate,
+      nested?.autoGenerate,
+      nested?.auto_generate,
+      nested?.auto
+    )
+  )
+  const enabledCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).enabled,
+      (payload as any).verticalCaptionEnabled,
+      (payload as any).vertical_caption_enabled,
+      nested?.enabled
+    )
+  )
+  if (
+    textCandidate === undefined &&
+    presetCandidate === undefined &&
+    fontSizeCandidate === undefined &&
+    autoGenerateCandidate === null &&
+    enabledCandidate === null
+  ) {
+    return null
+  }
+  const parsedPreset = parseVerticalCaptionPreset(presetCandidate)
+  const parsedFontSize = parseVerticalCaptionFontSize(fontSizeCandidate)
+  return {
+    ...(textCandidate === undefined ? {} : { text: normalizeVerticalCaptionTextInput(textCandidate) }),
+    ...(parsedPreset ? { preset: parsedPreset } : {}),
+    ...(parsedFontSize !== null ? { fontSize: parsedFontSize } : {}),
+    ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
+    ...(enabledCandidate === null ? {} : { enabled: enabledCandidate })
+  }
+}
+
+const resolveVerticalCaptionConfig = (
+  payload: any,
+  defaults?: Partial<VerticalCaptionConfig>
+): VerticalCaptionConfig => {
+  const override = getVerticalCaptionConfigFromPayload(payload) || {}
+  const fallbackPreset = parseVerticalCaptionPreset(defaults?.preset) || 'mrbeast_animated'
+  const fallbackFontSize = parseVerticalCaptionFontSize(defaults?.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
+  const fallbackAutoGenerate = typeof defaults?.autoGenerate === 'boolean' ? defaults.autoGenerate : true
+  const fallbackEnabled = typeof defaults?.enabled === 'boolean' ? defaults.enabled : true
+  const fallbackText = normalizeVerticalCaptionTextInput(defaults?.text ?? '')
+
+  return {
+    enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
+    autoGenerate: typeof override.autoGenerate === 'boolean' ? override.autoGenerate : fallbackAutoGenerate,
+    preset: parseVerticalCaptionPreset(override.preset) || fallbackPreset,
+    fontSize: parseVerticalCaptionFontSize(override.fontSize) ?? fallbackFontSize,
+    text: typeof override.text === 'string' ? override.text : fallbackText
+  }
+}
+
+const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => ({
+  enabled: true,
+  autoGenerate: true,
+  preset: 'mrbeast_animated',
+  fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
+  text: ''
+})
+
+const resolveVerticalCaptionConfigForState = ({
+  analysis,
+  renderSettings,
+  payload
+}: {
+  analysis?: any
+  renderSettings?: any
+  payload?: any
+}): VerticalCaptionConfig => {
+  const defaults = getDefaultVerticalCaptionConfig()
+  const fromAnalysis = resolveVerticalCaptionConfig(analysis, defaults)
+  const fromRenderSettings = resolveVerticalCaptionConfig(renderSettings, fromAnalysis)
+  if (payload && typeof payload === 'object') {
+    return resolveVerticalCaptionConfig(payload, fromRenderSettings)
+  }
+  return fromRenderSettings
+}
+
+const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) => {
+  const fontSize = parseVerticalCaptionFontSize(config.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
+  const text = normalizeVerticalCaptionTextInput(config.text)
+  const normalized: VerticalCaptionConfig = {
+    enabled: Boolean(config.enabled),
+    autoGenerate: Boolean(config.autoGenerate),
+    preset: parseVerticalCaptionPreset(config.preset) || 'mrbeast_animated',
+    fontSize,
+    text
+  }
+  return {
+    verticalCaptions: {
+      enabled: normalized.enabled,
+      autoGenerate: normalized.autoGenerate,
+      preset: normalized.preset,
+      fontSize,
+      text,
+      captionText: text
+    },
+    verticalCaptionEnabled: normalized.enabled,
+    vertical_caption_enabled: normalized.enabled,
+    verticalCaptionAutoGenerate: normalized.autoGenerate,
+    vertical_caption_auto_generate: normalized.autoGenerate,
+    verticalCaptionPreset: normalized.preset,
+    vertical_caption_preset: normalized.preset,
+    verticalCaptionFontSize: fontSize,
+    vertical_caption_font_size: fontSize,
+    verticalCaptionText: text,
+    vertical_caption_text: text
+  }
 }
 
 const parseEffectPreviewType = (value: any): EffectPreviewType | null => {
@@ -3694,6 +3877,7 @@ const buildPersistedRenderSettings = (
     longFormAggression?: number | null
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
+    verticalCaptionConfig?: VerticalCaptionConfig | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -3715,6 +3899,9 @@ const buildPersistedRenderSettings = (
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
   const tangentKiller = typeof opts?.tangentKiller === 'boolean' ? opts.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const verticalCaptionConfig = opts?.verticalCaptionConfig
+    ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
+    : null
   return {
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
@@ -3747,7 +3934,8 @@ const buildPersistedRenderSettings = (
     ...(transitions === null ? {} : { transitions }),
     ...(soundFx === null ? {} : { soundFx }),
     ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts }),
-    ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode })
+    ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode }),
+    ...(verticalCaptionConfig ? buildVerticalCaptionPersistenceFields(verticalCaptionConfig) : {})
   }
 }
 
@@ -3766,6 +3954,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression,
   longFormClarityVsSpeed,
   tangentKiller,
+  verticalCaptionConfig,
   retentionTargetPlatform,
   platformProfile
 }: {
@@ -3783,6 +3972,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression?: number | null
   longFormClarityVsSpeed?: number | null
   tangentKiller?: boolean | null
+  verticalCaptionConfig?: VerticalCaptionConfig | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
   platformProfile?: PlatformProfile | null
 }) => {
@@ -3892,6 +4082,19 @@ const buildPersistedRenderAnalysis = ({
         }
       : null,
     verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
+  }
+  const existingVerticalCaptionOverride = getVerticalCaptionConfigFromPayload(existing)
+  const shouldPersistVerticalCaptions = Boolean(
+    renderConfig.mode === 'vertical' ||
+    verticalCaptionConfig ||
+    existingVerticalCaptionOverride
+  )
+  if (shouldPersistVerticalCaptions) {
+    const resolvedVerticalCaptionConfig = resolveVerticalCaptionConfig(
+      verticalCaptionConfig || {},
+      resolveVerticalCaptionConfig(existing, getDefaultVerticalCaptionConfig())
+    )
+    Object.assign(payload, buildVerticalCaptionPersistenceFields(resolvedVerticalCaptionConfig))
   }
   const resolvedTargetPlatform = retentionTargetPlatform
     ? parseRetentionTargetPlatform(retentionTargetPlatform)
@@ -6918,6 +7121,8 @@ const parseTranscriptCues = (srtPath: string | null) => {
 }
 
 const CAPTION_EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u
+const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯', '⚡']
+const VIRAL_KEYWORD_PATTERN = /\b(crazy|insane|what|no way|can't believe|cant believe|bro|wild|shocking|wtf)\b/i
 
 const sanitizeCaptionPhrase = (value: string) => (
   String(value || '')
@@ -6944,6 +7149,81 @@ const splitVerticalCaptionPhrases = (rawText: string): string[] => {
     if (unique.length >= 12) break
   }
   return unique
+}
+
+const pickViralEmoji = (seed: number) => VIRAL_EMOJI_POOL[Math.abs(seed) % VIRAL_EMOJI_POOL.length]
+
+const hypeVerticalCaptionPhrase = (
+  text: string,
+  opts?: { highEnergy?: boolean; preset?: VerticalCaptionPreset; seed?: number }
+) => {
+  const cleaned = sanitizeCaptionPhrase(
+    String(text || '')
+      .replace(/[“”]/g, '"')
+      .replace(/[‘’]/g, "'")
+      .replace(/\s+/g, ' ')
+      .trim()
+  )
+  if (!cleaned) return ''
+  const maxLen = opts?.preset === 'mrbeast_animated' ? 34 : 40
+  let phrase = cleaned.length > maxLen ? `${cleaned.slice(0, maxLen - 1).trim()}…` : cleaned
+  if (opts?.preset === 'mrbeast_animated') {
+    phrase = phrase.toUpperCase()
+  }
+  const shouldAddEmoji = (opts?.highEnergy || VIRAL_KEYWORD_PATTERN.test(cleaned)) && !CAPTION_EMOJI_PATTERN.test(phrase)
+  if (shouldAddEmoji && phrase.length <= 78) {
+    phrase = `${phrase} ${pickViralEmoji(opts?.seed ?? phrase.length)}`
+  }
+  return sanitizeCaptionPhrase(phrase)
+}
+
+const buildTranscriptDrivenVerticalCaptionPool = ({
+  transcriptCues,
+  range,
+  highEnergy,
+  phraseCount,
+  preset,
+  clipIndex
+}: {
+  transcriptCues: TranscriptCue[]
+  range: TimeRange
+  highEnergy: boolean
+  phraseCount: number
+  preset: VerticalCaptionPreset
+  clipIndex: number
+}) => {
+  const overlapping = transcriptCues
+    .filter((cue) => cue.end > range.start && cue.start < range.end)
+    .slice()
+    .sort((left, right) => {
+      const scoreRight = (
+        0.42 * clamp01(right.keywordIntensity) +
+        0.32 * clamp01(right.curiosityTrigger) +
+        0.26 * (1 - clamp01(right.fillerDensity))
+      )
+      const scoreLeft = (
+        0.42 * clamp01(left.keywordIntensity) +
+        0.32 * clamp01(left.curiosityTrigger) +
+        0.26 * (1 - clamp01(left.fillerDensity))
+      )
+      return scoreRight - scoreLeft
+    })
+  if (!overlapping.length) return [] as string[]
+  const out: string[] = []
+  for (let index = 0; index < overlapping.length; index += 1) {
+    const cue = overlapping[index]
+    const phrase = hypeVerticalCaptionPhrase(cue.text, {
+      highEnergy,
+      preset,
+      seed: clipIndex + index
+    })
+    if (!phrase) continue
+    const duplicate = out.some((entry) => entry.toLowerCase() === phrase.toLowerCase())
+    if (duplicate) continue
+    out.push(phrase)
+    if (out.length >= phraseCount) break
+  }
+  return out
 }
 
 const inferHighEnergyVerticalClip = ({
@@ -7007,6 +7287,9 @@ const buildVerticalClipCaptionOverlays = ({
   clipIndex,
   windows,
   userCaptionText,
+  transcriptCues,
+  captionPreset,
+  autoGenerateFromTranscript,
   editorMode,
   styleProfile,
   nicheProfile
@@ -7015,6 +7298,9 @@ const buildVerticalClipCaptionOverlays = ({
   clipIndex: number
   windows: EngagementWindow[]
   userCaptionText: string
+  transcriptCues?: TranscriptCue[]
+  captionPreset?: VerticalCaptionPreset
+  autoGenerateFromTranscript?: boolean
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
@@ -7034,24 +7320,45 @@ const buildVerticalClipCaptionOverlays = ({
     1,
     3
   ))
+  const effectivePreset: VerticalCaptionPreset = captionPreset || 'mrbeast_animated'
   const selectedPhrases: string[] = []
   if (userPhrases.length) {
     for (let index = 0; index < phraseCount; index += 1) {
       let phrase = userPhrases[(clipIndex + index) % userPhrases.length]
-      if (highEnergy && !CAPTION_EMOJI_PATTERN.test(phrase) && phrase.length <= 78) {
-        phrase = `${phrase}${index === 0 ? ' 😳' : ' 🔥'}`
-      }
+      phrase = hypeVerticalCaptionPhrase(phrase, {
+        highEnergy,
+        preset: effectivePreset,
+        seed: clipIndex + index
+      })
       selectedPhrases.push(sanitizeCaptionPhrase(phrase))
     }
   } else {
-    const pool = buildAutoVerticalCaptionPool({
-      editorMode,
-      styleProfile,
-      nicheProfile,
-      highEnergy
-    })
-    for (let index = 0; index < phraseCount; index += 1) {
-      selectedPhrases.push(pool[(clipIndex + index) % pool.length])
+    const transcriptPool = autoGenerateFromTranscript
+      ? buildTranscriptDrivenVerticalCaptionPool({
+          transcriptCues: Array.isArray(transcriptCues) ? transcriptCues : [],
+          range,
+          highEnergy,
+          phraseCount,
+          preset: effectivePreset,
+          clipIndex
+        })
+      : []
+    if (transcriptPool.length) {
+      selectedPhrases.push(...transcriptPool.slice(0, phraseCount))
+    } else {
+      const pool = buildAutoVerticalCaptionPool({
+        editorMode,
+        styleProfile,
+        nicheProfile,
+        highEnergy
+      })
+      for (let index = 0; index < phraseCount; index += 1) {
+        selectedPhrases.push(hypeVerticalCaptionPhrase(pool[(clipIndex + index) % pool.length], {
+          highEnergy,
+          preset: effectivePreset,
+          seed: clipIndex + index
+        }))
+      }
     }
   }
 
@@ -11280,7 +11587,8 @@ const buildMrBeastAnimatedAss = ({
   const primaryColor = toAssColorFromHex(config.textColor)
   const secondaryColor = toAssColorFromHex(config.accentColor)
   const outlineColor = toAssColorFromHex(config.outlineColor)
-  const outlineWidth = Math.max(1, Math.min(12, Math.round(Number(config.outlineWidth || 6))))
+  const outlineWidth = Math.max(1, Math.min(24, Math.round(Number(config.outlineWidth || 20))))
+  const fontSize = Math.max(36, Math.min(220, Math.round(Number(config.fontSize || 96))))
   const baseTag = config.animation === 'pop'
     ? `{\\an2\\fscx82\\fscy82\\bord${outlineWidth}\\t(0,130,\\fscx100\\fscy100)\\t(130,240,\\fscx106\\fscy106)\\t(240,320,\\fscx100\\fscy100)}`
     : `{\\an2\\bord${outlineWidth}}`
@@ -11295,7 +11603,7 @@ const buildMrBeastAnimatedAss = ({
     '',
     '[V4+ Styles]',
     'Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding',
-    `Style: Beast,${fontName},58,${primaryColor},${secondaryColor},${outlineColor},&H64000000,-1,0,0,0,100,100,1,0,1,${outlineWidth},0,2,30,30,70,1`,
+    `Style: Beast,${fontName},${fontSize},${primaryColor},${secondaryColor},${outlineColor},&H64000000,-1,0,0,0,100,100,1,0,1,${outlineWidth},0,2,30,30,70,1`,
     '',
     '[Events]',
     'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text'
@@ -11320,8 +11628,52 @@ const buildMrBeastAnimatedAss = ({
   return assPath
 }
 
+const buildVerticalCaptionSubtitleStyle = ({
+  preset,
+  fontSize,
+  fallbackStyle
+}: {
+  preset: VerticalCaptionPreset
+  fontSize: number | null
+  fallbackStyle?: string | null
+}) => {
+  const resolvedFontSize = parseVerticalCaptionFontSize(fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
+  if (preset === 'basic_clean') {
+    return 'basic_clean'
+  }
+
+  if (preset === 'neon_glow') {
+    const fallback = parseSubtitleStyleConfig(fallbackStyle)
+    const base = fallback.preset === 'neon_glow' ? fallback : parseSubtitleStyleConfig('neon_glow')
+    return serializeSubtitleStyleConfig({
+      ...base,
+      preset: 'neon_glow',
+      fontSize: resolvedFontSize,
+      textColor: base.textColor || '00FFFF',
+      accentColor: base.accentColor || 'FF00FF',
+      outlineColor: base.outlineColor || '101018',
+      outlineWidth: Math.max(2, Math.min(10, Number(base.outlineWidth || 4))),
+      animation: 'pop'
+    })
+  }
+
+  const fallback = parseSubtitleStyleConfig(fallbackStyle)
+  const base = fallback.preset === 'mrbeast_animated' ? fallback : parseSubtitleStyleConfig('mrbeast_animated')
+  return serializeSubtitleStyleConfig({
+    ...base,
+    preset: 'mrbeast_animated',
+    fontSize: resolvedFontSize,
+    textColor: base.textColor || 'FFFF00',
+    outlineColor: base.outlineColor || '000000',
+    outlineWidth: Math.max(12, Math.min(24, Number(base.outlineWidth || 20))),
+    animation: 'pop'
+  })
+}
+
 const buildSubtitleStyle = (style?: string | null) => {
   const styleConfig = parseSubtitleStyleConfig(style)
+  const dynamicFontSize = String(Math.max(24, Math.min(220, Math.round(Number(styleConfig.fontSize || 58)))))
+  const dynamicOutline = String(Math.max(1, Math.min(24, Math.round(Number(styleConfig.outlineWidth || 6)))))
   const base = {
     FontName: 'DejaVu Sans',
     FontSize: '42',
@@ -11335,10 +11687,10 @@ const buildSubtitleStyle = (style?: string | null) => {
   }
   const mrBeastStyle: Partial<typeof base> = {
     FontName: resolveSubtitleFontName(styleConfig.fontId),
-    FontSize: '58',
+    FontSize: dynamicFontSize,
     PrimaryColour: toAssColorFromHex(styleConfig.textColor),
     OutlineColour: toAssColorFromHex(styleConfig.outlineColor),
-    Outline: String(Math.max(1, Math.min(12, Math.round(Number(styleConfig.outlineWidth || 6))))),
+    Outline: dynamicOutline,
     Shadow: '0',
     Alignment: '2'
   }
@@ -11349,8 +11701,24 @@ const buildSubtitleStyle = (style?: string | null) => {
     bold: { FontName: 'DejaVu Sans', FontSize: '48', Outline: '3', Shadow: '1' },
     boldpop: { FontName: 'DejaVu Sans', FontSize: '48', Outline: '3', Shadow: '1', PrimaryColour: '&H0000FFFF' },
     mrbeastanimated: mrBeastStyle,
-    neon: { PrimaryColour: '&H00F5FF00', OutlineColour: '&H80000000', Shadow: '2', Outline: '3' },
-    neonglow: { PrimaryColour: '&H00F5FF00', OutlineColour: '&H80000000', Shadow: '2', Outline: '3' },
+    neon: {
+      FontName: resolveSubtitleFontName(styleConfig.fontId),
+      FontSize: dynamicFontSize,
+      PrimaryColour: toAssColorFromHex(styleConfig.textColor || '00FFFF'),
+      OutlineColour: toAssColorFromHex(styleConfig.outlineColor || '101018'),
+      BackColour: '&H22000000',
+      Shadow: '2',
+      Outline: '4'
+    },
+    neonglow: {
+      FontName: resolveSubtitleFontName(styleConfig.fontId),
+      FontSize: dynamicFontSize,
+      PrimaryColour: toAssColorFromHex(styleConfig.textColor || '00FFFF'),
+      OutlineColour: toAssColorFromHex(styleConfig.outlineColor || '101018'),
+      BackColour: '&H22000000',
+      Shadow: '2',
+      Outline: '4'
+    },
     cinematic: { FontName: 'DejaVu Serif', FontSize: '40', Outline: '2', Shadow: '1' },
     outlineheavy: { FontName: 'DejaVu Serif', FontSize: '40', Outline: '3', Shadow: '1' },
     highcontrast: { PrimaryColour: '&H0000FFFF', OutlineColour: '&H80000000', Outline: '3' },
@@ -11393,6 +11761,137 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
     })
     .sort((a, b) => b.mtimeMs - a.mtimeMs)
   return candidates.length ? candidates[0].fullPath : null
+}
+
+const FASTER_WHISPER_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/faster_whisper_transcribe.py')
+const FASTER_WHISPER_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.FASTER_WHISPER_TIMEOUT_MS || 300_000)
+  if (!Number.isFinite(raw)) return 300_000
+  return Math.max(20_000, Math.min(900_000, Math.round(raw)))
+})()
+const ALLOW_OPENAI_TRANSCRIPTION_FALLBACK = /^(1|true|yes)$/i.test(
+  String(process.env.ALLOW_OPENAI_TRANSCRIPTION_FALLBACK || '').trim()
+)
+const FAST_WHISPER_SCRIPT_OUTPUT_PATTERN = /\{[\s\S]*"srtPath"[\s\S]*\}/
+
+const buildFasterWhisperAttempts = () => {
+  const configuredPython = String(process.env.FASTER_WHISPER_PYTHON || '').trim()
+  const attempts: Array<{ command: string; preArgs: string[]; label: string }> = []
+  const add = (command: string, preArgs: string[], label: string) => {
+    const normalized = String(command || '').trim()
+    if (!normalized) return
+    const duplicate = attempts.some((attempt) => (
+      attempt.command === normalized &&
+      attempt.preArgs.join('\u001f') === preArgs.join('\u001f')
+    ))
+    if (duplicate) return
+    attempts.push({ command: normalized, preArgs, label })
+  }
+  if (configuredPython) add(configuredPython, [], 'FASTER_WHISPER_PYTHON')
+  add('python', [], 'python')
+  add('python3', [], 'python3')
+  add('py', ['-3'], 'py -3')
+  add('py', [], 'py')
+  return attempts
+}
+
+const parseFasterWhisperResult = (stdout: string): { srtPath?: string | null } => {
+  const output = String(stdout || '')
+  if (!output.trim()) return {}
+  const match = output.match(FAST_WHISPER_SCRIPT_OUTPUT_PATTERN)
+  if (!match) return {}
+  try {
+    const parsed = JSON.parse(match[0])
+    return {
+      srtPath: typeof parsed?.srtPath === 'string' ? parsed.srtPath : null
+    }
+  } catch {
+    return {}
+  }
+}
+
+const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: string) => {
+  if (!fs.existsSync(FASTER_WHISPER_SCRIPT_PATH)) return null
+  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'medium').trim() || 'medium'
+  const language = String(process.env.FASTER_WHISPER_LANGUAGE || process.env.CAPTION_LANGUAGE || process.env.WHISPER_LANGUAGE || '').trim()
+  const device = String(process.env.FASTER_WHISPER_DEVICE || '').trim()
+  const computeType = String(process.env.FASTER_WHISPER_COMPUTE_TYPE || '').trim()
+  const beamSizeRaw = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 5)
+  const beamSize = Number.isFinite(beamSizeRaw) ? Math.max(1, Math.min(10, Math.round(beamSizeRaw))) : 5
+  const extraArgs = splitWhisperArgs(process.env.FASTER_WHISPER_ARGS)
+  const baseName = path.basename(inputPath, path.extname(inputPath))
+
+  for (const attempt of buildFasterWhisperAttempts()) {
+    const args = [
+      '--input',
+      inputPath,
+      '--output-dir',
+      workingDir,
+      '--base-name',
+      baseName,
+      '--model',
+      model,
+      '--beam-size',
+      String(beamSize),
+      '--vad-filter'
+    ]
+    if (language) args.push('--language', language)
+    if (device) args.push('--device', device)
+    if (computeType) args.push('--compute-type', computeType)
+    if (extraArgs.length) args.push(...extraArgs)
+
+    const command = attempt.command
+    const invocationArgs = [...attempt.preArgs, FASTER_WHISPER_SCRIPT_PATH, ...args]
+
+    const ffmpegDir = path.dirname(FFMPEG_PATH)
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+      PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+    }
+    if (ffmpegDir && ffmpegDir !== '.' && ffmpegDir !== FFMPEG_PATH) {
+      env.PATH = prependPathEntry(process.env.PATH, ffmpegDir)
+    }
+
+    const output = await new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve) => {
+      let stdout = ''
+      let stderr = ''
+      const proc = spawn(command, invocationArgs, { env, windowsHide: true })
+      const timeout = setTimeout(() => {
+        try {
+          proc.kill('SIGKILL')
+        } catch {
+          // ignore
+        }
+      }, FASTER_WHISPER_TIMEOUT_MS)
+      proc.stdout.on('data', (chunk) => {
+        stdout += String(chunk || '')
+      })
+      proc.stderr.on('data', (chunk) => {
+        stderr += String(chunk || '')
+      })
+      proc.on('error', () => {
+        clearTimeout(timeout)
+        resolve({ ok: false, stdout, stderr })
+      })
+      proc.on('close', (code) => {
+        clearTimeout(timeout)
+        resolve({ ok: code === 0, stdout, stderr })
+      })
+    })
+    if (!output.ok) {
+      const reason = String(output.stderr || output.stdout || '').trim().slice(0, 220)
+      console.warn(`subtitle generation failed via ${attempt.label}${reason ? `: ${reason}` : ''}`)
+      continue
+    }
+    const parsed = parseFasterWhisperResult(output.stdout)
+    if (parsed.srtPath && fs.existsSync(parsed.srtPath)) {
+      return parsed.srtPath
+    }
+    const fallbackPath = resolveGeneratedSubtitlePath(inputPath, workingDir)
+    if (fallbackPath) return fallbackPath
+  }
+  return null
 }
 
 const CAPTION_API_TIMEOUT_MS = (() => {
@@ -11541,6 +12040,9 @@ const runWhisperTranscribe = async ({
 
 const generateSubtitles = async (inputPath: string, workingDir: string) => {
   const captionEngine = getCaptionEngineStatus()
+  const fasterWhisperOutput = await generateSubtitlesViaFasterWhisper(inputPath, workingDir)
+  if (fasterWhisperOutput) return fasterWhisperOutput
+
   const model = process.env.WHISPER_MODEL || 'base'
   const configuredArgs = splitWhisperArgs(process.env.WHISPER_ARGS)
   const baseArgs = configuredArgs.length
@@ -11557,7 +12059,7 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
     attempts.push({ command: normalized, args, label })
   }
 
-  if (captionEngine.command && captionEngine.provider === 'whisper') {
+  if (captionEngine.command && (captionEngine.provider === 'whisper' || captionEngine.provider === 'faster_whisper')) {
     const args = captionEngine.mode === 'python_module'
       ? ['-m', 'whisper', inputPath, ...baseArgs]
       : [inputPath, ...baseArgs]
@@ -11580,8 +12082,10 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
     if (output) return output
   }
 
-  const openAiOutput = await generateSubtitlesViaOpenAiApi(inputPath, workingDir)
-  if (openAiOutput) return openAiOutput
+  if (ALLOW_OPENAI_TRANSCRIPTION_FALLBACK) {
+    const openAiOutput = await generateSubtitlesViaOpenAiApi(inputPath, workingDir)
+    if (openAiOutput) return openAiOutput
+  }
 
   const embeddedOutput = await extractEmbeddedSubtitlesAsSrt(inputPath, workingDir)
   if (embeddedOutput) return embeddedOutput
@@ -14666,6 +15170,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const existingProxyPath = existingAnalysis?.proxyPath ?? null
     const latestRenderSettings = (freshJob as any)?.renderSettings ?? (job as any)?.renderSettings
     const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis, latestRenderSettings)
+    const verticalCaptionConfigForAnalysis = resolveVerticalCaptionConfigForState({
+      analysis: existingAnalysis,
+      renderSettings: latestRenderSettings
+    })
     const resolvedTargetPlatform = getRetentionTargetPlatformFromJob({
       analysis: existingAnalysis,
       renderSettings: latestRenderSettings
@@ -14784,7 +15292,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       longFormPreset: options.longFormPreset,
       longFormAggression: options.longFormAggression,
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
-      tangentKiller: options.tangentKiller
+      tangentKiller: options.tangentKiller,
+      verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
     try {
@@ -14808,7 +15317,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         longFormPreset: options.longFormPreset,
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
-        tangentKiller: options.tangentKiller
+        tangentKiller: options.tangentKiller,
+        verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
       analysis: analysis
     })
@@ -14853,6 +15363,10 @@ const processJob = async (
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
   }
   const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+  const persistedVerticalCaptionConfig = resolveVerticalCaptionConfigForState({
+    analysis: job.analysis as any,
+    renderSettings: (job as any)?.renderSettings
+  })
   let requestedStrategyProfile = parseRetentionStrategyProfile(
     options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
   )
@@ -15132,14 +15646,24 @@ const processJob = async (
           })
           .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
       }
-      const verticalCaptionTextInput = getVerticalCaptionTextFromPayload(verticalAnalysis) ?? ''
-      const shouldApplyVerticalCaptionOverlays = true
-      const overlaySubtitleStyle = normalizedSubtitle === 'mrbeast_animated'
-        ? subtitleStyle
-        : 'mrbeast_animated'
+      const verticalCaptionConfig = resolveVerticalCaptionConfigForState({
+        analysis: verticalAnalysis,
+        renderSettings: (job as any)?.renderSettings
+      })
+      const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
+      const shouldApplyVerticalCaptionOverlays = Boolean(verticalCaptionConfig.enabled)
+      const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
+        preset: verticalCaptionConfig.preset,
+        fontSize: verticalCaptionConfig.fontSize,
+        fallbackStyle: subtitleStyle
+      })
       await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: false })
       await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
-      if (options.autoCaptions) {
+      const shouldGenerateVerticalTranscript = (
+        options.autoCaptions ||
+        (shouldApplyVerticalCaptionOverlays && verticalCaptionConfig.autoGenerate)
+      )
+      if (shouldGenerateVerticalTranscript) {
         const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
         if (generatedVerticalSubtitlePath) {
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
@@ -15219,6 +15743,9 @@ const processJob = async (
               clipIndex: idx,
               windows: verticalWindows,
               userCaptionText: verticalCaptionTextInput,
+              transcriptCues: verticalSourceCues,
+              captionPreset: verticalCaptionConfig.preset,
+              autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
               editorMode: editorModeForRender,
               styleProfile: verticalStyleProfile,
               nicheProfile: verticalNicheProfile
@@ -15412,6 +15939,7 @@ const processJob = async (
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
+        verticalCaptionConfig,
         outputPaths
       })
 
@@ -15472,7 +16000,8 @@ const processJob = async (
           longFormPreset: options.longFormPreset,
           longFormAggression: options.longFormAggression,
           longFormClarityVsSpeed: options.longFormClarityVsSpeed,
-          tangentKiller: options.tangentKiller
+          tangentKiller: options.tangentKiller,
+          verticalCaptionConfig
         }),
         analysis: nextAnalysis
       })
@@ -17243,6 +17772,7 @@ const processJob = async (
       longFormAggression: options.longFormAggression,
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
+      verticalCaptionConfig: persistedVerticalCaptionConfig,
       outputPaths
     })
 
@@ -17272,7 +17802,8 @@ const processJob = async (
         longFormPreset: options.longFormPreset,
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
-        tangentKiller: options.tangentKiller
+        tangentKiller: options.tangentKiller,
+        verticalCaptionConfig: persistedVerticalCaptionConfig
       }),
       analysis: nextAnalysis
     })
@@ -17704,7 +18235,9 @@ const handleCreateJob = async (req: any, res: any) => {
     const styleBlendOverride = parseStyleArchetypeBlendFromPayload(req.body)
     const autoCaptionsOverride = getAutoCaptionsFromPayload(req.body)
     const subtitleStyleOverride = getSubtitleStyleFromPayload(req.body)
-    const verticalCaptionTextOverride = getVerticalCaptionTextFromPayload(req.body)
+    const verticalCaptionConfigOverride = renderConfig.mode === 'vertical'
+      ? resolveVerticalCaptionConfig(req.body, getDefaultVerticalCaptionConfig())
+      : null
 
     // Ensure Supabase admin client envs are present for signed upload URLs
     const missingEnvs: string[] = []
@@ -17786,15 +18319,13 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormPreset: longFormPresetOverride,
             longFormAggression: longFormAggressionOverride,
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
-            tangentKiller: tangentKillerOverride
+            tangentKiller: tangentKillerOverride,
+            verticalCaptionConfig: verticalCaptionConfigOverride
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
           algorithm_config_source: configSelection.source,
-          ...(verticalCaptionTextOverride === null ? {} : {
-            verticalCaptionText: verticalCaptionTextOverride,
-            vertical_caption_text: verticalCaptionTextOverride
-          })
+          ...(verticalCaptionConfigOverride ? buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride) : {})
         },
         analysis: buildPersistedRenderAnalysis({
           existing: {
@@ -17818,10 +18349,7 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(soundFxOverride === null ? {} : { soundFx: soundFxOverride }),
             ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
             ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-            ...(verticalCaptionTextOverride === null ? {} : {
-              verticalCaptionText: verticalCaptionTextOverride,
-              vertical_caption_text: verticalCaptionTextOverride
-            }),
+            ...(verticalCaptionConfigOverride ? buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride) : {}),
             pipelineSteps: normalizePipelineStepMap({}),
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride }),
             ...(maxCutsOverride === null ? {} : { maxCuts: maxCutsOverride, max_cuts: maxCutsOverride, maxCutsRequested: maxCutsOverride }),
@@ -17846,6 +18374,7 @@ const handleCreateJob = async (req: any, res: any) => {
           longFormAggression: longFormAggressionOverride,
           longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
           tangentKiller: tangentKillerOverride,
+          verticalCaptionConfig: verticalCaptionConfigOverride,
           outputPaths: null
         })
       }
@@ -18402,10 +18931,11 @@ const handleCompleteUpload = async (req: any, res: any) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
-    const verticalCaptionTextOverride = (
-      getVerticalCaptionTextFromPayload(req.body) ??
-      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
-    )
+    const verticalCaptionConfigOverride = resolveVerticalCaptionConfigForState({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      payload: req.body
+    })
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: requestedAggressionLevel,
@@ -18433,10 +18963,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      })
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -18456,10 +18983,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      }),
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
       ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
@@ -18546,10 +19070,11 @@ router.post('/:id/analyze', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
-    const verticalCaptionTextOverride = (
-      getVerticalCaptionTextFromPayload(req.body) ??
-      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
-    )
+    const verticalCaptionConfigOverride = resolveVerticalCaptionConfigForState({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      payload: req.body
+    })
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
@@ -18584,7 +19109,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller
+      tangent_killer: requestedTangentKiller,
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -18604,10 +19130,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      }),
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
@@ -18621,11 +19144,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       longformClarityVsSpeed: requestedLongFormClarityVsSpeed,
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      tangent_killer: requestedTangentKiller,
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      })
+      tangent_killer: requestedTangentKiller
     }
     await updateJob(id, {
       renderSettings: nextRenderSettings,
@@ -18699,10 +19218,11 @@ router.post('/:id/process', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
-    const verticalCaptionTextOverride = (
-      getVerticalCaptionTextFromPayload(req.body) ??
-      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
-    )
+    const verticalCaptionConfigOverride = resolveVerticalCaptionConfigForState({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      payload: req.body
+    })
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
@@ -18738,10 +19258,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      })
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
@@ -18761,10 +19278,7 @@ router.post('/:id/process', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      }),
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
@@ -19046,10 +19560,11 @@ router.post('/:id/reprocess', async (req: any, res) => {
       getSubtitleStyleFromPayload(req.body) ??
       getSubtitleStyleFromPayload((job.analysis as any) || {})
     )
-    const verticalCaptionTextOverride = (
-      getVerticalCaptionTextFromPayload(req.body) ??
-      getVerticalCaptionTextFromPayload((job.analysis as any) || {})
-    )
+    const verticalCaptionConfigOverride = resolveVerticalCaptionConfigForState({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      payload: req.body
+    })
     const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
     const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
     const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
@@ -19097,10 +19612,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       ...(requestedSmartZoom === null ? {} : { smartZoom: requestedSmartZoom }),
       ...(requestedTransitions === null ? {} : { transitions: requestedTransitions }),
       ...(requestedSoundFx === null ? {} : { soundFx: requestedSoundFx }),
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      }),
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
       longFormPreset: requestedLongFormPreset,
@@ -19136,10 +19648,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       ...(requestedSmartZoom === null ? {} : { smartZoom: requestedSmartZoom }),
       ...(requestedTransitions === null ? {} : { transitions: requestedTransitions }),
       ...(requestedSoundFx === null ? {} : { soundFx: requestedSoundFx }),
-      ...(verticalCaptionTextOverride === null ? {} : {
-        verticalCaptionText: verticalCaptionTextOverride,
-        vertical_caption_text: verticalCaptionTextOverride
-      }),
+      ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
       longFormPreset: requestedLongFormPreset,

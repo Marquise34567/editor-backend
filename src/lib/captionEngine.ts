@@ -2,7 +2,7 @@ import { spawnSync } from 'child_process'
 import { existsSync } from 'fs'
 import path from 'path'
 
-type CaptionProbeMode = 'whisper' | 'python_module' | 'api'
+type CaptionProbeMode = 'faster_whisper' | 'whisper' | 'python_module' | 'api'
 
 type CaptionProbeAttempt = {
   label: string
@@ -13,7 +13,7 @@ type CaptionProbeAttempt = {
 
 export type CaptionEngineStatus = {
   available: boolean
-  provider: 'whisper' | 'openai_api' | 'none'
+  provider: 'faster_whisper' | 'whisper' | 'openai_api' | 'none'
   command: string | null
   mode: CaptionProbeMode | null
   reason: string
@@ -34,6 +34,7 @@ const CAPTION_PROBE_TIMEOUT_MS = (() => {
   )
 })()
 const CAPTION_USAGE_SIGNATURE = /usage|--output_format|--model|transcribe/i
+const FAST_WHISPER_SIGNATURE = /(faster_whisper|whispermodel|ok)/i
 const DEFAULT_PYTHON_UTF8_ENV = '1'
 const DEFAULT_PYTHON_IO_ENCODING = 'utf-8'
 
@@ -75,6 +76,11 @@ const buildProbeAttempts = () => {
     attempts.push({ label, command: normalized, args, mode })
   }
 
+  addAttempt('FASTER_WHISPER_PYTHON', process.env.FASTER_WHISPER_PYTHON, ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
+  addAttempt('python -c faster_whisper', 'python', ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
+  addAttempt('python3 -c faster_whisper', 'python3', ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
+  addAttempt('py -3 -c faster_whisper', 'py', ['-3', '-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
+  addAttempt('py -c faster_whisper', 'py', ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
   addAttempt('WHISPER_BIN', process.env.WHISPER_BIN, ['--help'], 'whisper')
   for (const candidate of getLikelyWindowsWhisperBins()) {
     addAttempt(`WINDOWS_WHISPER_BIN(${candidate})`, candidate, ['--help'], 'whisper')
@@ -105,6 +111,9 @@ const probeAttempt = (attempt: CaptionProbeAttempt) => {
     })
     if (result.error) return false
     const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`
+    if (attempt.mode === 'faster_whisper') {
+      return result.status === 0 && FAST_WHISPER_SIGNATURE.test(combinedOutput)
+    }
     if (CAPTION_USAGE_SIGNATURE.test(combinedOutput)) return true
     return result.status === 0
   } catch {
@@ -116,6 +125,16 @@ const resolveCaptionEngineStatus = (): CaptionEngineStatus => {
   const attempts = buildProbeAttempts()
   for (const attempt of attempts) {
     if (!probeAttempt(attempt)) continue
+    if (attempt.mode === 'faster_whisper') {
+      return {
+        available: true,
+        provider: 'faster_whisper',
+        command: attempt.command,
+        mode: attempt.mode,
+        reason: `Caption engine available via ${attempt.label}.`,
+        checkedAt: new Date().toISOString()
+      }
+    }
     return {
       available: true,
       provider: 'whisper',
@@ -125,7 +144,8 @@ const resolveCaptionEngineStatus = (): CaptionEngineStatus => {
       checkedAt: new Date().toISOString()
     }
   }
-  if (trimToEmpty(process.env.OPENAI_API_KEY)) {
+  const allowOpenAiApi = /^(1|true|yes)$/i.test(String(process.env.ALLOW_OPENAI_CAPTION_API || '').trim())
+  if (allowOpenAiApi && trimToEmpty(process.env.OPENAI_API_KEY)) {
     return {
       available: true,
       provider: 'openai_api',
@@ -140,7 +160,7 @@ const resolveCaptionEngineStatus = (): CaptionEngineStatus => {
     provider: 'none',
     command: null,
     mode: null,
-    reason: 'Caption engine unavailable: Whisper runtime not found and OPENAI_API_KEY is not configured.',
+    reason: 'Caption engine unavailable: faster-whisper/whisper runtime not found.',
     checkedAt: new Date().toISOString()
   }
 }
