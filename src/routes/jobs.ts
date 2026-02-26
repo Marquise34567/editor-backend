@@ -5,6 +5,7 @@ import path from 'path'
 import crypto from 'crypto'
 import { AsyncLocalStorage } from 'async_hooks'
 import { spawn, spawnSync } from 'child_process'
+import fetch, { File, FormData } from 'node-fetch'
 import { prisma } from '../db/prisma'
 import { supabaseAdmin } from '../supabaseClient'
 import r2 from '../lib/r2'
@@ -5704,30 +5705,85 @@ const buildFallbackHookCandidateFromStorySegments = ({
 }) => {
   const scored = segments
     .map((segment) => {
-      const start = clamp(segment.start, 0, Math.max(0, durationSeconds - 0.5))
-      const maxEnd = Math.min(durationSeconds, segment.end)
-      const end = Math.min(maxEnd, start + HOOK_MAX)
-      const duration = end - start
-      if (duration < Math.max(3.2, HOOK_MIN - 1.4)) return null
-      const hookSignal = averageWindowMetric(windows, start, end, (window) => window.hookScore ?? window.score)
-      const speech = averageWindowMetric(windows, start, end, (window) => window.speechIntensity)
-      const emotion = averageWindowMetric(windows, start, end, (window) => window.emotionIntensity)
-      const vocal = averageWindowMetric(windows, start, end, (window) => window.vocalExcitement)
-      const scene = averageWindowMetric(windows, start, end, (window) => window.sceneChangeRate)
-      const silenceRatio = getSilenceCoverageRatio({ start, end }, silences)
-      const earlyBias = 1 - clamp01(start / Math.max(45, durationSeconds * 0.4))
+      const segmentStart = clamp(segment.start, 0, Math.max(0, durationSeconds - 0.5))
+      const segmentEnd = clamp(segment.end, segmentStart + 0.2, durationSeconds)
+      const maxDuration = Math.min(AUTO_HOOK_DURATION_MAX_SECONDS, segmentEnd - segmentStart)
+      const minDuration = Math.min(AUTO_HOOK_DURATION_MIN_SECONDS, maxDuration)
+      if (maxDuration < Math.max(2.8, Math.min(HOOK_MIN, AUTO_HOOK_DURATION_MIN_SECONDS) - 0.6)) return null
+
+      const segmentWindows = windows.filter((window) => window.time >= segmentStart && window.time < segmentEnd)
+      const impactAtWindow = (window: EngagementWindow) => clamp01(
+        0.32 * (window.hookScore ?? window.score) +
+        0.24 * window.audioEnergy +
+        0.16 * window.emotionIntensity +
+        0.12 * window.vocalExcitement +
+        0.1 * (window.actionSpike ?? 0) +
+        0.06 * (window.curiosityTrigger ?? 0)
+      )
+      const peakWindow = segmentWindows.reduce(
+        (best, window) => {
+          const impact = impactAtWindow(window)
+          if (!best || impact > best.impact) return { window, impact }
+          return best
+        },
+        null as { window: EngagementWindow; impact: number } | null
+      )
+
+      const targetDuration = clamp(
+        6.2,
+        Math.max(0.2, minDuration),
+        Math.max(0.2, maxDuration)
+      )
+      const anchorTime = peakWindow ? peakWindow.window.time : segmentStart
+      const anchoredStart = anchorTime - Math.max(0.8, targetDuration * 0.35)
+      const hookStart = clamp(anchoredStart, segmentStart, Math.max(segmentStart, segmentEnd - targetDuration))
+      const hookEnd = clamp(hookStart + targetDuration, hookStart + Math.min(0.2, maxDuration), segmentEnd)
+      const duration = hookEnd - hookStart
+      if (duration < Math.max(2.8, minDuration - 0.4)) return null
+
+      const hookSignal = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.hookScore ?? window.score)
+      const energy = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.audioEnergy)
+      const speech = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.speechIntensity)
+      const emotion = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.emotionIntensity)
+      const vocal = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.vocalExcitement)
+      const action = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.actionSpike ?? 0)
+      const curiosity = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.curiosityTrigger ?? 0)
+      const scene = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.sceneChangeRate)
+      const silenceRatio = getSilenceCoverageRatio({ start: hookStart, end: hookEnd }, silences)
+      const windowCount = segmentWindows.length || 1
+      const spikeDensity = segmentWindows.length
+        ? segmentWindows.filter((window) => (
+            window.emotionalSpike > 0 ||
+            (window.actionSpike ?? 0) >= 0.62 ||
+            (window.hookScore ?? window.score) >= 0.78
+          )).length / windowCount
+        : 0
+      const peakImpact = peakWindow?.impact ?? clamp01(
+        0.36 * hookSignal +
+        0.24 * energy +
+        0.16 * emotion +
+        0.12 * vocal +
+        0.07 * action +
+        0.05 * curiosity
+      )
+      const earlyBias = 1 - clamp01(hookStart / Math.max(45, durationSeconds * 0.42))
       const score = clamp01(
-        0.42 * hookSignal +
-        0.2 * speech +
-        0.14 * emotion +
-        0.08 * vocal +
-        0.08 * scene +
-        0.08 * earlyBias -
-        0.28 * silenceRatio
+        0.22 * hookSignal +
+        0.24 * energy +
+        0.12 * emotion +
+        0.1 * vocal +
+        0.08 * action +
+        0.06 * curiosity +
+        0.04 * speech +
+        0.04 * scene +
+        0.22 * peakImpact +
+        0.1 * spikeDensity +
+        0.03 * earlyBias -
+        0.05 * silenceRatio
       )
       return {
-        start,
-        end,
+        start: hookStart,
+        end: hookEnd,
         score
       }
     })
@@ -5751,7 +5807,7 @@ const buildFallbackHookCandidateFromStorySegments = ({
     auditScore: Number(clamp01(confidence - 0.02).toFixed(4)),
     auditPassed: false,
     text: '',
-    reason: 'Fallback hook selected from the strongest low-silence segment after weak candidate pool.',
+    reason: 'Fallback hook selected from the highest-impact energy peak after weak candidate pool.',
     synthetic: true
   } as HookCandidate
 }
@@ -10425,6 +10481,98 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
   return candidates.length ? candidates[0].fullPath : null
 }
 
+const CAPTION_API_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.CAPTION_API_TIMEOUT_MS || process.env.OPENAI_TRANSCRIPTION_TIMEOUT_MS || 180_000)
+  if (!Number.isFinite(raw)) return 180_000
+  return Math.max(15_000, Math.min(600_000, Math.round(raw)))
+})()
+
+const getCaptionUploadMimeType = (inputPath: string) => {
+  const ext = path.extname(inputPath).toLowerCase()
+  if (ext === '.mp3') return 'audio/mpeg'
+  if (ext === '.m4a') return 'audio/mp4'
+  if (ext === '.wav') return 'audio/wav'
+  if (ext === '.webm') return 'audio/webm'
+  if (ext === '.ogg' || ext === '.oga') return 'audio/ogg'
+  if (ext === '.flac') return 'audio/flac'
+  if (ext === '.aac') return 'audio/aac'
+  if (ext === '.mov') return 'video/quicktime'
+  if (ext === '.mkv') return 'video/x-matroska'
+  return 'video/mp4'
+}
+
+const generateSubtitlesViaOpenAiApi = async (inputPath: string, workingDir: string) => {
+  const apiKey = String(process.env.OPENAI_API_KEY || '').trim()
+  if (!apiKey) return null
+  const endpoint = String(process.env.OPENAI_TRANSCRIPTION_ENDPOINT || 'https://api.openai.com/v1/audio/transcriptions').trim()
+  const model = String(process.env.OPENAI_TRANSCRIPTION_MODEL || process.env.CAPTION_API_MODEL || 'whisper-1').trim() || 'whisper-1'
+  const baseName = path.basename(inputPath, path.extname(inputPath))
+  const outputPath = path.join(workingDir, `${baseName}.openai.srt`)
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), CAPTION_API_TIMEOUT_MS)
+  try {
+    const mediaBytes = fs.readFileSync(inputPath)
+    const formData = new FormData()
+    formData.append(
+      'file',
+      new File([mediaBytes], path.basename(inputPath), { type: getCaptionUploadMimeType(inputPath) })
+    )
+    formData.append('model', model)
+    formData.append('response_format', 'srt')
+    const language = String(process.env.CAPTION_LANGUAGE || process.env.WHISPER_LANGUAGE || '').trim()
+    if (language) formData.append('language', language)
+    const prompt = String(process.env.OPENAI_TRANSCRIPTION_PROMPT || '').trim()
+    if (prompt) formData.append('prompt', prompt)
+
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: formData,
+      signal: controller.signal as any
+    } as any)
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      const shortDetail = detail ? ` ${String(detail).slice(0, 220)}` : ''
+      console.warn(`subtitle generation failed via openai_api (${response.status})${shortDetail}`)
+      return null
+    }
+    const srtBody = String(await response.text()).trim()
+    if (!srtBody || !srtBody.includes('-->')) {
+      console.warn('subtitle generation failed via openai_api (invalid srt payload)')
+      return null
+    }
+    fs.writeFileSync(outputPath, srtBody, 'utf8')
+    return outputPath
+  } catch (error: any) {
+    console.warn('subtitle generation failed via openai_api', error?.message || error)
+    return null
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+const extractEmbeddedSubtitlesAsSrt = async (inputPath: string, workingDir: string) => {
+  const baseName = path.basename(inputPath, path.extname(inputPath))
+  const outputPath = path.join(workingDir, `${baseName}.embedded.srt`)
+  return new Promise<string | null>((resolve) => {
+    const proc = spawn(
+      FFMPEG_PATH,
+      ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-map', '0:s:0', '-c:s', 'srt', outputPath],
+      { windowsHide: true }
+    )
+    proc.on('error', () => resolve(null))
+    proc.on('close', (code) => {
+      if (code !== 0) return resolve(null)
+      if (!fs.existsSync(outputPath)) return resolve(null)
+      const content = String(fs.readFileSync(outputPath, 'utf8') || '').trim()
+      if (!content || !content.includes('-->')) return resolve(null)
+      resolve(outputPath)
+    })
+  })
+}
+
 const prependPathEntry = (existingPath: string | undefined, entry: string) => {
   const normalizedEntry = String(entry || '').trim()
   if (!normalizedEntry) return String(existingPath || '')
@@ -10479,10 +10627,6 @@ const runWhisperTranscribe = async ({
 
 const generateSubtitles = async (inputPath: string, workingDir: string) => {
   const captionEngine = getCaptionEngineStatus()
-  if (!captionEngine.available) {
-    console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
-    return null
-  }
   const model = process.env.WHISPER_MODEL || 'base'
   const configuredArgs = splitWhisperArgs(process.env.WHISPER_ARGS)
   const baseArgs = configuredArgs.length
@@ -10499,7 +10643,7 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
     attempts.push({ command: normalized, args, label })
   }
 
-  if (captionEngine.command) {
+  if (captionEngine.command && captionEngine.provider === 'whisper') {
     const args = captionEngine.mode === 'python_module'
       ? ['-m', 'whisper', inputPath, ...baseArgs]
       : [inputPath, ...baseArgs]
@@ -10520,6 +10664,16 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
       label: attempt.label
     })
     if (output) return output
+  }
+
+  const openAiOutput = await generateSubtitlesViaOpenAiApi(inputPath, workingDir)
+  if (openAiOutput) return openAiOutput
+
+  const embeddedOutput = await extractEmbeddedSubtitlesAsSrt(inputPath, workingDir)
+  if (embeddedOutput) return embeddedOutput
+
+  if (!captionEngine.available) {
+    console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
   }
   return null
 }
@@ -13970,7 +14124,7 @@ const processJob = async (
           auditScore: 0.44,
           auditPassed: false,
           text: '',
-          reason: 'Fallback hook generated from earliest stable segment due weak candidate pool.',
+          reason: 'Fallback hook generated from strongest high-energy moment due weak candidate pool.',
           synthetic: true
         }
         resolvedHookDecision = {
@@ -13985,7 +14139,7 @@ const processJob = async (
           usedFallback: true,
           reason: fallbackHook.reason
         }
-        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected strongest low-silence highlight.')
+        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected highest-impact energy peak.')
       }
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
