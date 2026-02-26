@@ -2,6 +2,7 @@ import type { Server } from 'http'
 import crypto from 'crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { supabaseAdmin } from './supabaseClient'
+import { buildPublicLivePulse } from './services/liveStats'
 
 type SocketWithMeta = WebSocket & { userId?: string; sessionId?: string; userEmail?: string }
 
@@ -11,6 +12,7 @@ const PRESENCE_SNAPSHOT_INTERVAL_MS = 60_000
 const PRESENCE_HEARTBEAT_INTERVAL_MS = 20_000
 const PRESENCE_STALE_TIMEOUT_MS = 120_000
 const PRESENCE_HISTORY_LIMIT = 24 * 60 + 5
+const LIVE_STATS_BROADCAST_INTERVAL_MS = 4_000
 
 type PresenceSession = {
   sessionId: string
@@ -75,6 +77,31 @@ captureActiveUsersSnapshot()
 export const initRealtime = (server: Server) => {
   const wss = new WebSocketServer({ server, path: '/ws' })
 
+  const broadcastLiveStatsPulse = async () => {
+    if (wss.clients.size === 0) return
+    try {
+      const payload = await buildPublicLivePulse({
+        activeUsers: getRealtimeActiveUsersCount(),
+        activeUsersSeries: getRealtimeActiveUsersSeries(),
+        connectedClients: getConnectedRealtimeClientCount()
+      })
+      const message = JSON.stringify({ type: 'live:stats', payload })
+      for (const socket of wss.clients) {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(message)
+        }
+      }
+    } catch {
+      // best-effort pulse broadcast
+    }
+  }
+
+  const pulseTimer = setInterval(() => {
+    void broadcastLiveStatsPulse()
+  }, LIVE_STATS_BROADCAST_INTERVAL_MS)
+  pulseTimer.unref()
+  void broadcastLiveStatsPulse()
+
   wss.on('connection', async (socket: SocketWithMeta, req) => {
     try {
       const url = new URL(req.url || '', 'http://localhost')
@@ -115,6 +142,17 @@ export const initRealtime = (server: Server) => {
           activeWindowMs: ACTIVE_WINDOW_MS
         }
       }))
+
+      void buildPublicLivePulse({
+        activeUsers: getRealtimeActiveUsersCount(),
+        activeUsersSeries: getRealtimeActiveUsersSeries(),
+        connectedClients: getConnectedRealtimeClientCount()
+      })
+        .then((payload) => {
+          if (socket.readyState !== WebSocket.OPEN) return
+          socket.send(JSON.stringify({ type: 'live:stats', payload }))
+        })
+        .catch(() => null)
 
       socket.on('pong', () => {
         touchPresenceSession(sessionId)
@@ -176,4 +214,12 @@ export const getRealtimePresenceSessions = () => {
 
 export const getRealtimeActiveUsersSeries = () => {
   return activeUsersSeries.slice()
+}
+
+export const getConnectedRealtimeClientCount = () => {
+  let count = 0
+  for (const sockets of clientsByUser.values()) {
+    count += sockets.size
+  }
+  return count
 }

@@ -17,6 +17,8 @@ import audioAssetsRoutes from './routes/audioAssets'
 import adminRoutes from './routes/admin'
 import debugRoutes from './routes/debug'
 import analyticsRoutes from './routes/analytics'
+import feedbackRoutes from './routes/feedback'
+import liveStatsRoutes from './routes/liveStats'
 import algorithmDevRoutes from './dev/algorithm/routes/algorithm'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
@@ -239,8 +241,10 @@ app.use('/api', requireAuth, checkoutRoutes)
 app.use('/api/jobs', requireAuth, jobsRoutes)
 app.use('/api/uploads', requireAuth, uploadsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
+app.use('/api/live-stats', requireAuth, liveStatsRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
 app.use('/api/analytics', requireAuth, analyticsRoutes)
+app.use('/api/feedback', requireAuth, feedbackRoutes)
 app.use('/api/dev/algorithm', algorithmDevRoutes)
 app.use('/api/admin', adminRoutes)
 
