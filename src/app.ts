@@ -13,6 +13,7 @@ import webhookRoutes from './webhooks/stripe'
 import meRoutes from './routes/me'
 import settingsRoutes from './routes/settings'
 import publicRoutes from './routes/public'
+import audioAssetsRoutes from './routes/audioAssets'
 import adminRoutes from './routes/admin'
 import debugRoutes from './routes/debug'
 import analyticsRoutes from './routes/analytics'
@@ -230,6 +231,7 @@ app.post('/api/stripe/webhook', rateLimit({ windowMs: 60_000, max: 120 }), bodyP
 app.use(express.json({ limit: '10mb' }))
 
 app.use('/api/public', publicRoutes)
+app.use('/api/audio-assets', audioAssetsRoutes)
 app.use('/api/debug', debugRoutes)
 app.use('/outputs', express.static(localOutputsDir))
 app.use('/api/billing', requireAuth, billingRoutes)

@@ -23,6 +23,7 @@ import {
   EDITOR_RETENTION_CONFIG,
   EMOTIONAL_NICHE_TUNING,
   EMOTIONAL_STYLE_TUNING,
+  isLikelyStaleJobStatusUpdate,
   isJobStatusTransitionAllowed,
   normalizeJobStatus
 } from '../lib/editorConfig'
@@ -70,6 +71,7 @@ const FFMPEG_LOG_LIMIT = 10_000_000
 
 type FfmpegRunResult = {
   exitCode: number | null
+  signal: NodeJS.Signals | null
   stdout: string
   stderr: string
 }
@@ -313,11 +315,16 @@ const runFfmpegProcess = (args: string[]) => {
     })
     proc.on('error', (err) => {
       cleanup()
-      reject(err)
+      const wrapped: any = new Error(`ffmpeg_spawn_error:${String((err as any)?.code || err?.message || 'unknown')}`)
+      wrapped.cause = err
+      wrapped.command = formatFfmpegCommand(args)
+      wrapped.stdout = stdout
+      wrapped.stderr = stderr
+      reject(wrapped)
     })
-    proc.on('close', (exitCode) => {
+    proc.on('close', (exitCode, signal) => {
       cleanup()
-      resolve({ exitCode, stdout, stderr })
+      resolve({ exitCode, signal, stdout, stderr })
     })
   })
 }
@@ -335,8 +342,12 @@ const runFfmpeg = async (args: string[]) => {
   if (isPipelineCanceled(jobId)) {
     throw new JobCanceledError(jobId || undefined)
   }
-  const err: any = new Error(`ffmpeg_failed_${result.exitCode}`)
+  const errorCode = result.exitCode === null || result.exitCode === undefined
+    ? (result.signal ? `signal_${result.signal}` : 'unknown')
+    : String(result.exitCode)
+  const err: any = new Error(`ffmpeg_failed_${errorCode}`)
   err.exitCode = result.exitCode
+  err.exitSignal = result.signal
   err.stdout = result.stdout
   err.stderr = result.stderr
   err.command = formatFfmpegCommand(args)
@@ -525,11 +536,22 @@ const formatFfmpegCommand = (args: string[]) => {
 
 const formatFfmpegFailure = (err: any) => {
   const message = err?.message ? String(err.message) : 'ffmpeg_failed'
-  const exitCode = err?.exitCode !== undefined && err?.exitCode !== null ? `exit=${err.exitCode}` : 'exit=unknown'
   const stderr = err?.stderr ? String(err.stderr).trim() : ''
   const stdout = err?.stdout ? String(err.stdout).trim() : ''
+  const hasFfmpegContext =
+    err?.exitCode !== undefined ||
+    err?.exitSignal !== undefined ||
+    Boolean(stderr) ||
+    Boolean(stdout) ||
+    /^ffmpeg_/i.test(message) ||
+    String(err?.command || '').toLowerCase().includes('ffmpeg')
   const detail = [stderr, stdout].filter(Boolean).join('\n')
-  const combined = `${message} (${exitCode})${detail ? `\n${detail}` : ''}`
+  const exitDetail = err?.exitCode !== undefined && err?.exitCode !== null
+    ? `exit=${err.exitCode}`
+    : (err?.exitSignal ? `signal=${err.exitSignal}` : 'exit=unknown')
+  const combined = hasFfmpegContext
+    ? `${message} (${exitDetail})${detail ? `\n${detail}` : ''}`
+    : `${message}${detail ? `\n${detail}` : ''}`
   return combined.length > 3500 ? combined.slice(0, 3500) : combined
 }
 
@@ -559,29 +581,80 @@ export const updateJob = async (
     if (Number.isFinite(parsedExpected.getTime())) expectedUpdatedAt = parsedExpected
   }
 
-  if (hasStatusPatch) {
-    const normalizedStatus = normalizeJobStatus(nextData.status)
-    if (!normalizedStatus) {
-      throw new Error(`invalid_job_status:${String(nextData.status || '')}`)
-    }
-    const existing = await prisma.job.findUnique({
-      where: { id: jobId },
-      select: { status: true }
-    })
-    if (!existing) throw new Error('job_not_found')
-    const currentStatus = normalizeJobStatus(existing.status)
-    if (
-      currentStatus &&
-      EDITOR_RETENTION_CONFIG.enforceStatusTransitions &&
-      !isJobStatusTransitionAllowed(currentStatus, normalizedStatus)
-    ) {
-      throw new Error(`invalid_status_transition:${currentStatus}->${normalizedStatus}`)
-    }
-    nextData.status = normalizedStatus
+  const normalizedStatus = hasStatusPatch ? normalizeJobStatus(nextData.status) : null
+  if (hasStatusPatch && !normalizedStatus) {
+    throw new Error(`invalid_job_status:${String(nextData.status || '')}`)
   }
+  if (normalizedStatus) nextData.status = normalizedStatus
 
   if (hasAnalysisPatch && nextData.analysis !== null && nextData.analysis !== undefined) {
     nextData.analysis = normalizeAnalysisPayload(nextData.analysis)
+  }
+
+  if (normalizedStatus) {
+    const maxStatusUpdateAttempts = 4
+    for (let attempt = 1; attempt <= maxStatusUpdateAttempts; attempt += 1) {
+      const existing = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { status: true }
+      })
+      if (!existing) throw new Error('job_not_found')
+      const currentStatus = normalizeJobStatus(existing.status)
+      if (!currentStatus) throw new Error(`invalid_job_status:${String(existing.status || '')}`)
+
+      if (
+        EDITOR_RETENTION_CONFIG.enforceStatusTransitions &&
+        !isJobStatusTransitionAllowed(currentStatus, normalizedStatus)
+      ) {
+        if (isLikelyStaleJobStatusUpdate(currentStatus, normalizedStatus)) {
+          const current = await prisma.job.findUnique({ where: { id: jobId } })
+          if (!current) throw new Error('job_not_found')
+          return current
+        }
+        throw new Error(`invalid_status_transition:${currentStatus}->${normalizedStatus}`)
+      }
+
+      const statusWhere: Record<string, any> = { id: jobId, status: currentStatus }
+      if (expectedUpdatedAt) statusWhere.updatedAt = expectedUpdatedAt
+      const result = await prisma.job.updateMany({
+        where: statusWhere as any,
+        data: nextData
+      })
+      if (result.count > 0) {
+        const updated = await prisma.job.findUnique({ where: { id: jobId } })
+        if (!updated) throw new Error('job_not_found')
+        broadcastJobUpdate(updated.userId, { job: updated })
+        return updated
+      }
+
+      if (expectedUpdatedAt) {
+        const conflict: any = new Error('job_update_conflict')
+        conflict.code = 'job_update_conflict'
+        throw conflict
+      }
+
+      const latest = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: { status: true }
+      })
+      if (!latest) throw new Error('job_not_found')
+      const latestStatus = normalizeJobStatus(latest.status)
+      if (!latestStatus) {
+        throw new Error(`invalid_job_status:${String(latest.status || '')}`)
+      }
+      if (
+        latestStatus === normalizedStatus ||
+        isLikelyStaleJobStatusUpdate(latestStatus, normalizedStatus)
+      ) {
+        const current = await prisma.job.findUnique({ where: { id: jobId } })
+        if (!current) throw new Error('job_not_found')
+        return current
+      }
+
+      if (attempt === maxStatusUpdateAttempts) {
+        throw new Error('job_status_update_conflict')
+      }
+    }
   }
 
   let updated: any
@@ -15064,13 +15137,15 @@ const processJob = async (
       const overlaySubtitleStyle = normalizedSubtitle === 'mrbeast_animated'
         ? subtitleStyle
         : 'mrbeast_animated'
+      await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: false })
+      await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
       if (options.autoCaptions) {
-        await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
         const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
         if (generatedVerticalSubtitlePath) {
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
         }
       }
+      await updateJob(jobId, { status: 'audio', progress: 68, watermarkApplied: false })
       const verticalPreScan = buildLongFormPreScanSummary({
         durationSeconds,
         windows: verticalWindows,
@@ -15079,6 +15154,7 @@ const processJob = async (
         nicheProfile: verticalNicheProfile,
         editorMode: editorModeForRender
       })
+      await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: false })
       const verticalSelection = buildVerticalRetentionCandidates({
         durationSeconds: durationSeconds || 0,
         requestedCount: renderConfig.verticalClipCount,

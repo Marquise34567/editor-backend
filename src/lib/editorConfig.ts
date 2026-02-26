@@ -170,10 +170,12 @@ const makeTransitions = (allowed: JobStatusKey[]) => new Set<JobStatusKey>(allow
 export const JOB_STATUS_TRANSITIONS: Record<JobStatusKey, Set<JobStatusKey>> = {
   queued: makeTransitions(['queued', 'uploading', 'analyzing', 'failed']),
   uploading: makeTransitions(['uploading', 'queued', 'analyzing', 'failed']),
-  analyzing: makeTransitions(['analyzing', 'queued', 'hooking', 'cutting', 'pacing', 'story', 'failed']),
+  // Vertical jobs can skip directly from analysis to subtitle/render stages.
+  analyzing: makeTransitions(['analyzing', 'queued', 'hooking', 'cutting', 'pacing', 'story', 'subtitling', 'rendering', 'failed']),
   hooking: makeTransitions(['hooking', 'queued', 'cutting', 'pacing', 'story', 'failed']),
   cutting: makeTransitions(['cutting', 'queued', 'hooking', 'pacing', 'story', 'failed']),
-  pacing: makeTransitions(['pacing', 'queued', 'hooking', 'story', 'failed']),
+  // Vertical jobs can jump from pacing directly into subtitle/render stages.
+  pacing: makeTransitions(['pacing', 'queued', 'hooking', 'story', 'subtitling', 'audio', 'retention', 'rendering', 'failed']),
   subtitling: makeTransitions(['subtitling', 'queued', 'audio', 'retention', 'rendering', 'failed']),
   audio: makeTransitions(['audio', 'queued', 'retention', 'rendering', 'failed']),
   story: makeTransitions(['story', 'queued', 'hooking', 'pacing', 'subtitling', 'audio', 'retention', 'rendering', 'failed']),
@@ -181,6 +183,43 @@ export const JOB_STATUS_TRANSITIONS: Record<JobStatusKey, Set<JobStatusKey>> = {
   rendering: makeTransitions(['rendering', 'queued', 'completed', 'failed']),
   completed: makeTransitions(['completed', 'queued']),
   failed: makeTransitions(['failed', 'queued'])
+}
+
+export const JOB_STATUS_PROGRESS_ORDER: readonly JobStatusKey[] = [
+  'queued',
+  'uploading',
+  'analyzing',
+  'hooking',
+  'cutting',
+  'pacing',
+  'story',
+  'subtitling',
+  'audio',
+  'retention',
+  'rendering',
+  'completed',
+  'failed'
+] as const
+
+const JOB_STATUS_PROGRESS_INDEX: Record<JobStatusKey, number> = JOB_STATUS_PROGRESS_ORDER.reduce((map, status, index) => {
+  map[status] = index
+  return map
+}, {} as Record<JobStatusKey, number>)
+
+export const getJobStatusProgressIndex = (status: JobStatusKey) => JOB_STATUS_PROGRESS_INDEX[status] ?? -1
+
+export const isLikelyStaleJobStatusUpdate = (currentStatus: JobStatusKey, nextStatus: JobStatusKey) => {
+  if (currentStatus === nextStatus) return false
+  if (currentStatus === 'completed') {
+    return nextStatus !== 'queued'
+  }
+  if (currentStatus === 'failed') {
+    return nextStatus !== 'queued'
+  }
+  const currentIndex = getJobStatusProgressIndex(currentStatus)
+  const nextIndex = getJobStatusProgressIndex(nextStatus)
+  if (currentIndex === -1 || nextIndex === -1) return false
+  return nextIndex < currentIndex
 }
 
 export const normalizeJobStatus = (value: unknown): JobStatusKey | null => {
