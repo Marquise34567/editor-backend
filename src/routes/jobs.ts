@@ -3018,6 +3018,36 @@ const getOnlyCutsFromPayload = (payload?: any): boolean | null => {
   )
 }
 
+const getSmartZoomFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).smartZoom) ??
+    parseBooleanFlag((payload as any).smart_zoom) ??
+    null
+  )
+}
+
+const getTransitionsFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).transitions) ??
+    parseBooleanFlag((payload as any).enableTransitions) ??
+    parseBooleanFlag((payload as any).enable_transitions) ??
+    null
+  )
+}
+
+const getSoundFxFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).soundFx) ??
+    parseBooleanFlag((payload as any).sound_fx) ??
+    parseBooleanFlag((payload as any).soundEffects) ??
+    parseBooleanFlag((payload as any).sound_effects) ??
+    null
+  )
+}
+
 const getMaxCutsFromPayload = (payload?: any): number | null => {
   if (!payload || typeof payload !== 'object') return null
   return (
@@ -3267,6 +3297,48 @@ const getOnlyCutsFromJob = (job?: any): boolean | null => {
   )
 }
 
+const getSmartZoomFromJob = (job?: any): boolean | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.smartZoom) ??
+    parseBooleanFlag(settings?.smart_zoom) ??
+    parseBooleanFlag(analysis?.smartZoom) ??
+    parseBooleanFlag(analysis?.smart_zoom) ??
+    null
+  )
+}
+
+const getTransitionsFromJob = (job?: any): boolean | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.transitions) ??
+    parseBooleanFlag(settings?.enableTransitions) ??
+    parseBooleanFlag(settings?.enable_transitions) ??
+    parseBooleanFlag(analysis?.transitions) ??
+    parseBooleanFlag(analysis?.enableTransitions) ??
+    parseBooleanFlag(analysis?.enable_transitions) ??
+    null
+  )
+}
+
+const getSoundFxFromJob = (job?: any): boolean | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.soundFx) ??
+    parseBooleanFlag(settings?.sound_fx) ??
+    parseBooleanFlag(settings?.soundEffects) ??
+    parseBooleanFlag(settings?.sound_effects) ??
+    parseBooleanFlag(analysis?.soundFx) ??
+    parseBooleanFlag(analysis?.sound_fx) ??
+    parseBooleanFlag(analysis?.soundEffects) ??
+    parseBooleanFlag(analysis?.sound_effects) ??
+    null
+  )
+}
+
 const getMaxCutsFromJob = (job?: any): number | null => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -3478,6 +3550,9 @@ const buildPersistedRenderSettings = (
     retentionTargetPlatform?: RetentionTargetPlatform | null
     platformProfile?: PlatformProfile | null
     onlyCuts?: boolean | null
+    smartZoom?: boolean | null
+    transitions?: boolean | null
+    soundFx?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
     hookSelectionMode?: HookSelectionMode | null
@@ -3496,6 +3571,9 @@ const buildPersistedRenderSettings = (
   const retentionTargetPlatform = parseRetentionTargetPlatform(opts?.retentionTargetPlatform || 'auto')
   const platformProfile = parsePlatformProfile(opts?.platformProfile || retentionTargetPlatform, 'auto')
   const onlyCuts = typeof opts?.onlyCuts === 'boolean' ? opts.onlyCuts : null
+  const smartZoom = typeof opts?.smartZoom === 'boolean' ? opts.smartZoom : null
+  const transitions = typeof opts?.transitions === 'boolean' ? opts.transitions : null
+  const soundFx = typeof opts?.soundFx === 'boolean' ? opts.soundFx : null
   const maxCuts = parseMaxCutsPreference(opts?.maxCuts)
   const editorMode = parseEditorModeSelection(opts?.editorMode)
   const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'auto') || 'auto'
@@ -3531,6 +3609,9 @@ const buildPersistedRenderSettings = (
     tangentKiller,
     tangent_killer: tangentKiller,
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
+    ...(smartZoom === null ? {} : { smartZoom }),
+    ...(transitions === null ? {} : { transitions }),
+    ...(soundFx === null ? {} : { soundFx }),
     ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts }),
     ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode })
   }
@@ -3541,6 +3622,9 @@ const buildPersistedRenderAnalysis = ({
   renderConfig,
   outputPaths,
   onlyCuts,
+  smartZoom,
+  transitions,
+  soundFx,
   maxCuts,
   editorMode,
   hookSelectionMode,
@@ -3555,6 +3639,9 @@ const buildPersistedRenderAnalysis = ({
   renderConfig: RenderConfig
   outputPaths?: string[] | null
   onlyCuts?: boolean | null
+  smartZoom?: boolean | null
+  transitions?: boolean | null
+  soundFx?: boolean | null
   maxCuts?: number | null
   editorMode?: EditorModeSelection | null
   hookSelectionMode?: HookSelectionMode | null
@@ -3570,6 +3657,30 @@ const buildPersistedRenderAnalysis = ({
     : (
       parseBooleanFlag((existing as any)?.onlyCuts) ??
       parseBooleanFlag((existing as any)?.onlyHookAndCut) ??
+      null
+    )
+  const resolvedSmartZoom = typeof smartZoom === 'boolean'
+    ? smartZoom
+    : (
+      parseBooleanFlag((existing as any)?.smartZoom) ??
+      parseBooleanFlag((existing as any)?.smart_zoom) ??
+      null
+    )
+  const resolvedTransitions = typeof transitions === 'boolean'
+    ? transitions
+    : (
+      parseBooleanFlag((existing as any)?.transitions) ??
+      parseBooleanFlag((existing as any)?.enableTransitions) ??
+      parseBooleanFlag((existing as any)?.enable_transitions) ??
+      null
+    )
+  const resolvedSoundFx = typeof soundFx === 'boolean'
+    ? soundFx
+    : (
+      parseBooleanFlag((existing as any)?.soundFx) ??
+      parseBooleanFlag((existing as any)?.sound_fx) ??
+      parseBooleanFlag((existing as any)?.soundEffects) ??
+      parseBooleanFlag((existing as any)?.sound_effects) ??
       null
     )
   const resolvedMaxCuts = parseMaxCutsPreference(
@@ -3677,6 +3788,15 @@ const buildPersistedRenderAnalysis = ({
   if (resolvedOnlyCuts !== null) {
     payload.onlyCuts = resolvedOnlyCuts
     payload.onlyHookAndCut = resolvedOnlyCuts
+  }
+  if (resolvedSmartZoom !== null) {
+    payload.smartZoom = resolvedSmartZoom
+  }
+  if (resolvedTransitions !== null) {
+    payload.transitions = resolvedTransitions
+  }
+  if (resolvedSoundFx !== null) {
+    payload.soundFx = resolvedSoundFx
   }
   if (resolvedMaxCuts !== null) {
     payload.maxCuts = resolvedMaxCuts
@@ -12923,6 +13043,10 @@ const renderVerticalClip = async ({
   audioBitrate,
   audioSampleRate,
   audioFilters,
+  enableTransitions,
+  enableSmartZoom,
+  enableSoundFx,
+  autoZoomMax,
   subtitlePath,
   subtitleIsAss,
   subtitleStyle
@@ -12940,6 +13064,10 @@ const renderVerticalClip = async ({
   audioBitrate: string
   audioSampleRate: string
   audioFilters: string[]
+  enableTransitions: boolean
+  enableSmartZoom: boolean
+  enableSoundFx: boolean
+  autoZoomMax: number
   subtitlePath?: string | null
   subtitleIsAss?: boolean
   subtitleStyle?: string | null
@@ -12975,6 +13103,9 @@ const renderVerticalClip = async ({
             withAudio
           })
       })()
+  const clipDuration = Math.max(0.08, roundForFilter(Math.max(0.08, end - start)))
+  const fadeDuration = Number(clamp(clipDuration * 0.1, 0.04, 0.16).toFixed(3))
+  const fadeOutStart = Number(Math.max(0, clipDuration - fadeDuration).toFixed(3))
   const subtitleFilter = subtitlePath
     ? (
       subtitleIsAss
@@ -12982,13 +13113,60 @@ const renderVerticalClip = async ({
         : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
     )
     : ''
-  const filterWithSubtitles = subtitleFilter
-    ? `${baseFilterComplex};[outv]${subtitleFilter}[vsub]`
-    : baseFilterComplex
+  const graphParts: string[] = [baseFilterComplex]
+  let videoLabel = 'outv'
+  if (subtitleFilter) {
+    graphParts.push(`[${videoLabel}]${subtitleFilter}[vsub]`)
+    videoLabel = 'vsub'
+  }
+  const shouldApplySmartZoom = Boolean(enableSmartZoom)
+  const shouldApplyClipTransitions = Boolean(enableTransitions)
+  if (shouldApplySmartZoom || shouldApplyClipTransitions) {
+    const videoFx: string[] = []
+    if (shouldApplySmartZoom) {
+      const zoomFactor = clamp(Number(autoZoomMax || 1.08), 1.04, ZOOM_HARD_MAX)
+      const scaledWidth = Math.max(outputWidth + 2, Math.round(outputWidth * zoomFactor))
+      const scaledHeight = Math.max(outputHeight + 2, Math.round(outputHeight * zoomFactor))
+      videoFx.push(
+        `scale=${scaledWidth}:${scaledHeight}:flags=lanczos`,
+        `crop=${outputWidth}:${outputHeight}:(iw-ow)/2:(ih-oh)/2`
+      )
+    }
+    if (shouldApplyClipTransitions) {
+      videoFx.push(
+        `fade=t=in:st=0:d=${toFilterNumber(fadeDuration)}`,
+        `fade=t=out:st=${toFilterNumber(fadeOutStart)}:d=${toFilterNumber(fadeDuration)}`
+      )
+    }
+    graphParts.push(`[${videoLabel}]${videoFx.join(',')}[vfx]`)
+    videoLabel = 'vfx'
+  }
   const shouldPolishAudio = withAudio && audioFilters.length > 0
-  const filterComplex = shouldPolishAudio
-    ? `${filterWithSubtitles};[outa]${audioFilters.join(',')}[aout]`
-    : filterWithSubtitles
+  let audioLabel = 'outa'
+  if (withAudio) {
+    if (shouldPolishAudio) {
+      graphParts.push(`[${audioLabel}]${audioFilters.join(',')}[apolished]`)
+      audioLabel = 'apolished'
+    }
+    if (shouldApplyClipTransitions) {
+      graphParts.push(
+        `[${audioLabel}]afade=t=in:st=0:d=${toFilterNumber(fadeDuration)},afade=t=out:st=${toFilterNumber(fadeOutStart)}:d=${toFilterNumber(fadeDuration)}[afaded]`
+      )
+      audioLabel = 'afaded'
+    }
+    const canAddSoundFx = Boolean(enableSoundFx) && hasFfmpegFilter('anoisesrc') && clipDuration >= 0.2
+    if (canAddSoundFx) {
+      const noiseDuration = Number(clamp(0.12 + clipDuration * 0.08, 0.1, Math.min(0.32, clipDuration)).toFixed(3))
+      const noiseFadeDuration = Number(clamp(noiseDuration * 0.72, 0.04, 0.16).toFixed(3))
+      const noiseFadeStart = Number(Math.max(0.01, noiseDuration - noiseFadeDuration).toFixed(3))
+      graphParts.push(
+        `anoisesrc=r=48000:color=white:duration=${toFilterNumber(noiseDuration)},aformat=sample_rates=48000:channel_layouts=stereo,highpass=f=1200,lowpass=f=9200,volume=0.03,afade=t=out:st=${toFilterNumber(noiseFadeStart)}:d=${toFilterNumber(noiseFadeDuration)}[asfx]`
+      )
+      graphParts.push(`[${audioLabel}][asfx]amix=inputs=2:weights='1 0.92':normalize=0[amixed]`)
+      audioLabel = 'amixed'
+    }
+  }
+  const filterComplex = graphParts.join(';')
 
   const args = [
     '-y',
@@ -13015,12 +13193,12 @@ const renderVerticalClip = async ({
     '-filter_complex',
     filterComplex,
     '-map',
-    subtitleFilter ? '[vsub]' : '[outv]'
+    `[${videoLabel}]`
   ]
   if (withAudio) {
     args.push(
       '-map',
-      shouldPolishAudio ? '[aout]' : '[outa]',
+      `[${audioLabel}]`,
       '-c:a',
       'aac',
       '-b:a',
@@ -13679,6 +13857,9 @@ const getEditOptionsForUser = async (
     retentionAggressionLevel?: RetentionAggressionLevel | null
     retentionStrategyProfile?: RetentionStrategyProfile | null
     onlyCuts?: boolean | null
+    smartZoom?: boolean | null
+    transitions?: boolean | null
+    soundFx?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
     hookSelectionMode?: HookSelectionMode | null
@@ -13699,6 +13880,9 @@ const getEditOptionsForUser = async (
   const subtitleStyle =
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, tier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
   const autoCaptionsOverride = typeof overrides?.autoCaptions === 'boolean' ? overrides.autoCaptions : null
+  const smartZoomOverride = typeof overrides?.smartZoom === 'boolean' ? overrides.smartZoom : null
+  const transitionsOverride = typeof overrides?.transitions === 'boolean' ? overrides.transitions : null
+  const soundFxOverride = typeof overrides?.soundFx === 'boolean' ? overrides.soundFx : null
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
     : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
@@ -13770,10 +13954,10 @@ const getEditOptionsForUser = async (
     autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
     removeBoring,
     onlyCuts,
-    smartZoom: onlyCuts ? false : (settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
+    smartZoom: onlyCuts ? false : (smartZoomOverride ?? settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
     jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
-    transitions: onlyCuts ? false : (settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
-    soundFx: onlyCuts ? false : (settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
+    transitions: onlyCuts ? false : (transitionsOverride ?? settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
+    soundFx: onlyCuts ? false : (soundFxOverride ?? settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
     emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
     aggressiveMode,
     autoCaptions: subtitlesEnabled
@@ -14677,6 +14861,10 @@ const processJob = async (
           audioBitrate: ffAudioBitrate,
           audioSampleRate: ffAudioSampleRate,
           audioFilters: verticalAudioFilters,
+          enableTransitions: options.transitions,
+          enableSmartZoom: options.smartZoom,
+          enableSoundFx: options.soundFx,
+          autoZoomMax: options.autoZoomMax,
           subtitlePath: clipSubtitlePath,
           subtitleIsAss: clipSubtitleIsAss,
           subtitleStyle: clipSubtitleStyle
@@ -16726,6 +16914,9 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
         onlyCuts: getOnlyCutsFromJob(existing),
+        smartZoom: getSmartZoomFromJob(existing),
+        transitions: getTransitionsFromJob(existing),
+        soundFx: getSoundFxFromJob(existing),
         maxCuts: getMaxCutsFromJob(existing),
         editorMode: getEditorModeFromJob(existing),
         hookSelectionMode: getHookSelectionModeFromJob(existing),
@@ -17074,6 +17265,9 @@ const handleCreateJob = async (req: any, res: any) => {
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
     const renderConfig = parseRenderConfigFromRequest(req.body)
     const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
+    const smartZoomOverride = getSmartZoomFromPayload(req.body)
+    const transitionsOverride = getTransitionsFromPayload(req.body)
+    const soundFxOverride = getSoundFxFromPayload(req.body)
     const maxCutsOverride = getMaxCutsFromPayload(req.body)
     const editorModeOverride = getEditorModeFromPayload(req.body)
     const hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
@@ -17173,6 +17367,9 @@ const handleCreateJob = async (req: any, res: any) => {
             retentionTargetPlatform,
             platformProfile,
             onlyCuts: onlyCutsOverride,
+            smartZoom: smartZoomOverride,
+            transitions: transitionsOverride,
+            soundFx: soundFxOverride,
             maxCuts: maxCutsOverride,
             editorMode: editorModeOverride,
             hookSelectionMode: hookSelectionModeOverride,
@@ -17206,6 +17403,9 @@ const handleCreateJob = async (req: any, res: any) => {
             algorithm_config_version_id: configSelection.config_version_id,
             algorithm_experiment_id: configSelection.experiment_id,
             algorithm_config_source: configSelection.source,
+            ...(smartZoomOverride === null ? {} : { smartZoom: smartZoomOverride }),
+            ...(transitionsOverride === null ? {} : { transitions: transitionsOverride }),
+            ...(soundFxOverride === null ? {} : { soundFx: soundFxOverride }),
             ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
             ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
             ...(verticalCaptionTextOverride === null ? {} : {
@@ -17226,6 +17426,9 @@ const handleCreateJob = async (req: any, res: any) => {
           retentionTargetPlatform,
           platformProfile,
           onlyCuts: onlyCutsOverride,
+          smartZoom: smartZoomOverride,
+          transitions: transitionsOverride,
+          soundFx: soundFxOverride,
           maxCuts: maxCutsOverride,
           editorMode: editorModeOverride,
           hookSelectionMode: hookSelectionModeOverride,
@@ -18329,6 +18532,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       getVerticalCaptionTextFromPayload(req.body) ??
       getVerticalCaptionTextFromPayload((job.analysis as any) || {})
     )
+    const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
+    const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
+    const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
@@ -18370,6 +18576,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       hook_selection_mode: requestedHookSelectionMode,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(requestedSmartZoom === null ? {} : { smartZoom: requestedSmartZoom }),
+      ...(requestedTransitions === null ? {} : { transitions: requestedTransitions }),
+      ...(requestedSoundFx === null ? {} : { soundFx: requestedSoundFx }),
       ...(verticalCaptionTextOverride === null ? {} : {
         verticalCaptionText: verticalCaptionTextOverride,
         vertical_caption_text: verticalCaptionTextOverride
@@ -18406,6 +18615,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(requestedSmartZoom === null ? {} : { smartZoom: requestedSmartZoom }),
+      ...(requestedTransitions === null ? {} : { transitions: requestedTransitions }),
+      ...(requestedSoundFx === null ? {} : { soundFx: requestedSoundFx }),
       ...(verticalCaptionTextOverride === null ? {} : {
         verticalCaptionText: verticalCaptionTextOverride,
         vertical_caption_text: verticalCaptionTextOverride
