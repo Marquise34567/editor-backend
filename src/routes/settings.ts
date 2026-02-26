@@ -30,7 +30,6 @@ const DEFAULT_SETTINGS = {
   soundFx: true,
   emotionalBoost: true,
   musicDuck: true,
-  aggressiveMode: false,
   subtitleStyle: DEFAULT_SUBTITLE_PRESET,
   autoZoomMax: 1.1
 }
@@ -96,7 +95,6 @@ router.get('/', async (req: any, res) => {
         soundFx: true,
         emotionalBoost: features.advancedEffects ? true : false,
         musicDuck: true,
-        aggressiveMode: features.advancedEffects ? false : false,
         subtitleStyle: DEFAULT_SUBTITLE_PRESET,
         autoZoomMax: features.autoZoomMax ?? 1.1
       }
@@ -119,7 +117,7 @@ router.get('/', async (req: any, res) => {
       userId,
       watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
-      autoCaptions: subtitlesEnabled && capabilities.captions.available ? (settings?.autoCaptions ?? false) : false,
+      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? false) : false,
       autoHookMove: settings?.autoHookMove ?? true,
       removeBoring: settings?.removeBoring ?? true,
       onlyCuts: settings?.onlyCuts ?? false,
@@ -129,7 +127,6 @@ router.get('/', async (req: any, res) => {
       soundFx: settings?.soundFx ?? true,
       emotionalBoost: features.advancedEffects ? (settings?.emotionalBoost ?? true) : false,
       musicDuck: settings?.musicDuck ?? true,
-      aggressiveMode: features.advancedEffects ? (settings?.aggressiveMode ?? false) : false,
       subtitleStyle: enforcedSubtitle,
       autoZoomMax: enforcedAutoZoomMax
     }
@@ -158,13 +155,6 @@ router.patch('/', async (req: any, res) => {
     if (!subtitlesEnabled && (payload.autoCaptions === true || payload.subtitleStyle)) {
       return sendPlanLimit(res, 'creator', 'subtitles', 'Subtitles are temporarily disabled.')
     }
-    if (payload.autoCaptions === true && !capabilities.captions.available) {
-      return res.status(409).json({
-        error: 'CAPTION_ENGINE_UNAVAILABLE',
-        message: 'Auto captions require a Whisper runtime on the backend.',
-        capabilities
-      })
-    }
     if (features.watermark && payload.watermarkEnabled === false) {
       return sendPlanLimit(res, 'starter', 'watermark', 'Upgrade to remove watermark')
     }
@@ -183,7 +173,7 @@ router.patch('/', async (req: any, res) => {
       const requiredPlan = getRequiredPlanForAutoZoom(Number(payload.autoZoomMax))
       return sendPlanLimit(res, requiredPlan, 'autoZoomMax', 'Upgrade to unlock higher auto zoom limits')
     }
-    const wantsAdvancedEffects = Boolean(payload.emotionalBoost) || Boolean(payload.aggressiveMode)
+    const wantsAdvancedEffects = Boolean(payload.emotionalBoost)
     if (wantsAdvancedEffects && !features.advancedEffects) {
       const requiredPlan = getRequiredPlanForAdvancedEffects()
       return sendPlanLimit(res, requiredPlan, 'advancedEffects', 'Upgrade to unlock advanced effects')
@@ -194,7 +184,7 @@ router.patch('/', async (req: any, res) => {
     const sanitized = {
       watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, tier),
-      autoCaptions: subtitlesEnabled && capabilities.captions.available
+      autoCaptions: subtitlesEnabled
         ? (payload.autoCaptions ?? existing?.autoCaptions ?? false)
         : false,
       autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
@@ -206,7 +196,6 @@ router.patch('/', async (req: any, res) => {
       soundFx: payload.soundFx ?? existing?.soundFx ?? true,
       emotionalBoost: features.advancedEffects ? (payload.emotionalBoost ?? existing?.emotionalBoost ?? true) : false,
       musicDuck: payload.musicDuck ?? existing?.musicDuck ?? true,
-      aggressiveMode: features.advancedEffects ? (payload.aggressiveMode ?? existing?.aggressiveMode ?? false) : false,
       subtitleStyle: subtitlesEnabled ? (payload.subtitleStyle ?? existingSubtitle) : DEFAULT_SUBTITLE_PRESET,
       autoZoomMax: sanitizedAutoZoom
     }
@@ -214,7 +203,7 @@ router.patch('/', async (req: any, res) => {
     res.json({
       settings: {
         ...updated,
-        autoCaptions: capabilities.captions.available ? Boolean(updated?.autoCaptions) : false
+        autoCaptions: Boolean(updated?.autoCaptions)
       },
       capabilities
     })

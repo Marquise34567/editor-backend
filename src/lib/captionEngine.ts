@@ -2,7 +2,7 @@ import { spawnSync } from 'child_process'
 import { existsSync } from 'fs'
 import path from 'path'
 
-type CaptionProbeMode = 'whisper' | 'python_module'
+type CaptionProbeMode = 'whisper' | 'python_module' | 'api'
 
 type CaptionProbeAttempt = {
   label: string
@@ -13,7 +13,7 @@ type CaptionProbeAttempt = {
 
 export type CaptionEngineStatus = {
   available: boolean
-  provider: 'whisper' | 'none'
+  provider: 'whisper' | 'openai_api' | 'none'
   command: string | null
   mode: CaptionProbeMode | null
   reason: string
@@ -125,14 +125,22 @@ const resolveCaptionEngineStatus = (): CaptionEngineStatus => {
       checkedAt: new Date().toISOString()
     }
   }
+  if (trimToEmpty(process.env.OPENAI_API_KEY)) {
+    return {
+      available: true,
+      provider: 'openai_api',
+      command: 'https://api.openai.com/v1/audio/transcriptions',
+      mode: 'api',
+      reason: 'Caption engine available via OpenAI audio transcription API.',
+      checkedAt: new Date().toISOString()
+    }
+  }
   return {
     available: false,
     provider: 'none',
     command: null,
     mode: null,
-    reason: attempts.length
-      ? `Whisper is unavailable (tried: ${attempts.map((attempt) => attempt.label).join(', ')}).`
-      : 'Whisper is unavailable.',
+    reason: 'Caption engine unavailable: Whisper runtime not found and OPENAI_API_KEY is not configured.',
     checkedAt: new Date().toISOString()
   }
 }

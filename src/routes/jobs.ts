@@ -14900,14 +14900,10 @@ const processJob = async (
 
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })
-        const captionEngine = getCaptionEngineStatus()
-        if (!captionEngine.available) {
+        subtitlePath = await generateSubtitles(tmpIn, workDir)
+        if (!subtitlePath) {
+          const captionEngine = getCaptionEngineStatus()
           optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
-        } else {
-          subtitlePath = await generateSubtitles(tmpIn, workDir)
-          if (!subtitlePath) {
-            optimizationNotes.push('Auto subtitles skipped: subtitle generation failed.')
-          }
         }
       }
 
