@@ -1592,6 +1592,17 @@ const RESCUE_RENDER_MINIMUMS = {
   hook_strength: 52,
   pacing_score: 50
 }
+const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floor: number }> = {
+  auto: { target: 70, floor: 60 },
+  reaction: { target: 70, floor: 62 },
+  commentary: { target: 68, floor: 60 },
+  'savage-roast': { target: 72, floor: 62 },
+  vlog: { target: 67, floor: 60 },
+  gaming: { target: 70, floor: 61 },
+  sports: { target: 70, floor: 61 },
+  education: { target: 67, floor: 60 },
+  podcast: { target: 66, floor: 60 }
+}
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
   low: 0.62,
   medium: 0.68,
@@ -2927,6 +2938,16 @@ const parseEditorModeSelection = (value: any): EditorModeSelection | null => {
   return (EDITOR_MODE_VALUES as string[]).includes(normalized)
     ? (normalized as EditorModeSelection)
     : null
+}
+
+const resolveModeRetentionTargets = (
+  value?: EditorModeSelection | string | null
+): { mode: EditorModeSelection; target: number; floor: number } => {
+  const mode = parseEditorModeSelection(value) || 'auto'
+  const configured = MODE_RETENTION_TARGETS[mode] || MODE_RETENTION_TARGETS.auto
+  const floor = Math.round(clamp(Number(configured.floor || 60), 55, 90))
+  const target = Math.round(clamp(Number(configured.target || 70), floor, 95))
+  return { mode, target, floor }
 }
 
 const parseHookSelectionMode = (
@@ -6614,7 +6635,8 @@ const resolveQualityGateThresholds = ({
   signalStrength,
   contentFormat = 'youtube_long',
   targetPlatform = 'auto',
-  feedbackOffset = 0
+  feedbackOffset = 0,
+  retentionTargetScore
 }: {
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
@@ -6622,6 +6644,7 @@ const resolveQualityGateThresholds = ({
   contentFormat?: RetentionContentFormat
   targetPlatform?: RetentionTargetPlatform
   feedbackOffset?: number
+  retentionTargetScore?: number
 }): QualityGateThresholds => {
   const levelOffset = LEVEL_QUALITY_THRESHOLD_OFFSET[aggressionLevel]
   const transcriptOffset = hasTranscript ? 0 : -8
@@ -6630,6 +6653,14 @@ const resolveQualityGateThresholds = ({
   const formatOffset = FORMAT_QUALITY_GATE_OFFSET[contentFormat] || FORMAT_QUALITY_GATE_OFFSET.youtube_long
   const platformOffset = PLATFORM_QUALITY_GATE_OFFSET[parseRetentionTargetPlatform(targetPlatform)] || PLATFORM_QUALITY_GATE_OFFSET.auto
   const telemetryOffset = Math.round(clamp(Number(feedbackOffset || 0), -4, 4))
+  const hasExplicitRetentionTarget = Number.isFinite(Number(retentionTargetScore))
+  const retentionTargetFloor = hasExplicitRetentionTarget
+    ? Math.round(clamp(
+        Number(retentionTargetScore),
+        QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+        95
+      ))
+    : null
   const baseOffset = levelOffset + transcriptOffset + lowSignalPenalty + highSignalBoost
   return normalizeQualityGateThresholds({
     hook_strength: clamp(
@@ -6665,7 +6696,9 @@ const resolveQualityGateThresholds = ({
       Number(formatOffset.retention_score || 0) +
       Number(platformOffset.retention_score || 0) +
       telemetryOffset,
-      QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+      retentionTargetFloor === null
+        ? QUALITY_GATE_THRESHOLD_FLOORS.retention_score
+        : Math.max(QUALITY_GATE_THRESHOLD_FLOORS.retention_score, retentionTargetFloor),
       95
     )
   })
@@ -6675,14 +6708,21 @@ const maybeAllowQualityGateOverride = ({
   judge,
   thresholds,
   hasTranscript,
-  signalStrength
+  signalStrength,
+  minimumRetentionScore
 }: {
   judge: RetentionJudgeReport
   thresholds: QualityGateThresholds
   hasTranscript: boolean
   signalStrength: number
+  minimumRetentionScore?: number
 }) => {
   if (hasTranscript && signalStrength >= 0.5) return null
+  const requiredRetentionFloor = Math.round(clamp(
+    Number(minimumRetentionScore ?? RETENTION_RENDER_THRESHOLD),
+    QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+    MIN_PREDICTED_COMPLETION_PERCENT
+  ))
   const hookBuffer = hasTranscript ? 8 : 14
   const emotionBuffer = hasTranscript ? 10 : 16
   const pacingBuffer = 8
@@ -6691,7 +6731,7 @@ const maybeAllowQualityGateOverride = ({
   const emotionOk = judge.emotional_pull >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.emotional_pull, thresholds.emotional_pull - emotionBuffer)
   const pacingOk = judge.pacing_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.pacing_score, thresholds.pacing_score - pacingBuffer)
   const retentionOk = judge.retention_score >= Math.max(QUALITY_GATE_THRESHOLD_FLOORS.retention_score, thresholds.retention_score - retentionBuffer)
-  if (hookOk && emotionOk && pacingOk && retentionOk && judge.retention_score >= Math.max(RETENTION_RENDER_THRESHOLD, MIN_PREDICTED_COMPLETION_PERCENT)) {
+  if (hookOk && emotionOk && pacingOk && retentionOk && judge.retention_score >= Math.max(RETENTION_RENDER_THRESHOLD, requiredRetentionFloor)) {
     if (!hasTranscript) {
       return 'Quality gate override: transcript unavailable, accepted strongest non-verbal retention cut.'
     }
@@ -6702,9 +6742,16 @@ const maybeAllowQualityGateOverride = ({
   return null
 }
 
-const shouldForceRescueRender = (judge: RetentionJudgeReport) => {
+const shouldForceRescueRender = (
+  judge: RetentionJudgeReport,
+  minimumRetentionScore = RESCUE_RENDER_MINIMUMS.retention_score
+) => {
+  const requiredRetentionFloor = Math.max(
+    RESCUE_RENDER_MINIMUMS.retention_score,
+    Math.round(clamp(Number(minimumRetentionScore || RESCUE_RENDER_MINIMUMS.retention_score), 45, 95))
+  )
   return (
-    judge.retention_score >= RESCUE_RENDER_MINIMUMS.retention_score &&
+    judge.retention_score >= requiredRetentionFloor &&
     judge.hook_strength >= RESCUE_RENDER_MINIMUMS.hook_strength &&
     judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score
   )
@@ -15190,6 +15237,10 @@ const ensureUsageWithinLimits = async (
   renderMode: RenderMode
 ) => {
   const monthKey = getMonthKey()
+  if (isDevAccount(userId, userEmail)) {
+    const usage = await getUsageForMonth(userId, monthKey)
+    return { usage, monthKey }
+  }
   const renderViolation = await getRenderLimitViolation({
     userId,
     email: userEmail,
@@ -15211,7 +15262,7 @@ const ensureUsageWithinLimits = async (
   if (plan.maxMinutesPerMonth !== null && (usage?.minutesUsed ?? 0) + durationMinutes > plan.maxMinutesPerMonth) {
     const requiredPlan = getRequiredPlanForRenders(tier)
     throw new PlanLimitError(
-      'Monthly minutes limit reached. Upgrade to continue.',
+      'Upgrade for more minutes.',
       'minutes',
       requiredPlan,
       undefined,
@@ -15901,6 +15952,7 @@ const processJob = async (
     }
   }
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
+  let modeRetentionTargets = resolveModeRetentionTargets(editorModeForRender)
   const hookSelectionModeForRender: HookSelectionMode = requestedHookSelectionMode
   options.hookSelectionMode = hookSelectionModeForRender
   options.manualTimestampConfig = requestedManualTimestampConfig
@@ -16677,13 +16729,14 @@ const processJob = async (
         )
       )
       contentSignalStrength = computeContentSignalStrength(editPlan?.engagementWindows ?? [])
-      const qualityGateThresholds = resolveQualityGateThresholds({
+      let qualityGateThresholds = resolveQualityGateThresholds({
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength,
         contentFormat: selectedContentFormat,
         targetPlatform: retentionTargetPlatform,
-        feedbackOffset: combinedQualityGateOffset
+        feedbackOffset: combinedQualityGateOffset,
+        retentionTargetScore: modeRetentionTargets.target
       })
       qualityGateOverride = null
       const latestJobHookSnapshot = await prisma.job.findUnique({
@@ -17265,7 +17318,7 @@ const processJob = async (
         })
       }
       const initialPredictedRetention = Number(selectedJudge.retention_score ?? 0)
-      const lowRetentionRecoveryRequested = initialPredictedRetention < MIN_PREDICTED_COMPLETION_PERCENT
+      const lowRetentionRecoveryRequested = initialPredictedRetention < modeRetentionTargets.target
       if (
         lowRetentionRecoveryRequested &&
         requestedEditorModeRaw === 'auto' &&
@@ -17278,8 +17331,19 @@ const processJob = async (
           nicheProfile: nicheProfileForAnalysis
         })
         editorModeForRender = lowRetentionEditorMode.mode
+        modeRetentionTargets = resolveModeRetentionTargets(editorModeForRender)
+        qualityGateThresholds = resolveQualityGateThresholds({
+          aggressionLevel,
+          hasTranscript: hasTranscriptSignals,
+          signalStrength: contentSignalStrength,
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          feedbackOffset: combinedQualityGateOffset,
+          retentionTargetScore: modeRetentionTargets.target
+        })
         optimizationNotes.push(
-          `Low-retention recovery auto-mode activated: ${lowRetentionEditorMode.mode} (${lowRetentionEditorMode.reason})`
+          `Low-retention recovery auto-mode activated: ${lowRetentionEditorMode.mode} (${lowRetentionEditorMode.reason})`,
+          `Mode retention target adjusted to ${modeRetentionTargets.target}% (floor ${modeRetentionTargets.floor}%).`
         )
       }
       if (!selectedJudge.passed || lowRetentionRecoveryRequested) {
@@ -17287,7 +17351,8 @@ const processJob = async (
           judge: selectedJudge,
           thresholds: qualityGateThresholds,
           hasTranscript: hasTranscriptSignals,
-          signalStrength: contentSignalStrength
+          signalStrength: contentSignalStrength,
+          minimumRetentionScore: modeRetentionTargets.floor
         })
         if (!overrideReason) {
           const rescueHookCandidate = preferredHookCandidate || orderedHookCandidates.find((candidate) => candidate.auditPassed) || initialHook
@@ -17326,7 +17391,7 @@ const processJob = async (
             ),
             retention_score: clamp(
               qualityGateThresholds.retention_score - 10,
-              QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
+              Math.max(QUALITY_GATE_THRESHOLD_FLOORS.retention_score, modeRetentionTargets.floor),
               qualityGateThresholds.retention_score
             )
           })
@@ -17377,7 +17442,7 @@ const processJob = async (
           )
           if (rescueJudge.passed) {
             overrideReason = 'Rescue edit pass raised quality enough to render.'
-          } else if (shouldForceRescueRender(rescueJudge)) {
+          } else if (shouldForceRescueRender(rescueJudge, modeRetentionTargets.floor)) {
             overrideReason = 'Rescue render forced at adaptive floor to avoid hard-failing low-signal uploads.'
           }
         }
@@ -17385,11 +17450,13 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
-          const belowMinimum = Number(selectedJudge?.retention_score ?? 0) < MIN_PREDICTED_COMPLETION_PERCENT
+          const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
+          const belowMinimum = resolvedRetention < modeRetentionTargets.floor
+          const belowTarget = resolvedRetention < modeRetentionTargets.target
           const forcedReason = belowMinimum
-            ? `Predicted completion ${Number(selectedJudge?.retention_score ?? 0).toFixed(1)}% below ${MIN_PREDICTED_COMPLETION_PERCENT}% minimum. Continuing with best available rescue output.`
-            : lowRetentionRecoveryRequested
-              ? 'Low-retention recovery ran but remained below target; using best available rescue output.'
+            ? `Predicted completion ${resolvedRetention.toFixed(1)}% below ${modeRetentionTargets.floor}% mode floor (target ${modeRetentionTargets.target}%). Continuing with best available rescue output.`
+            : belowTarget
+              ? `Low-retention recovery ran but remained below ${modeRetentionTargets.target}% target; using best available rescue output.`
             : 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
           qualityGateOverride = { applied: true, reason: forcedReason }
           optimizationNotes.push(forcedReason)
@@ -18498,7 +18565,10 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       await processJob(jobId, user, requestedQuality, options, requestId)
     } catch (err: any) {
       if (err instanceof PlanLimitError) {
-        await updateJob(jobId, { status: 'failed', error: err.code })
+        const planLimitMessage = err.code === 'MINUTES_LIMIT_REACHED'
+          ? 'Upgrade for more minutes'
+          : err.code
+        await updateJob(jobId, { status: 'failed', error: planLimitMessage })
         try {
           await updatePipelineStepState(jobId, 'RENDER_FINAL', {
             status: 'failed',
@@ -20416,7 +20486,8 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
     if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
 
     const { tier } = await getUserPlan(req.user.id)
-    if (!isPaidTier(tier)) {
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    if (!isPaidTier(tier) && !devBypass) {
       return res.status(403).json({
         error: 'PAID_ONLY_FEATURE',
         message: 'Creator correction feedback is available on paid plans.',
@@ -20722,12 +20793,14 @@ const buildUniquenessSignatureForTest = ({
     : resolvedTargetPlatform === 'tiktok' || resolvedTargetPlatform === 'instagram_reels'
       ? 'tiktok_short'
       : 'youtube_long'
+  const modeRetentionTargets = resolveModeRetentionTargets(resolvedEditorMode)
   const qualityThresholds = resolveQualityGateThresholds({
     aggressionLevel: resolvedAggressionLevel,
     hasTranscript: true,
     signalStrength: 0.64,
     contentFormat,
-    targetPlatform: resolvedTargetPlatform
+    targetPlatform: resolvedTargetPlatform,
+    retentionTargetScore: modeRetentionTargets.target
   })
   const modeBias = getVerticalModeScoreBias(resolvedEditorMode)
   const maxCutsPerTen = getMaxCutsPer10Seconds({
@@ -20756,6 +20829,7 @@ const buildUniquenessSignatureForTest = ({
     clipCandidateTarget,
     clipExportTarget,
     qualityThresholds,
+    modeRetentionTargets,
     modeBias,
     avgSpeed: Number(avgSpeed.toFixed(4))
   })
