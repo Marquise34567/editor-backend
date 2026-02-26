@@ -17150,6 +17150,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     return res.json({
       ok: true,
       queued: true,
+      hookSelectionMode: requestedHookSelectionMode,
       rerenderUsage: {
         day: rerenderUsage.dayKey,
         rerendersUsed: rerenderUsage.rerendersUsed,
