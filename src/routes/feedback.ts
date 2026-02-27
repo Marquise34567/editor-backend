@@ -479,6 +479,87 @@ const buildClassicInput = (job: any): VideoFeedbackInput => {
 
   const modeSource = String(analysis?.renderMode || renderSettings?.renderMode || '').toLowerCase()
   const orientation: 'vertical' | 'horizontal' | 'unknown' = modeSource === 'vertical' ? 'vertical' : modeSource === 'horizontal' ? 'horizontal' : 'unknown'
+  const clips = Array.isArray(metadata?.clips) ? metadata.clips : []
+  const clipRetentionCurve = clips
+    .map((clip: any, index: number) => {
+      const predicted = parsePercent(clip?.predictedCompletion ?? clip?.predicted_completion)
+      if (predicted === null) return null
+      const start = asNumber(clip?.start, Number.NaN)
+      const end = asNumber(clip?.end, Number.NaN)
+      const fallbackStep = rawDurationSeconds / Math.max(1, clips.length)
+      const fallbackTime = fallbackStep * index
+      const timestampSeconds = Number.isFinite(start)
+        ? start
+        : Number.isFinite(end)
+          ? Math.max(0, end - Math.max(2, Math.min(10, fallbackStep * 0.45)))
+          : fallbackTime
+      return {
+        timestampSeconds: Number(clamp(timestampSeconds, 0, rawDurationSeconds).toFixed(2)),
+        watchedPercent: Number(predicted.toFixed(2)),
+        signal: Number((predicted / 100).toFixed(4)),
+        category: String(clip?.type || clip?.label || '').toLowerCase() || null,
+        label: String(clip?.title || clip?.label || `Clip ${index + 1}`),
+        note: String(clip?.reason || clip?.description || '')
+      }
+    })
+    .filter((item): item is {
+      timestampSeconds: number
+      watchedPercent: number
+      signal: number
+      category: string | null
+      label: string
+      note: string
+    } => Boolean(item))
+
+  const engagementWindows = Array.isArray(analysis?.engagementWindows)
+    ? analysis.engagementWindows
+    : Array.isArray(analysis?.editPlan?.engagementWindows)
+      ? analysis.editPlan.engagementWindows
+      : []
+  const windowRetentionCurve = engagementWindows
+    .map((window: any, index: number) => {
+      const time = asNumber(window?.time, Number.NaN)
+      const score = asNumber(window?.score, Number.NaN)
+      if (!Number.isFinite(time) || !Number.isFinite(score)) return null
+      const scorePct = clamp(score <= 1 ? score * 100 : score, 0, 100)
+      const moodScore = asNumber(window?.emotionIntensity ?? window?.audioEnergy ?? window?.speechIntensity, Number.NaN)
+      const category = scorePct >= 78
+        ? 'best'
+        : scorePct <= 36
+          ? 'skip_risk'
+          : scorePct <= 52
+            ? 'low_energy'
+            : index <= 1
+              ? 'hook'
+              : 'worst'
+      return {
+        timestampSeconds: Number(clamp(time, 0, rawDurationSeconds).toFixed(2)),
+        watchedPercent: Number(scorePct.toFixed(2)),
+        signal: Number((scorePct / 100).toFixed(4)),
+        category,
+        label: `Window ${index + 1}`,
+        note: Number.isFinite(moodScore)
+          ? `Composite intensity ${Math.round(clamp(moodScore <= 1 ? moodScore * 100 : moodScore, 0, 100))}%.`
+          : ''
+      }
+    })
+    .filter((item): item is {
+      timestampSeconds: number
+      watchedPercent: number
+      signal: number
+      category: string
+      label: string
+      note: string
+    } => Boolean(item))
+
+  const trendRaw = (
+    (analysis?.currentPlatformTrends && typeof analysis.currentPlatformTrends === 'object' && analysis.currentPlatformTrends) ||
+    (analysis?.current_platform_trends && typeof analysis.current_platform_trends === 'object' && analysis.current_platform_trends) ||
+    (metadata?.currentPlatformTrends && typeof metadata.currentPlatformTrends === 'object' && metadata.currentPlatformTrends) ||
+    (metadata?.current_platform_trends && typeof metadata.current_platform_trends === 'object' && metadata.current_platform_trends) ||
+    {}
+  ) as any
+  const retentionCurve = (clipRetentionCurve.length ? clipRetentionCurve : windowRetentionCurve).slice(0, 96)
 
   return {
     sourceType: 'classic',
@@ -525,7 +606,13 @@ const buildClassicInput = (job: any): VideoFeedbackInput => {
       likesPerView: parseRatio(retentionFeedback?.likesPerView ?? retentionFeedback?.likes_per_view),
       commentsPerView: parseRatio(retentionFeedback?.commentsPerView ?? retentionFeedback?.comments_per_view),
       sharesPerView: parseRatio(retentionFeedback?.sharesPerView ?? retentionFeedback?.shares_per_view)
-    }
+    },
+    trendSignals: {
+      tiktokShortBoost: parseTrendBoost(trendRaw?.tiktokShortBoost ?? trendRaw?.tiktok),
+      youtubeLongBoost: parseTrendBoost(trendRaw?.youtubeLongBoost ?? trendRaw?.youtube),
+      instagramCaptionBoost: parseTrendBoost(trendRaw?.instagramCaptionBoost ?? trendRaw?.instagram)
+    },
+    retentionCurve
   }
 }
 
@@ -575,6 +662,16 @@ const buildVibecutInput = (job: any): VideoFeedbackInput => {
   const avgRetention = points.length
     ? points.reduce((sum: number, point: any) => sum + asNumber(point?.watchedPct, 0), 0) / points.length
     : null
+  const retentionCurve = points
+    .map((point: any, index: number) => ({
+      timestampSeconds: Number(clamp(asNumber(point?.timestamp, 0), 0, rawDurationSeconds).toFixed(2)),
+      watchedPercent: Number(clamp(asNumber(point?.watchedPct, 0), 0, 100).toFixed(2)),
+      signal: Number((clamp(asNumber(point?.watchedPct, 0), 0, 100) / 100).toFixed(4)),
+      category: String(point?.type || '').toLowerCase() || (index <= 1 ? 'hook' : ''),
+      label: String(point?.label || `Moment ${index + 1}`),
+      note: String(point?.description || '')
+    }))
+    .filter((point) => Number.isFinite(point.timestampSeconds) && Number.isFinite(point.watchedPercent))
 
   return {
     sourceType: 'vibecut',
@@ -621,7 +718,8 @@ const buildVibecutInput = (job: any): VideoFeedbackInput => {
       likesPerView: null,
       commentsPerView: null,
       sharesPerView: null
-    }
+    },
+    retentionCurve
   }
 }
 
@@ -948,6 +1046,20 @@ router.post('/analyze', async (req: any, res) => {
 
     if (!input) {
       return res.status(400).json({ error: 'invalid_source' })
+    }
+
+    const bodyTrendSignals = req.body?.trendSignals && typeof req.body.trendSignals === 'object'
+      ? req.body.trendSignals
+      : null
+    if (bodyTrendSignals) {
+      input = {
+        ...input,
+        trendSignals: {
+          tiktokShortBoost: parseTrendBoost(bodyTrendSignals?.tiktokShortBoost ?? bodyTrendSignals?.tiktok),
+          youtubeLongBoost: parseTrendBoost(bodyTrendSignals?.youtubeLongBoost ?? bodyTrendSignals?.youtube),
+          instagramCaptionBoost: parseTrendBoost(bodyTrendSignals?.instagramCaptionBoost ?? bodyTrendSignals?.instagram)
+        }
+      }
     }
 
     const feedback = await buildVideoFeedbackAnalysis(input)

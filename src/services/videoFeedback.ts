@@ -55,6 +55,14 @@ export type VideoFeedbackInput = {
     youtubeLongBoost?: number | null;
     instagramCaptionBoost?: number | null;
   } | null;
+  retentionCurve?: Array<{
+    timestampSeconds?: number | null;
+    watchedPercent?: number | null;
+    signal?: number | null;
+    category?: string | null;
+    label?: string | null;
+    note?: string | null;
+  }> | null;
 };
 
 export type VideoFeedbackOutput = Record<string, any>;
@@ -91,6 +99,167 @@ const normalizeContrib = (items: Array<{ feature: string; value: number }>) => {
   return items
     .map((item) => ({ feature: item.feature, percent: round((Math.max(0, item.value) / total) * 100, 1) }))
     .sort((a, b) => b.percent - a.percent);
+};
+
+type RetentionMomentCategory = "best" | "worst" | "low_energy" | "skip_risk" | "hook";
+
+type RetentionMoment = {
+  timestampSeconds: number;
+  watchedPercent: number;
+  category: RetentionMomentCategory;
+  label: string;
+  note: string;
+};
+
+const toRetentionCategory = (
+  rawCategory: unknown,
+  watchedPercent: number,
+  timestampSeconds: number,
+  hookStartSeconds: number | null,
+  index: number
+): RetentionMomentCategory => {
+  const normalized = String(rawCategory || "").trim().toLowerCase();
+  if (normalized === "hook") return "hook";
+  if (normalized === "best" || normalized === "emotional_peak" || normalized === "peak") return "best";
+  if (normalized === "worst" || normalized === "dropoff") return "worst";
+  if (normalized === "skip_zone" || normalized === "skip-risk" || normalized === "skip_risk") return "skip_risk";
+  if (normalized === "low_energy" || normalized === "low-energy") return "low_energy";
+
+  if (index <= 1 && watchedPercent >= 68) return "hook";
+  if (hookStartSeconds !== null && Math.abs(timestampSeconds - hookStartSeconds) <= 3 && watchedPercent >= 62) return "hook";
+  if (watchedPercent >= 78) return "best";
+  if (watchedPercent <= 35) return "skip_risk";
+  if (watchedPercent <= 52) return "low_energy";
+  return "worst";
+};
+
+const noteForCategory = (category: RetentionMomentCategory, watchedPercent: number, kind: "short-form" | "long-form") => {
+  if (category === "hook") return `Opening hook holds around ${watchedPercent.toFixed(1)}% viewers.`;
+  if (category === "best") return `High-energy moment (${watchedPercent.toFixed(1)}% hold) worth emphasizing in preview cuts.`;
+  if (category === "skip_risk") return `Skip-risk zone (${watchedPercent.toFixed(1)}% hold). Tighten this beat or jump to payoff sooner.`;
+  if (category === "low_energy") {
+    return kind === "long-form"
+      ? `Low-energy section (${watchedPercent.toFixed(1)}% hold). Add chapter transition or recap hook.`
+      : `Low-energy section (${watchedPercent.toFixed(1)}% hold). Increase pacing or visual contrast.`;
+  }
+  return `Drop-off signal near ${watchedPercent.toFixed(1)}% hold. Rework transition framing.`;
+};
+
+const buildSyntheticRetentionCurve = ({
+  rawSeconds,
+  hookStrength,
+  removedRatio,
+  retentionLift,
+  kind,
+  hookStartSeconds,
+}: {
+  rawSeconds: number;
+  hookStrength: number;
+  removedRatio: number;
+  retentionLift: number;
+  kind: "short-form" | "long-form";
+  hookStartSeconds: number | null;
+}): RetentionMoment[] => {
+  const totalPoints = Math.max(
+    8,
+    Math.min(kind === "long-form" ? 42 : 26, Math.round(kind === "long-form" ? rawSeconds / 24 : rawSeconds / 4))
+  );
+
+  const points: RetentionMoment[] = Array.from({ length: totalPoints }).map((_, index) => {
+    const ratio = totalPoints === 1 ? 0 : index / (totalPoints - 1);
+    const timestampSeconds = Number((ratio * rawSeconds).toFixed(2));
+    const baseDrop = kind === "long-form" ? 44 : 34;
+    const wave = Math.sin(ratio * 8.1 + hookStrength * 2.4) * 7.4;
+    const lowEnergyPenalty = kind === "long-form" && ratio > 0.34 && ratio < 0.72 ? 6.8 : 0;
+    const watchedPercent = clamp(
+      88 - ratio * baseDrop + hookStrength * 10 + removedRatio * 9 + (retentionLift / 58) * 6 + wave - lowEnergyPenalty,
+      18,
+      98
+    );
+    const category = toRetentionCategory(null, watchedPercent, timestampSeconds, hookStartSeconds, index);
+    return {
+      timestampSeconds,
+      watchedPercent: round(watchedPercent, 2),
+      category,
+      label: `${category.replace("_", " ").replace(/\b\w/g, (c) => c.toUpperCase())} @ ${timestampSeconds.toFixed(1)}s`,
+      note: noteForCategory(category, watchedPercent, kind),
+    };
+  });
+
+  return points;
+};
+
+const buildRetentionTimeline = ({
+  curve,
+  rawSeconds,
+  kind,
+  hookStartSeconds,
+  hookStrength,
+  removedRatio,
+  retentionLift,
+}: {
+  curve: VideoFeedbackInput["retentionCurve"];
+  rawSeconds: number;
+  kind: "short-form" | "long-form";
+  hookStartSeconds: number | null;
+  hookStrength: number;
+  removedRatio: number;
+  retentionLift: number;
+}) => {
+  const normalizedCurve = Array.isArray(curve)
+    ? curve
+        .map((item, index) => {
+          const timestampSeconds = toNum(item?.timestampSeconds, Number.NaN);
+          const watchedFromSignal = toNum(item?.signal, Number.NaN);
+          const watchedFromPercent = toNum(item?.watchedPercent, Number.NaN);
+          const watchedPercentRaw = Number.isFinite(watchedFromPercent)
+            ? watchedFromPercent
+            : Number.isFinite(watchedFromSignal)
+              ? watchedFromSignal <= 1
+                ? watchedFromSignal * 100
+                : watchedFromSignal
+              : Number.NaN;
+          if (!Number.isFinite(timestampSeconds) || timestampSeconds < 0 || !Number.isFinite(watchedPercentRaw)) return null;
+          const watchedPercent = clamp(watchedPercentRaw, 0, 100);
+          const category = toRetentionCategory(item?.category, watchedPercent, timestampSeconds, hookStartSeconds, index);
+          return {
+            timestampSeconds: round(clamp(timestampSeconds, 0, rawSeconds), 2),
+            watchedPercent: round(watchedPercent, 2),
+            category,
+            label: String(item?.label || `${category.replace("_", " ").replace(/\b\w/g, (c) => c.toUpperCase())} @ ${timestampSeconds.toFixed(1)}s`),
+            note: String(item?.note || noteForCategory(category, watchedPercent, kind)),
+          } as RetentionMoment;
+        })
+        .filter((item): item is RetentionMoment => Boolean(item))
+        .sort((a, b) => a.timestampSeconds - b.timestampSeconds)
+    : [];
+
+  const baseTimeline = normalizedCurve.length >= 5
+    ? normalizedCurve
+    : buildSyntheticRetentionCurve({
+        rawSeconds,
+        hookStrength,
+        removedRatio,
+        retentionLift,
+        kind,
+        hookStartSeconds,
+      });
+
+  const bestMoments = baseTimeline
+    .filter((point) => point.category === "best" || point.category === "hook")
+    .sort((a, b) => b.watchedPercent - a.watchedPercent)
+    .slice(0, 4);
+
+  const weakMoments = baseTimeline
+    .filter((point) => point.category === "skip_risk" || point.category === "low_energy" || point.category === "worst")
+    .sort((a, b) => a.watchedPercent - b.watchedPercent)
+    .slice(0, 4);
+
+  return {
+    points: baseTimeline,
+    bestMoments,
+    weakMoments,
+  };
 };
 
 const parseAudioScore = (chain: string[], noiseLevel: number, eqApplied: boolean) => {
@@ -185,6 +354,18 @@ export const buildVideoFeedbackAnalysis = async (input: VideoFeedbackInput): Pro
         return { chapter: i + 1, estimatedLiftPercent: round(clamp(retentionLift / Math.max(1, chapters) + wave, 0, 12), 2) };
       })
     : [];
+  const hookStartSeconds = Number.isFinite(Number(input.hook?.startSeconds))
+    ? clamp(toNum(input.hook?.startSeconds, 0), 0, rawSeconds)
+    : null;
+  const retentionTimeline = buildRetentionTimeline({
+    curve: input.retentionCurve,
+    rawSeconds,
+    kind,
+    hookStartSeconds,
+    hookStrength,
+    removedRatio,
+    retentionLift,
+  });
 
   const views = toNum(input.engagement?.views, Number.NaN);
   const likes = toNum(input.engagement?.likes, Number.NaN);
@@ -324,6 +505,21 @@ export const buildVideoFeedbackAnalysis = async (input: VideoFeedbackInput): Pro
     if (weakest === "instagram") suggestions.push("For Instagram uplift, prioritize visual rhythm and bold caption styling in the first two scene changes.");
   }
   if (!suggestions.length) suggestions.push("Current edit is well-balanced; run one variant with a stronger opening hook to test upside in distribution.");
+  const prioritizedSuggestions = suggestions.slice(0, 6);
+  const suggestionActionItems = prioritizedSuggestions.map((tip, index) => ({
+    id: `suggestion_${index + 1}`,
+    priority: index < 2 ? "high" : index < 4 ? "medium" : "low",
+    tip,
+    impact: index < 2 ? "High potential lift" : index < 4 ? "Moderate gain" : "Incremental gain",
+    category:
+      /hook|opening|payoff/i.test(tip)
+        ? "hook"
+        : /chapter|transition|mid-video|watch-time/i.test(tip)
+          ? "retention_structure"
+          : /caption/i.test(tip)
+            ? "caption"
+            : "pacing",
+  }));
 
   return {
     schemaVersion: 1,
@@ -361,9 +557,12 @@ export const buildVideoFeedbackAnalysis = async (input: VideoFeedbackInput): Pro
         driverBreakdown: { deadAirTrim: deadAirDriver, hookStrength: hookDriver, captionClarity: captionDriver, chapterFlow: chapterDriver },
         simulatedWatchTimeSeconds: { before: simulatedBefore, after: simulatedAfter },
         chapterBreakdown,
+        retentionTimeline: retentionTimeline.points,
+        bestMoments: retentionTimeline.bestMoments,
+        weakMoments: retentionTimeline.weakMoments,
         summary: `Hook and pacing profile suggest ~${retentionLift.toFixed(1)}% retention upside on this cut.`,
-        visualization: kind === "long-form" ? "Before/after line graph with chapter overlay" : "Before/after retention sparkline",
-        action: kind === "long-form" ? "Focus on mid-video transitions to protect cumulative watch time." : "Front-load payoff language before second 5 for stronger hold."
+        visualization: kind === "long-form" ? "Before/after line graph with chapter overlay + best/worst markers" : "Before/after retention sparkline + skip-risk markers",
+        action: kind === "long-form" ? "For long-form, strengthen mid-video retention to boost YouTube watch time." : "Front-load payoff language before second 5 for stronger hold."
       },
       engagementInsights: {
         available: hasEngagement,
@@ -408,6 +607,35 @@ export const buildVideoFeedbackAnalysis = async (input: VideoFeedbackInput): Pro
         tiktok,
         instagram,
         bestFit,
+        heuristics: {
+          youtube: {
+            norm: "Rewards 10m+ watch-time sessions with 50%+ retention and strong chapter flow.",
+            inputs: {
+              lengthFitPercent: round(lenYoutube * 100, 2),
+              retentionStrengthPercent: round(retentionStrength * 100, 2),
+              chapterStrengthPercent: round(chapterStrength * 100, 2),
+              trendMultiplier: trendYoutube,
+            },
+          },
+          tiktok: {
+            norm: "Strongest for <60s vertical clips with instant hooks and pacing contrast.",
+            inputs: {
+              lengthFitPercent: round(lenTikTok * 100, 2),
+              hookStrengthPercent: round(hookStrength * 100, 2),
+              pacingStrengthPercent: round(pacingStrength * 100, 2),
+              trendMultiplier: trendTikTok,
+            },
+          },
+          instagram: {
+            norm: "Balances short vertical visual rhythm, captions, and engagement consistency.",
+            inputs: {
+              lengthFitPercent: round(lenInstagram * 100, 2),
+              captionStrengthPercent: round(captionStrength * 100, 2),
+              retentionStrengthPercent: round(retentionStrength * 100, 2),
+              trendMultiplier: trendInstagram,
+            },
+          },
+        },
         summary: `Best projected fit: ${bestFit === "youtube" ? "YouTube" : bestFit === "tiktok" ? "TikTok" : "Instagram"} based on runtime, hook strength, pacing, and retention signals from this video only.`,
         visualization: "Bar chart of platform scores with confidence badges",
         action: bestFit === "youtube"
@@ -417,8 +645,9 @@ export const buildVideoFeedbackAnalysis = async (input: VideoFeedbackInput): Pro
             : "Publish as Reel with bold captions and first-frame visual contrast."
       },
       improvementSuggestions: {
-        suggestions: suggestions.slice(0, 6),
-        summary: `Top focus: ${(suggestions[0] || "Run one additional variant test to validate the strongest hook.")}`,
+        suggestions: prioritizedSuggestions,
+        actionItems: suggestionActionItems,
+        summary: `Top focus: ${(prioritizedSuggestions[0] || "Run one additional variant test to validate the strongest hook.")}`,
         visualization: "Checklist cards sorted by predicted impact"
       }
     },
