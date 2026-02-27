@@ -7,6 +7,7 @@ import { spawn } from 'child_process'
 import multer from 'multer'
 import fetch from 'node-fetch'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
+import { prisma } from '../db/prisma'
 
 const router = express.Router()
 
@@ -16,6 +17,7 @@ type SuggestedSubMode = 'highlight_mode' | 'story_mode' | 'standard_mode'
 
 type UploadedVideoRecord = {
   id: string
+  userId: string
   fileName: string
   storedPath: string
   createdAt: string
@@ -79,6 +81,7 @@ type ThumbnailOption = {
 
 type RenderJobRecord = {
   id: string
+  userId: string
   status: JobStatus
   createdAt: string
   updatedAt: string
@@ -168,6 +171,180 @@ ensureDir(VIBECUT_RENDER_DIR)
 
 const uploadedVideos = new Map<string, UploadedVideoRecord>()
 const jobs = new Map<string, RenderJobRecord>()
+
+let prismaVibeCutEnabled = true
+const disablePrismaVibeCut = (reason: string, error?: unknown) => {
+  prismaVibeCutEnabled = false
+  console.warn(`vibecut prisma disabled: ${reason}`, error || '')
+}
+
+const canUsePrismaVibeCut = () => {
+  if (!prismaVibeCutEnabled) return false
+  const client: any = prisma as any
+  return Boolean(client?.vibeCutUpload && client?.vibeCutJob)
+}
+
+const toUploadedVideoRecord = (row: any): UploadedVideoRecord => {
+  return {
+    id: String(row?.id || ''),
+    userId: String(row?.userId || row?.user_id || ''),
+    fileName: String(row?.fileName || row?.file_name || ''),
+    storedPath: String(row?.storedPath || row?.stored_path || ''),
+    createdAt: new Date(row?.createdAt || row?.created_at || new Date()).toISOString(),
+    metadata: (row?.metadata || {}) as VideoMetadata,
+    autoDetection: (row?.autoDetection || row?.auto_detection || {}) as AutoDetectionPayload
+  }
+}
+
+const toRenderJobRecord = (row: any): RenderJobRecord => {
+  const retention = (row?.retention || {}) as RenderJobRecord['retention']
+  return {
+    id: String(row?.id || ''),
+    userId: String(row?.userId || row?.user_id || ''),
+    status: String(row?.status || 'queued') as JobStatus,
+    createdAt: new Date(row?.createdAt || row?.created_at || new Date()).toISOString(),
+    updatedAt: new Date(row?.updatedAt || row?.updated_at || new Date()).toISOString(),
+    mode: String(row?.mode || 'horizontal') === 'vertical' ? 'vertical' : 'horizontal',
+    progress: Number(row?.progress || 0),
+    fileName: String(row?.fileName || row?.file_name || ''),
+    videoId: String(row?.videoId || row?.video_id || row?.uploadId || row?.upload_id || ''),
+    outputVideoUrl: String(row?.outputVideoUrl || row?.output_video_url || ''),
+    outputVideoPath: String(row?.outputVideoPath || row?.output_video_path || ''),
+    clipUrls: Array.isArray(row?.clipUrls) ? row.clipUrls : Array.isArray(row?.clip_urls) ? row.clip_urls : [],
+    ffmpegCommands: Array.isArray(row?.ffmpegCommands) ? row.ffmpegCommands : Array.isArray(row?.ffmpeg_commands) ? row.ffmpeg_commands : [],
+    thumbnails: Array.isArray(row?.thumbnails) ? row.thumbnails : [],
+    retention: {
+      points: Array.isArray(retention?.points) ? retention.points : [],
+      heatmap: Array.isArray(retention?.heatmap) ? retention.heatmap : [],
+      summary: String(retention?.summary || '')
+    },
+    errorMessage: row?.errorMessage ? String(row.errorMessage) : row?.error_message ? String(row.error_message) : null
+  }
+}
+
+const persistUploadRecord = async (record: UploadedVideoRecord) => {
+  if (!canUsePrismaVibeCut()) return
+  try {
+    await (prisma as any).vibeCutUpload.upsert({
+      where: { id: record.id },
+      update: {
+        userId: record.userId,
+        fileName: record.fileName,
+        storedPath: record.storedPath,
+        metadata: record.metadata,
+        autoDetection: record.autoDetection
+      },
+      create: {
+        id: record.id,
+        userId: record.userId,
+        fileName: record.fileName,
+        storedPath: record.storedPath,
+        metadata: record.metadata,
+        autoDetection: record.autoDetection
+      }
+    })
+  } catch (error) {
+    disablePrismaVibeCut('upload_upsert_failed', error)
+  }
+}
+
+const findUploadRecord = async (videoId: string, userId: string): Promise<UploadedVideoRecord | null> => {
+  const inMemory = uploadedVideos.get(videoId) || null
+  if (inMemory && inMemory.userId === userId) return inMemory
+  if (!canUsePrismaVibeCut()) return inMemory && inMemory.userId === userId ? inMemory : null
+  try {
+    const row = await (prisma as any).vibeCutUpload.findUnique({ where: { id: videoId } })
+    if (!row) return null
+    const record = toUploadedVideoRecord(row)
+    uploadedVideos.set(record.id, record)
+    return record.userId === userId ? record : null
+  } catch (error) {
+    disablePrismaVibeCut('upload_find_failed', error)
+    return inMemory && inMemory.userId === userId ? inMemory : null
+  }
+}
+
+const persistJobRecord = async (record: RenderJobRecord) => {
+  if (!canUsePrismaVibeCut()) return
+  try {
+    await (prisma as any).vibeCutJob.upsert({
+      where: { id: record.id },
+      update: {
+        userId: record.userId,
+        uploadId: record.videoId,
+        status: record.status,
+        mode: record.mode,
+        progress: record.progress,
+        fileName: record.fileName,
+        outputVideoUrl: record.outputVideoUrl || null,
+        outputVideoPath: record.outputVideoPath || null,
+        clipUrls: record.clipUrls,
+        ffmpegCommands: record.ffmpegCommands,
+        thumbnails: record.thumbnails,
+        retention: record.retention,
+        errorMessage: record.errorMessage
+      },
+      create: {
+        id: record.id,
+        userId: record.userId,
+        uploadId: record.videoId,
+        status: record.status,
+        mode: record.mode,
+        progress: record.progress,
+        fileName: record.fileName,
+        outputVideoUrl: record.outputVideoUrl || null,
+        outputVideoPath: record.outputVideoPath || null,
+        clipUrls: record.clipUrls,
+        ffmpegCommands: record.ffmpegCommands,
+        thumbnails: record.thumbnails,
+        retention: record.retention,
+        errorMessage: record.errorMessage
+      }
+    })
+  } catch (error) {
+    disablePrismaVibeCut('job_upsert_failed', error)
+  }
+}
+
+const listRecentJobsByUser = async (userId: string): Promise<RenderJobRecord[]> => {
+  const fromMemory = Array.from(jobs.values()).filter((job) => job.userId === userId)
+  if (!canUsePrismaVibeCut()) {
+    return fromMemory
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 12)
+  }
+  try {
+    const rows = await (prisma as any).vibeCutJob.findMany({
+      where: { userId },
+      orderBy: { createdAt: 'desc' },
+      take: 12
+    })
+    const mapped = (rows || []).map((row: any) => toRenderJobRecord(row))
+    mapped.forEach((job) => jobs.set(job.id, job))
+    return mapped
+  } catch (error) {
+    disablePrismaVibeCut('job_list_failed', error)
+    return fromMemory
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
+      .slice(0, 12)
+  }
+}
+
+const findJobByIdAndUser = async (jobId: string, userId: string): Promise<RenderJobRecord | null> => {
+  const inMemory = jobs.get(jobId) || null
+  if (inMemory && inMemory.userId === userId) return inMemory
+  if (!canUsePrismaVibeCut()) return inMemory && inMemory.userId === userId ? inMemory : null
+  try {
+    const row = await (prisma as any).vibeCutJob.findUnique({ where: { id: jobId } })
+    if (!row) return null
+    const job = toRenderJobRecord(row)
+    jobs.set(job.id, job)
+    return job.userId === userId ? job : null
+  } catch (error) {
+    disablePrismaVibeCut('job_find_failed', error)
+    return inMemory && inMemory.userId === userId ? inMemory : null
+  }
+}
 
 const resolveScriptPath = (relativeToBackend: string) => {
   const candidates = [
@@ -419,6 +596,11 @@ const buildJobSummary = (job: RenderJobRecord) => ({
 
 router.post('/upload/analyze', upload.single('video'), async (req: any, res) => {
   try {
+    const userId = String(req?.user?.id || '').trim()
+    if (!userId) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+    }
+
     const uploaded = req?.file as Express.Multer.File | undefined
     if (!uploaded || !uploaded.path) {
       return res.status(400).json({ error: 'invalid_upload', message: 'Upload a video file in field "video".' })
@@ -431,6 +613,7 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
     const videoId = crypto.randomUUID()
     const record: UploadedVideoRecord = {
       id: videoId,
+      userId,
       fileName: uploaded.originalname || path.basename(uploaded.path),
       storedPath: uploaded.path,
       createdAt: new Date().toISOString(),
@@ -438,6 +621,7 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
       autoDetection
     }
     uploadedVideos.set(videoId, record)
+    void persistUploadRecord(record)
 
     return res.json({
       videoId,
@@ -467,11 +651,13 @@ const parseSegments = (value: unknown, duration: number) => {
 const updateJobState = (jobId: string, patch: Partial<RenderJobRecord>) => {
   const current = jobs.get(jobId)
   if (!current) return
-  jobs.set(jobId, {
+  const next: RenderJobRecord = {
     ...current,
     ...patch,
     updatedAt: new Date().toISOString()
-  })
+  }
+  jobs.set(jobId, next)
+  void persistJobRecord(next)
 }
 
 const runFfmpegCommand = async (args: string[], ffmpegCommands: string[]) => {
@@ -1003,11 +1189,11 @@ const generateThumbnailSet = async ({
   return thumbnails
 }
 
-const processRenderJob = async (jobId: string, payload: RenderRequestPayload) => {
+const processRenderJob = async (jobId: string, userId: string, payload: RenderRequestPayload) => {
   const job = jobs.get(jobId)
   if (!job) return
 
-  const source = uploadedVideos.get(payload.videoId)
+  const source = await findUploadRecord(payload.videoId, userId)
   if (!source) {
     updateJobState(jobId, {
       status: 'failed',
@@ -1117,12 +1303,17 @@ const processRenderJob = async (jobId: string, payload: RenderRequestPayload) =>
 
 router.post('/render', async (req: any, res) => {
   try {
+    const userId = String(req?.user?.id || '').trim()
+    if (!userId) {
+      return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+    }
+
     const payload = (req.body || {}) as RenderRequestPayload
     const videoId = String(payload.videoId || '').trim()
     if (!videoId) {
       return res.status(400).json({ error: 'invalid_video_id', message: 'videoId is required.' })
     }
-    const source = uploadedVideos.get(videoId)
+    const source = await findUploadRecord(videoId, userId)
     if (!source) {
       return res.status(404).json({ error: 'video_not_found', message: 'Upload video and analyze it first.' })
     }
@@ -1134,6 +1325,7 @@ router.post('/render', async (req: any, res) => {
 
     const record: RenderJobRecord = {
       id: jobId,
+      userId,
       status: 'queued',
       createdAt: now,
       updatedAt: now,
@@ -1151,8 +1343,9 @@ router.post('/render', async (req: any, res) => {
     }
 
     jobs.set(jobId, record)
+    void persistJobRecord(record)
 
-    void processRenderJob(jobId, payload)
+    void processRenderJob(jobId, userId, payload)
 
     return res.json({
       jobId,
@@ -1164,12 +1357,6 @@ router.post('/render', async (req: any, res) => {
     return res.status(500).json({ error: 'render_start_failed', message: error?.message || 'Could not start render.' })
   }
 })
-
-const listRecentJobs = () =>
-  Array.from(jobs.values())
-    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))
-    .slice(0, 12)
-    .map(buildJobSummary)
 
 const serializeJob = (job: RenderJobRecord) => ({
   jobId: job.id,
@@ -1184,29 +1371,47 @@ const serializeJob = (job: RenderJobRecord) => ({
   errorMessage: job.errorMessage
 })
 
-router.get('/jobs', async (_req: any, res) => {
-  return res.json({ jobs: listRecentJobs() })
+router.get('/jobs', async (req: any, res) => {
+  const userId = String(req?.user?.id || '').trim()
+  if (!userId) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+  }
+  const jobsForUser = await listRecentJobsByUser(userId)
+  return res.json({ jobs: jobsForUser.map(buildJobSummary) })
 })
 
-router.get('/', async (_req: any, res) => {
-  return res.json({ jobs: listRecentJobs() })
+router.get('/', async (req: any, res) => {
+  const userId = String(req?.user?.id || '').trim()
+  if (!userId) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+  }
+  const jobsForUser = await listRecentJobsByUser(userId)
+  return res.json({ jobs: jobsForUser.map(buildJobSummary) })
 })
 
 router.get('/jobs/:id', async (req: any, res) => {
+  const userId = String(req?.user?.id || '').trim()
+  if (!userId) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+  }
   const id = String(req.params?.id || '').trim()
   if (!id) return res.status(400).json({ error: 'invalid_id', message: 'Missing job id.' })
 
-  const job = jobs.get(id)
+  const job = await findJobByIdAndUser(id, userId)
   if (!job) return res.status(404).json({ error: 'not_found', message: 'Job not found.' })
 
   return res.json(serializeJob(job))
 })
 
 router.get('/:id', async (req: any, res) => {
+  const userId = String(req?.user?.id || '').trim()
+  if (!userId) {
+    return res.status(401).json({ error: 'unauthorized', message: 'Sign in required.' })
+  }
   const id = String(req.params?.id || '').trim()
   if (!id) return res.status(400).json({ error: 'invalid_id', message: 'Missing job id.' })
 
-  const job = jobs.get(id)
+  const job = await findJobByIdAndUser(id, userId)
   if (!job) return res.status(404).json({ error: 'not_found', message: 'Job not found.' })
 
   return res.json(serializeJob(job))

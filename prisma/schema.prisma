@@ -87,6 +87,44 @@ model Job {
   @@map("jobs")
 }
 
+model VibeCutUpload {
+  id            String       @id @default(uuid())
+  userId        String       @map("user_id")
+  fileName      String       @map("file_name")
+  storedPath    String       @map("stored_path")
+  metadata      Json
+  autoDetection Json         @map("auto_detection")
+  createdAt     DateTime     @default(now()) @map("created_at")
+  jobs          VibeCutJob[]
+
+  @@index([userId, createdAt], map: "idx_vibecut_uploads_user_created_at")
+  @@map("vibecut_uploads")
+}
+
+model VibeCutJob {
+  id             String        @id @default(uuid())
+  userId         String        @map("user_id")
+  uploadId       String        @map("upload_id")
+  status         String
+  mode           String
+  progress       Int           @default(0)
+  fileName       String        @map("file_name")
+  outputVideoUrl String?       @map("output_video_url")
+  outputVideoPath String?      @map("output_video_path")
+  clipUrls       Json?         @map("clip_urls")
+  ffmpegCommands Json?         @map("ffmpeg_commands")
+  thumbnails     Json?
+  retention      Json?
+  errorMessage   String?       @map("error_message")
+  createdAt      DateTime      @default(now()) @map("created_at")
+  updatedAt      DateTime      @updatedAt @map("updated_at")
+  upload         VibeCutUpload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt], map: "idx_vibecut_jobs_user_created_at")
+  @@index([uploadId], map: "idx_vibecut_jobs_upload_id")
+  @@map("vibecut_jobs")
+}
+
 model EditorConfigVersion {
   id              String   @id @default(uuid())
   createdAt       DateTime @default(now()) @map("created_at")
