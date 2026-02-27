@@ -19944,7 +19944,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
         throw new Error('ffmpeg_missing')
       }
-      const { options } = await getEditOptionsForUser(user.id, {
+      const { options: analyzeOptions } = await getEditOptionsForUser(user.id, {
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
         onlyCuts: getOnlyCutsFromJob(existing),
@@ -19964,11 +19964,35 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       }, user.email)
       const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
-      if (styleBlendOverride) options.styleArchetypeBlend = styleBlendOverride
+      if (styleBlendOverride) analyzeOptions.styleArchetypeBlend = styleBlendOverride
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
-      await analyzeJob(jobId, options, requestId)
+      await analyzeJob(jobId, analyzeOptions, requestId)
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
-      await processJob(jobId, user, requestedQuality, options, requestId)
+      const latestBeforeProcess = await prisma.job.findUnique({ where: { id: jobId } })
+      if (!latestBeforeProcess) throw new Error('not_found')
+      const { options: processOptions } = await getEditOptionsForUser(user.id, {
+        retentionAggressionLevel: getRetentionAggressionFromJob(latestBeforeProcess),
+        retentionStrategyProfile: getRetentionStrategyFromJob(latestBeforeProcess),
+        onlyCuts: getOnlyCutsFromJob(latestBeforeProcess),
+        smartZoom: getSmartZoomFromJob(latestBeforeProcess),
+        transitions: getTransitionsFromJob(latestBeforeProcess),
+        soundFx: getSoundFxFromJob(latestBeforeProcess),
+        maxCuts: getMaxCutsFromJob(latestBeforeProcess),
+        editorMode: getEditorModeFromJob(latestBeforeProcess),
+        hookSelectionMode: getHookSelectionModeFromJob(latestBeforeProcess),
+        longFormPreset: getLongFormPresetFromJob(latestBeforeProcess),
+        longFormAggression: getLongFormAggressionFromJob(latestBeforeProcess),
+        longFormClarityVsSpeed: getLongFormClarityVsSpeedFromJob(latestBeforeProcess),
+        tangentKiller: getTangentKillerFromJob(latestBeforeProcess),
+        manualTimestampConfig: getManualTimestampConfigFromJob(latestBeforeProcess),
+        fastMode: getFastModeFromJob(latestBeforeProcess),
+        autoCaptions: getAutoCaptionsFromPayload((latestBeforeProcess.analysis as any) || {}),
+        subtitleStyle: getSubtitleStyleFromPayload((latestBeforeProcess.analysis as any) || {})
+      }, user.email)
+      const processStyleBlendOverride = parseStyleArchetypeBlendFromPayload((latestBeforeProcess.analysis as any) || {})
+      if (processStyleBlendOverride) processOptions.styleArchetypeBlend = processStyleBlendOverride
+      if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
+      await processJob(jobId, user, requestedQuality, processOptions, requestId)
     } catch (err: any) {
       if (err instanceof PlanLimitError) {
         const planLimitMessage = err.code === 'MINUTES_LIMIT_REACHED'
@@ -21499,6 +21523,200 @@ router.post('/:id/process', async (req: any, res) => {
       // ignore
     }
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+const LIVE_RENDER_SETTINGS_MUTABLE_STATUSES = new Set([
+  'queued',
+  'uploading',
+  'analyzing',
+  'hooking',
+  'cutting',
+  'pacing',
+  'story',
+  'subtitling',
+  'audio',
+  'retention',
+  'rendering'
+])
+
+router.patch('/:id/live-settings', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+
+    const status = String(job.status || '').toLowerCase()
+    if (!LIVE_RENDER_SETTINGS_MUTABLE_STATUSES.has(status)) {
+      return res.status(409).json({
+        error: 'live_settings_stage_locked',
+        message: 'Live editor settings can only be changed while the pipeline is still running.'
+      })
+    }
+
+    const persistedRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const requestedVerticalModeOverride = (
+      req.body?.verticalMode && typeof req.body.verticalMode === 'object'
+    )
+      ? {
+          ...(persistedRenderConfig.verticalMode || {}),
+          ...(req.body.verticalMode || {}),
+          output: {
+            ...((persistedRenderConfig.verticalMode as any)?.output || {}),
+            ...((req.body.verticalMode as any)?.output || {})
+          }
+        }
+      : (req.body?.verticalMode ?? persistedRenderConfig.verticalMode)
+    const effectiveRenderConfig = hasRenderConfigOverrideInPayload(req.body)
+      ? parseRenderConfigFromRequest({
+          ...req.body,
+          renderMode: req.body?.renderMode ?? req.body?.mode ?? persistedRenderConfig.mode,
+          mode: req.body?.mode ?? req.body?.renderMode ?? persistedRenderConfig.mode,
+          horizontalMode: req.body?.horizontalMode ?? persistedRenderConfig.horizontalMode,
+          verticalMode: requestedVerticalModeOverride,
+          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount
+        })
+      : persistedRenderConfig
+
+    const tuning = buildRetentionTuningFromPayload({
+      payload: req.body,
+      fallbackAggression: getRetentionAggressionFromJob(job),
+      fallbackStrategy: getRetentionStrategyFromJob(job)
+    })
+    const platformTuning = buildRetentionPlatformFromPayload({
+      payload: req.body,
+      fallbackPlatform: getRetentionTargetPlatformFromJob(job)
+    })
+    const requestedAggressionLevel = tuning.aggression
+    const requestedStrategyProfile = tuning.strategy
+    const requestedTargetPlatform = platformTuning.targetPlatform
+    const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
+      ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
+      : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const styleBlendOverride =
+      parseStyleArchetypeBlendFromPayload(req.body) ??
+      parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
+    const autoCaptionsOverride = (
+      getAutoCaptionsFromPayload(req.body) ??
+      getAutoCaptionsFromPayload((job.analysis as any) || {})
+    )
+    const subtitleStyleOverride = (
+      getSubtitleStyleFromPayload(req.body) ??
+      getSubtitleStyleFromPayload((job.analysis as any) || {})
+    )
+    const verticalCaptionConfigOverride = resolveVerticalCaptionConfigForState({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      payload: req.body
+    })
+    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
+    const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
+    const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
+    const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
+    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
+    const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedHookSelectionModeRaw = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    const requestedHookSelectionMode = requestedManualTimestampConfig?.enabled ? 'manual' : requestedHookSelectionModeRaw
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+
+    const nextRenderSettings = {
+      ...((job as any)?.renderSettings || {}),
+      ...buildPersistedRenderSettings(effectiveRenderConfig, {
+        retentionAggressionLevel: requestedAggressionLevel,
+        retentionStrategyProfile: requestedStrategyProfile,
+        retentionTargetPlatform: requestedTargetPlatform,
+        platformProfile: requestedPlatformProfile,
+        onlyCuts: requestedOnlyCuts,
+        smartZoom: requestedSmartZoom,
+        transitions: requestedTransitions,
+        soundFx: requestedSoundFx,
+        maxCuts: requestedMaxCuts,
+        editorMode: requestedEditorMode,
+        hookSelectionMode: requestedHookSelectionMode,
+        longFormPreset: requestedLongFormPreset,
+        longFormAggression: requestedLongFormAggression,
+        longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+        tangentKiller: requestedTangentKiller,
+        manualTimestampConfig: requestedManualTimestampConfig,
+        verticalCaptionConfig: verticalCaptionConfigOverride
+      }),
+      ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
+      ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
+      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode })
+    }
+
+    const nowIso = toIsoNow()
+    const nextAnalysis = buildPersistedRenderAnalysis({
+      existing: {
+        ...((job.analysis as any) || {}),
+        retentionAggressionLevel: requestedAggressionLevel,
+        retentionLevel: requestedAggressionLevel,
+        retentionStrategyProfile: requestedStrategyProfile,
+        retentionStrategy: requestedStrategyProfile,
+        retentionTargetPlatform: requestedTargetPlatform,
+        retention_target_platform: requestedTargetPlatform,
+        retentionPlatform: requestedTargetPlatform,
+        targetPlatform: requestedTargetPlatform,
+        platform: requestedTargetPlatform,
+        platformProfile: requestedPlatformProfile,
+        platform_profile: requestedPlatformProfile,
+        style_archetype_blend_override: styleBlendOverride
+      },
+      renderConfig: effectiveRenderConfig,
+      retentionTargetPlatform: requestedTargetPlatform,
+      platformProfile: requestedPlatformProfile,
+      onlyCuts: requestedOnlyCuts,
+      smartZoom: requestedSmartZoom,
+      transitions: requestedTransitions,
+      soundFx: requestedSoundFx,
+      maxCuts: requestedMaxCuts,
+      editorMode: requestedEditorMode,
+      hookSelectionMode: requestedHookSelectionMode,
+      longFormPreset: requestedLongFormPreset,
+      longFormAggression: requestedLongFormAggression,
+      longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
+      tangentKiller: requestedTangentKiller,
+      manualTimestampConfig: requestedManualTimestampConfig,
+      verticalCaptionConfig: verticalCaptionConfigOverride
+    }) as Record<string, any>
+    if (autoCaptionsOverride !== null) nextAnalysis.autoCaptions = autoCaptionsOverride
+    if (subtitleStyleOverride) nextAnalysis.subtitleStyle = subtitleStyleOverride
+    if (requestedFastMode !== null) {
+      nextAnalysis.fastMode = requestedFastMode
+      nextAnalysis.fast_mode = requestedFastMode
+    }
+    nextAnalysis.style_archetype_blend_override = styleBlendOverride
+    nextAnalysis.live_settings_updated_at = nowIso
+
+    await updateJob(
+      id,
+      {
+        renderSettings: nextRenderSettings,
+        analysis: nextAnalysis
+      },
+      { expectedUpdatedAt: job.updatedAt }
+    )
+
+    return res.json({
+      ok: true,
+      status,
+      hookSelectionMode: requestedHookSelectionMode,
+      appliedAt: nowIso
+    })
+  } catch (err: any) {
+    if (String(err?.code || '').toLowerCase() === 'job_update_conflict' || String(err?.message || '').includes('job_update_conflict')) {
+      return res.status(409).json({
+        error: 'live_settings_update_conflict',
+        message: 'Live editor settings changed in another request. Refresh and retry.'
+      })
+    }
+    console.error('live settings update error', err)
+    return res.status(500).json({ error: 'server_error' })
   }
 })
 
