@@ -1720,6 +1720,21 @@ router.post('/upload/analyze', handleAnalyzeUpload, async (req: any, res) => {
       console.warn('vibecut upload detectMode failed, using fallback auto-detection', error)
     }
 
+    try {
+      const ruthlessSignal = await runUploadRuthlessPrompt({
+        metadata,
+        frameScan,
+        transcript,
+        mode: autoDetection.finalMode
+      })
+      autoDetection = applyUploadRuthlessSignalToDetection({
+        detection: autoDetection,
+        signal: ruthlessSignal
+      })
+    } catch (error) {
+      console.warn('vibecut upload ruthless prompt apply failed', error)
+    }
+
     const record: UploadedVideoRecord = {
       id: videoId,
       userId,
@@ -2487,6 +2502,53 @@ const forceSegmentsToFixedLength = ({
   return normalizeSegments(output, safeDuration)
 }
 
+const isUncutLikeSegmentSet = (segments: TimelineSegment[], duration: number) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  if (segments.length !== 1) return false
+  const segment = segments[0]
+  if (!segment) return false
+  return segment.start <= 0.18 && segment.end >= safeDuration - 0.18
+}
+
+const buildEmergencyFallbackSegments = ({
+  mode,
+  duration,
+  points
+}: {
+  mode: RenderMode
+  duration: number
+  points: RetentionPoint[]
+}): TimelineSegment[] => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const strategy = resolveSegmentStrategy({
+    mode,
+    pacingPreset: 'aggressive',
+    highlightReel: true,
+    duration: safeDuration
+  })
+  const adaptive = buildAdaptiveHighlightSegments({
+    duration: safeDuration,
+    points,
+    strategy
+  })
+  if (adaptive.length > 0) {
+    const fixed = forceSegmentsToFixedLength({
+      segments: adaptive,
+      duration: safeDuration,
+      targetSeconds: AUTO_FIXED_CUT_SECONDS
+    })
+    if (fixed.length > 0) return fixed
+    return adaptive
+  }
+
+  const fallbackSpan = clamp(mode === 'vertical' ? 10 : 16, 0.4, safeDuration)
+  return [{
+    start: 0,
+    end: Number(fallbackSpan.toFixed(3)),
+    speed: 1
+  }]
+}
+
 const applyPacingAdjustmentsToSegments = ({
   segments,
   adjustments,
@@ -2816,6 +2878,30 @@ const runVerticalMoviepyPipeline = async ({
   }
 }
 
+const resolveValidVerticalClipPaths = ({
+  clipPaths,
+  expectedCount
+}: {
+  clipPaths: string[]
+  expectedCount: number
+}) => {
+  const cleaned = clipPaths
+    .map((clipPath) => String(clipPath || '').trim())
+    .filter(Boolean)
+    .filter((clipPath) => fs.existsSync(clipPath))
+    .filter((clipPath) => {
+      try {
+        return fs.statSync(clipPath).size > 0
+      } catch {
+        return false
+      }
+    })
+
+  if (!cleaned.length) return [] as string[]
+  if (expectedCount > 0 && cleaned.length < expectedCount) return [] as string[]
+  return cleaned
+}
+
 const runVerticalPipeline = async ({
   inputPath,
   outputPath,
@@ -2843,7 +2929,14 @@ const runVerticalPipeline = async ({
   })
 
   if (moviepyResult.ok) {
-    clipPaths = moviepyResult.clipPaths
+    const expectedClipCount = Math.max(1, Math.min(segments.length, 3))
+    clipPaths = resolveValidVerticalClipPaths({
+      clipPaths: moviepyResult.clipPaths,
+      expectedCount: expectedClipCount
+    })
+    if (clipPaths.length === 0) {
+      console.warn('moviepy returned incomplete clips; forcing ffmpeg fallback')
+    }
   }
 
   if (clipPaths.length === 0) {
@@ -3007,18 +3100,21 @@ const coerceEditorProfile = ({
 
 const resolveRenderProfile = ({
   mode,
+  requestedMode,
   payload,
   baseProfile
 }: {
   mode: RenderMode
+  requestedMode: RenderModeRequest
   payload: RenderRequestPayload
   baseProfile: AdaptiveEditorProfile
-}): AdaptiveEditorProfile => {
+}): { profile: AdaptiveEditorProfile; quickControlMode: QuickControlMode } => {
   const pacingPreset = parsePacingPreset(payload.pacing, baseProfile.pacingPreset)
   const pacingValue = payload.pacing ? pacingValueFromPreset(pacingPreset, mode) : baseProfile.pacingValue
   const quickControls = parseQuickControls(payload.quickControls, baseProfile.quickControls)
+  const quickControlMode = resolveQuickControlMode({ quickControls, requestedMode })
 
-  return {
+  const parsedProfile: AdaptiveEditorProfile = {
     ...baseProfile,
     formatPreset: parseFormatPreset(payload.formatPreset, baseProfile.formatPreset),
     vibeChip: parseVibeChip(payload.vibeChip, baseProfile.vibeChip),
@@ -3034,6 +3130,15 @@ const resolveRenderProfile = ({
     audioOption: parseAudioOption(payload.audioOption, baseProfile.audioOption),
     quickControls,
     suggestedSubMode: parseSuggestedSubMode(payload.suggestedSubMode, baseProfile.suggestedSubMode)
+  }
+
+  return {
+    profile: applyQuickControlModeToProfile({
+      profile: parsedProfile,
+      mode,
+      quickControlMode
+    }),
+    quickControlMode
   }
 }
 
@@ -3051,7 +3156,8 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     return
   }
 
-  const mode: RenderMode = payload.mode === 'vertical' ? 'vertical' : 'horizontal'
+  const requestedMode = parseRequestedRenderMode(payload.mode, 'horizontal')
+  const mode = resolveEffectiveRenderMode(requestedMode, source)
   const jobDir = path.join(VIBECUT_RENDER_DIR, jobId)
   ensureDir(jobDir)
 
@@ -3081,11 +3187,14 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       fallback: inferredProfile,
       mode
     })
-    const resolvedProfile = resolveRenderProfile({
+    const resolvedProfileResult = resolveRenderProfile({
       mode,
+      requestedMode,
       payload,
       baseProfile
     })
+    const resolvedProfile = resolvedProfileResult.profile
+    const quickControlMode = resolvedProfileResult.quickControlMode
     const defaultZoomEffect: ZoomEffect =
       mode === 'vertical' || resolvedProfile.quickControls.speedRamp || resolvedProfile.quickControls.highlightReel
         ? 'beat_zoom'
@@ -3226,8 +3335,20 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       })
     }
 
+    if (manualSegments.length === 0 && isUncutLikeSegmentSet(segments, source.metadata.duration)) {
+      segments = buildEmergencyFallbackSegments({
+        mode,
+        duration: source.metadata.duration,
+        points: retention.points
+      })
+    }
+
     if (segments.length === 0) {
-      segments = [{ start: 0, end: source.metadata.duration, speed: 1 }]
+      segments = buildEmergencyFallbackSegments({
+        mode,
+        duration: source.metadata.duration,
+        points: retention.points
+      })
     }
 
     let clipPathsAbs: string[] = []
@@ -3359,6 +3480,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         insights: generatedInsights,
         summary: [
           `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
+          `Quick-control mode: ${quickControlMode.replace(/_/g, ' ')}${requestedMode === 'ai' ? ' (AI mode selected)' : ''}.`,
           'Planner: ruthless retention prompt (deterministic, local).',
           freeAiPlan.selectedHook && shouldApplyHookAndPacing
             ? `Hook opener: ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s moved to timeline start (${hookRangeLabel}).`
@@ -3427,7 +3549,8 @@ router.post('/render', async (req: any, res) => {
       return res.status(404).json({ error: 'video_not_found', message: 'Upload video and analyze it first.' })
     }
 
-    const mode: RenderMode = payload.mode === 'vertical' ? 'vertical' : 'horizontal'
+    const requestedMode = parseRequestedRenderMode(payload.mode, 'horizontal')
+    const mode = resolveEffectiveRenderMode(requestedMode, source)
     const jobId = crypto.randomUUID()
     const now = new Date().toISOString()
     const emptyRetention = createEmptyRetentionPayload()

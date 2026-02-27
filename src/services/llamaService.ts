@@ -93,7 +93,7 @@ const withTimeoutResult = async <T>(
   timeoutMs: number,
   onTimeout: () => T
 ): Promise<T> => {
-  const safeTimeout = clamp(Math.round(Number(timeoutMs || 0)), 1_000, 600_000)
+  const safeTimeout = clamp(Math.round(Number(timeoutMs || 0)), 100, 600_000)
   let timeoutHandle: NodeJS.Timeout | null = null
   try {
     return await Promise.race([
@@ -386,9 +386,33 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
         lastReason = result.reason || 'llama_request_failed'
         lastStatusCode = result.statusCode
         if (!isRetryable(result) || attempt >= maxRetries) break
+        const remainingForRetryMs = totalTimeoutMs - (Date.now() - queryStartedAt)
+        if (remainingForRetryMs <= 200) {
+          return {
+            ok: false,
+            text: '',
+            model: null,
+            provider: null,
+            attempts,
+            reason: 'llama_timeout_budget_exceeded',
+            statusCode: lastStatusCode
+          }
+        }
         const jitter = Math.floor(Math.random() * 250)
         const delayMs = baseBackoffMs * 2 ** (attempt - 1) + jitter
-        await delay(delayMs)
+        const boundedDelayMs = Math.min(delayMs, Math.max(0, remainingForRetryMs - 150))
+        if (boundedDelayMs <= 0) {
+          return {
+            ok: false,
+            text: '',
+            model: null,
+            provider: null,
+            attempts,
+            reason: 'llama_timeout_budget_exceeded',
+            statusCode: lastStatusCode
+          }
+        }
+        await delay(boundedDelayMs)
       }
     }
   }
