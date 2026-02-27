@@ -1,6 +1,3 @@
-import fetch from 'node-fetch'
-import { queryRetentionModel } from './aiService'
-
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 export type PlannerMode = 'horizontal' | 'vertical'
@@ -85,7 +82,7 @@ export type RetentionTitleSuggestion = {
 export type PredictionConfidenceLevel = 'low' | 'medium' | 'high'
 
 export type FreeAiHookPlan = {
-  provider: 'llama_local' | 'llama_local_with_heuristic' | 'huggingface' | 'heuristic' | 'huggingface_with_heuristic'
+  provider: 'ruthless_retention_prompt' | 'heuristic'
   model: string | null
   selectedHook: HookCandidate | null
   rankedHooks: HookCandidate[]
@@ -210,26 +207,6 @@ const countKeywordHits = (value: string, keywords: string[]) => {
     if (text.includes(token)) hits += 1
   }
   return hits
-}
-
-const extractJson = (text: string) => {
-  const raw = String(text || '').trim()
-  if (!raw) return null
-  const candidates = [raw]
-  const objStart = raw.indexOf('{')
-  const objEnd = raw.lastIndexOf('}')
-  if (objStart >= 0 && objEnd > objStart) candidates.push(raw.slice(objStart, objEnd + 1))
-  const arrStart = raw.indexOf('[')
-  const arrEnd = raw.lastIndexOf(']')
-  if (arrStart >= 0 && arrEnd > arrStart) candidates.push(raw.slice(arrStart, arrEnd + 1))
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate)
-    } catch {
-      // noop
-    }
-  }
-  return null
 }
 
 const buildCandidateId = (prefix: string, index: number) => `${prefix}_${String(index + 1).padStart(2, '0')}`
@@ -475,44 +452,6 @@ const buildScoredCandidates = ({
   })
 }
 
-const requestHuggingFaceSentiment = async ({
-  token,
-  model,
-  text
-}: {
-  token: string
-  model: string
-  text: string
-}): Promise<number | null> => {
-  const endpoint = String(process.env.HF_SENTIMENT_ENDPOINT || '').trim() || `https://api-inference.huggingface.co/models/${model}`
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify({ inputs: text })
-    })
-    if (!response.ok) return null
-    const payload = await response.json().catch(() => null)
-    const rows = Array.isArray(payload) ? payload : []
-    const labels = Array.isArray(rows[0]) ? rows[0] : rows
-    if (!Array.isArray(labels)) return null
-    let positive = 0.5
-    for (const row of labels) {
-      const label = String((row as any)?.label || '').toLowerCase()
-      const score = Number((row as any)?.score || 0)
-      if (!Number.isFinite(score)) continue
-      if (label.includes('positive')) positive = Math.max(positive, score)
-      if (label.includes('negative')) positive = Math.min(positive, 1 - score)
-    }
-    return clamp(positive, 0.05, 0.95)
-  } catch {
-    return null
-  }
-}
-
 const buildCandidateContext = (candidates: HookCandidate[]) =>
   candidates.map((candidate) => ({
     id: candidate.id,
@@ -525,31 +464,6 @@ const buildCandidateContext = (candidates: HookCandidate[]) =>
     heuristic_score: Number(candidate.scores.combined.toFixed(3)),
     reason: candidate.reason
   }))
-
-const parseEligibleIds = (payload: any): string[] => {
-  if (!payload) return []
-  if (Array.isArray(payload)) return payload.map((value) => String(value || '').trim()).filter(Boolean)
-  if (Array.isArray(payload.eligible_ids)) return payload.eligible_ids.map((value: any) => String(value || '').trim()).filter(Boolean)
-  if (Array.isArray(payload.eligibleIds)) return payload.eligibleIds.map((value: any) => String(value || '').trim()).filter(Boolean)
-  return []
-}
-
-const parseRankedIds = (payload: any): string[] => {
-  if (!payload) return []
-  if (Array.isArray(payload.ranked_ids)) return payload.ranked_ids.map((value: any) => String(value || '').trim()).filter(Boolean)
-  if (Array.isArray(payload.rankedIds)) return payload.rankedIds.map((value: any) => String(value || '').trim()).filter(Boolean)
-  if (Array.isArray(payload.top_ids)) return payload.top_ids.map((value: any) => String(value || '').trim()).filter(Boolean)
-  return []
-}
-
-const parseSelectedId = (payload: any): string | null => {
-  if (!payload || typeof payload !== 'object') return null
-  if (typeof payload.selected_id === 'string') return payload.selected_id.trim()
-  if (typeof payload.selectedId === 'string') return payload.selectedId.trim()
-  if (typeof payload.best_id === 'string') return payload.best_id.trim()
-  if (payload.selected && typeof payload.selected.id === 'string') return payload.selected.id.trim()
-  return null
-}
 
 const parsePacingAdjustments = (payload: any, duration: number): PacingAdjustment[] => {
   const rows = Array.isArray(payload?.cuts)
@@ -1158,22 +1072,6 @@ ${context}`
   }
 }
 
-const rankByIds = (candidates: HookCandidate[], rankedIds: string[]) => {
-  const map = new Map(candidates.map((candidate) => [candidate.id, candidate]))
-  const ranked: HookCandidate[] = []
-  const used = new Set<string>()
-  for (const id of rankedIds) {
-    const candidate = map.get(id)
-    if (!candidate) continue
-    ranked.push(candidate)
-    used.add(id)
-  }
-  const leftovers = candidates
-    .filter((candidate) => !used.has(candidate.id))
-    .sort((left, right) => right.scores.combined - left.scores.combined)
-  return [...ranked, ...leftovers]
-}
-
 const estimateFallbackRetention = ({
   rankedHooks,
   weakSegments,
@@ -1212,9 +1110,6 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : []
   })
 
-  const hfToken = String(process.env.HUGGINGFACE_API_KEY || process.env.HF_API_TOKEN || '').trim()
-  const hfSentimentModel = String(process.env.HF_SENTIMENT_MODEL || 'distilbert-base-uncased-finetuned-sst-2-english').trim()
-
   const prompts = buildPrompts({
     mode,
     duration,
@@ -1223,221 +1118,19 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     windows
   })
 
-  const notes: string[] = []
-  let provider: FreeAiHookPlan['provider'] = 'heuristic'
-  let model: string | null = null
-  const llmDecisionBudgetMs = clamp(
-    Math.round(Number(process.env.RETENTION_LLM_DECISION_TIMEOUT_MS || 60_000)),
-    10_000,
-    240_000
-  )
-  const llmDecisionStartedAt = Date.now()
-  const remainingDecisionBudgetMs = () => llmDecisionBudgetMs - (Date.now() - llmDecisionStartedAt)
-  const queryWithDecisionBudget = async ({
-    prompt,
-    maxNewTokens,
-    temperature
-  }: {
-    prompt: string
-    maxNewTokens: number
-    temperature: number
-  }) => {
-    const remainingMs = remainingDecisionBudgetMs()
-    if (remainingMs <= 1_200) {
-      return {
-        ok: false as const,
-        provider: 'none' as const,
-        model: null,
-        text: '',
-        reason: 'llm_decision_budget_exhausted'
+  const notes: string[] = ['ruthless_retention_prompt:deterministic_local_planner']
+  const provider: FreeAiHookPlan['provider'] = 'ruthless_retention_prompt'
+  const model: string | null = null
+
+  candidates = candidates
+    .sort((left, right) => right.scores.combined - left.scores.combined)
+    .map((candidate, index) => ({
+      ...candidate,
+      scores: {
+        ...candidate.scores,
+        llm: Number(clamp(1 - index * 0.08, 0.2, 1).toFixed(4))
       }
-    }
-    return queryRetentionModel({
-      prompt,
-      maxNewTokens,
-      temperature,
-      timeoutMs: Math.min(remainingMs, 60_000)
-    })
-  }
-
-  if (candidates.length > 0) {
-    const sampleForSentiment = candidates
-      .filter((candidate) => candidate.transcript.length > 0)
-      .slice(0, 10)
-
-    if (hfToken) {
-      for (const candidate of sampleForSentiment) {
-        const sentiment = await requestHuggingFaceSentiment({
-          token: hfToken,
-          model: hfSentimentModel,
-          text: candidate.transcript
-        })
-        if (sentiment === null) continue
-        candidate.scores.sentiment = Number(sentiment.toFixed(4))
-        candidate.scores.combined = Number(
-          clamp(candidate.scores.motion * 0.42 + candidate.scores.audio * 0.3 + sentiment * 0.28, 0, 1).toFixed(4)
-        )
-      }
-    }
-
-    const eligibility = await queryWithDecisionBudget({
-      prompt: prompts.eligibilityPrompt,
-      maxNewTokens: 360,
-      temperature: 0.1
-    })
-    const ranking = await queryWithDecisionBudget({
-      prompt: prompts.rankingPrompt,
-      maxNewTokens: 640,
-      temperature: 0.15
-    })
-    const pacing = await queryWithDecisionBudget({
-      prompt: prompts.pacingPrompt,
-      maxNewTokens: 900,
-      temperature: 0.2
-    })
-
-    if (eligibility.ok || ranking.ok || pacing.ok) {
-      const providersUsed = new Set(
-        [eligibility.provider, ranking.provider, pacing.provider].filter((entry) => entry !== 'none')
-      )
-      const fullModelCoverage = ranking.ok && pacing.ok
-      if (providersUsed.has('local')) {
-        provider = fullModelCoverage ? 'llama_local' : 'llama_local_with_heuristic'
-      } else {
-        provider = fullModelCoverage ? 'huggingface' : 'huggingface_with_heuristic'
-      }
-      model = ranking.model || pacing.model || eligibility.model || model
-    } else {
-      notes.push(`llm_unavailable:${eligibility.reason || ranking.reason || pacing.reason || 'unknown'}`)
-    }
-
-    const eligibilityJson = extractJson(eligibility.text)
-    const rankingJson = extractJson(ranking.text)
-    const pacingJson = extractJson(pacing.text)
-
-    const eligibleIds = parseEligibleIds(eligibilityJson)
-    if (eligibleIds.length > 0) {
-      candidates = candidates.map((candidate) => ({
-        ...candidate,
-        scores: {
-          ...candidate.scores,
-          llm: eligibleIds.includes(candidate.id) ? 0.85 : 0.2,
-          combined: Number(
-            clamp(candidate.scores.combined * 0.74 + (eligibleIds.includes(candidate.id) ? 0.26 : 0.06), 0, 1).toFixed(4)
-          )
-        }
-      }))
-    }
-
-    const rankedIds = parseRankedIds(rankingJson)
-    if (rankedIds.length > 0) {
-      candidates = rankByIds(candidates, rankedIds).map((candidate, index) => ({
-        ...candidate,
-        scores: {
-          ...candidate.scores,
-          llm: Number(clamp(1 - index * 0.08, 0.2, 1).toFixed(4))
-        }
-      }))
-    } else {
-      candidates = candidates.sort((left, right) => right.scores.combined - left.scores.combined)
-    }
-
-    const selectedId = parseSelectedId(rankingJson)
-    if (selectedId) {
-      candidates = rankByIds(candidates, [selectedId, ...candidates.map((candidate) => candidate.id)])
-    }
-
-    const selectedCandidate = candidates[0] ? toAIDurationHook(candidates[0], duration, 8) : null
-    const selectedReason = clipText(
-      String(
-        (rankingJson as any)?.selected_reason ||
-        (rankingJson as any)?.why ||
-        (selectedCandidate
-          ? `Selected this 8-second opener over alternatives because it has the strongest early-retention prediction (${selectedCandidate.start.toFixed(1)}s-${selectedCandidate.end.toFixed(1)}s).`
-          : '')
-      ),
-      220
-    )
-    const selectedHook = selectedCandidate
-      ? { ...selectedCandidate, reason: selectedReason || selectedCandidate.reason }
-      : null
-    const hookComparison = parseHookComparisons(rankingJson, candidates)
-    const parsedPacingAdjustments = parsePacingAdjustments(pacingJson, duration)
-    const parsedWeakSegments = parseSegmentInsights({
-      payload: pacingJson,
-      key: 'weak_segments',
-      duration,
-      fallbackReason: 'Predicted drop-off from low novelty and weak progression.',
-      fallbackFix: 'Trim setup and add speed/text contrast.',
-      defaultPredictedRetention: 42
-    })
-    const parsedStrongSegments = parseSegmentInsights({
-      payload: pacingJson,
-      key: 'strong_segments',
-      duration,
-      fallbackReason: 'Strong payoff and curiosity hold.',
-      defaultPredictedRetention: 88
-    })
-    const parsedTitles = parseTitleSuggestions(pacingJson)
-    const fallbackWeak = buildHeuristicWeakSegments({
-      duration,
-      windows,
-      pacingAdjustments: parsedPacingAdjustments
-    })
-    const weakSegments = parsedWeakSegments.length ? parsedWeakSegments : fallbackWeak
-    const strongSegments = parsedStrongSegments.length
-      ? parsedStrongSegments
-      : buildHeuristicStrongSegments({ rankedHooks: candidates, windows })
-    const retentionFromModel = parsePredictedRetention(
-      pacingJson,
-      estimateFallbackRetention({
-        rankedHooks: candidates,
-        weakSegments,
-        strongSegments
-      }).predictedAverageRetention
-    )
-    const retentionProtectionChanges = parseRetentionProtectionChanges({
-      payload: pacingJson,
-      selectedHook,
-      pacingAdjustments: parsedPacingAdjustments.length
-        ? parsedPacingAdjustments
-        : buildHeuristicPacingAdjustments({ duration, transcriptSegments, windows }),
-      weakSegments
-    })
-    const finalSummary = parseFinalSummary(pacingJson)
-    const titleSuggestions = parsedTitles.length
-      ? parsedTitles
-      : buildFallbackTitleSuggestions({ transcriptExcerpt: input.transcriptExcerpt, mode })
-
-    if (eligibility.ok || ranking.ok || pacing.ok) {
-      return {
-        provider,
-        model,
-        selectedHook,
-        rankedHooks: candidates.slice(0, 8),
-        pacingAdjustments: parsedPacingAdjustments.length
-          ? parsedPacingAdjustments
-          : buildHeuristicPacingAdjustments({ duration, transcriptSegments, windows }),
-        hookComparison,
-        weakSegments,
-        strongSegments,
-        predictedAverageRetention: retentionFromModel.predictedAverageRetention,
-        predictionConfidence: retentionFromModel.predictionConfidence,
-        predictionConfidenceLevel: retentionFromModel.predictionConfidenceLevel,
-        retentionProtectionChanges,
-        finalSummary,
-        titleSuggestions: titleSuggestions.slice(0, 5),
-        notes,
-        prompts: {
-          eligibility: prompts.eligibilityPrompt,
-          ranking: prompts.rankingPrompt,
-          pacing: prompts.pacingPrompt
-        }
-      }
-    }
-  }
-
-  candidates = candidates.sort((left, right) => right.scores.combined - left.scores.combined)
+    }))
   const selected = candidates[0] ? toAIDurationHook(candidates[0], duration, 8) : null
   const pacingAdjustments = buildHeuristicPacingAdjustments({ duration, transcriptSegments, windows })
   const weakSegments = buildHeuristicWeakSegments({ duration, windows, pacingAdjustments })
@@ -1472,7 +1165,7 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       ? {
           ...selected,
           reason:
-            `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
+            `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),

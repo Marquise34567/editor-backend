@@ -6,8 +6,8 @@ import crypto from 'crypto'
 import { spawn } from 'child_process'
 import multer from 'multer'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
-import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
 import { queryRetentionModel } from '../lib/aiService'
+import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
 import {
   generateMetadataStats,
   generateUniqueRetention,
@@ -19,6 +19,7 @@ import { prisma } from '../db/prisma'
 const router = express.Router()
 
 type RenderMode = 'horizontal' | 'vertical'
+type RenderModeRequest = RenderMode | 'ai'
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed'
 type SuggestedSubMode = 'highlight_mode' | 'story_mode' | 'standard_mode'
 type FormatPreset = 'youtube' | 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'custom'
@@ -84,6 +85,8 @@ type QuickControls = {
   speedRamp: boolean
   musicSync: boolean
 }
+
+type QuickControlMode = 'ai_director' | 'ruthless_retention' | 'highlight_hunter' | 'story_preserve' | 'balanced'
 
 type AdaptiveEditorProfile = {
   formatPreset: FormatPreset
@@ -198,7 +201,7 @@ type TimelineSegment = { start: number; end: number; speed?: number }
 
 type RenderRequestPayload = {
   videoId: string
-  mode: RenderMode
+  mode: RenderModeRequest
   manualSegments?: SegmentInput[]
   quickControls?: Partial<QuickControls>
   formatPreset?: string
@@ -255,6 +258,16 @@ type LlamaRetentionOutput = {
   summary: string
 } | null
 
+type UploadRuthlessSignal = {
+  hookStrength: number
+  pacingRisk: number
+  confidence: number
+  quickControlMode: QuickControlMode | null
+  reason: string
+  provider: 'local' | 'huggingface' | 'none'
+  model: string | null
+} | null
+
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
 const DEFAULT_CAPTION_FONT = 'Inter'
@@ -298,8 +311,44 @@ const AUTO_HOOK_MIN_SECONDS = 5
 const AUTO_HOOK_MAX_SECONDS = 8
 const frameScanRatioRaw = Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1)
 const FRAME_SCAN_SAMPLE_RATIO = Number.isFinite(frameScanRatioRaw) ? clamp(frameScanRatioRaw, 0.05, 1) : 1
+const UPLOAD_RUTHLESS_TIMEOUT_MS = clamp(Number(process.env.VIBECUT_UPLOAD_RUTHLESS_TIMEOUT_MS || 3500), 1500, 10_000)
+
+const RUTHLESS_UPLOAD_PROMPT = `You are AutoEditor's ruthless retention-maximizing AI brain.
+Mission: maximize retention and completion rate, not runtime.
+Rules:
+- Find the strongest opener and weakest pacing valleys fast.
+- Prefer shorter, tighter structure when it boosts retention.
+- If drop-off risk is high, force aggressive cuts + stronger hook handling.
+Return JSON only:
+{
+  "hook_strength": 0.0,
+  "pacing_risk": 0.0,
+  "confidence": 0.0,
+  "quick_control_mode": "ruthless_retention|highlight_hunter|story_preserve|balanced",
+  "reason": "short reason"
+}`
 
 const normalizeToken = (value: unknown) => String(value || '').trim().toLowerCase().replace(/\s+/g, '_')
+
+const parseRequestedRenderMode = (value: unknown, fallback: RenderModeRequest = 'horizontal'): RenderModeRequest => {
+  const raw = normalizeToken(value)
+  if (raw === 'ai' || raw === 'auto' || raw === 'auto_mode' || raw === 'aidirector') return 'ai'
+  if (raw === 'vertical' || raw === 'portrait') return 'vertical'
+  if (raw === 'horizontal' || raw === 'landscape') return 'horizontal'
+  return fallback
+}
+
+const resolveEffectiveRenderMode = (
+  requestedMode: RenderModeRequest,
+  source: Pick<UploadedVideoRecord, 'metadata' | 'autoDetection'>
+): RenderMode => {
+  if (requestedMode !== 'ai') return requestedMode
+  const detected = source.autoDetection?.finalMode
+  if (detected === 'vertical' || detected === 'horizontal') return detected
+  return Number(source.metadata?.width || 0) > Number(source.metadata?.height || 0) * 1.02
+    ? 'horizontal'
+    : 'vertical'
+}
 
 const parseFormatPreset = (value: unknown, fallback: FormatPreset): FormatPreset => {
   const raw = normalizeToken(value)
@@ -444,6 +493,129 @@ const parseQuickControls = (value: unknown, fallback: QuickControls): QuickContr
     highlightReel: typeof candidate.highlightReel === 'boolean' ? candidate.highlightReel : fallback.highlightReel,
     speedRamp: typeof candidate.speedRamp === 'boolean' ? candidate.speedRamp : fallback.speedRamp,
     musicSync: typeof candidate.musicSync === 'boolean' ? candidate.musicSync : fallback.musicSync
+  }
+}
+
+const resolveQuickControlMode = ({
+  quickControls,
+  requestedMode
+}: {
+  quickControls: QuickControls
+  requestedMode: RenderModeRequest
+}): QuickControlMode => {
+  if (requestedMode === 'ai') return 'ai_director'
+  if (quickControls.autoEdit && quickControls.highlightReel && (quickControls.speedRamp || quickControls.musicSync)) {
+    return 'ruthless_retention'
+  }
+  if (quickControls.autoEdit && (quickControls.highlightReel || quickControls.speedRamp)) {
+    return 'highlight_hunter'
+  }
+  if (!quickControls.highlightReel && !quickControls.speedRamp && !quickControls.musicSync) {
+    return 'story_preserve'
+  }
+  return 'balanced'
+}
+
+const applyQuickControlModeToProfile = ({
+  profile,
+  mode,
+  quickControlMode
+}: {
+  profile: AdaptiveEditorProfile
+  mode: RenderMode
+  quickControlMode: QuickControlMode
+}): AdaptiveEditorProfile => {
+  if (quickControlMode === 'ai_director') {
+    const pacingPreset: PacingPreset = mode === 'vertical' ? 'aggressive' : 'balanced'
+    return {
+      ...profile,
+      formatPreset: mode === 'vertical' ? 'tiktok' : 'youtube',
+      vibeChip: mode === 'vertical' ? 'energetic' : 'cinematic',
+      stylePreset: mode === 'vertical' ? 'bold' : 'clean',
+      pacingPreset,
+      pacingValue: pacingValueFromPreset(pacingPreset, mode),
+      autoDetectBestMoments: true,
+      captionMode: 'ai',
+      captionStyle: mode === 'vertical' ? 'impact_clean' : 'subtle',
+      captionEffect: mode === 'vertical' ? 'kinetic_pop' : 'clean_fade',
+      audioOption: 'auto_sync_tracks',
+      quickControls: {
+        autoEdit: true,
+        highlightReel: true,
+        speedRamp: true,
+        musicSync: true
+      },
+      suggestedSubMode: mode === 'vertical' ? 'highlight_mode' : 'story_mode',
+      rationale: [...profile.rationale, 'quick_control_mode=ai_director'].slice(0, 6)
+    }
+  }
+
+  if (quickControlMode === 'ruthless_retention') {
+    return {
+      ...profile,
+      vibeChip: mode === 'vertical' ? 'energetic' : profile.vibeChip,
+      stylePreset: mode === 'vertical' ? 'bold' : profile.stylePreset,
+      pacingPreset: 'aggressive',
+      pacingValue: pacingValueFromPreset('aggressive', mode),
+      autoDetectBestMoments: true,
+      captionMode: 'ai',
+      captionStyle: mode === 'vertical' ? 'impact_clean' : profile.captionStyle,
+      captionEffect: mode === 'vertical' ? 'kinetic_pop' : profile.captionEffect,
+      audioOption: 'auto_sync_tracks',
+      quickControls: {
+        autoEdit: true,
+        highlightReel: true,
+        speedRamp: true,
+        musicSync: true
+      },
+      suggestedSubMode: mode === 'vertical' ? 'highlight_mode' : 'story_mode',
+      rationale: [...profile.rationale, 'quick_control_mode=ruthless_retention'].slice(0, 6)
+    }
+  }
+
+  if (quickControlMode === 'highlight_hunter') {
+    const pacingPreset: PacingPreset = mode === 'vertical' ? 'aggressive' : 'balanced'
+    return {
+      ...profile,
+      stylePreset: mode === 'vertical' ? 'bold' : profile.stylePreset,
+      pacingPreset,
+      pacingValue: pacingValueFromPreset(pacingPreset, mode),
+      autoDetectBestMoments: true,
+      captionMode: 'ai',
+      captionStyle: mode === 'vertical' ? 'impact_clean' : profile.captionStyle,
+      quickControls: {
+        ...profile.quickControls,
+        autoEdit: true,
+        highlightReel: true
+      },
+      suggestedSubMode: mode === 'vertical' ? 'highlight_mode' : 'standard_mode',
+      rationale: [...profile.rationale, 'quick_control_mode=highlight_hunter'].slice(0, 6)
+    }
+  }
+
+  if (quickControlMode === 'story_preserve') {
+    const pacingPreset: PacingPreset = mode === 'vertical' ? 'chill' : 'cinematic'
+    return {
+      ...profile,
+      vibeChip: mode === 'vertical' ? 'chill' : 'cinematic',
+      stylePreset: mode === 'vertical' ? 'clean' : 'minimal',
+      pacingPreset,
+      pacingValue: pacingValueFromPreset(pacingPreset, mode),
+      autoDetectBestMoments: mode === 'vertical',
+      quickControls: {
+        ...profile.quickControls,
+        highlightReel: false,
+        speedRamp: false,
+        musicSync: false
+      },
+      suggestedSubMode: mode === 'vertical' ? 'story_mode' : 'standard_mode',
+      rationale: [...profile.rationale, 'quick_control_mode=story_preserve'].slice(0, 6)
+    }
+  }
+
+  return {
+    ...profile,
+    rationale: [...profile.rationale, 'quick_control_mode=balanced'].slice(0, 6)
   }
 }
 
@@ -1180,6 +1352,124 @@ const buildAdaptiveEditorProfile = ({
   }
 }
 
+const parseQuickControlModeToken = (value: unknown): QuickControlMode | null => {
+  const raw = normalizeToken(value)
+  if (raw === 'ai_director' || raw === 'aidirector') return 'ai_director'
+  if (raw === 'ruthless_retention' || raw === 'ruthless' || raw === 'retention') return 'ruthless_retention'
+  if (raw === 'highlight_hunter' || raw === 'highlight') return 'highlight_hunter'
+  if (raw === 'story_preserve' || raw === 'story') return 'story_preserve'
+  if (raw === 'balanced') return 'balanced'
+  return null
+}
+
+const parseUploadRuthlessSignal = (
+  text: string,
+  provider: 'local' | 'huggingface' | 'none',
+  model: string | null
+): UploadRuthlessSignal => {
+  const parsed = tryParseJson(text) as any
+  if (!parsed || typeof parsed !== 'object') return null
+
+  const hookStrength = clamp(
+    Number(parsed.hook_strength ?? parsed.hookStrength ?? parsed.hook ?? 0.5),
+    0,
+    1
+  )
+  const pacingRisk = clamp(
+    Number(parsed.pacing_risk ?? parsed.pacingRisk ?? parsed.risk ?? 0.5),
+    0,
+    1
+  )
+  const confidence = clamp(
+    Number(parsed.confidence ?? parsed.confidence_percent ?? parsed.confidencePercent ?? 0.55),
+    0,
+    1
+  )
+  const quickControlMode = parseQuickControlModeToken(parsed.quick_control_mode ?? parsed.quickControlMode)
+  const reason = String(parsed.reason || parsed.summary || '').trim().slice(0, 220)
+
+  return {
+    hookStrength,
+    pacingRisk,
+    confidence,
+    quickControlMode,
+    reason: reason || 'Ruthless upload prompt scored hook and pacing risk.',
+    provider,
+    model
+  }
+}
+
+const runUploadRuthlessPrompt = async ({
+  metadata,
+  frameScan,
+  transcript,
+  mode
+}: {
+  metadata: VideoMetadata
+  frameScan: FrameScanSummary
+  transcript: TranscriptSummary
+  mode: RenderMode
+}): Promise<UploadRuthlessSignal> => {
+  const prompt = `${RUTHLESS_UPLOAD_PROMPT}
+Context:
+- mode=${mode}
+- duration_seconds=${metadata.duration.toFixed(2)}
+- portrait_signal=${frameScan.portraitSignal.toFixed(3)}
+- landscape_signal=${frameScan.landscapeSignal.toFixed(3)}
+- centered_face_vertical=${frameScan.centeredFaceVerticalSignal.toFixed(3)}
+- horizontal_motion_signal=${frameScan.horizontalMotionSignal.toFixed(3)}
+- high_motion_short_clip_signal=${frameScan.highMotionShortClipSignal.toFixed(3)}
+- transcript_segment_count=${transcript.segmentCount}
+- transcript_excerpt=${transcript.excerpt || '[none]'}`
+
+  try {
+    const response = await queryRetentionModel({
+      prompt,
+      maxNewTokens: 220,
+      temperature: 0.1,
+      timeoutMs: UPLOAD_RUTHLESS_TIMEOUT_MS
+    })
+    if (!response.ok || !response.text) return null
+    return parseUploadRuthlessSignal(response.text, response.provider, response.model)
+  } catch (error) {
+    console.warn('vibecut upload ruthless prompt failed', error)
+    return null
+  }
+}
+
+const applyUploadRuthlessSignalToDetection = ({
+  detection,
+  signal
+}: {
+  detection: AutoDetectionPayload
+  signal: UploadRuthlessSignal
+}): AutoDetectionPayload => {
+  if (!signal) return detection
+  const quickControlMode =
+    signal.quickControlMode ||
+    (signal.pacingRisk > 0.64 ? 'ruthless_retention' : signal.hookStrength > 0.58 ? 'highlight_hunter' : 'balanced')
+  const tunedProfile = applyQuickControlModeToProfile({
+    profile: detection.editorProfile,
+    mode: detection.finalMode,
+    quickControlMode
+  })
+
+  return {
+    ...detection,
+    bannerMessage: `${detection.bannerMessage} • Ruthless AI tuned`,
+    reason: `${detection.reason}. Ruthless upload prompt: ${signal.reason}`,
+    editorProfile: {
+      ...tunedProfile,
+      confidence: Number(clamp((tunedProfile.confidence + signal.confidence) / 2, 0, 1).toFixed(3)),
+      rationale: [
+        ...tunedProfile.rationale,
+        `upload_ruthless_provider=${signal.provider}${signal.model ? `:${signal.model}` : ''}`,
+        `upload_hook_strength=${signal.hookStrength.toFixed(2)}, pacing_risk=${signal.pacingRisk.toFixed(2)}`
+      ].slice(0, 6)
+    }
+  }
+}
+
 const detectMode = (
   metadata: VideoMetadata,
   frameScan: FrameScanSummary,
@@ -1587,71 +1877,6 @@ const readTranscriptSummary = async (
   } catch (error) {
     console.warn('vibecut transcript parse failed', error)
     return fallback
-  }
-}
-
-const parseLlamaJson = (value: string): LlamaRetentionOutput => {
-  const parsed = tryParseJson(value)
-  if (!parsed || typeof parsed !== 'object') return null
-  const hookStrength = clamp(Number((parsed as any).hookStrength ?? (parsed as any).hook_strength ?? 0.5), 0, 1)
-  const emotionLift = clamp(Number((parsed as any).emotionLift ?? (parsed as any).emotion_lift ?? 0.5), 0, 1)
-  const pacingRisk = clamp(Number((parsed as any).pacingRisk ?? (parsed as any).pacing_risk ?? 0.5), 0, 1)
-  const summary = String((parsed as any).summary || '').trim().slice(0, 240)
-  return {
-    hookStrength,
-    emotionLift,
-    pacingRisk,
-    summary: summary || 'Llama model predicted moderate retention behavior.'
-  }
-}
-
-const runLlamaRetentionModel = async ({
-  metadata,
-  frameScan,
-  transcript,
-  mode
-}: {
-  metadata: VideoMetadata
-  frameScan: FrameScanSummary
-  transcript: TranscriptSummary
-  mode: RenderMode
-}): Promise<LlamaRetentionOutput> => {
-  const prompt = `You are AutoEditor's ruthless retention-maximizing AI brain.
-Mission: maximize average retention percent and full-watch completion, not runtime.
-In 2026 ranking behavior, shorter videos with much higher retention usually beat longer videos with weak retention.
-Rules:
-- Remove/compress segments with predicted drop-off above 15-20%.
-- Prioritize smooth retention with no deep valleys.
-- Keep strongest opener in first 8-15 seconds and sustain micro-progress every 15-30 seconds.
-Return ONLY compact JSON with keys: hookStrength (0-1), emotionLift (0-1), pacingRisk (0-1), summary.
-Context:
-- mode: ${mode}
-- duration_seconds: ${metadata.duration.toFixed(2)}
-- portrait_signal: ${frameScan.portraitSignal.toFixed(3)}
-- landscape_signal: ${frameScan.landscapeSignal.toFixed(3)}
-- centered_face_vertical: ${frameScan.centeredFaceVerticalSignal.toFixed(3)}
-- high_motion_short_clip_signal: ${frameScan.highMotionShortClipSignal.toFixed(3)}
-- transcript_segment_count: ${transcript.segmentCount}
-- transcript_excerpt: ${transcript.excerpt || '[none]'}
-`
-
-  try {
-    const response = await queryRetentionModel({
-      prompt,
-      maxNewTokens: 300,
-      temperature: 0.15,
-      timeoutMs: clamp(Number(process.env.RETENTION_LLM_DECISION_TIMEOUT_MS || 60_000), 10_000, 120_000)
-    })
-
-    if (!response.ok || !response.text) {
-      console.warn('llama retention request failed', response.reason || 'unknown')
-      return null
-    }
-
-    return parseLlamaJson(response.text)
-  } catch (error) {
-    console.warn('llama retention request exception', error)
-    return null
   }
 }
 
@@ -2889,17 +3114,10 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       transcriptExcerpt: transcript.excerpt
     })
 
-    const llamaRetention = await runLlamaRetentionModel({
-      metadata: source.metadata,
-      frameScan,
-      transcript,
-      mode
-    })
-
     const retention = buildRetentionSignals({
       duration: source.metadata.duration,
       frameScan,
-      llama: llamaRetention,
+      llama: null,
       mode
     })
 
@@ -3141,7 +3359,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         insights: generatedInsights,
         summary: [
           `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
-          `Free AI planner: ${freeAiPlan.provider}${freeAiPlan.model ? ` (${freeAiPlan.model})` : ''}${llamaRetention ? ' + Llama retention refinement' : ''}.`,
+          'Planner: ruthless retention prompt (deterministic, local).',
           freeAiPlan.selectedHook && shouldApplyHookAndPacing
             ? `Hook opener: ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s moved to timeline start (${hookRangeLabel}).`
             : manualSegments.length > 0
