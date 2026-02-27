@@ -19,6 +19,7 @@ import debugRoutes from './routes/debug'
 import analyticsRoutes from './routes/analytics'
 import feedbackRoutes from './routes/feedback'
 import liveStatsRoutes from './routes/liveStats'
+import vibeCutRoutes from './routes/vibecut'
 import algorithmDevRoutes from './dev/algorithm/routes/algorithm'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
@@ -242,6 +243,7 @@ app.use('/api/jobs', requireAuth, jobsRoutes)
 app.use('/api/uploads', requireAuth, uploadsRoutes)
 app.use('/api/me', requireAuth, meRoutes)
 app.use('/api/live-stats', requireAuth, liveStatsRoutes)
+app.use('/api/vibecut', requireAuth, vibeCutRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
 app.use('/api/analytics', requireAuth, analyticsRoutes)
 app.use('/api/feedback', requireAuth, feedbackRoutes)
