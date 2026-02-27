@@ -754,7 +754,132 @@ const toOutputUrl = (absolutePath: string) => {
   return `/outputs/${relative}`
 }
 
-const ffprobeMetadata = async (videoPath: string): Promise<VideoMetadata> => {
+const createEmptyTranscriptSummary = (): TranscriptSummary => ({
+  segments: [],
+  segmentCount: 0,
+  excerpt: '',
+  language: null
+})
+
+const createFallbackVideoMetadata = (fileName?: string | null): VideoMetadata => {
+  const rawName = String(fileName || '').toLowerCase()
+  const preferVertical = /(vertical|portrait|tiktok|reels?|shorts?|story)/i.test(rawName)
+  const width = preferVertical ? 1080 : 1920
+  const height = preferVertical ? 1920 : 1080
+  return {
+    width,
+    height,
+    duration: 60,
+    fps: 30,
+    aspectRatio: width / height
+  }
+}
+
+const createFallbackFrameScan = (): FrameScanSummary => ({
+  sampledFrames: 0,
+  sampleStride: 0,
+  portraitSignal: 0.5,
+  landscapeSignal: 0.5,
+  centeredFaceVerticalSignal: 0,
+  horizontalMotionSignal: 0,
+  highMotionShortClipSignal: 0,
+  motionPeaks: []
+})
+
+const parseDurationSeconds = (value: unknown): number => {
+  const raw = String(value || '').trim()
+  if (!raw) return 0
+  const numeric = Number(raw)
+  if (Number.isFinite(numeric) && numeric > 0) return numeric
+  const match = raw.match(/^(\d+):(\d{2}):(\d{2}(?:\.\d+)?)$/)
+  if (!match) return 0
+  const hours = Number(match[1])
+  const minutes = Number(match[2])
+  const seconds = Number(match[3])
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes) || !Number.isFinite(seconds)) return 0
+  return hours * 3600 + minutes * 60 + seconds
+}
+
+const sanitizeVideoMetadata = (candidate: Partial<VideoMetadata>, fallback: VideoMetadata): VideoMetadata => {
+  const widthRaw = Number(candidate.width)
+  const heightRaw = Number(candidate.height)
+  const durationRaw = Number(candidate.duration)
+  const fpsRaw = Number(candidate.fps)
+  const aspectRaw = Number(candidate.aspectRatio)
+
+  const width = Number.isFinite(widthRaw) && widthRaw > 0 ? Math.round(widthRaw) : fallback.width
+  const height = Number.isFinite(heightRaw) && heightRaw > 0 ? Math.round(heightRaw) : fallback.height
+  const duration = Number.isFinite(durationRaw) && durationRaw > 0 ? clamp(durationRaw, 0.1, 60 * 60 * 24) : fallback.duration
+  const fps = Number.isFinite(fpsRaw) && fpsRaw > 0 ? clamp(fpsRaw, 1, 240) : fallback.fps
+  const computedAspect = width > 0 && height > 0 ? width / height : fallback.aspectRatio
+  const aspectRatio =
+    Number.isFinite(aspectRaw) && aspectRaw > 0
+      ? clamp(aspectRaw, 0.1, 10)
+      : Number.isFinite(computedAspect) && computedAspect > 0
+        ? clamp(computedAspect, 0.1, 10)
+        : fallback.aspectRatio
+
+  return { width, height, duration, fps, aspectRatio }
+}
+
+const createFallbackEditorProfile = (mode: RenderMode, suggestedSubMode: SuggestedSubMode): AdaptiveEditorProfile => ({
+  formatPreset: mode === 'vertical' ? 'tiktok' : 'youtube',
+  vibeChip: mode === 'vertical' ? 'energetic' : 'cinematic',
+  stylePreset: mode === 'vertical' ? 'bold' : 'clean',
+  pacingPreset: mode === 'vertical' ? 'aggressive' : 'balanced',
+  pacingValue: mode === 'vertical' ? 72 : 52,
+  autoDetectBestMoments: true,
+  captionMode: 'manual',
+  captionStyle: mode === 'vertical' ? 'impact' : 'subtle',
+  captionFont: DEFAULT_CAPTION_FONT,
+  captionEffect: mode === 'vertical' ? 'kinetic_pop' : 'clean_fade',
+  audioOption: 'auto_sync_tracks',
+  quickControls: {
+    autoEdit: true,
+    highlightReel: mode === 'vertical',
+    speedRamp: mode === 'vertical',
+    musicSync: true
+  },
+  suggestedSubMode,
+  confidence: 0.52,
+  rationale: ['Fallback profile generated because advanced upload analysis was unavailable.']
+})
+
+const createFallbackAutoDetection = (
+  metadata: VideoMetadata,
+  frameScan: FrameScanSummary,
+  reasonOverride?: string
+): AutoDetectionPayload => {
+  const aspectRatio = Number.isFinite(metadata.aspectRatio) && metadata.aspectRatio > 0 ? metadata.aspectRatio : 1
+  const metadataMode: RenderMode = aspectRatio > 1.08 ? 'horizontal' : 'vertical'
+  const frameScanMode: RenderMode = frameScan.portraitSignal >= frameScan.landscapeSignal ? 'vertical' : 'horizontal'
+  const ambiguous = aspectRatio >= 0.92 && aspectRatio <= 1.08
+  const finalMode: RenderMode = ambiguous ? 'vertical' : metadataMode
+  const suggestedSubMode: SuggestedSubMode = finalMode === 'vertical' ? 'highlight_mode' : 'standard_mode'
+  const bannerMessage =
+    finalMode === 'vertical'
+      ? 'Auto-detected: Vertical Mode (fallback defaults). Switch?'
+      : 'Auto-detected: Horizontal Mode (fallback defaults). Switch?'
+
+  return {
+    metadataMode,
+    frameScanMode,
+    finalMode,
+    ambiguous,
+    confidence: 0.52,
+    reason:
+      reasonOverride ||
+      'Fallback mode detection applied because one or more analysis providers did not return complete data.',
+    suggestedSubMode,
+    suggestedSubModes: [suggestedSubMode],
+    bannerMessage,
+    frameScan,
+    editorProfile: createFallbackEditorProfile(finalMode, suggestedSubMode)
+  }
+}
+
+const ffprobeMetadata = async (videoPath: string, opts?: { fileName?: string | null }): Promise<VideoMetadata> => {
+  const fallback = createFallbackVideoMetadata(opts?.fileName || path.basename(videoPath))
   const args = [
     '-v', 'error',
     '-select_streams', 'v:0',
@@ -764,30 +889,38 @@ const ffprobeMetadata = async (videoPath: string): Promise<VideoMetadata> => {
   ]
   const result = await runProcess(FFPROBE_PATH, args)
   if (result.code !== 0) {
-    throw new Error(`ffprobe failed: ${result.stderr || result.stdout}`)
+    console.warn('vibecut ffprobe metadata failed, using fallback metadata', result.stderr || result.stdout)
+    return fallback
   }
 
   const parsed = tryParseJson(result.stdout)
-  const stream = Array.isArray(parsed?.streams) ? parsed.streams[0] : null
+  const stream = Array.isArray(parsed?.streams)
+    ? parsed.streams.find((entry: any) => Number(entry?.width) > 0 && Number(entry?.height) > 0) || parsed.streams[0]
+    : null
   const width = Number(stream?.width || 0)
   const height = Number(stream?.height || 0)
-  const duration = Number(stream?.duration || parsed?.format?.duration || 0)
+  const duration = parseDurationSeconds(
+    stream?.duration || parsed?.format?.duration || stream?.tags?.DURATION || parsed?.format?.tags?.DURATION
+  )
   const fpsFromAvg = parseRational(stream?.avg_frame_rate)
   const fpsFromRaw = parseRational(stream?.r_frame_rate)
-  const fps = clamp(fpsFromAvg || fpsFromRaw || 30, 1, 240)
-  const aspectRatio = width > 0 && height > 0 ? width / height : 1
+  const aspectRatio = width > 0 && height > 0 ? width / height : fallback.aspectRatio
+  const metadata = sanitizeVideoMetadata(
+    {
+      width,
+      height,
+      duration,
+      fps: fpsFromAvg || fpsFromRaw || fallback.fps,
+      aspectRatio
+    },
+    fallback
+  )
 
-  if (!width || !height || !duration) {
-    throw new Error('ffprobe did not return usable metadata')
+  if (metadata.width === fallback.width && metadata.height === fallback.height && metadata.duration === fallback.duration) {
+    console.warn('vibecut ffprobe returned incomplete metadata, using fallback defaults')
   }
 
-  return {
-    width,
-    height,
-    duration,
-    fps,
-    aspectRatio
-  }
+  return metadata
 }
 
 const probeHasAudioStream = async (videoPath: string): Promise<boolean> => {
@@ -804,16 +937,7 @@ const probeHasAudioStream = async (videoPath: string): Promise<boolean> => {
 }
 
 const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
-  const fallback: FrameScanSummary = {
-    sampledFrames: 0,
-    sampleStride: 0,
-    portraitSignal: 0.5,
-    landscapeSignal: 0.5,
-    centeredFaceVerticalSignal: 0,
-    horizontalMotionSignal: 0,
-    highMotionShortClipSignal: 0,
-    motionPeaks: []
-  }
+  const fallback = createFallbackFrameScan()
 
   if (!fs.existsSync(VIBECUT_FRAME_SCANNER_SCRIPT)) {
     return fallback
@@ -1065,8 +1189,8 @@ const detectMode = (
   ].filter((value): value is string => Boolean(value))
 
   const bannerMessage = finalMode === 'vertical'
-    ? 'Auto-detected: Vertical Mode (TikTok-ready). Switch?'
-    : 'Auto-detected: Horizontal Mode (YouTube-ready). Switch?'
+    ? 'Auto-detected: Vertical (High retention potential) • Edit?'
+    : 'Auto-detected: Horizontal (Narrative retention mode) • Edit?'
 
   const editorProfile = buildAdaptiveEditorProfile({
     metadata,
@@ -1117,10 +1241,9 @@ const upload = multer({
   },
   fileFilter: (_req, file, cb) => {
     const normalized = String(file.mimetype || '').toLowerCase()
-    const allowed = ['video/mp4', 'video/quicktime', 'video/x-matroska', 'video/mpeg']
-    if (allowed.includes(normalized)) return cb(null, true)
-    if (String(file.originalname || '').toLowerCase().match(/\.(mp4|mov|mkv|mpeg)$/)) return cb(null, true)
-    cb(new Error('Only mp4/mov/mkv/mpeg video files are supported'))
+    if (normalized.startsWith('video/')) return cb(null, true)
+    if (String(file.originalname || '').toLowerCase().match(/\.(mp4|mov|mkv|mpeg|mpg|webm|m4v|avi)$/)) return cb(null, true)
+    cb(new Error('Upload a valid video file.'))
   }
 })
 
@@ -1151,17 +1274,44 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
       return res.status(400).json({ error: 'invalid_upload', message: 'Upload a video file in field "video".' })
     }
 
-    const videoId = crypto.randomUUID()
-    const metadata = await ffprobeMetadata(uploaded.path)
-    const frameScan = await runFrameScan(uploaded.path)
-    const analysisDir = path.join(VIBECUT_UPLOAD_DIR, `${videoId}_analysis`)
-    ensureDir(analysisDir)
-    const transcript = await readTranscriptSummary(uploaded.path, analysisDir)
     const originalFileName = uploaded.originalname || path.basename(uploaded.path)
-    const autoDetection = detectMode(metadata, frameScan, {
-      transcript,
-      fileName: originalFileName
-    })
+    const videoId = crypto.randomUUID()
+    let metadata = createFallbackVideoMetadata(originalFileName)
+    try {
+      metadata = await ffprobeMetadata(uploaded.path, { fileName: originalFileName })
+    } catch (error) {
+      console.warn('vibecut upload metadata probe failed, using fallback metadata', error)
+    }
+
+    let frameScan = createFallbackFrameScan()
+    try {
+      frameScan = await runFrameScan(uploaded.path)
+    } catch (error) {
+      console.warn('vibecut upload frame scan failed, using fallback frame scan', error)
+    }
+
+    const analysisDir = path.join(VIBECUT_UPLOAD_DIR, `${videoId}_analysis`)
+    let transcript = createEmptyTranscriptSummary()
+    try {
+      ensureDir(analysisDir)
+      transcript = await readTranscriptSummary(uploaded.path, analysisDir)
+    } catch (error) {
+      console.warn('vibecut upload transcript summary failed, using empty transcript', error)
+    }
+
+    let autoDetection = createFallbackAutoDetection(
+      metadata,
+      frameScan,
+      'Fallback mode detection applied because upload analysis steps were partially unavailable.'
+    )
+    try {
+      autoDetection = detectMode(metadata, frameScan, {
+        transcript,
+        fileName: originalFileName
+      })
+    } catch (error) {
+      console.warn('vibecut upload detectMode failed, using fallback auto-detection', error)
+    }
 
     const record: UploadedVideoRecord = {
       id: videoId,
@@ -1184,6 +1334,37 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
     })
   } catch (error: any) {
     console.error('vibecut upload/analyze failed', error)
+    const userId = String(req?.user?.id || '').trim()
+    const uploaded = req?.file as Express.Multer.File | undefined
+    if (userId && uploaded?.path) {
+      const fallbackFileName = uploaded.originalname || path.basename(uploaded.path)
+      const fallbackMetadata = createFallbackVideoMetadata(fallbackFileName)
+      const fallbackFrameScan = createFallbackFrameScan()
+      const fallbackAutoDetection = createFallbackAutoDetection(
+        fallbackMetadata,
+        fallbackFrameScan,
+        'Fallback mode detection applied after an unexpected upload analysis error.'
+      )
+      const videoId = crypto.randomUUID()
+      const record: UploadedVideoRecord = {
+        id: videoId,
+        userId,
+        fileName: fallbackFileName,
+        storedPath: uploaded.path,
+        createdAt: new Date().toISOString(),
+        metadata: fallbackMetadata,
+        autoDetection: fallbackAutoDetection
+      }
+      uploadedVideos.set(videoId, record)
+      void persistUploadRecord(record)
+      return res.json({
+        videoId,
+        videoUrl: toOutputUrl(uploaded.path),
+        fileName: record.fileName,
+        metadata: fallbackMetadata,
+        autoDetection: fallbackAutoDetection
+      })
+    }
     return res.status(500).json({ error: 'upload_analyze_failed', message: error?.message || 'Upload analysis failed.' })
   }
 })
@@ -1221,12 +1402,7 @@ const runFfmpegCommand = async (args: string[], ffmpegCommands: string[]) => {
 }
 
 const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise<TranscriptSummary> => {
-  const fallback: TranscriptSummary = {
-    segments: [],
-    segmentCount: 0,
-    excerpt: '',
-    language: null
-  }
+  const fallback = createEmptyTranscriptSummary()
 
   if (!fs.existsSync(FASTER_WHISPER_SCRIPT)) {
     return fallback
@@ -2576,7 +2752,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
           watchedPct: Number(clamp(86 + hookStrength * 12, 42, 99).toFixed(1)),
           type: 'hook',
           label: 'AI Selected Hook',
-          description: `Selected ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s as opener (${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-trim).`
+          description: `Selected ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s as opener (${mode === 'vertical' ? '3s mandatory hook' : `${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-trim`}).`
         },
         ...retention.points.filter((point) => point.id !== 'ai_hook_selected')
       ]
@@ -2630,14 +2806,6 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         adjustments: [...plannerAdjustments, ...lowRetentionAdjustments],
         duration: source.metadata.duration
       })
-
-      if (mode === 'vertical') {
-        segments = forceSegmentsToFixedLength({
-          segments,
-          duration: source.metadata.duration,
-          targetSeconds: AUTO_FIXED_CUT_SECONDS
-        })
-      }
 
       segments = prependSelectedHookSegment({
         segments,
@@ -2773,7 +2941,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
               ? '(manual override)'
               : shouldApplyHookAndPacing
                 ? mode === 'vertical'
-                  ? `(auto-selected + boring/silent trims, ${AUTO_FIXED_CUT_SECONDS}s per cut)`
+                  ? '(auto-selected + boring/silent trims, 15-30s highlight windows)'
                   : '(auto-selected + pacing trims with long-form coverage guard)'
                 : '(auto-selected + pacing optimized)'
           }.`,
