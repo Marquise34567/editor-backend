@@ -6,6 +6,7 @@ export type AiQueryParams = {
   prompt: string
   maxNewTokens?: number
   temperature?: number
+  timeoutMs?: number
 }
 
 export type AiQueryResult = {
@@ -34,7 +35,8 @@ const mapProvider = (provider: LlamaProvider | null): AiProvider => {
 export const queryRetentionModel = async ({
   prompt,
   maxNewTokens = 640,
-  temperature = 0.2
+  temperature = 0.2,
+  timeoutMs
 }: AiQueryParams): Promise<AiQueryResult> => {
   const cleanPrompt = String(prompt || '').trim()
   if (!cleanPrompt) {
@@ -44,7 +46,8 @@ export const queryRetentionModel = async ({
   const result = await llamaQuery(cleanPrompt, {
     model: resolveRetentionModelOverride(),
     maxTokens: maxNewTokens,
-    temperature
+    temperature,
+    timeoutMs
   })
 
   if (!result.ok) {

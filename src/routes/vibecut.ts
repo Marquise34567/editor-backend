@@ -698,11 +698,42 @@ const VIBECUT_FRAME_SCANNER_SCRIPT = resolveScriptPath(path.join('scripts', 'vib
 const VIBECUT_MOVIEPY_PIPELINE_SCRIPT = resolveScriptPath(path.join('scripts', 'vibecut_moviepy_pipeline.py'))
 const FASTER_WHISPER_SCRIPT = resolveScriptPath(path.join('scripts', 'faster_whisper_transcribe.py'))
 
-const runProcess = async (cmd: string, args: string[], cwd?: string): Promise<ProcessResult> => {
+const runProcess = async (
+  cmd: string,
+  args: string[],
+  cwd?: string,
+  timeoutMs?: number
+): Promise<ProcessResult> => {
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    let settled = false
+    let timedOut = false
     let stdout = ''
     let stderr = ''
+    const safeTimeoutMs = Number(timeoutMs)
+    const timeoutHandle =
+      Number.isFinite(safeTimeoutMs) && safeTimeoutMs > 0
+        ? setTimeout(() => {
+            if (settled) return
+            timedOut = true
+            settled = true
+            stderr += `\nProcess timeout after ${Math.round(safeTimeoutMs)}ms`
+            try {
+              child.kill('SIGKILL')
+            } catch {
+              // noop
+            }
+            resolve({ code: 124, stdout, stderr })
+          }, safeTimeoutMs)
+        : null
+
+    const finalize = (result: ProcessResult) => {
+      if (settled) return
+      settled = true
+      if (timeoutHandle) clearTimeout(timeoutHandle)
+      resolve(result)
+    }
+
     child.stdout.on('data', (chunk) => {
       stdout += chunk.toString()
     })
@@ -711,10 +742,11 @@ const runProcess = async (cmd: string, args: string[], cwd?: string): Promise<Pr
     })
     child.on('error', (error) => {
       stderr += `${error?.message || error}`
-      resolve({ code: 1, stdout, stderr })
+      finalize({ code: 1, stdout, stderr })
     })
     child.on('close', (code) => {
-      resolve({ code, stdout, stderr })
+      if (timedOut) return
+      finalize({ code, stdout, stderr })
     })
   })
 }
@@ -879,7 +911,10 @@ const createFallbackAutoDetection = (
   }
 }
 
-const ffprobeMetadata = async (videoPath: string, opts?: { fileName?: string | null }): Promise<VideoMetadata> => {
+const ffprobeMetadata = async (
+  videoPath: string,
+  opts?: { fileName?: string | null; timeoutMs?: number }
+): Promise<VideoMetadata> => {
   const fallback = createFallbackVideoMetadata(opts?.fileName || path.basename(videoPath))
   const args = [
     '-v', 'error',
@@ -888,7 +923,7 @@ const ffprobeMetadata = async (videoPath: string, opts?: { fileName?: string | n
     '-of', 'json',
     videoPath
   ]
-  const result = await runProcess(FFPROBE_PATH, args)
+  const result = await runProcess(FFPROBE_PATH, args, undefined, opts?.timeoutMs)
   if (result.code !== 0) {
     console.warn('vibecut ffprobe metadata failed, using fallback metadata', result.stderr || result.stdout)
     return fallback
@@ -937,7 +972,10 @@ const probeHasAudioStream = async (videoPath: string): Promise<boolean> => {
   return String(result.stdout || '').trim().length > 0
 }
 
-const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
+const runFrameScan = async (
+  inputPath: string,
+  opts?: { timeoutMs?: number }
+): Promise<FrameScanSummary> => {
   const fallback = createFallbackFrameScan()
 
   if (!fs.existsSync(VIBECUT_FRAME_SCANNER_SCRIPT)) {
@@ -950,7 +988,7 @@ const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
     inputPath,
     '--sample-ratio',
     String(FRAME_SCAN_SAMPLE_RATIO)
-  ])
+  ], undefined, opts?.timeoutMs)
 
   if (result.code !== 0) {
     console.warn('vibecut frame scanner failed', result.stderr || result.stdout)
@@ -1248,6 +1286,32 @@ const upload = multer({
   }
 })
 
+const handleAnalyzeUpload = (req: any, res: any, next: any) => {
+  upload.single('video')(req, res, (error: any) => {
+    if (!error) return next()
+
+    if (error instanceof multer.MulterError) {
+      if (error.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({
+          error: 'upload_too_large',
+          message: 'Upload exceeds the 8 GB file size limit.'
+        })
+      }
+      return res.status(400).json({
+        error: 'invalid_upload',
+        message: String(error.message || 'Upload validation failed.')
+      })
+    }
+
+    const message = String(error?.message || '').trim() || 'Upload parsing failed.'
+    const isInvalidUpload = /upload a valid video file/i.test(message)
+    return res.status(isInvalidUpload ? 400 : 500).json({
+      error: isInvalidUpload ? 'invalid_upload' : 'upload_parse_failed',
+      message
+    })
+  })
+}
+
 const createEmptyRetentionPayload = () => ({
   points: [] as RetentionPoint[],
   heatmap: [] as RetentionHeatCell[],
@@ -1263,7 +1327,7 @@ const buildJobSummary = (job: RenderJobRecord) => ({
   fileName: job.fileName
 })
 
-router.post('/upload/analyze', upload.single('video'), async (req: any, res) => {
+router.post('/upload/analyze', handleAnalyzeUpload, async (req: any, res) => {
   try {
     const userId = String(req?.user?.id || '').trim()
     if (!userId) {
@@ -1277,27 +1341,79 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
 
     const originalFileName = uploaded.originalname || path.basename(uploaded.path)
     const videoId = crypto.randomUUID()
+    const analyzeBudgetMs = clamp(
+      Number(process.env.VIBECUT_UPLOAD_ANALYZE_MAX_MS || 35_000),
+      10_000,
+      120_000
+    )
+    const ffprobeTimeoutMs = clamp(
+      Number(process.env.VIBECUT_UPLOAD_FFPROBE_TIMEOUT_MS || 6_000),
+      1_500,
+      30_000
+    )
+    const frameScanTimeoutMs = clamp(
+      Number(process.env.VIBECUT_UPLOAD_FRAME_SCAN_TIMEOUT_MS || 10_000),
+      2_000,
+      40_000
+    )
+    const transcriptTimeoutMs = clamp(
+      Number(process.env.VIBECUT_UPLOAD_TRANSCRIPT_TIMEOUT_MS || 12_000),
+      2_000,
+      45_000
+    )
+    const skipTranscript = !/^(0|false|no)$/i.test(
+      String(process.env.VIBECUT_UPLOAD_SKIP_TRANSCRIPT || 'true').trim()
+    )
+    const budgetStartedAt = Date.now()
+    const getRemainingBudgetMs = () => analyzeBudgetMs - (Date.now() - budgetStartedAt)
+
     let metadata = createFallbackVideoMetadata(originalFileName)
     try {
-      metadata = await ffprobeMetadata(uploaded.path, { fileName: originalFileName })
+      const remainingMs = getRemainingBudgetMs()
+      if (remainingMs > 1_000) {
+        metadata = await ffprobeMetadata(uploaded.path, {
+          fileName: originalFileName,
+          timeoutMs: Math.min(ffprobeTimeoutMs, remainingMs)
+        })
+      } else {
+        console.warn('vibecut upload metadata probe skipped: analysis budget exhausted')
+      }
     } catch (error) {
       console.warn('vibecut upload metadata probe failed, using fallback metadata', error)
     }
 
     let frameScan = createFallbackFrameScan()
     try {
-      frameScan = await runFrameScan(uploaded.path)
+      const remainingMs = getRemainingBudgetMs()
+      if (remainingMs > 1_000) {
+        frameScan = await runFrameScan(uploaded.path, {
+          timeoutMs: Math.min(frameScanTimeoutMs, remainingMs)
+        })
+      } else {
+        console.warn('vibecut upload frame scan skipped: analysis budget exhausted')
+      }
     } catch (error) {
       console.warn('vibecut upload frame scan failed, using fallback frame scan', error)
     }
 
     const analysisDir = path.join(VIBECUT_UPLOAD_DIR, `${videoId}_analysis`)
     let transcript = createEmptyTranscriptSummary()
-    try {
-      ensureDir(analysisDir)
-      transcript = await readTranscriptSummary(uploaded.path, analysisDir)
-    } catch (error) {
-      console.warn('vibecut upload transcript summary failed, using empty transcript', error)
+    if (!skipTranscript) {
+      try {
+        const remainingMs = getRemainingBudgetMs()
+        if (remainingMs > 1_000) {
+          ensureDir(analysisDir)
+          transcript = await readTranscriptSummary(uploaded.path, analysisDir, {
+            timeoutMs: Math.min(transcriptTimeoutMs, remainingMs)
+          })
+        } else {
+          console.warn('vibecut upload transcript skipped: analysis budget exhausted')
+        }
+      } catch (error) {
+        console.warn('vibecut upload transcript summary failed, using empty transcript', error)
+      }
+    } else {
+      console.warn('vibecut upload transcript skipped: VIBECUT_UPLOAD_SKIP_TRANSCRIPT enabled')
     }
 
     let autoDetection = createFallbackAutoDetection(
@@ -1403,7 +1519,11 @@ const runFfmpegCommand = async (args: string[], ffmpegCommands: string[]) => {
   }
 }
 
-const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise<TranscriptSummary> => {
+const readTranscriptSummary = async (
+  inputPath: string,
+  jobDir: string,
+  opts?: { timeoutMs?: number }
+): Promise<TranscriptSummary> => {
   const fallback = createEmptyTranscriptSummary()
 
   if (!fs.existsSync(FASTER_WHISPER_SCRIPT)) {
@@ -1424,7 +1544,7 @@ const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise
     '--vad-filter'
   ]
 
-  const result = await runProcess(PYTHON_BIN, args)
+  const result = await runProcess(PYTHON_BIN, args, undefined, opts?.timeoutMs)
   if (result.code !== 0) {
     console.warn('vibecut whisper failed', result.stderr || result.stdout)
     return fallback
@@ -1519,7 +1639,8 @@ Context:
     const response = await queryRetentionModel({
       prompt,
       maxNewTokens: 300,
-      temperature: 0.15
+      temperature: 0.15,
+      timeoutMs: clamp(Number(process.env.RETENTION_LLM_DECISION_TIMEOUT_MS || 60_000), 10_000, 120_000)
     })
 
     if (!response.ok || !response.text) {

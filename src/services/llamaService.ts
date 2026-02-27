@@ -36,6 +36,7 @@ export type LlamaQueryOptions = {
   model?: string
   prependRuthlessPrompt?: boolean
   useFallbackModels?: boolean
+  timeoutMs?: number
 }
 
 type ProviderRequestResult = {
@@ -86,6 +87,25 @@ const buildPrompt = (prompt: string, prependRuthlessPrompt = true) => {
 }
 
 const delay = async (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+const withTimeoutResult = async <T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  onTimeout: () => T
+): Promise<T> => {
+  const safeTimeout = clamp(Math.round(Number(timeoutMs || 0)), 1_000, 600_000)
+  let timeoutHandle: NodeJS.Timeout | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(onTimeout()), safeTimeout)
+      })
+    ])
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle)
+  }
+}
 
 const coerceGeneratedText = (payload: any): string => {
   if (!payload) return ''
@@ -292,6 +312,17 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
   const models = buildModelList(options.model, includeFallback)
   const maxRetries = clamp(Math.round(Number(process.env.LLAMA_MAX_RETRIES || 3)), 1, 8)
   const baseBackoffMs = clamp(Math.round(Number(process.env.LLAMA_BACKOFF_BASE_MS || 1200)), 200, 15_000)
+  const totalTimeoutMs = clamp(
+    Math.round(Number(options.timeoutMs ?? process.env.LLAMA_DECISION_TIMEOUT_MS ?? 60_000)),
+    5_000,
+    300_000
+  )
+  const perAttemptTimeoutMs = clamp(
+    Math.round(Number(process.env.LLAMA_REQUEST_TIMEOUT_MS || 30_000)),
+    2_000,
+    120_000
+  )
+  const queryStartedAt = Date.now()
 
   let attempts = 0
   let lastReason = 'llama_no_response'
@@ -303,10 +334,22 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
 
     for (const model of models) {
       for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
+        const elapsedMs = Date.now() - queryStartedAt
+        const remainingMs = totalTimeoutMs - elapsedMs
+        if (remainingMs <= 0) {
+          return {
+            ok: false,
+            text: '',
+            model: null,
+            provider: null,
+            attempts,
+            reason: 'llama_timeout_budget_exceeded'
+          }
+        }
         attempts += 1
-        const result =
+        const result = await withTimeoutResult(
           provider === 'huggingface'
-            ? await requestHf({
+            ? requestHf({
                 token,
                 model,
                 prompt: promptText,
@@ -314,14 +357,21 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
                 temperature,
                 topP
               })
-            : await requestLocal({
+            : requestLocal({
                 endpoint: localEndpoint,
                 model,
                 prompt: promptText,
                 maxTokens,
                 temperature,
                 topP
-              })
+              }),
+          Math.min(perAttemptTimeoutMs, remainingMs),
+          () => ({
+            ok: false,
+            text: '',
+            reason: 'llama_request_timeout'
+          })
+        )
 
         if (result.ok) {
           return {

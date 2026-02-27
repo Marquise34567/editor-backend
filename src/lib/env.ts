@@ -47,6 +47,7 @@ const envSchema = z.object({
   RETENTION_AI_PROVIDER_ORDER: z.string().optional(),
   RETENTION_AI_RETRIES: z.string().optional(),
   RETENTION_AI_BACKOFF_BASE_MS: z.string().optional(),
+  RETENTION_LLM_DECISION_TIMEOUT_MS: z.string().optional(),
   HUGGINGFACE_API_KEY: z.string().optional(),
   HF_API_TOKEN: z.string().optional(),
   HF_RETENTION_MODEL: z.string().optional(),
@@ -59,6 +60,13 @@ const envSchema = z.object({
   LLAMA_LOCAL_API_KEY: z.string().optional(),
   LLAMA_MAX_RETRIES: z.string().optional(),
   LLAMA_BACKOFF_BASE_MS: z.string().optional(),
+  LLAMA_DECISION_TIMEOUT_MS: z.string().optional(),
+  LLAMA_REQUEST_TIMEOUT_MS: z.string().optional(),
+  VIBECUT_UPLOAD_ANALYZE_MAX_MS: z.string().optional(),
+  VIBECUT_UPLOAD_FFPROBE_TIMEOUT_MS: z.string().optional(),
+  VIBECUT_UPLOAD_FRAME_SCAN_TIMEOUT_MS: z.string().optional(),
+  VIBECUT_UPLOAD_TRANSCRIPT_TIMEOUT_MS: z.string().optional(),
+  VIBECUT_UPLOAD_SKIP_TRANSCRIPT: z.string().optional(),
 })
 
 export const getEnv = () => {
@@ -107,6 +115,7 @@ export const getEnv = () => {
     RETENTION_AI_PROVIDER_ORDER: process.env.RETENTION_AI_PROVIDER_ORDER,
     RETENTION_AI_RETRIES: process.env.RETENTION_AI_RETRIES,
     RETENTION_AI_BACKOFF_BASE_MS: process.env.RETENTION_AI_BACKOFF_BASE_MS,
+    RETENTION_LLM_DECISION_TIMEOUT_MS: process.env.RETENTION_LLM_DECISION_TIMEOUT_MS,
     HUGGINGFACE_API_KEY: process.env.HUGGINGFACE_API_KEY,
     HF_API_TOKEN: process.env.HF_API_TOKEN,
     HF_RETENTION_MODEL: process.env.HF_RETENTION_MODEL,
@@ -119,6 +128,13 @@ export const getEnv = () => {
     LLAMA_LOCAL_API_KEY: process.env.LLAMA_LOCAL_API_KEY,
     LLAMA_MAX_RETRIES: process.env.LLAMA_MAX_RETRIES,
     LLAMA_BACKOFF_BASE_MS: process.env.LLAMA_BACKOFF_BASE_MS,
+    LLAMA_DECISION_TIMEOUT_MS: process.env.LLAMA_DECISION_TIMEOUT_MS,
+    LLAMA_REQUEST_TIMEOUT_MS: process.env.LLAMA_REQUEST_TIMEOUT_MS,
+    VIBECUT_UPLOAD_ANALYZE_MAX_MS: process.env.VIBECUT_UPLOAD_ANALYZE_MAX_MS,
+    VIBECUT_UPLOAD_FFPROBE_TIMEOUT_MS: process.env.VIBECUT_UPLOAD_FFPROBE_TIMEOUT_MS,
+    VIBECUT_UPLOAD_FRAME_SCAN_TIMEOUT_MS: process.env.VIBECUT_UPLOAD_FRAME_SCAN_TIMEOUT_MS,
+    VIBECUT_UPLOAD_TRANSCRIPT_TIMEOUT_MS: process.env.VIBECUT_UPLOAD_TRANSCRIPT_TIMEOUT_MS,
+    VIBECUT_UPLOAD_SKIP_TRANSCRIPT: process.env.VIBECUT_UPLOAD_SKIP_TRANSCRIPT,
   }
   const parsed = envSchema.safeParse(raw)
   if (parsed.success) return parsed.data

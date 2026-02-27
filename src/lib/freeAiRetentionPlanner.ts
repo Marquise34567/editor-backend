@@ -1226,6 +1226,39 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   const notes: string[] = []
   let provider: FreeAiHookPlan['provider'] = 'heuristic'
   let model: string | null = null
+  const llmDecisionBudgetMs = clamp(
+    Math.round(Number(process.env.RETENTION_LLM_DECISION_TIMEOUT_MS || 60_000)),
+    10_000,
+    240_000
+  )
+  const llmDecisionStartedAt = Date.now()
+  const remainingDecisionBudgetMs = () => llmDecisionBudgetMs - (Date.now() - llmDecisionStartedAt)
+  const queryWithDecisionBudget = async ({
+    prompt,
+    maxNewTokens,
+    temperature
+  }: {
+    prompt: string
+    maxNewTokens: number
+    temperature: number
+  }) => {
+    const remainingMs = remainingDecisionBudgetMs()
+    if (remainingMs <= 1_200) {
+      return {
+        ok: false as const,
+        provider: 'none' as const,
+        model: null,
+        text: '',
+        reason: 'llm_decision_budget_exhausted'
+      }
+    }
+    return queryRetentionModel({
+      prompt,
+      maxNewTokens,
+      temperature,
+      timeoutMs: Math.min(remainingMs, 60_000)
+    })
+  }
 
   if (candidates.length > 0) {
     const sampleForSentiment = candidates
@@ -1247,17 +1280,17 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       }
     }
 
-    const eligibility = await queryRetentionModel({
+    const eligibility = await queryWithDecisionBudget({
       prompt: prompts.eligibilityPrompt,
       maxNewTokens: 360,
       temperature: 0.1
     })
-    const ranking = await queryRetentionModel({
+    const ranking = await queryWithDecisionBudget({
       prompt: prompts.rankingPrompt,
       maxNewTokens: 640,
       temperature: 0.15
     })
-    const pacing = await queryRetentionModel({
+    const pacing = await queryWithDecisionBudget({
       prompt: prompts.pacingPrompt,
       maxNewTokens: 900,
       temperature: 0.2
