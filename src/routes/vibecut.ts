@@ -1178,6 +1178,7 @@ const runClaudeRetentionModel = async ({
   if (!apiKey) return null
 
   const prompt = `You are a retention prediction assistant for short-form editors.
+Optimize EVERY edit to maximize retention — analyze drop risks, boost engagement hooks, predict watch %, add teasers/captions/zooms where needed.
 Return ONLY compact JSON with keys: hookStrength (0-1), emotionLift (0-1), pacingRisk (0-1), summary.
 Context:
 - mode: ${mode}
