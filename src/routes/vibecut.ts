@@ -14,6 +14,55 @@ const router = express.Router()
 type RenderMode = 'horizontal' | 'vertical'
 type JobStatus = 'queued' | 'processing' | 'completed' | 'failed'
 type SuggestedSubMode = 'highlight_mode' | 'story_mode' | 'standard_mode'
+type FormatPreset = 'youtube' | 'tiktok' | 'instagram_reels' | 'youtube_shorts' | 'custom'
+type VibeChip =
+  | 'energetic'
+  | 'chill'
+  | 'luxury'
+  | 'funny'
+  | 'motivational'
+  | 'aesthetic'
+  | 'dark'
+  | 'cinematic'
+type StylePreset = 'clean' | 'bold' | 'vintage' | 'glitch' | 'neon' | 'minimal' | 'meme'
+type PacingPreset = 'aggressive' | 'balanced' | 'chill' | 'cinematic'
+type CaptionMode = 'ai' | 'manual'
+type CaptionStylePreset =
+  | 'impact'
+  | 'subtle'
+  | 'pop'
+  | 'meme'
+  | 'scroll'
+  | 'neon_glow'
+  | 'vintage_typewriter'
+type CaptionEffect = 'clean_fade' | 'kinetic_pop' | 'underline_sweep' | 'none'
+type AudioOption = 'auto_sync_tracks' | 'mute' | 'voiceover_ai' | 'sfx_library'
+type ZoomEffect = 'punch_zoom' | 'slow_push_in' | 'ken_burns' | 'beat_zoom'
+
+type QuickControls = {
+  autoEdit: boolean
+  highlightReel: boolean
+  speedRamp: boolean
+  musicSync: boolean
+}
+
+type AdaptiveEditorProfile = {
+  formatPreset: FormatPreset
+  vibeChip: VibeChip
+  stylePreset: StylePreset
+  pacingPreset: PacingPreset
+  pacingValue: number
+  autoDetectBestMoments: boolean
+  captionMode: CaptionMode
+  captionStyle: CaptionStylePreset
+  captionFont: string
+  captionEffect: CaptionEffect
+  audioOption: AudioOption
+  quickControls: QuickControls
+  suggestedSubMode: SuggestedSubMode
+  confidence: number
+  rationale: string[]
+}
 
 type UploadedVideoRecord = {
   id: string
@@ -55,6 +104,7 @@ type AutoDetectionPayload = {
   suggestedSubModes: SuggestedSubMode[]
   bannerMessage: string
   frameScan: FrameScanSummary
+  editorProfile: AdaptiveEditorProfile
 }
 
 type RetentionPointType = 'best' | 'worst' | 'skip_zone' | 'hook' | 'emotional_peak'
@@ -108,7 +158,7 @@ type RenderRequestPayload = {
   videoId: string
   mode: RenderMode
   manualSegments?: SegmentInput[]
-  quickControls?: Record<string, boolean>
+  quickControls?: Partial<QuickControls>
   formatPreset?: string
   vibeChip?: string
   stylePreset?: string
@@ -117,6 +167,7 @@ type RenderRequestPayload = {
   captionMode?: string
   captionStyle?: string
   captionFont?: string
+  captionEffect?: string
   zoomEffect?: string
   audioOption?: string
   suggestedSubMode?: SuggestedSubMode
@@ -153,6 +204,178 @@ type ClaudeRetentionOutput = {
 } | null
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+
+const DEFAULT_CAPTION_FONT = 'Inter'
+const CAPTION_FONT_OPTIONS = [
+  'Inter',
+  'Geist',
+  'SF Pro Display',
+  'Manrope',
+  'Space Grotesk',
+  'Poppins',
+  'Bebas Neue',
+  'DM Sans',
+  'Sora',
+  'Outfit'
+]
+
+const normalizeToken = (value: unknown) => String(value || '').trim().toLowerCase().replace(/\s+/g, '_')
+
+const parseFormatPreset = (value: unknown, fallback: FormatPreset): FormatPreset => {
+  const raw = normalizeToken(value)
+  if (raw === 'youtube') return 'youtube'
+  if (raw === 'tiktok') return 'tiktok'
+  if (raw === 'instagram_reels' || raw === 'instagramreels' || raw === 'reels') return 'instagram_reels'
+  if (raw === 'youtube_shorts' || raw === 'youtubeshorts' || raw === 'shorts') return 'youtube_shorts'
+  if (raw === 'custom') return 'custom'
+  return fallback
+}
+
+const parseVibeChip = (value: unknown, fallback: VibeChip): VibeChip => {
+  const raw = normalizeToken(value)
+  if (raw === 'energetic') return 'energetic'
+  if (raw === 'chill') return 'chill'
+  if (raw === 'luxury') return 'luxury'
+  if (raw === 'funny') return 'funny'
+  if (raw === 'motivational') return 'motivational'
+  if (raw === 'aesthetic') return 'aesthetic'
+  if (raw === 'dark') return 'dark'
+  if (raw === 'cinematic') return 'cinematic'
+  return fallback
+}
+
+const parseStylePreset = (value: unknown, fallback: StylePreset): StylePreset => {
+  const raw = normalizeToken(value)
+  if (raw === 'clean') return 'clean'
+  if (raw === 'bold') return 'bold'
+  if (raw === 'vintage') return 'vintage'
+  if (raw === 'glitch') return 'glitch'
+  if (raw === 'neon') return 'neon'
+  if (raw === 'minimal') return 'minimal'
+  if (raw === 'meme') return 'meme'
+  return fallback
+}
+
+const parsePacingPreset = (value: unknown, fallback: PacingPreset): PacingPreset => {
+  const raw = normalizeToken(value)
+  if (raw === 'aggressive' || raw === 'fast' || raw === 'high') return 'aggressive'
+  if (raw === 'balanced' || raw === 'normal' || raw === 'medium') return 'balanced'
+  if (raw === 'chill' || raw === 'slow') return 'chill'
+  if (raw === 'cinematic') return 'cinematic'
+  return fallback
+}
+
+const parseCaptionMode = (value: unknown, fallback: CaptionMode): CaptionMode => {
+  const raw = normalizeToken(value)
+  if (raw === 'ai' || raw === 'auto') return 'ai'
+  if (raw === 'manual' || raw === 'off') return 'manual'
+  return fallback
+}
+
+const parseCaptionStyle = (value: unknown, fallback: CaptionStylePreset): CaptionStylePreset => {
+  const raw = normalizeToken(value)
+  if (raw === 'impact') return 'impact'
+  if (raw === 'subtle') return 'subtle'
+  if (raw === 'pop') return 'pop'
+  if (raw === 'meme') return 'meme'
+  if (raw === 'scroll') return 'scroll'
+  if (raw === 'neon_glow' || raw === 'neonglow') return 'neon_glow'
+  if (raw === 'vintage_typewriter' || raw === 'typewriter') return 'vintage_typewriter'
+  return fallback
+}
+
+const parseCaptionEffect = (value: unknown, fallback: CaptionEffect): CaptionEffect => {
+  const raw = normalizeToken(value)
+  if (raw === 'clean_fade' || raw === 'fade') return 'clean_fade'
+  if (raw === 'kinetic_pop' || raw === 'kinetic') return 'kinetic_pop'
+  if (raw === 'underline_sweep' || raw === 'underline') return 'underline_sweep'
+  if (raw === 'none' || raw === 'off') return 'none'
+  return fallback
+}
+
+const parseAudioOption = (value: unknown, fallback: AudioOption): AudioOption => {
+  const raw = normalizeToken(value)
+  if (raw === 'auto_sync_tracks' || raw === 'auto_sync' || raw === 'auto') return 'auto_sync_tracks'
+  if (raw === 'mute' || raw === 'silent') return 'mute'
+  if (raw === 'voiceover_ai' || raw === 'voiceover') return 'voiceover_ai'
+  if (raw === 'sfx_library' || raw === 'sfx') return 'sfx_library'
+  return fallback
+}
+
+const parseZoomEffect = (value: unknown, fallback: ZoomEffect): ZoomEffect => {
+  const raw = normalizeToken(value)
+  if (raw === 'punch_zoom' || raw === 'punch') return 'punch_zoom'
+  if (raw === 'slow_push_in' || raw === 'slow_push') return 'slow_push_in'
+  if (raw === 'ken_burns' || raw === 'kenburns') return 'ken_burns'
+  if (raw === 'beat_zoom' || raw === 'beat') return 'beat_zoom'
+  return fallback
+}
+
+const parseSuggestedSubMode = (value: unknown, fallback: SuggestedSubMode): SuggestedSubMode => {
+  const raw = normalizeToken(value)
+  if (raw === 'highlight_mode' || raw === 'highlight') return 'highlight_mode'
+  if (raw === 'story_mode' || raw === 'story') return 'story_mode'
+  if (raw === 'standard_mode' || raw === 'standard') return 'standard_mode'
+  return fallback
+}
+
+const sanitizeCaptionFont = (value: unknown, fallback = DEFAULT_CAPTION_FONT) => {
+  const raw = String(value || '').trim()
+  if (!raw) return fallback
+  const matched = CAPTION_FONT_OPTIONS.find((font) => font.toLowerCase() === raw.toLowerCase())
+  if (matched) return matched
+  const cleaned = raw.replace(/[,:;'"\\]/g, '').slice(0, 48).trim()
+  return cleaned || fallback
+}
+
+const parseQuickControls = (value: unknown, fallback: QuickControls): QuickControls => {
+  if (!value || typeof value !== 'object') return { ...fallback }
+  const candidate = value as any
+  return {
+    autoEdit: typeof candidate.autoEdit === 'boolean' ? candidate.autoEdit : fallback.autoEdit,
+    highlightReel: typeof candidate.highlightReel === 'boolean' ? candidate.highlightReel : fallback.highlightReel,
+    speedRamp: typeof candidate.speedRamp === 'boolean' ? candidate.speedRamp : fallback.speedRamp,
+    musicSync: typeof candidate.musicSync === 'boolean' ? candidate.musicSync : fallback.musicSync
+  }
+}
+
+const pacingPresetFromValue = (value: number): PacingPreset => {
+  if (value >= 72) return 'aggressive'
+  if (value <= 38) return 'chill'
+  return 'balanced'
+}
+
+const pacingValueFromPreset = (preset: PacingPreset, fallbackByMode: RenderMode): number => {
+  if (preset === 'aggressive') return fallbackByMode === 'vertical' ? 80 : 72
+  if (preset === 'chill') return fallbackByMode === 'vertical' ? 52 : 34
+  if (preset === 'cinematic') return fallbackByMode === 'vertical' ? 58 : 36
+  return fallbackByMode === 'vertical' ? 68 : 56
+}
+
+const stableUnit = (input: string) => {
+  let hash = 2166136261
+  for (let index = 0; index < input.length; index += 1) {
+    hash ^= input.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return ((hash >>> 0) % 10000) / 10000
+}
+
+const countKeywordHits = (value: string, keywords: string[]) => {
+  const normalized = ` ${String(value || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ')} `
+  let hits = 0
+  for (const keyword of keywords) {
+    const token = ` ${keyword.toLowerCase()} `
+    if (normalized.includes(token)) hits += 1
+  }
+  return hits
+}
+
+const pickBySeed = <T>(items: T[], seed: number, fallback: T): T => {
+  if (!items.length) return fallback
+  const index = Math.max(0, Math.min(items.length - 1, Math.floor(seed * items.length)))
+  return items[index] ?? fallback
+}
 
 const processCwd = process.cwd()
 const OUTPUT_ROOT = path.join(processCwd, 'outputs')
@@ -457,6 +680,19 @@ const ffprobeMetadata = async (videoPath: string): Promise<VideoMetadata> => {
   }
 }
 
+const probeHasAudioStream = async (videoPath: string): Promise<boolean> => {
+  const args = [
+    '-v', 'error',
+    '-select_streams', 'a:0',
+    '-show_entries', 'stream=index',
+    '-of', 'default=nokey=1:noprint_wrappers=1',
+    videoPath
+  ]
+  const result = await runProcess(FFPROBE_PATH, args)
+  if (result.code !== 0) return false
+  return String(result.stdout || '').trim().length > 0
+}
+
 const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
   const fallback: FrameScanSummary = {
     sampledFrames: 0,
@@ -503,7 +739,179 @@ const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
   }
 }
 
-const detectMode = (metadata: VideoMetadata, frameScan: FrameScanSummary): AutoDetectionPayload => {
+const buildAdaptiveEditorProfile = ({
+  metadata,
+  frameScan,
+  finalMode,
+  suggestedSubMode,
+  transcript,
+  fileName
+}: {
+  metadata: VideoMetadata
+  frameScan: FrameScanSummary
+  finalMode: RenderMode
+  suggestedSubMode: SuggestedSubMode
+  transcript?: TranscriptSummary | null
+  fileName?: string | null
+}): AdaptiveEditorProfile => {
+  const transcriptText = String(transcript?.excerpt || '')
+  const language = String(transcript?.language || '').toLowerCase()
+  const segmentCount = Number(transcript?.segmentCount || 0)
+  const transcriptDensity = clamp(segmentCount / Math.max(1, metadata.duration * 0.33), 0, 1)
+  const fpsSignal = clamp((metadata.fps - 24) / 36, 0, 1)
+  const motionSignal = clamp(frameScan.highMotionShortClipSignal * 0.64 + frameScan.horizontalMotionSignal * 0.36, 0, 1)
+  const faceSignal = clamp(frameScan.centeredFaceVerticalSignal, 0, 1)
+
+  const energyScore = clamp(motionSignal * 0.62 + fpsSignal * 0.18 + transcriptDensity * 0.2, 0, 1)
+  const narrativeScore = clamp(faceSignal * 0.46 + (1 - motionSignal) * 0.26 + transcriptDensity * 0.28, 0, 1)
+
+  const keywordText = `${fileName || ''} ${transcriptText}`.toLowerCase()
+  const funnyHits = countKeywordHits(keywordText, ['funny', 'comedy', 'joke', 'lol', 'meme', 'prank', 'reaction'])
+  const motivationalHits = countKeywordHits(keywordText, ['motivation', 'discipline', 'mindset', 'grind', 'hustle', 'success'])
+  const luxuryHits = countKeywordHits(keywordText, ['luxury', 'wealth', 'rich', 'fashion', 'travel', 'lifestyle'])
+  const darkHits = countKeywordHits(keywordText, ['dark', 'horror', 'crime', 'sad', 'fear', 'mystery'])
+  const cinematicHits = countKeywordHits(keywordText, ['cinematic', 'story', 'film', 'documentary', 'journey'])
+
+  const styleSeed = stableUnit([
+    metadata.width,
+    metadata.height,
+    metadata.duration.toFixed(2),
+    metadata.fps.toFixed(2),
+    frameScan.highMotionShortClipSignal.toFixed(4),
+    frameScan.centeredFaceVerticalSignal.toFixed(4),
+    frameScan.motionPeaks.slice(0, 4).join(','),
+    segmentCount,
+    language,
+    keywordText.slice(0, 220)
+  ].join('|'))
+
+  let vibeChip: VibeChip
+  if (funnyHits > 0) {
+    vibeChip = 'funny'
+  } else if (motivationalHits > 0) {
+    vibeChip = 'motivational'
+  } else if (darkHits > 0) {
+    vibeChip = 'dark'
+  } else if (luxuryHits > 0) {
+    vibeChip = styleSeed > 0.5 ? 'luxury' : 'aesthetic'
+  } else if (energyScore > 0.76) {
+    vibeChip = 'energetic'
+  } else if (cinematicHits > 0 || (narrativeScore > 0.7 && energyScore < 0.56)) {
+    vibeChip = 'cinematic'
+  } else if (narrativeScore > 0.7 && energyScore < 0.52) {
+    vibeChip = 'chill'
+  } else {
+    vibeChip = pickBySeed<VibeChip>(['aesthetic', 'luxury', 'cinematic'], styleSeed, 'aesthetic')
+  }
+
+  const styleMap: Record<VibeChip, StylePreset[]> = {
+    energetic: ['bold', 'glitch', 'meme'],
+    chill: ['minimal', 'clean', 'vintage'],
+    luxury: ['clean', 'minimal', 'vintage'],
+    funny: ['meme', 'bold', 'clean'],
+    motivational: ['bold', 'clean', 'neon'],
+    aesthetic: ['minimal', 'clean', 'vintage'],
+    dark: ['glitch', 'neon', 'bold'],
+    cinematic: ['vintage', 'clean', 'minimal']
+  }
+  const stylePreset = pickBySeed<StylePreset>(styleMap[vibeChip], styleSeed * 0.91 + 0.04, styleMap[vibeChip][0])
+
+  let pacingValue = Math.round(
+    (finalMode === 'vertical' ? 60 : 47) + energyScore * 33 - narrativeScore * 9 + (vibeChip === 'energetic' ? 5 : 0)
+  )
+  if (vibeChip === 'cinematic' || vibeChip === 'luxury') pacingValue -= 7
+  if (vibeChip === 'funny') pacingValue += 6
+  pacingValue = Math.round(clamp(pacingValue, 20, 92))
+
+  let pacingPreset = pacingPresetFromValue(pacingValue)
+  if (narrativeScore > 0.74 && energyScore < 0.5) pacingPreset = 'cinematic'
+
+  const captionStyle: CaptionStylePreset =
+    vibeChip === 'funny'
+      ? 'meme'
+      : vibeChip === 'dark'
+        ? 'neon_glow'
+        : pacingPreset === 'cinematic'
+          ? 'subtle'
+          : energyScore > 0.72
+            ? 'impact'
+            : energyScore < 0.36
+              ? 'scroll'
+              : 'pop'
+
+  const captionEffect: CaptionEffect =
+    energyScore > 0.72 ? 'kinetic_pop' : pacingPreset === 'cinematic' ? 'clean_fade' : 'underline_sweep'
+
+  const captionFont =
+    vibeChip === 'funny'
+      ? 'Bebas Neue'
+      : vibeChip === 'cinematic'
+        ? 'Manrope'
+        : vibeChip === 'dark'
+          ? 'Space Grotesk'
+          : vibeChip === 'aesthetic'
+            ? 'Sora'
+            : DEFAULT_CAPTION_FONT
+
+  const quickControls: QuickControls = {
+    autoEdit: true,
+    highlightReel: finalMode === 'vertical' ? true : energyScore > 0.56,
+    speedRamp: energyScore > 0.68,
+    musicSync: energyScore > 0.45 || vibeChip === 'funny'
+  }
+
+  const autoDetectBestMoments = finalMode === 'vertical' ? true : energyScore > 0.42 || quickControls.highlightReel
+
+  const audioOption: AudioOption =
+    segmentCount >= 6 && narrativeScore > 0.68
+      ? 'voiceover_ai'
+      : energyScore > 0.78
+        ? 'sfx_library'
+        : 'auto_sync_tracks'
+
+  const formatPreset: FormatPreset =
+    finalMode === 'vertical'
+      ? energyScore > 0.78
+        ? 'tiktok'
+        : narrativeScore > 0.7
+          ? 'instagram_reels'
+          : 'youtube_shorts'
+      : metadata.aspectRatio > 2.05
+        ? 'custom'
+        : 'youtube'
+
+  const profileConfidence = clamp(0.56 + energyScore * 0.16 + transcriptDensity * 0.12 + (segmentCount > 0 ? 0.06 : 0), 0.5, 0.96)
+
+  const rationale = [
+    `energy=${energyScore.toFixed(2)}, narrative=${narrativeScore.toFixed(2)}, transcript_density=${transcriptDensity.toFixed(2)}`,
+    `keywords funny=${funnyHits}, motivational=${motivationalHits}, luxury=${luxuryHits}, dark=${darkHits}, cinematic=${cinematicHits}`,
+    `motion=${frameScan.highMotionShortClipSignal.toFixed(2)}, face_center=${frameScan.centeredFaceVerticalSignal.toFixed(2)}, fps=${metadata.fps.toFixed(1)}`
+  ]
+
+  return {
+    formatPreset,
+    vibeChip,
+    stylePreset,
+    pacingPreset,
+    pacingValue,
+    autoDetectBestMoments,
+    captionMode: segmentCount > 0 ? 'ai' : 'manual',
+    captionStyle,
+    captionFont,
+    captionEffect,
+    audioOption,
+    quickControls,
+    suggestedSubMode,
+    confidence: Number(profileConfidence.toFixed(3)),
+    rationale
+  }
+}
+
+const detectMode = (
+  metadata: VideoMetadata,
+  frameScan: FrameScanSummary,
+  opts?: { transcript?: TranscriptSummary | null; fileName?: string | null }
+): AutoDetectionPayload => {
   const ratio = metadata.aspectRatio
   const metadataMode: RenderMode = ratio > 1.08 ? 'horizontal' : ratio < 0.92 ? 'vertical' : 'vertical'
   const ambiguous = ratio >= 0.92 && ratio <= 1.08
@@ -542,6 +950,15 @@ const detectMode = (metadata: VideoMetadata, frameScan: FrameScanSummary): AutoD
     ? 'Auto-detected: Vertical Mode (TikTok-ready). Switch?'
     : 'Auto-detected: Horizontal Mode (YouTube-ready). Switch?'
 
+  const editorProfile = buildAdaptiveEditorProfile({
+    metadata,
+    frameScan,
+    finalMode,
+    suggestedSubMode,
+    transcript: opts?.transcript || null,
+    fileName: opts?.fileName || null
+  })
+
   return {
     metadataMode,
     frameScanMode: frameMode,
@@ -552,7 +969,8 @@ const detectMode = (metadata: VideoMetadata, frameScan: FrameScanSummary): AutoD
     suggestedSubMode,
     suggestedSubModes: uniqueSubModes,
     bannerMessage,
-    frameScan
+    frameScan,
+    editorProfile
   }
 }
 
@@ -606,15 +1024,22 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
       return res.status(400).json({ error: 'invalid_upload', message: 'Upload a video file in field "video".' })
     }
 
+    const videoId = crypto.randomUUID()
     const metadata = await ffprobeMetadata(uploaded.path)
     const frameScan = await runFrameScan(uploaded.path)
-    const autoDetection = detectMode(metadata, frameScan)
+    const analysisDir = path.join(VIBECUT_UPLOAD_DIR, `${videoId}_analysis`)
+    ensureDir(analysisDir)
+    const transcript = await readTranscriptSummary(uploaded.path, analysisDir)
+    const originalFileName = uploaded.originalname || path.basename(uploaded.path)
+    const autoDetection = detectMode(metadata, frameScan, {
+      transcript,
+      fileName: originalFileName
+    })
 
-    const videoId = crypto.randomUUID()
     const record: UploadedVideoRecord = {
       id: videoId,
       userId,
-      fileName: uploaded.originalname || path.basename(uploaded.path),
+      fileName: originalFileName,
       storedPath: uploaded.path,
       createdAt: new Date().toISOString(),
       metadata,
@@ -898,52 +1323,182 @@ const buildRetentionSignals = ({
   return { points, heatmap, summary }
 }
 
-const buildVerticalHighlightSegments = (duration: number, points: RetentionPoint[]) => {
+type SegmentStrategy = {
+  targetCount: number
+  minSeconds: number
+  maxSeconds: number
+  includeIntroHook: boolean
+  spacingSeconds: number
+}
+
+type CreativePipelineConfig = {
+  stylePreset: StylePreset
+  vibeChip: VibeChip
+  audioOption: AudioOption
+  zoomEffect: ZoomEffect
+  withAudio: boolean
+}
+
+const resolveSegmentStrategy = ({
+  mode,
+  pacingPreset,
+  highlightReel
+}: {
+  mode: RenderMode
+  pacingPreset: PacingPreset
+  highlightReel: boolean
+}): SegmentStrategy => {
+  if (mode === 'vertical') {
+    if (pacingPreset === 'aggressive') {
+      return { targetCount: highlightReel ? 4 : 3, minSeconds: 10, maxSeconds: 22, includeIntroHook: true, spacingSeconds: 5.5 }
+    }
+    if (pacingPreset === 'cinematic') {
+      return { targetCount: 2, minSeconds: 22, maxSeconds: 42, includeIntroHook: false, spacingSeconds: 9 }
+    }
+    if (pacingPreset === 'chill') {
+      return { targetCount: 2, minSeconds: 18, maxSeconds: 36, includeIntroHook: true, spacingSeconds: 8 }
+    }
+    return { targetCount: highlightReel ? 3 : 2, minSeconds: 14, maxSeconds: 30, includeIntroHook: true, spacingSeconds: 6.5 }
+  }
+
+  if (pacingPreset === 'aggressive') {
+    return { targetCount: 6, minSeconds: 8, maxSeconds: 18, includeIntroHook: true, spacingSeconds: 4 }
+  }
+  if (pacingPreset === 'cinematic') {
+    return { targetCount: 2, minSeconds: 26, maxSeconds: 58, includeIntroHook: false, spacingSeconds: 12 }
+  }
+  if (pacingPreset === 'chill') {
+    return { targetCount: 3, minSeconds: 18, maxSeconds: 42, includeIntroHook: false, spacingSeconds: 9 }
+  }
+  return { targetCount: 4, minSeconds: 12, maxSeconds: 32, includeIntroHook: true, spacingSeconds: 7 }
+}
+
+const buildAdaptiveHighlightSegments = ({
+  duration,
+  points,
+  strategy
+}: {
+  duration: number
+  points: RetentionPoint[]
+  strategy: SegmentStrategy
+}) => {
   const sortedByScore = points.slice().sort((a, b) => b.watchedPct - a.watchedPct)
   const selected: Array<{ start: number; end: number }> = []
+  const safeDuration = Math.max(0.4, duration)
 
   const pushSegment = (start: number, end: number) => {
-    const safeStart = clamp(start, 0, Math.max(0, duration - 0.4))
-    const safeEnd = clamp(end, safeStart + 0.4, duration)
+    const safeStart = clamp(start, 0, Math.max(0, safeDuration - 0.4))
+    const safeEnd = clamp(end, safeStart + 0.4, safeDuration)
     if (safeEnd - safeStart < 0.4) return
-    if (selected.some((segment) => Math.abs(segment.start - safeStart) < 6)) return
+    if (selected.some((segment) => Math.abs(segment.start - safeStart) < strategy.spacingSeconds)) return
     selected.push({ start: Number(safeStart.toFixed(2)), end: Number(safeEnd.toFixed(2)) })
   }
 
-  // Mandatory first 3-second hook support.
-  pushSegment(0, Math.min(duration, 18))
+  if (strategy.includeIntroHook) {
+    const introEnd = clamp(strategy.minSeconds + (strategy.maxSeconds - strategy.minSeconds) * 0.35, strategy.minSeconds, strategy.maxSeconds)
+    pushSegment(0, Math.min(safeDuration, introEnd))
+  }
 
   for (const point of sortedByScore) {
-    if (selected.length >= 3) break
-    const targetDuration = clamp(18 + (point.watchedPct - 45) * 0.18, 15, 30)
-    const start = Math.max(0, point.timestamp - targetDuration * 0.35)
-    const end = Math.min(duration, start + targetDuration)
+    if (selected.length >= strategy.targetCount) break
+    const targetDuration = clamp(
+      (strategy.minSeconds + strategy.maxSeconds) / 2 + (point.watchedPct - 50) * 0.22,
+      strategy.minSeconds,
+      strategy.maxSeconds
+    )
+    const start = Math.max(0, point.timestamp - targetDuration * 0.36)
+    const end = Math.min(safeDuration, start + targetDuration)
     pushSegment(start, end)
   }
 
-  if (selected.length < 3) {
-    while (selected.length < 3) {
-      const segmentLength = 15
-      const offset = selected.length * (segmentLength + 1)
-      pushSegment(offset, Math.min(duration, offset + segmentLength))
-      if (offset + 1 >= duration) break
+  if (selected.length < strategy.targetCount) {
+    const fallbackLength = clamp((strategy.minSeconds + strategy.maxSeconds) / 2, 3, Math.max(3, safeDuration))
+    while (selected.length < strategy.targetCount) {
+      const offsetRatio = selected.length / Math.max(1, strategy.targetCount)
+      const start = clamp(offsetRatio * Math.max(0, safeDuration - fallbackLength), 0, Math.max(0, safeDuration - 0.4))
+      const end = clamp(start + fallbackLength, start + 0.4, safeDuration)
+      pushSegment(start, end)
+      if (start >= safeDuration - 1) break
     }
   }
 
-  return selected.slice(0, 3)
+  return selected
+    .slice(0, strategy.targetCount)
+    .sort((a, b) => a.start - b.start)
 }
+
+const buildStyleVideoFilters = (stylePreset: StylePreset, vibeChip: VibeChip): string[] => {
+  const styleFilters: Record<StylePreset, string[]> = {
+    clean: ['eq=contrast=1.05:saturation=1.08'],
+    bold: ['eq=contrast=1.13:saturation=1.2', 'unsharp=5:5:0.42:3:3:0.0'],
+    vintage: ['eq=contrast=1.02:saturation=0.84:brightness=0.03'],
+    glitch: ['eq=contrast=1.1:saturation=1.14', 'unsharp=3:3:0.36:3:3:0.0'],
+    neon: ['eq=contrast=1.09:saturation=1.28'],
+    minimal: ['eq=contrast=1.01:saturation=0.94'],
+    meme: ['eq=contrast=1.14:saturation=1.24']
+  }
+  const vibeFilters: Record<VibeChip, string[]> = {
+    energetic: ['eq=contrast=1.06:saturation=1.12'],
+    chill: ['eq=contrast=0.99:saturation=0.94'],
+    luxury: ['eq=contrast=1.03:saturation=1.0:brightness=0.01'],
+    funny: ['eq=contrast=1.08:saturation=1.14'],
+    motivational: ['eq=contrast=1.09:saturation=1.1'],
+    aesthetic: ['eq=contrast=1.01:saturation=1.02:brightness=0.015'],
+    dark: ['eq=contrast=1.12:saturation=0.88:brightness=-0.01'],
+    cinematic: ['eq=contrast=1.04:saturation=0.95']
+  }
+  return [...(styleFilters[stylePreset] || []), ...(vibeFilters[vibeChip] || [])]
+}
+
+const buildAudioFilterChain = (audioOption: AudioOption): string[] => {
+  if (audioOption === 'mute') return []
+  if (audioOption === 'voiceover_ai') {
+    return [
+      'highpass=f=90',
+      'lowpass=f=7800',
+      'afftdn=nf=-24',
+      'acompressor=threshold=-18dB:ratio=2.4:attack=18:release=140',
+      'loudnorm=I=-16:TP=-1.5:LRA=9'
+    ]
+  }
+  if (audioOption === 'sfx_library') {
+    return [
+      'acompressor=threshold=-20dB:ratio=2.8:attack=8:release=90',
+      'treble=g=2',
+      'loudnorm=I=-15:TP=-1.5:LRA=10'
+    ]
+  }
+  return ['acompressor=threshold=-20dB:ratio=2.0:attack=15:release=130', 'loudnorm=I=-16:TP=-1.5:LRA=11']
+}
+
+const resolveVerticalZoomFilter = (zoomEffect: ZoomEffect) => {
+  const zoomExpr =
+    zoomEffect === 'beat_zoom'
+      ? "min(1.58,zoom+0.0062)"
+      : zoomEffect === 'slow_push_in'
+        ? "min(1.24,zoom+0.0012)"
+        : zoomEffect === 'ken_burns'
+          ? "min(1.3,zoom+0.0017)"
+          : "min(1.45,zoom+0.0039)"
+  return `scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='${zoomExpr}':d=1:s=1080x1920:fps=30`
+}
+
+const shouldOutputAudio = (config: CreativePipelineConfig) => config.withAudio && config.audioOption !== 'mute'
 
 const runHorizontalPipeline = async ({
   inputPath,
   outputPath,
   segments,
-  ffmpegCommands
+  ffmpegCommands,
+  config
 }: {
   inputPath: string
   outputPath: string
   segments: Array<{ start: number; end: number }>
   ffmpegCommands: string[]
+  config: CreativePipelineConfig
 }) => {
+  const audioEnabled = shouldOutputAudio(config)
   const tempTrimmed = path.join(path.dirname(outputPath), 'horizontal_trimmed.mp4')
   let sourcePath = inputPath
 
@@ -953,62 +1508,51 @@ const runHorizontalPipeline = async ({
 
     segments.forEach((segment, index) => {
       filterParts.push(`[0:v]trim=start=${segment.start}:end=${segment.end},setpts=PTS-STARTPTS[v${index}]`)
-      filterParts.push(`[0:a]atrim=start=${segment.start}:end=${segment.end},asetpts=PTS-STARTPTS[a${index}]`)
-      concatInputs.push(`[v${index}][a${index}]`)
+      if (audioEnabled) {
+        filterParts.push(`[0:a]atrim=start=${segment.start}:end=${segment.end},asetpts=PTS-STARTPTS[a${index}]`)
+        concatInputs.push(`[v${index}][a${index}]`)
+      } else {
+        concatInputs.push(`[v${index}]`)
+      }
     })
 
-    filterParts.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=1[vout][aout]`)
+    if (audioEnabled) {
+      filterParts.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=1[vout][aout]`)
+    } else {
+      filterParts.push(`${concatInputs.join('')}concat=n=${segments.length}:v=1:a=0[vout]`)
+    }
 
-    await runFfmpegCommand([
-      '-y',
-      '-i',
-      inputPath,
-      '-filter_complex',
-      filterParts.join(';'),
-      '-map',
-      '[vout]',
-      '-map',
-      '[aout]',
-      '-c:v',
-      'libx264',
-      '-preset',
-      'medium',
-      '-crf',
-      '20',
-      '-c:a',
-      'aac',
-      '-b:a',
-      '160k',
-      '-movflags',
-      '+faststart',
-      tempTrimmed
-    ], ffmpegCommands)
+    const trimArgs = ['-y', '-i', inputPath, '-filter_complex', filterParts.join(';'), '-map', '[vout]']
+    if (audioEnabled) trimArgs.push('-map', '[aout]')
+    trimArgs.push('-c:v', 'libx264', '-preset', 'medium', '-crf', '20')
+    if (audioEnabled) {
+      trimArgs.push('-c:a', 'aac', '-b:a', '160k')
+    } else {
+      trimArgs.push('-an')
+    }
+    trimArgs.push('-movflags', '+faststart', tempTrimmed)
+    await runFfmpegCommand(trimArgs, ffmpegCommands)
 
     sourcePath = tempTrimmed
   }
 
-  await runFfmpegCommand([
-    '-y',
-    '-i',
-    sourcePath,
-    '-vf',
-    'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,eq=contrast=1.05:saturation=1.08',
-    '-af',
-    'loudnorm=I=-16:TP=-1.5:LRA=11',
-    '-c:v',
-    'libx264',
-    '-preset',
-    'medium',
-    '-crf',
-    '19',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '192k',
-    '-movflags',
-    '+faststart',
-    outputPath
-  ], ffmpegCommands)
+  const videoFilters = [
+    'scale=1920:1080:force_original_aspect_ratio=decrease',
+    'pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+    ...buildStyleVideoFilters(config.stylePreset, config.vibeChip)
+  ]
+  const outputArgs = ['-y', '-i', sourcePath, '-vf', videoFilters.join(','), '-c:v', 'libx264', '-preset', 'medium', '-crf', '19']
+  if (audioEnabled) {
+    const audioFilters = buildAudioFilterChain(config.audioOption)
+    if (audioFilters.length > 0) {
+      outputArgs.push('-af', audioFilters.join(','))
+    }
+    outputArgs.push('-c:a', 'aac', '-b:a', '192k')
+  } else {
+    outputArgs.push('-an')
+  }
+  outputArgs.push('-movflags', '+faststart', outputPath)
+  await runFfmpegCommand(outputArgs, ffmpegCommands)
 }
 
 const runVerticalMoviepyPipeline = async ({
@@ -1059,14 +1603,17 @@ const runVerticalPipeline = async ({
   outputPath,
   segments,
   ffmpegCommands,
-  workDir
+  workDir,
+  config
 }: {
   inputPath: string
   outputPath: string
   segments: Array<{ start: number; end: number }>
   ffmpegCommands: string[]
   workDir: string
+  config: CreativePipelineConfig
 }) => {
+  const audioEnabled = shouldOutputAudio(config)
   const clipDir = path.join(workDir, 'clips')
   ensureDir(clipDir)
 
@@ -1082,35 +1629,19 @@ const runVerticalPipeline = async ({
   }
 
   if (clipPaths.length === 0) {
-    const verticalFilter = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,zoompan=z='min(1.45,zoom+0.003)':d=1:s=1080x1920:fps=30"
+    const verticalFilter = resolveVerticalZoomFilter(config.zoomEffect)
 
     for (let index = 0; index < segments.length; index += 1) {
       const segment = segments[index]
       const clipPath = path.join(clipDir, `clip_${String(index + 1).padStart(2, '0')}.mp4`)
-      await runFfmpegCommand([
-        '-y',
-        '-ss',
-        String(segment.start),
-        '-to',
-        String(segment.end),
-        '-i',
-        inputPath,
-        '-vf',
-        verticalFilter,
-        '-c:v',
-        'libx264',
-        '-preset',
-        'medium',
-        '-crf',
-        '20',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-movflags',
-        '+faststart',
-        clipPath
-      ], ffmpegCommands)
+      const clipArgs = ['-y', '-ss', String(segment.start), '-to', String(segment.end), '-i', inputPath, '-vf', verticalFilter, '-c:v', 'libx264', '-preset', 'medium', '-crf', '20']
+      if (audioEnabled) {
+        clipArgs.push('-c:a', 'aac', '-b:a', '128k')
+      } else {
+        clipArgs.push('-an')
+      }
+      clipArgs.push('-movflags', '+faststart', clipPath)
+      await runFfmpegCommand(clipArgs, ffmpegCommands)
       clipPaths.push(clipPath)
     }
   }
@@ -1122,7 +1653,8 @@ const runVerticalPipeline = async ({
   const concatListPath = path.join(workDir, 'concat_list.txt')
   fs.writeFileSync(concatListPath, clipPaths.map((clipPath) => `file '${clipPath.replace(/'/g, "''")}'`).join('\n'))
 
-  await runFfmpegCommand([
+  const finalVideoFilters = buildStyleVideoFilters(config.stylePreset, config.vibeChip)
+  const concatArgs = [
     '-y',
     '-f',
     'concat',
@@ -1130,20 +1662,26 @@ const runVerticalPipeline = async ({
     '0',
     '-i',
     concatListPath,
+    '-vf',
+    (finalVideoFilters.length ? finalVideoFilters : ['format=yuv420p']).join(','),
     '-c:v',
     'libx264',
     '-preset',
     'medium',
     '-crf',
-    '20',
-    '-c:a',
-    'aac',
-    '-b:a',
-    '128k',
-    '-movflags',
-    '+faststart',
-    outputPath
-  ], ffmpegCommands)
+    '20'
+  ]
+  if (audioEnabled) {
+    const audioFilters = buildAudioFilterChain(config.audioOption)
+    if (audioFilters.length > 0) {
+      concatArgs.push('-af', audioFilters.join(','))
+    }
+    concatArgs.push('-c:a', 'aac', '-b:a', '128k')
+  } else {
+    concatArgs.push('-an')
+  }
+  concatArgs.push('-movflags', '+faststart', outputPath)
+  await runFfmpegCommand(concatArgs, ffmpegCommands)
 
   return clipPaths
 }
@@ -1189,6 +1727,74 @@ const generateThumbnailSet = async ({
   return thumbnails
 }
 
+const coerceEditorProfile = ({
+  candidate,
+  fallback,
+  mode
+}: {
+  candidate: Partial<AdaptiveEditorProfile> | null | undefined
+  fallback: AdaptiveEditorProfile
+  mode: RenderMode
+}): AdaptiveEditorProfile => {
+  const safe = candidate || {}
+  const pacingPreset = parsePacingPreset((safe as any).pacingPreset, fallback.pacingPreset)
+  const pacingValueRaw = Number((safe as any).pacingValue)
+  const pacingValue = Number.isFinite(pacingValueRaw)
+    ? Math.round(clamp(pacingValueRaw, 0, 100))
+    : pacingValueFromPreset(pacingPreset, mode)
+  return {
+    formatPreset: parseFormatPreset((safe as any).formatPreset, fallback.formatPreset),
+    vibeChip: parseVibeChip((safe as any).vibeChip, fallback.vibeChip),
+    stylePreset: parseStylePreset((safe as any).stylePreset, fallback.stylePreset),
+    pacingPreset,
+    pacingValue,
+    autoDetectBestMoments: typeof (safe as any).autoDetectBestMoments === 'boolean' ? Boolean((safe as any).autoDetectBestMoments) : fallback.autoDetectBestMoments,
+    captionMode: parseCaptionMode((safe as any).captionMode, fallback.captionMode),
+    captionStyle: parseCaptionStyle((safe as any).captionStyle, fallback.captionStyle),
+    captionFont: sanitizeCaptionFont((safe as any).captionFont, fallback.captionFont),
+    captionEffect: parseCaptionEffect((safe as any).captionEffect, fallback.captionEffect),
+    audioOption: parseAudioOption((safe as any).audioOption, fallback.audioOption),
+    quickControls: parseQuickControls((safe as any).quickControls, fallback.quickControls),
+    suggestedSubMode: parseSuggestedSubMode((safe as any).suggestedSubMode, fallback.suggestedSubMode),
+    confidence: Number.isFinite(Number((safe as any).confidence)) ? clamp(Number((safe as any).confidence), 0, 1) : fallback.confidence,
+    rationale: Array.isArray((safe as any).rationale)
+      ? (safe as any).rationale.map((value: any) => String(value || '').trim()).filter(Boolean).slice(0, 4)
+      : fallback.rationale
+  }
+}
+
+const resolveRenderProfile = ({
+  mode,
+  payload,
+  baseProfile
+}: {
+  mode: RenderMode
+  payload: RenderRequestPayload
+  baseProfile: AdaptiveEditorProfile
+}): AdaptiveEditorProfile => {
+  const pacingPreset = parsePacingPreset(payload.pacing, baseProfile.pacingPreset)
+  const pacingValue = payload.pacing ? pacingValueFromPreset(pacingPreset, mode) : baseProfile.pacingValue
+  const quickControls = parseQuickControls(payload.quickControls, baseProfile.quickControls)
+
+  return {
+    ...baseProfile,
+    formatPreset: parseFormatPreset(payload.formatPreset, baseProfile.formatPreset),
+    vibeChip: parseVibeChip(payload.vibeChip, baseProfile.vibeChip),
+    stylePreset: parseStylePreset(payload.stylePreset, baseProfile.stylePreset),
+    pacingPreset,
+    pacingValue,
+    autoDetectBestMoments:
+      typeof payload.autoDetectBestMoments === 'boolean' ? payload.autoDetectBestMoments : baseProfile.autoDetectBestMoments,
+    captionMode: parseCaptionMode(payload.captionMode, baseProfile.captionMode),
+    captionStyle: parseCaptionStyle(payload.captionStyle, baseProfile.captionStyle),
+    captionFont: sanitizeCaptionFont(payload.captionFont, baseProfile.captionFont),
+    captionEffect: parseCaptionEffect(payload.captionEffect, baseProfile.captionEffect),
+    audioOption: parseAudioOption(payload.audioOption, baseProfile.audioOption),
+    quickControls,
+    suggestedSubMode: parseSuggestedSubMode(payload.suggestedSubMode, baseProfile.suggestedSubMode)
+  }
+}
+
 const processRenderJob = async (jobId: string, userId: string, payload: RenderRequestPayload) => {
   const job = jobs.get(jobId)
   if (!job) return
@@ -1218,6 +1824,38 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     updateJobState(jobId, { progress: 22 })
 
     const frameScan = await runFrameScan(source.storedPath)
+    const hasAudio = await probeHasAudioStream(source.storedPath)
+    const fallbackSubMode: SuggestedSubMode = mode === 'vertical' ? 'highlight_mode' : 'standard_mode'
+    const inferredProfile = buildAdaptiveEditorProfile({
+      metadata: source.metadata,
+      frameScan,
+      finalMode: mode,
+      suggestedSubMode: parseSuggestedSubMode(source.autoDetection?.suggestedSubMode, fallbackSubMode),
+      transcript,
+      fileName: source.fileName
+    })
+    const baseProfile = coerceEditorProfile({
+      candidate: source.autoDetection?.editorProfile || null,
+      fallback: inferredProfile,
+      mode
+    })
+    const resolvedProfile = resolveRenderProfile({
+      mode,
+      payload,
+      baseProfile
+    })
+    const zoomEffect = parseZoomEffect(
+      payload.zoomEffect,
+      resolvedProfile.quickControls.speedRamp ? 'beat_zoom' : mode === 'vertical' ? 'punch_zoom' : 'slow_push_in'
+    )
+    const creativeConfig: CreativePipelineConfig = {
+      stylePreset: resolvedProfile.stylePreset,
+      vibeChip: resolvedProfile.vibeChip,
+      audioOption: resolvedProfile.audioOption,
+      zoomEffect,
+      withAudio: hasAudio
+    }
+
     const claude = await runClaudeRetentionModel({
       metadata: source.metadata,
       frameScan,
@@ -1235,10 +1873,25 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     updateJobState(jobId, { progress: 38, retention })
 
     const manualSegments = parseSegments(payload.manualSegments, source.metadata.duration)
-    const segments =
-      mode === 'vertical'
-        ? buildVerticalHighlightSegments(source.metadata.duration, retention.points)
-        : manualSegments
+    const segmentStrategy = resolveSegmentStrategy({
+      mode,
+      pacingPreset: resolvedProfile.pacingPreset,
+      highlightReel: resolvedProfile.quickControls.highlightReel
+    })
+    const autoSegments = buildAdaptiveHighlightSegments({
+      duration: source.metadata.duration,
+      points: retention.points,
+      strategy: segmentStrategy
+    })
+    let segments =
+      manualSegments.length > 0
+        ? manualSegments
+        : resolvedProfile.autoDetectBestMoments || mode === 'vertical'
+          ? autoSegments
+          : []
+    if (mode === 'vertical' && segments.length === 0) {
+      segments = [{ start: 0, end: source.metadata.duration }]
+    }
 
     let clipPathsAbs: string[] = []
 
@@ -1248,14 +1901,16 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         outputPath: outputVideoPath,
         segments,
         ffmpegCommands,
-        workDir: jobDir
+        workDir: jobDir,
+        config: creativeConfig
       })
     } else {
       await runHorizontalPipeline({
         inputPath: source.storedPath,
         outputPath: outputVideoPath,
         segments,
-        ffmpegCommands
+        ffmpegCommands,
+        config: creativeConfig
       })
     }
 
@@ -1283,10 +1938,12 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       ffmpegCommands,
       retention: {
         ...retention,
-        summary:
-          mode === 'vertical'
-            ? `Vertical Highlight Mode extracted exactly 3 best moments (15-30s) with first-3s hook enforcement. ${retention.summary}`
-            : `Horizontal long-form pipeline optimized pacing and retention continuity. ${retention.summary}`
+        summary: [
+          `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
+          `Cuts: ${segments.length} segment${segments.length === 1 ? '' : 's'} ${manualSegments.length > 0 ? '(manual override)' : '(auto-selected)'}.`,
+          `Captions: ${resolvedProfile.captionMode}/${resolvedProfile.captionStyle}. Audio: ${resolvedProfile.audioOption}${hasAudio ? '' : ' (source has no audio stream)'}.`,
+          retention.summary
+        ].join(' ')
       },
       errorMessage: null
     })
