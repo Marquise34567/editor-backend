@@ -7,6 +7,7 @@ import { spawn } from 'child_process'
 import multer from 'multer'
 import fetch from 'node-fetch'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
+import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
 import { prisma } from '../db/prisma'
 
 const router = express.Router()
@@ -191,6 +192,12 @@ type FrameScanScriptResult = {
 }
 
 type TranscriptSummary = {
+  segments: Array<{
+    start: number
+    end: number
+    text: string
+    confidence: number | null
+  }>
   segmentCount: number
   excerpt: string
   language: string | null
@@ -218,6 +225,13 @@ const CAPTION_FONT_OPTIONS = [
   'Sora',
   'Outfit'
 ]
+const AUTO_FIXED_CUT_SECONDS = 5
+const LONGFORM_DURATION_SECONDS = 180
+const HORIZONTAL_LONGFORM_KEEP_RATIO = 0.68
+const HORIZONTAL_BASE_KEEP_RATIO = 0.58
+const AUTO_HOOK_MIN_SECONDS = 5
+const AUTO_HOOK_MAX_SECONDS = 8
+const FRAME_SCAN_SAMPLE_RATIO = clamp(Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1), 0.05, 1)
 
 const normalizeToken = (value: unknown) => String(value || '').trim().toLowerCase().replace(/\s+/g, '_')
 
@@ -714,7 +728,7 @@ const runFrameScan = async (inputPath: string): Promise<FrameScanSummary> => {
     '--input',
     inputPath,
     '--sample-ratio',
-    '0.1'
+    String(FRAME_SCAN_SAMPLE_RATIO)
   ])
 
   if (result.code !== 0) {
@@ -1095,6 +1109,7 @@ const runFfmpegCommand = async (args: string[], ffmpegCommands: string[]) => {
 
 const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise<TranscriptSummary> => {
   const fallback: TranscriptSummary = {
+    segments: [],
     segmentCount: 0,
     excerpt: '',
     language: null
@@ -1129,7 +1144,22 @@ const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise
 
   try {
     const parsed = JSON.parse(fs.readFileSync(transcriptPath, 'utf8')) as any
-    const segments = Array.isArray(parsed?.segments) ? parsed.segments : []
+    const segments = (Array.isArray(parsed?.segments) ? parsed.segments : [])
+      .map((segment: any) => {
+        const start = Number(segment?.start || 0)
+        const end = Number(segment?.end || 0)
+        const text = String(segment?.text || '').trim()
+        const confidenceRaw = Number(segment?.confidence)
+        return {
+          start: Number.isFinite(start) ? start : 0,
+          end: Number.isFinite(end) ? end : 0,
+          text,
+          confidence: Number.isFinite(confidenceRaw) ? confidenceRaw : null
+        }
+      })
+      .filter((segment: any) => segment.end > segment.start && segment.text.length > 0)
+      .slice(0, 900)
+
     const excerpt = segments
       .slice(0, 6)
       .map((segment) => String(segment?.text || '').trim())
@@ -1138,6 +1168,7 @@ const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise
       .slice(0, 600)
 
     return {
+      segments,
       segmentCount: segments.length,
       excerpt,
       language: typeof parsed?.language === 'string' ? parsed.language : null
@@ -1324,6 +1355,178 @@ const buildRetentionSignals = ({
   return { points, heatmap, summary }
 }
 
+const buildPostEditRetentionSignals = ({
+  duration,
+  frameScan,
+  mode,
+  transcript,
+  segments,
+  baseSummary
+}: {
+  duration: number
+  frameScan: FrameScanSummary
+  mode: RenderMode
+  transcript: TranscriptSummary
+  segments: Array<{ start: number; end: number }>
+  baseSummary?: string | null
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const normalized = mergeSegmentsWithGap(segments, safeDuration)
+  if (!normalized.length) {
+    return buildRetentionSignals({
+      duration: safeDuration,
+      frameScan,
+      claude: null,
+      mode
+    })
+  }
+
+  const keptSeconds = getSegmentDurationSeconds(normalized)
+  const keepRatio = clamp(keptSeconds / safeDuration, 0, 1)
+  const cutCount = Math.max(0, normalized.length - 1)
+  const runtimeMinutes = Math.max(safeDuration / 60, 0.1)
+  const cutRatePerMinute = cutCount / runtimeMinutes
+  const averageSegmentSeconds = keptSeconds / Math.max(1, normalized.length)
+
+  let maxGapSeconds = Math.max(0, normalized[0].start)
+  for (let index = 1; index < normalized.length; index += 1) {
+    maxGapSeconds = Math.max(maxGapSeconds, normalized[index].start - normalized[index - 1].end)
+  }
+  maxGapSeconds = Math.max(maxGapSeconds, safeDuration - normalized[normalized.length - 1].end)
+
+  const pacingTarget =
+    mode === 'vertical'
+      ? 12.5
+      : safeDuration >= LONGFORM_DURATION_SECONDS
+        ? 5.5
+        : 7.2
+  const pacingScore = clamp(
+    100 -
+      Math.abs(cutRatePerMinute - pacingTarget) * 10.8 -
+      Math.max(0, averageSegmentSeconds - 24) * 1.4 -
+      Math.max(0, 4 - averageSegmentSeconds) * 3.2,
+    28,
+    99
+  )
+  const startsNearZero = normalized[0].start <= 0.6
+  const endsNearTail = normalized[normalized.length - 1].end >= safeDuration - 0.8
+  const storyScore = clamp(
+    keepRatio * 100 -
+      Math.min(44, maxGapSeconds * 7.6) +
+      (startsNearZero ? 8 : 0) +
+      (endsNearTail ? 8 : 0),
+    18,
+    99
+  )
+
+  const points: RetentionPoint[] = []
+  const pointCount = 14
+  const transcriptLift = transcript.segmentCount > 0
+    ? clamp(transcript.segmentCount / 160, 0, 1) * 4
+    : 0
+  const motionLift = mode === 'vertical'
+    ? frameScan.centeredFaceVerticalSignal * 3.8 + frameScan.highMotionShortClipSignal * 4.1
+    : frameScan.horizontalMotionSignal * 2.8 + frameScan.highMotionShortClipSignal * 2.4
+
+  const distanceToCoverage = (timestamp: number) => {
+    for (const segment of normalized) {
+      if (timestamp >= segment.start && timestamp <= segment.end) return 0
+    }
+    let nearest = Number.POSITIVE_INFINITY
+    for (const segment of normalized) {
+      nearest = Math.min(nearest, Math.abs(timestamp - segment.start), Math.abs(timestamp - segment.end))
+    }
+    return Number.isFinite(nearest) ? nearest : safeDuration
+  }
+
+  for (let index = 0; index < pointCount; index += 1) {
+    const timestamp = (safeDuration * index) / Math.max(1, pointCount - 1)
+    const coverageDistance = distanceToCoverage(timestamp)
+    const isCovered = coverageDistance <= 0.02
+    const progress = index / Math.max(1, pointCount - 1)
+    const baseline = 94 - progress * (mode === 'vertical' ? 56 : 44)
+    const coverageAdjustment = isCovered ? 6.5 : -14 - Math.min(12, coverageDistance * 3.3)
+    const watchPct = clamp(
+      baseline + coverageAdjustment + motionLift + transcriptLift,
+      8,
+      99
+    )
+    points.push({
+      id: `post_edit_${index}`,
+      timestamp: Number(timestamp.toFixed(2)),
+      watchedPct: Number(watchPct.toFixed(1)),
+      type: 'hook',
+      label: 'Retention Point',
+      description: 'Coverage-adjusted retention estimate.'
+    })
+  }
+
+  const ranked = points.slice().sort((left, right) => right.watchedPct - left.watchedPct)
+  const bestIds = new Set(ranked.slice(0, 2).map((point) => point.id))
+  const worstSorted = ranked.slice().reverse().slice(0, 2)
+  const worstIds = new Set(worstSorted.map((point) => point.id))
+
+  points.forEach((point) => {
+    if (point.timestamp <= 3.2) {
+      point.type = 'hook'
+      point.label = 'Hook Moment'
+      point.description = 'Opening retention is calibrated from the final edit.'
+      return
+    }
+    if (bestIds.has(point.id)) {
+      point.type = 'best'
+      point.label = 'Best Part: Peak Engagement'
+      point.description = 'High retention confidence after final pacing pass.'
+      return
+    }
+    if (worstIds.has(point.id)) {
+      point.type = point.watchedPct <= 42 ? 'skip_zone' : 'worst'
+      point.label = point.type === 'skip_zone' ? 'Skip Zone' : 'Worst Part: Biggest Drop'
+      point.description = point.type === 'skip_zone'
+        ? 'This range likely causes skips; tighten pacing or add payoff sooner.'
+        : 'This range has the weakest modeled hold after cuts.'
+      return
+    }
+    point.type = 'hook'
+    point.label = 'Retention Point'
+    point.description = 'Steady engagement segment.'
+  })
+
+  for (let index = 1; index < points.length - 1; index += 1) {
+    const point = points[index]
+    if (point.type !== 'hook') continue
+    if (
+      point.watchedPct > points[index - 1].watchedPct + 1.2 &&
+      point.watchedPct > points[index + 1].watchedPct + 1.2 &&
+      point.watchedPct >= 70
+    ) {
+      point.type = 'emotional_peak'
+      point.label = 'Emotional Peak'
+      point.description = 'Strong momentum spike in the final edit timeline.'
+      break
+    }
+  }
+
+  const heatmap = points.map((point) => ({
+    timestamp: point.timestamp,
+    intensity: Number(clamp((point.watchedPct - 8) / 91, 0.06, 1).toFixed(3))
+  }))
+
+  const pacingLabel = pacingScore >= 80 ? 'strong' : pacingScore >= 65 ? 'steady' : 'needs work'
+  const storyLabel = storyScore >= 80 ? 'coherent' : storyScore >= 65 ? 'mostly coherent' : 'fragmented'
+  const removedSeconds = Math.max(0, safeDuration - keptSeconds)
+  const metricsSummary = [
+    `Runtime kept ${keptSeconds.toFixed(1)}s/${safeDuration.toFixed(1)}s (${(keepRatio * 100).toFixed(1)}% kept, ${((removedSeconds / safeDuration) * 100).toFixed(1)}% removed).`,
+    `${cutCount} cuts (${cutRatePerMinute.toFixed(1)}/min), avg segment ${averageSegmentSeconds.toFixed(1)}s, max gap ${maxGapSeconds.toFixed(1)}s.`,
+    `Pacing ${pacingScore.toFixed(0)}/100 (${pacingLabel}) and story ${storyScore.toFixed(0)}/100 (${storyLabel}).`
+  ].join(' ')
+  const summary = String(baseSummary || '').trim()
+    ? `${metricsSummary} ${String(baseSummary || '').trim()}`
+    : metricsSummary
+
+  return { points, heatmap, summary }
+}
+
 type SegmentStrategy = {
   targetCount: number
   minSeconds: number
@@ -1343,12 +1546,15 @@ type CreativePipelineConfig = {
 const resolveSegmentStrategy = ({
   mode,
   pacingPreset,
-  highlightReel
+  highlightReel,
+  duration
 }: {
   mode: RenderMode
   pacingPreset: PacingPreset
   highlightReel: boolean
+  duration: number
 }): SegmentStrategy => {
+  const safeDuration = Math.max(1, Number(duration || 0))
   if (mode === 'vertical') {
     if (pacingPreset === 'aggressive') {
       return { targetCount: highlightReel ? 4 : 3, minSeconds: 10, maxSeconds: 22, includeIntroHook: true, spacingSeconds: 5.5 }
@@ -1362,16 +1568,43 @@ const resolveSegmentStrategy = ({
     return { targetCount: highlightReel ? 3 : 2, minSeconds: 14, maxSeconds: 30, includeIntroHook: true, spacingSeconds: 6.5 }
   }
 
+  const runtimeMinutes = safeDuration / 60
+  const durationBoost = Math.max(0, Math.floor(runtimeMinutes / 1.8))
+
   if (pacingPreset === 'aggressive') {
-    return { targetCount: 6, minSeconds: 8, maxSeconds: 18, includeIntroHook: true, spacingSeconds: 4 }
+    return {
+      targetCount: Math.round(clamp((highlightReel ? 8 : 7) + durationBoost, 6, 30)),
+      minSeconds: 6,
+      maxSeconds: 14,
+      includeIntroHook: true,
+      spacingSeconds: 3.2
+    }
   }
   if (pacingPreset === 'cinematic') {
-    return { targetCount: 2, minSeconds: 26, maxSeconds: 58, includeIntroHook: false, spacingSeconds: 12 }
+    return {
+      targetCount: Math.round(clamp((highlightReel ? 5 : 4) + Math.floor(durationBoost * 0.75), 3, 18)),
+      minSeconds: 16,
+      maxSeconds: 32,
+      includeIntroHook: false,
+      spacingSeconds: 7.8
+    }
   }
   if (pacingPreset === 'chill') {
-    return { targetCount: 3, minSeconds: 18, maxSeconds: 42, includeIntroHook: false, spacingSeconds: 9 }
+    return {
+      targetCount: Math.round(clamp((highlightReel ? 6 : 5) + Math.floor(durationBoost * 0.8), 4, 22)),
+      minSeconds: 12,
+      maxSeconds: 28,
+      includeIntroHook: false,
+      spacingSeconds: 6.8
+    }
   }
-  return { targetCount: 4, minSeconds: 12, maxSeconds: 32, includeIntroHook: true, spacingSeconds: 7 }
+  return {
+    targetCount: Math.round(clamp((highlightReel ? 7 : 6) + durationBoost, 5, 26)),
+    minSeconds: 10,
+    maxSeconds: 22,
+    includeIntroHook: true,
+    spacingSeconds: 4.8
+  }
 }
 
 const buildAdaptiveHighlightSegments = ({
@@ -1426,6 +1659,269 @@ const buildAdaptiveHighlightSegments = ({
   return selected
     .slice(0, strategy.targetCount)
     .sort((a, b) => a.start - b.start)
+}
+
+const normalizeSegments = (segments: Array<{ start: number; end: number }>, duration: number) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  return segments
+    .map((segment) => {
+      const start = clamp(Number(segment.start || 0), 0, Math.max(0, safeDuration - 0.4))
+      const end = clamp(Number(segment.end || 0), start + 0.4, safeDuration)
+      return {
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3))
+      }
+    })
+    .filter((segment) => segment.end - segment.start >= 0.4)
+}
+
+const mergeSegmentsWithGap = (
+  segments: Array<{ start: number; end: number }>,
+  duration: number,
+  mergeGapSeconds = 0.22
+) => {
+  const normalized = normalizeSegments(segments, duration).sort((left, right) => left.start - right.start)
+  if (!normalized.length) return normalized
+  const merged: Array<{ start: number; end: number }> = [{ ...normalized[0] }]
+  for (let index = 1; index < normalized.length; index += 1) {
+    const current = normalized[index]
+    const last = merged[merged.length - 1]
+    if (current.start <= last.end + mergeGapSeconds) {
+      last.end = Number(Math.max(last.end, current.end).toFixed(3))
+      continue
+    }
+    merged.push({ ...current })
+  }
+  return normalizeSegments(merged, duration)
+}
+
+const getSegmentDurationSeconds = (segments: Array<{ start: number; end: number }>) =>
+  segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start), 0)
+
+const ensureSegmentCoverageFloor = ({
+  segments,
+  duration,
+  mode,
+  pacingPreset
+}: {
+  segments: Array<{ start: number; end: number }>
+  duration: number
+  mode: RenderMode
+  pacingPreset: PacingPreset
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  let normalized = mergeSegmentsWithGap(segments, safeDuration)
+  if (!normalized.length) return normalized
+  if (mode !== 'horizontal') return normalized
+
+  const pacingRatioOffset =
+    pacingPreset === 'aggressive'
+      ? -0.1
+      : pacingPreset === 'cinematic'
+        ? 0.1
+        : pacingPreset === 'chill'
+          ? 0.06
+          : 0
+  const baseTargetRatio = safeDuration >= LONGFORM_DURATION_SECONDS
+    ? HORIZONTAL_LONGFORM_KEEP_RATIO
+    : HORIZONTAL_BASE_KEEP_RATIO
+  const targetRatio = clamp(baseTargetRatio + pacingRatioOffset, 0.46, 0.88)
+  const minimumKeepSeconds = safeDuration >= LONGFORM_DURATION_SECONDS
+    ? Math.max(95, safeDuration * targetRatio)
+    : Math.max(45, safeDuration * targetRatio)
+
+  let currentKeepSeconds = getSegmentDurationSeconds(normalized)
+  if (currentKeepSeconds >= minimumKeepSeconds - 0.2) return normalized
+
+  const fillSpan = clamp(
+    pacingPreset === 'aggressive'
+      ? 9
+      : pacingPreset === 'cinematic'
+        ? 18
+        : pacingPreset === 'chill'
+          ? 16
+          : 13,
+    6,
+    28
+  )
+  const fillGap = clamp(fillSpan * 0.34, 2, 6)
+  const filler: Array<{ start: number; end: number }> = []
+  for (let cursor = 0; cursor < safeDuration && currentKeepSeconds < minimumKeepSeconds; cursor += fillSpan + fillGap) {
+    const start = clamp(cursor, 0, Math.max(0, safeDuration - 0.4))
+    const end = clamp(start + fillSpan, start + 0.4, safeDuration)
+    filler.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3))
+    })
+    currentKeepSeconds += Math.max(0, end - start)
+  }
+
+  normalized = mergeSegmentsWithGap([...normalized, ...filler], safeDuration)
+  if (getSegmentDurationSeconds(normalized) < minimumKeepSeconds * 0.92) {
+    return [{ start: 0, end: Number(safeDuration.toFixed(3)) }]
+  }
+  return normalized
+}
+
+const forceSegmentsToFixedLength = ({
+  segments,
+  duration,
+  targetSeconds
+}: {
+  segments: Array<{ start: number; end: number }>
+  duration: number
+  targetSeconds: number
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const normalized = normalizeSegments(segments, safeDuration).sort((left, right) => left.start - right.start)
+  if (normalized.length === 0) return normalized
+
+  const fixedLength = clamp(Number(targetSeconds || AUTO_FIXED_CUT_SECONDS), 0.4, safeDuration)
+  const maxStart = Math.max(0, safeDuration - fixedLength)
+  const minimumStartGap = Math.max(0.45, fixedLength * 0.34)
+  const output: Array<{ start: number; end: number }> = []
+
+  for (const segment of normalized) {
+    const center = (segment.start + segment.end) / 2
+    const alignedStart = clamp(center - fixedLength / 2, 0, maxStart)
+    const alignedEnd = clamp(alignedStart + fixedLength, alignedStart + 0.4, safeDuration)
+    if (alignedEnd - alignedStart < 0.4) continue
+    if (output.some((existing) => Math.abs(existing.start - alignedStart) < minimumStartGap)) continue
+
+    output.push({
+      start: Number(alignedStart.toFixed(3)),
+      end: Number(alignedEnd.toFixed(3))
+    })
+  }
+
+  return normalizeSegments(output, safeDuration)
+}
+
+const applyPacingAdjustmentsToSegments = ({
+  segments,
+  adjustments,
+  duration
+}: {
+  segments: Array<{ start: number; end: number }>
+  adjustments: Array<{ start: number; end: number; action: 'trim' | 'speed_up' | 'transition_boost'; intensity: number }>
+  duration: number
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  let next = normalizeSegments(segments, safeDuration)
+
+  const trimWindow = (segment: { start: number; end: number }, start: number, end: number) => {
+    if (end <= segment.start || start >= segment.end) return [segment]
+    const windows: Array<{ start: number; end: number }> = []
+    if (start > segment.start + 0.22) {
+      windows.push({
+        start: segment.start,
+        end: start
+      })
+    }
+    if (end < segment.end - 0.22) {
+      windows.push({
+        start: end,
+        end: segment.end
+      })
+    }
+    return windows
+  }
+
+  for (const adjustment of adjustments.slice(0, 10)) {
+    const start = clamp(Number(adjustment.start || 0), 0, Math.max(0, safeDuration - 0.4))
+    const end = clamp(Number(adjustment.end || 0), start + 0.4, safeDuration)
+    const intensity = clamp(Number(adjustment.intensity || 0.4), 0.05, 1)
+
+    if (adjustment.action === 'trim') {
+      next = next.flatMap((segment) => trimWindow(segment, start, end))
+      continue
+    }
+
+    if (adjustment.action === 'speed_up') {
+      next = next.map((segment) => {
+        if (segment.end <= start || segment.start >= end) return segment
+        const durationSpan = segment.end - segment.start
+        const shrinkBy = clamp(durationSpan * 0.16 * intensity, 0.15, durationSpan * 0.42)
+        return {
+          start: segment.start,
+          end: Math.max(segment.start + 0.4, segment.end - shrinkBy)
+        }
+      })
+      continue
+    }
+  }
+
+  return normalizeSegments(next, safeDuration)
+}
+
+const buildLowRetentionTrimAdjustments = ({
+  points,
+  duration
+}: {
+  points: RetentionPoint[]
+  duration: number
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const trimTargets = points
+    .filter((point) => point.type === 'skip_zone' || point.type === 'worst' || point.watchedPct <= 43)
+    .sort((left, right) => left.watchedPct - right.watchedPct)
+    .slice(0, 6)
+
+  return trimTargets.map((point) => {
+    const intensity = clamp(1 - point.watchedPct / 100, 0.2, 0.92)
+    const span = clamp(1.9 + intensity * 2.2, 1.2, 3.6)
+    const start = clamp(point.timestamp - span / 2, 0, Math.max(0, safeDuration - 0.4))
+    const end = clamp(start + span, start + 0.4, safeDuration)
+    return {
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'trim' as const,
+      intensity: Number(intensity.toFixed(3))
+    }
+  })
+}
+
+const prependSelectedHookSegment = ({
+  segments,
+  hookCandidate,
+  mode,
+  duration
+}: {
+  segments: Array<{ start: number; end: number }>
+  hookCandidate: { start: number; end: number; duration?: number; score?: number } | null
+  mode: RenderMode
+  duration: number
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  if (!hookCandidate) return normalizeSegments(segments, safeDuration)
+
+  const hookStart = clamp(Number(hookCandidate.start || 0), 0, Math.max(0, safeDuration - 0.4))
+  const maxAvailable = Math.max(0.6, safeDuration - hookStart)
+  const safeHookMin = Math.min(AUTO_HOOK_MIN_SECONDS, maxAvailable)
+  const safeHookMax = Math.max(safeHookMin, Math.min(AUTO_HOOK_MAX_SECONDS, maxAvailable))
+  const score = clamp(Number(hookCandidate.score ?? (mode === 'vertical' ? 0.72 : 0.62)), 0, 1)
+  const scoreBasedDuration = safeHookMin + (safeHookMax - safeHookMin) * score
+  const candidateDuration = Number(hookCandidate.duration || Math.max(0, hookCandidate.end - hookCandidate.start))
+  const requestedDuration =
+    Number.isFinite(candidateDuration) && candidateDuration > 0
+      ? Math.min(candidateDuration, scoreBasedDuration)
+      : scoreBasedDuration
+  const resolvedDuration = clamp(
+    requestedDuration,
+    Math.max(0.4, safeHookMin),
+    Math.max(Math.max(0.4, safeHookMin), safeHookMax)
+  )
+  const hookEnd = clamp(hookStart + resolvedDuration, hookStart + 0.4, safeDuration)
+  const hookSegment = {
+    start: Number(hookStart.toFixed(3)),
+    end: Number(hookEnd.toFixed(3))
+  }
+
+  const remainder = normalizeSegments(segments, safeDuration)
+    .filter((segment) => !(segment.start < hookSegment.end - 0.1 && segment.end > hookSegment.start + 0.1))
+    .sort((left, right) => left.start - right.start)
+
+  return [hookSegment, ...remainder]
 }
 
 const buildStyleVideoFilters = (stylePreset: StylePreset, vibeChip: VibeChip): string[] => {
@@ -1857,12 +2353,33 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       withAudio: hasAudio
     }
 
-    const claude = await runClaudeRetentionModel({
+    const freeAiPlan = await planRetentionEditsWithFreeAi({
+      mode,
       metadata: source.metadata,
-      frameScan,
-      transcript,
-      mode
+      frameScan: {
+        portraitSignal: frameScan.portraitSignal,
+        landscapeSignal: frameScan.landscapeSignal,
+        centeredFaceVerticalSignal: frameScan.centeredFaceVerticalSignal,
+        horizontalMotionSignal: frameScan.horizontalMotionSignal,
+        highMotionShortClipSignal: frameScan.highMotionShortClipSignal,
+        motionPeaks: frameScan.motionPeaks
+      },
+      transcriptSegments: transcript.segments,
+      transcriptExcerpt: transcript.excerpt
     })
+
+    const shouldUseClaudeFallback =
+      freeAiPlan.provider === 'heuristic' &&
+      Boolean(String(process.env.ANTHROPIC_API_KEY || '').trim())
+
+    const claude = shouldUseClaudeFallback
+      ? await runClaudeRetentionModel({
+          metadata: source.metadata,
+          frameScan,
+          transcript,
+          mode
+        })
+      : null
 
     const retention = buildRetentionSignals({
       duration: source.metadata.duration,
@@ -1871,26 +2388,103 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       mode
     })
 
+    if (freeAiPlan.selectedHook) {
+      const hookStrength = clamp(freeAiPlan.selectedHook.scores.combined, 0, 1)
+      retention.points = [
+        {
+          id: 'ai_hook_selected',
+          timestamp: 0,
+          watchedPct: Number(clamp(86 + hookStrength * 12, 42, 99).toFixed(1)),
+          type: 'hook',
+          label: 'AI Selected Hook',
+          description: `Selected ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s as opener (${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-trim).`
+        },
+        ...retention.points.filter((point) => point.id !== 'ai_hook_selected')
+      ]
+      retention.heatmap = [
+        {
+          timestamp: 0,
+          intensity: Number(clamp(0.75 + hookStrength * 0.25, 0.25, 1).toFixed(3))
+        },
+        ...retention.heatmap.filter((cell) => cell.timestamp > 0.02)
+      ]
+    }
+
     updateJobState(jobId, { progress: 38, retention })
 
     const manualSegments = parseSegments(payload.manualSegments, source.metadata.duration)
     const segmentStrategy = resolveSegmentStrategy({
       mode,
       pacingPreset: resolvedProfile.pacingPreset,
-      highlightReel: resolvedProfile.quickControls.highlightReel
+      highlightReel: resolvedProfile.quickControls.highlightReel,
+      duration: source.metadata.duration
     })
     const autoSegments = buildAdaptiveHighlightSegments({
       duration: source.metadata.duration,
       points: retention.points,
       strategy: segmentStrategy
     })
+    const useAutoEditing = manualSegments.length === 0 && resolvedProfile.quickControls.autoEdit
+    const shouldGenerateAutoSegments = useAutoEditing || resolvedProfile.autoDetectBestMoments || mode === 'vertical'
+    const shouldApplyHookAndPacing = manualSegments.length === 0 && shouldGenerateAutoSegments
     let segments =
       manualSegments.length > 0
         ? manualSegments
-        : resolvedProfile.autoDetectBestMoments || mode === 'vertical'
+        : shouldGenerateAutoSegments
           ? autoSegments
           : []
-    if (mode === 'vertical' && segments.length === 0) {
+
+    if (shouldApplyHookAndPacing) {
+      const plannerAdjustments = freeAiPlan.pacingAdjustments.map((adjustment) => ({
+        start: adjustment.start,
+        end: adjustment.end,
+        action: adjustment.action,
+        intensity: adjustment.intensity
+      }))
+      const lowRetentionAdjustments = buildLowRetentionTrimAdjustments({
+        points: retention.points,
+        duration: source.metadata.duration
+      })
+
+      segments = applyPacingAdjustmentsToSegments({
+        segments,
+        adjustments: [...plannerAdjustments, ...lowRetentionAdjustments],
+        duration: source.metadata.duration
+      })
+
+      if (mode === 'vertical') {
+        segments = forceSegmentsToFixedLength({
+          segments,
+          duration: source.metadata.duration,
+          targetSeconds: AUTO_FIXED_CUT_SECONDS
+        })
+      }
+
+      segments = prependSelectedHookSegment({
+        segments,
+        hookCandidate: freeAiPlan.selectedHook
+          ? {
+              start: freeAiPlan.selectedHook.start,
+              end: freeAiPlan.selectedHook.end,
+              duration: freeAiPlan.selectedHook.duration,
+              score: freeAiPlan.selectedHook.scores.combined
+            }
+          : null,
+        mode,
+        duration: source.metadata.duration
+      })
+    }
+
+    if (manualSegments.length === 0 && segments.length > 0) {
+      segments = ensureSegmentCoverageFloor({
+        segments,
+        duration: source.metadata.duration,
+        mode,
+        pacingPreset: resolvedProfile.pacingPreset
+      })
+    }
+
+    if (segments.length === 0) {
       segments = [{ start: 0, end: source.metadata.duration }]
     }
 
@@ -1928,6 +2522,14 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     })
 
     const clipUrls = clipPathsAbs.map((clipPath) => toOutputUrl(clipPath))
+    const postEditRetention = buildPostEditRetentionSignals({
+      duration: source.metadata.duration,
+      frameScan,
+      mode,
+      transcript,
+      segments,
+      baseSummary: retention.summary
+    })
 
     updateJobState(jobId, {
       status: 'completed',
@@ -1938,12 +2540,26 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       thumbnails,
       ffmpegCommands,
       retention: {
-        ...retention,
+        ...postEditRetention,
         summary: [
           `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
-          `Cuts: ${segments.length} segment${segments.length === 1 ? '' : 's'} ${manualSegments.length > 0 ? '(manual override)' : '(auto-selected)'}.`,
+          `Free AI planner: ${freeAiPlan.provider}${freeAiPlan.model ? ` (${freeAiPlan.model})` : ''}${shouldUseClaudeFallback ? ' + Claude fallback' : ''}.`,
+          freeAiPlan.selectedHook && shouldApplyHookAndPacing
+            ? `Hook opener: ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s moved to timeline start (${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-target).`
+            : manualSegments.length > 0
+              ? 'Hook opener: manual timeline override active.'
+              : 'Hook opener: heuristic intro fallback.',
+          `Cuts: ${segments.length} segment${segments.length === 1 ? '' : 's'} ${
+            manualSegments.length > 0
+              ? '(manual override)'
+              : shouldApplyHookAndPacing
+                ? mode === 'vertical'
+                  ? `(auto-selected + boring/silent trims, ${AUTO_FIXED_CUT_SECONDS}s per cut)`
+                  : '(auto-selected + pacing trims with long-form coverage guard)'
+                : '(auto-selected + pacing optimized)'
+          }.`,
           `Captions: ${resolvedProfile.captionMode}/${resolvedProfile.captionStyle}. Audio: ${resolvedProfile.audioOption}${hasAudio ? '' : ' (source has no audio stream)'}.`,
-          retention.summary
+          postEditRetention.summary
         ].join(' ')
       },
       errorMessage: null
