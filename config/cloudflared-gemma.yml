@@ -1,0 +1,12 @@
+tunnel: a3c51b4c-6cfd-425c-90fc-64f4015d9486
+credentials-file: C:\Users\Quise\.cloudflared\a3c51b4c-6cfd-425c-90fc-64f4015d9486.json
+protocol: http2
+edge-ip-version: "4"
+ha-connections: 1
+
+ingress:
+  - hostname: gemma.sparkdd.live
+    service: http://127.0.0.1:11434
+    originRequest:
+      httpHostHeader: localhost:11434
+  - service: http_status:404
