@@ -194,6 +194,7 @@ type RenderJobRecord = {
 }
 
 type SegmentInput = { start: number; end: number }
+type TimelineSegment = { start: number; end: number; speed?: number }
 
 type RenderRequestPayload = {
   videoId: string
@@ -1370,12 +1371,13 @@ router.post('/upload/analyze', upload.single('video'), async (req: any, res) => 
 })
 
 const parseSegments = (value: unknown, duration: number) => {
-  if (!Array.isArray(value)) return [] as Array<{ start: number; end: number }>
+  if (!Array.isArray(value)) return [] as TimelineSegment[]
   return value
     .map((segment) => {
       const start = clamp(Number((segment as any)?.start || 0), 0, duration)
       const end = clamp(Number((segment as any)?.end || 0), 0, duration)
-      return { start, end }
+      const speed = clamp(Number((segment as any)?.speed || 1), 1, 1.8)
+      return { start, end, speed }
     })
     .filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end - segment.start >= 0.3)
     .sort((a, b) => a.start - b.start)
@@ -1497,8 +1499,13 @@ const runClaudeRetentionModel = async ({
   const apiKey = String(process.env.ANTHROPIC_API_KEY || '').trim()
   if (!apiKey) return null
 
-  const prompt = `You are a retention prediction assistant for short-form editors.
-Optimize EVERY edit to maximize retention — analyze drop risks, boost engagement hooks, predict watch %, add teasers/captions/zooms where needed.
+  const prompt = `You are AutoEditor's ruthless retention-maximizing AI brain.
+Mission: maximize average retention percent and full-watch completion, not runtime.
+In 2026 ranking behavior, shorter videos with much higher retention usually beat longer videos with weak retention.
+Rules:
+- Remove/compress segments with predicted drop-off above 15-20%.
+- Prioritize smooth retention with no deep valleys.
+- Keep strongest opener in first 8-15 seconds and sustain micro-progress every 15-30 seconds.
 Return ONLY compact JSON with keys: hookStrength (0-1), emotionLift (0-1), pacingRisk (0-1), summary.
 Context:
 - mode: ${mode}
@@ -1656,7 +1663,7 @@ const buildPostEditRetentionSignals = ({
   frameScan: FrameScanSummary
   mode: RenderMode
   transcript: TranscriptSummary
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   baseSummary?: string | null
 }) => {
   const safeDuration = Math.max(0.4, Number(duration || 0))
@@ -1927,7 +1934,7 @@ const buildAdaptiveHighlightSegments = ({
   strategy: SegmentStrategy
 }) => {
   const sortedByScore = points.slice().sort((a, b) => b.watchedPct - a.watchedPct)
-  const selected: Array<{ start: number; end: number }> = []
+  const selected: TimelineSegment[] = []
   const safeDuration = Math.max(0.4, duration)
 
   const pushSegment = (start: number, end: number) => {
@@ -1935,7 +1942,7 @@ const buildAdaptiveHighlightSegments = ({
     const safeEnd = clamp(end, safeStart + 0.4, safeDuration)
     if (safeEnd - safeStart < 0.4) return
     if (selected.some((segment) => Math.abs(segment.start - safeStart) < strategy.spacingSeconds)) return
-    selected.push({ start: Number(safeStart.toFixed(2)), end: Number(safeEnd.toFixed(2)) })
+    selected.push({ start: Number(safeStart.toFixed(2)), end: Number(safeEnd.toFixed(2)), speed: 1 })
   }
 
   if (strategy.includeIntroHook) {
@@ -1971,33 +1978,36 @@ const buildAdaptiveHighlightSegments = ({
     .sort((a, b) => a.start - b.start)
 }
 
-const normalizeSegments = (segments: Array<{ start: number; end: number }>, duration: number) => {
+const normalizeSegments = (segments: TimelineSegment[], duration: number): Array<{ start: number; end: number; speed: number }> => {
   const safeDuration = Math.max(0.4, Number(duration || 0))
   return segments
     .map((segment) => {
       const start = clamp(Number(segment.start || 0), 0, Math.max(0, safeDuration - 0.4))
       const end = clamp(Number(segment.end || 0), start + 0.4, safeDuration)
+      const speed = clamp(Number((segment as any)?.speed || 1), 1, 1.8)
       return {
         start: Number(start.toFixed(3)),
-        end: Number(end.toFixed(3))
+        end: Number(end.toFixed(3)),
+        speed: Number(speed.toFixed(3))
       }
     })
     .filter((segment) => segment.end - segment.start >= 0.4)
 }
 
 const mergeSegmentsWithGap = (
-  segments: Array<{ start: number; end: number }>,
+  segments: TimelineSegment[],
   duration: number,
   mergeGapSeconds = 0.22
 ) => {
   const normalized = normalizeSegments(segments, duration).sort((left, right) => left.start - right.start)
   if (!normalized.length) return normalized
-  const merged: Array<{ start: number; end: number }> = [{ ...normalized[0] }]
+  const merged: TimelineSegment[] = [{ ...normalized[0] }]
   for (let index = 1; index < normalized.length; index += 1) {
     const current = normalized[index]
     const last = merged[merged.length - 1]
     if (current.start <= last.end + mergeGapSeconds) {
       last.end = Number(Math.max(last.end, current.end).toFixed(3))
+      last.speed = Number(clamp(Math.max(Number(last.speed || 1), Number(current.speed || 1)), 1, 1.8).toFixed(3))
       continue
     }
     merged.push({ ...current })
@@ -2005,8 +2015,8 @@ const mergeSegmentsWithGap = (
   return normalizeSegments(merged, duration)
 }
 
-const getSegmentDurationSeconds = (segments: Array<{ start: number; end: number }>) =>
-  segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start), 0)
+const getSegmentDurationSeconds = (segments: TimelineSegment[]) =>
+  segments.reduce((sum, segment) => sum + Math.max(0, segment.end - segment.start) / Math.max(1, Number(segment.speed || 1)), 0)
 
 const ensureSegmentCoverageFloor = ({
   segments,
@@ -2014,7 +2024,7 @@ const ensureSegmentCoverageFloor = ({
   mode,
   pacingPreset
 }: {
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   duration: number
   mode: RenderMode
   pacingPreset: PacingPreset
@@ -2096,20 +2106,21 @@ const ensureSegmentCoverageFloor = ({
         22
       )
   const fillGap = clamp(fillSpan * 0.34, 2, 6)
-  const filler: Array<{ start: number; end: number }> = []
+  const filler: TimelineSegment[] = []
   for (let cursor = 0; cursor < safeDuration && currentKeepSeconds < minimumKeepSeconds; cursor += fillSpan + fillGap) {
     const start = clamp(cursor, 0, Math.max(0, safeDuration - 0.4))
     const end = clamp(start + fillSpan, start + 0.4, safeDuration)
     filler.push({
       start: Number(start.toFixed(3)),
-      end: Number(end.toFixed(3))
+      end: Number(end.toFixed(3)),
+      speed: 1
     })
     currentKeepSeconds += Math.max(0, end - start)
   }
 
   normalized = mergeSegmentsWithGap([...normalized, ...filler], safeDuration)
   if (getSegmentDurationSeconds(normalized) < minimumKeepSeconds * 0.92) {
-    return [{ start: 0, end: Number(safeDuration.toFixed(3)) }]
+    return [{ start: 0, end: Number(safeDuration.toFixed(3)), speed: 1 }]
   }
   return normalized
 }
@@ -2119,7 +2130,7 @@ const forceSegmentsToFixedLength = ({
   duration,
   targetSeconds
 }: {
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   duration: number
   targetSeconds: number
 }) => {
@@ -2130,7 +2141,7 @@ const forceSegmentsToFixedLength = ({
   const fixedLength = clamp(Number(targetSeconds || AUTO_FIXED_CUT_SECONDS), 0.4, safeDuration)
   const maxStart = Math.max(0, safeDuration - fixedLength)
   const minimumStartGap = Math.max(0.45, fixedLength * 0.34)
-  const output: Array<{ start: number; end: number }> = []
+  const output: TimelineSegment[] = []
 
   for (const segment of normalized) {
     const center = (segment.start + segment.end) / 2
@@ -2141,7 +2152,8 @@ const forceSegmentsToFixedLength = ({
 
     output.push({
       start: Number(alignedStart.toFixed(3)),
-      end: Number(alignedEnd.toFixed(3))
+      end: Number(alignedEnd.toFixed(3)),
+      speed: Number(clamp(Number(segment.speed || 1), 1, 1.8).toFixed(3))
     })
   }
 
@@ -2153,26 +2165,28 @@ const applyPacingAdjustmentsToSegments = ({
   adjustments,
   duration
 }: {
-  segments: Array<{ start: number; end: number }>
-  adjustments: Array<{ start: number; end: number; action: 'trim' | 'speed_up' | 'transition_boost'; intensity: number }>
+  segments: TimelineSegment[]
+  adjustments: Array<{ start: number; end: number; action: 'trim' | 'speed_up' | 'transition_boost'; intensity: number; speedMultiplier?: number }>
   duration: number
 }) => {
   const safeDuration = Math.max(0.4, Number(duration || 0))
   let next = normalizeSegments(segments, safeDuration)
 
-  const trimWindow = (segment: { start: number; end: number }, start: number, end: number) => {
-    if (end <= segment.start || start >= segment.end) return [segment]
-    const windows: Array<{ start: number; end: number }> = []
+  const trimWindow = (segment: { start: number; end: number; speed: number }, start: number, end: number) => {
+    if (end <= segment.start || start >= segment.end) return [{ ...segment }]
+    const windows: Array<{ start: number; end: number; speed: number }> = []
     if (start > segment.start + 0.22) {
       windows.push({
         start: segment.start,
-        end: start
+        end: start,
+        speed: Number(segment.speed || 1)
       })
     }
     if (end < segment.end - 0.22) {
       windows.push({
         start: end,
-        end: segment.end
+        end: segment.end,
+        speed: Number(segment.speed || 1)
       })
     }
     return windows
@@ -2191,11 +2205,16 @@ const applyPacingAdjustmentsToSegments = ({
     if (adjustment.action === 'speed_up') {
       next = next.map((segment) => {
         if (segment.end <= start || segment.start >= end) return segment
-        const durationSpan = segment.end - segment.start
-        const shrinkBy = clamp(durationSpan * 0.16 * intensity, 0.15, durationSpan * 0.42)
+        const overlapStart = Math.max(segment.start, start)
+        const overlapEnd = Math.min(segment.end, end)
+        const overlapRatio = (overlapEnd - overlapStart) / Math.max(0.4, segment.end - segment.start)
+        if (overlapRatio <= 0.12) return segment
+        const requestedSpeed = Number(adjustment.speedMultiplier || 1 + intensity * 0.72)
+        const speed = clamp(Math.max(Number(segment.speed || 1), requestedSpeed), 1, 1.8)
         return {
           start: segment.start,
-          end: Math.max(segment.start + 0.4, segment.end - shrinkBy)
+          end: segment.end,
+          speed: Number(speed.toFixed(3))
         }
       })
       continue
@@ -2238,7 +2257,7 @@ const prependSelectedHookSegment = ({
   mode,
   duration
 }: {
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   hookCandidate: { start: number; end: number; duration?: number; score?: number } | null
   mode: RenderMode
   duration: number
@@ -2248,17 +2267,16 @@ const prependSelectedHookSegment = ({
 
   const hookStart = clamp(Number(hookCandidate.start || 0), 0, Math.max(0, safeDuration - 0.4))
   const maxAvailable = Math.max(0.6, safeDuration - hookStart)
-  const verticalHookSeconds = 3
-  const hookMinTarget = mode === 'vertical' ? verticalHookSeconds : AUTO_HOOK_MIN_SECONDS
-  const hookMaxTarget = mode === 'vertical' ? verticalHookSeconds : AUTO_HOOK_MAX_SECONDS
+  const hookMinTarget = 6
+  const hookMaxTarget = 10
   const safeHookMin = Math.min(hookMinTarget, maxAvailable)
   const safeHookMax = Math.max(safeHookMin, Math.min(hookMaxTarget, maxAvailable))
   const score = clamp(Number(hookCandidate.score ?? (mode === 'vertical' ? 0.72 : 0.62)), 0, 1)
-  const scoreBasedDuration = safeHookMin + (safeHookMax - safeHookMin) * score
+  const scoreBasedDuration = clamp(8 + (score - 0.5) * 1.2, safeHookMin, safeHookMax)
   const candidateDuration = Number(hookCandidate.duration || Math.max(0, hookCandidate.end - hookCandidate.start))
   const requestedDuration =
     Number.isFinite(candidateDuration) && candidateDuration > 0
-      ? Math.min(candidateDuration, scoreBasedDuration)
+      ? clamp(candidateDuration, safeHookMin, safeHookMax)
       : scoreBasedDuration
   const resolvedDuration = clamp(
     requestedDuration,
@@ -2268,7 +2286,8 @@ const prependSelectedHookSegment = ({
   const hookEnd = clamp(hookStart + resolvedDuration, hookStart + 0.4, safeDuration)
   const hookSegment = {
     start: Number(hookStart.toFixed(3)),
-    end: Number(hookEnd.toFixed(3))
+    end: Number(hookEnd.toFixed(3)),
+    speed: 1
   }
 
   const remainder = normalizeSegments(segments, safeDuration)
@@ -2336,6 +2355,23 @@ const resolveVerticalZoomFilter = (zoomEffect: ZoomEffect) => {
 
 const shouldOutputAudio = (config: CreativePipelineConfig) => config.withAudio && config.audioOption !== 'mute'
 
+const buildAtempoChain = (speed: number) => {
+  let remaining = clamp(Number(speed || 1), 0.5, 3.5)
+  const filters: string[] = []
+  while (remaining > 2.0 + 1e-3) {
+    filters.push('atempo=2.0')
+    remaining /= 2
+  }
+  while (remaining < 0.5 - 1e-3) {
+    filters.push('atempo=0.5')
+    remaining *= 2
+  }
+  if (Math.abs(remaining - 1) > 1e-3) {
+    filters.push(`atempo=${remaining.toFixed(4)}`)
+  }
+  return filters
+}
+
 const runHorizontalPipeline = async ({
   inputPath,
   outputPath,
@@ -2345,7 +2381,7 @@ const runHorizontalPipeline = async ({
 }: {
   inputPath: string
   outputPath: string
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   ffmpegCommands: string[]
   config: CreativePipelineConfig
 }) => {
@@ -2358,9 +2394,13 @@ const runHorizontalPipeline = async ({
     const concatInputs: string[] = []
 
     segments.forEach((segment, index) => {
-      filterParts.push(`[0:v]trim=start=${segment.start}:end=${segment.end},setpts=PTS-STARTPTS[v${index}]`)
+      const speed = clamp(Number(segment.speed || 1), 1, 1.8)
+      const videoFilters = ['setpts=PTS-STARTPTS']
+      if (speed > 1.01) videoFilters.push(`setpts=PTS/${speed.toFixed(4)}`)
+      filterParts.push(`[0:v]trim=start=${segment.start}:end=${segment.end},${videoFilters.join(',')}[v${index}]`)
       if (audioEnabled) {
-        filterParts.push(`[0:a]atrim=start=${segment.start}:end=${segment.end},asetpts=PTS-STARTPTS[a${index}]`)
+        const audioFilters = ['asetpts=PTS-STARTPTS', ...buildAtempoChain(speed)]
+        filterParts.push(`[0:a]atrim=start=${segment.start}:end=${segment.end},${audioFilters.join(',')}[a${index}]`)
         concatInputs.push(`[v${index}][a${index}]`)
       } else {
         concatInputs.push(`[v${index}]`)
@@ -2413,7 +2453,7 @@ const runVerticalMoviepyPipeline = async ({
 }: {
   inputPath: string
   outputDir: string
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
 }) => {
   if (!fs.existsSync(VIBECUT_MOVIEPY_PIPELINE_SCRIPT)) {
     return { ok: false, clipPaths: [] as string[] }
@@ -2459,7 +2499,7 @@ const runVerticalPipeline = async ({
 }: {
   inputPath: string
   outputPath: string
-  segments: Array<{ start: number; end: number }>
+  segments: TimelineSegment[]
   ffmpegCommands: string[]
   workDir: string
   config: CreativePipelineConfig
@@ -2484,9 +2524,33 @@ const runVerticalPipeline = async ({
 
     for (let index = 0; index < segments.length; index += 1) {
       const segment = segments[index]
+      const speed = clamp(Number(segment.speed || 1), 1, 1.8)
       const clipPath = path.join(clipDir, `clip_${String(index + 1).padStart(2, '0')}.mp4`)
-      const clipArgs = ['-y', '-ss', String(segment.start), '-to', String(segment.end), '-i', inputPath, '-vf', verticalFilter, '-c:v', 'libx264', '-preset', 'medium', '-crf', '20']
+      const videoFilter = speed > 1.01
+        ? `setpts=PTS/${speed.toFixed(4)},${verticalFilter}`
+        : verticalFilter
+      const clipArgs = [
+        '-y',
+        '-ss',
+        String(segment.start),
+        '-to',
+        String(segment.end),
+        '-i',
+        inputPath,
+        '-vf',
+        videoFilter,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'medium',
+        '-crf',
+        '20'
+      ]
       if (audioEnabled) {
+        const atempoFilters = buildAtempoChain(speed)
+        if (atempoFilters.length > 0) {
+          clipArgs.push('-af', atempoFilters.join(','))
+        }
         clipArgs.push('-c:a', 'aac', '-b:a', '128k')
       } else {
         clipArgs.push('-an')
@@ -2752,7 +2816,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
           watchedPct: Number(clamp(86 + hookStrength * 12, 42, 99).toFixed(1)),
           type: 'hook',
           label: 'AI Selected Hook',
-          description: `Selected ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s as opener (${mode === 'vertical' ? '3s mandatory hook' : `${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-trim`}).`
+          description: `Selected ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s as 8s opener based on strongest surprise/energy profile.`
         },
         ...retention.points.filter((point) => point.id !== 'ai_hook_selected')
       ]
@@ -2782,6 +2846,14 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     const useAutoEditing = manualSegments.length === 0 && resolvedProfile.quickControls.autoEdit
     const shouldGenerateAutoSegments = useAutoEditing || resolvedProfile.autoDetectBestMoments || mode === 'vertical'
     const shouldApplyHookAndPacing = manualSegments.length === 0 && shouldGenerateAutoSegments
+    let appliedPacingAdjustments: Array<{
+      start: number
+      end: number
+      action: 'trim' | 'speed_up' | 'transition_boost'
+      intensity: number
+      speedMultiplier?: number
+      reason: string
+    }> = []
     let segments =
       manualSegments.length > 0
         ? manualSegments
@@ -2794,16 +2866,25 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         start: adjustment.start,
         end: adjustment.end,
         action: adjustment.action,
-        intensity: adjustment.intensity
+        intensity: adjustment.intensity,
+        speedMultiplier: adjustment.speedMultiplier,
+        reason: adjustment.reason
       }))
       const lowRetentionAdjustments = buildLowRetentionTrimAdjustments({
         points: retention.points,
         duration: source.metadata.duration
       })
+      appliedPacingAdjustments = [
+        ...plannerAdjustments,
+        ...lowRetentionAdjustments.map((adjustment) => ({
+          ...adjustment,
+          reason: 'Low-retention trim safeguard from retention graph.'
+        }))
+      ]
 
       segments = applyPacingAdjustmentsToSegments({
         segments,
-        adjustments: [...plannerAdjustments, ...lowRetentionAdjustments],
+        adjustments: appliedPacingAdjustments,
         duration: source.metadata.duration
       })
 
@@ -2832,7 +2913,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     }
 
     if (segments.length === 0) {
-      segments = [{ start: 0, end: source.metadata.duration }]
+      segments = [{ start: 0, end: source.metadata.duration, speed: 1 }]
     }
 
     let clipPathsAbs: string[] = []
@@ -2889,6 +2970,23 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       frameScan,
       transcript: { segmentCount: transcript.segmentCount, excerpt: transcript.excerpt },
       points: optimizedPoints,
+      planner: {
+        selectedHook: freeAiPlan.selectedHook
+          ? {
+              start: freeAiPlan.selectedHook.start,
+              end: freeAiPlan.selectedHook.end,
+              reason: freeAiPlan.selectedHook.reason,
+              score: freeAiPlan.selectedHook.scores.combined
+            }
+          : null,
+        hookComparison: freeAiPlan.hookComparison,
+        weakSegments: freeAiPlan.weakSegments,
+        strongSegments: freeAiPlan.strongSegments,
+        pacingAdjustments: appliedPacingAdjustments,
+        predictedAverageRetention: freeAiPlan.predictedAverageRetention,
+        predictionConfidence: freeAiPlan.predictionConfidence,
+        titleSuggestions: freeAiPlan.titleSuggestions
+      },
       targetAverageRetention,
       iterationCount
     })
@@ -2904,6 +3002,23 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         frameScan,
         transcript: { segmentCount: transcript.segmentCount, excerpt: transcript.excerpt },
         points: optimizedPoints,
+        planner: {
+          selectedHook: freeAiPlan.selectedHook
+            ? {
+                start: freeAiPlan.selectedHook.start,
+                end: freeAiPlan.selectedHook.end,
+                reason: freeAiPlan.selectedHook.reason,
+                score: freeAiPlan.selectedHook.scores.combined
+              }
+            : null,
+          hookComparison: freeAiPlan.hookComparison,
+          weakSegments: freeAiPlan.weakSegments,
+          strongSegments: freeAiPlan.strongSegments,
+          pacingAdjustments: appliedPacingAdjustments,
+          predictedAverageRetention: freeAiPlan.predictedAverageRetention,
+          predictionConfidence: freeAiPlan.predictionConfidence,
+          titleSuggestions: freeAiPlan.titleSuggestions
+        },
         targetAverageRetention,
         iterationCount
       })
@@ -2913,7 +3028,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       timestamp: point.timestamp,
       intensity: Number(clamp((point.watchedPct - 8) / 91, 0.06, 1).toFixed(3))
     }))
-    const hookRangeLabel = mode === 'vertical' ? '3s mandatory hook window' : `${AUTO_HOOK_MIN_SECONDS}-${AUTO_HOOK_MAX_SECONDS}s auto-target`
+    const hookRangeLabel = '8-second dopamine-trap opener'
 
     updateJobState(jobId, {
       status: 'completed',
@@ -2936,6 +3051,9 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
             : manualSegments.length > 0
               ? 'Hook opener: manual timeline override active.'
               : 'Hook opener: heuristic intro fallback.',
+          freeAiPlan.hookComparison.length > 0
+            ? `Hook runner-ups: ${freeAiPlan.hookComparison.slice(0, 3).map((item) => `${item.start.toFixed(1)}-${item.end.toFixed(1)}s (${item.predictedRetentionLift.toFixed(1)}%)`).join(', ')}.`
+            : 'Hook runner-ups: none.',
           `Cuts: ${segments.length} segment${segments.length === 1 ? '' : 's'} ${
             manualSegments.length > 0
               ? '(manual override)'
@@ -2945,8 +3063,22 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
                   : '(auto-selected + pacing trims with long-form coverage guard)'
                 : '(auto-selected + pacing optimized)'
           }.`,
+          generatedInsights.ruthlessAudit.cutsAndSpeed.length > 0
+            ? `Applied cut/speed actions: ${generatedInsights.ruthlessAudit.cutsAndSpeed.slice(0, 6).map((item) => `${item.action} ${item.start.toFixed(1)}-${item.end.toFixed(1)}s${item.speedMultiplier ? ` @${item.speedMultiplier.toFixed(2)}x` : ''}`).join(' | ')}.`
+            : 'Applied cut/speed actions: none.',
+          generatedInsights.ruthlessAudit.weakSegments.length > 0
+            ? `Weak segments: ${generatedInsights.ruthlessAudit.weakSegments.slice(0, 3).map((item) => `${item.start.toFixed(1)}-${item.end.toFixed(1)}s (${item.predictedRetention.toFixed(1)}% hold)`).join(' | ')}.`
+            : 'Weak segments: none flagged.',
+          generatedInsights.ruthlessAudit.strongSegments.length > 0
+            ? `Retention gold segments: ${generatedInsights.ruthlessAudit.strongSegments.slice(0, 3).map((item) => `${item.start.toFixed(1)}-${item.end.toFixed(1)}s (${item.predictedRetention.toFixed(1)}% hold)`).join(' | ')}.`
+            : 'Retention gold segments: none flagged.',
           `Captions: ${resolvedProfile.captionMode}/${resolvedProfile.captionStyle}. Audio: ${resolvedProfile.audioOption}${hasAudio ? '' : ' (source has no audio stream)'}.`,
-          `Predicted average retention ${generatedInsights.predictedAverageRetention.toFixed(1)}% (target ${targetAverageRetention}%, pass ${generatedInsights.iterationCount}).`,
+          `Planner predicted average retention ${freeAiPlan.predictedAverageRetention.toFixed(1)}% with ${freeAiPlan.predictionConfidenceLevel} confidence (${freeAiPlan.predictionConfidence.toFixed(1)}%).`,
+          freeAiPlan.retentionProtectionChanges.length > 0
+            ? `Retention protection changes: ${freeAiPlan.retentionProtectionChanges.slice(0, 4).join(' | ')}.`
+            : 'Retention protection changes: none generated.',
+          freeAiPlan.finalSummary,
+          `Predicted average retention ${generatedInsights.predictedAverageRetention.toFixed(1)}% (confidence ${generatedInsights.predictionConfidence.toFixed(1)}%, target ${targetAverageRetention}%, pass ${generatedInsights.iterationCount}).`,
           `Hook reason: ${generatedInsights.hookExplanation.reason}`,
           postEditRetention.summary
         ].join(' ')
