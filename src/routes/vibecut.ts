@@ -231,7 +231,8 @@ const HORIZONTAL_LONGFORM_KEEP_RATIO = 0.68
 const HORIZONTAL_BASE_KEEP_RATIO = 0.58
 const AUTO_HOOK_MIN_SECONDS = 5
 const AUTO_HOOK_MAX_SECONDS = 8
-const FRAME_SCAN_SAMPLE_RATIO = clamp(Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1), 0.05, 1)
+const frameScanRatioRaw = Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1)
+const FRAME_SCAN_SAMPLE_RATIO = Number.isFinite(frameScanRatioRaw) ? clamp(frameScanRatioRaw, 0.05, 1) : 1
 
 const normalizeToken = (value: unknown) => String(value || '').trim().toLowerCase().replace(/\s+/g, '_')
 
@@ -935,7 +936,14 @@ const detectMode = (
 
   const weightedVertical = (metadataMode === 'vertical' ? 0.58 : 0.42) + frameScan.portraitSignal * 0.38
   const weightedHorizontal = (metadataMode === 'horizontal' ? 0.58 : 0.42) + frameScan.landscapeSignal * 0.38
-  const finalMode: RenderMode = ambiguous ? 'vertical' : weightedVertical >= weightedHorizontal ? 'vertical' : 'horizontal'
+  let finalMode: RenderMode = ambiguous ? 'vertical' : weightedVertical >= weightedHorizontal ? 'vertical' : 'horizontal'
+  const longFormHorizontalLock =
+    metadataMode === 'horizontal' &&
+    ratio >= 1.18 &&
+    Number(metadata.duration || 0) >= LONGFORM_DURATION_SECONDS
+  if (longFormHorizontalLock && finalMode !== 'horizontal') {
+    finalMode = 'horizontal'
+  }
 
   const confidence = clamp(
     ambiguous ? 0.58 + frameConfidence * 0.25 : 0.66 + frameConfidence * 0.28,
@@ -957,8 +965,9 @@ const detectMode = (
   const reasonParts = [
     `ffprobe ratio ${ratio.toFixed(3)} favored ${metadataMode}`,
     `OpenCV frame scan favored ${frameMode}`,
-    ambiguous ? 'square-like ratio defaulted to vertical social mode' : 'metadata + frame scan agreed on orientation weighting'
-  ]
+    ambiguous ? 'square-like ratio defaulted to vertical social mode' : 'metadata + frame scan agreed on orientation weighting',
+    longFormHorizontalLock ? 'Long-form landscape safeguard forced horizontal mode to preserve timeline context.' : null
+  ].filter((value): value is string => Boolean(value))
 
   const bannerMessage = finalMode === 'vertical'
     ? 'Auto-detected: Vertical Mode (TikTok-ready). Switch?'
@@ -1712,38 +1721,79 @@ const ensureSegmentCoverageFloor = ({
   const safeDuration = Math.max(0.4, Number(duration || 0))
   let normalized = mergeSegmentsWithGap(segments, safeDuration)
   if (!normalized.length) return normalized
-  if (mode !== 'horizontal') return normalized
 
-  const pacingRatioOffset =
-    pacingPreset === 'aggressive'
-      ? -0.1
-      : pacingPreset === 'cinematic'
-        ? 0.1
-        : pacingPreset === 'chill'
-          ? 0.06
-          : 0
-  const baseTargetRatio = safeDuration >= LONGFORM_DURATION_SECONDS
-    ? HORIZONTAL_LONGFORM_KEEP_RATIO
-    : HORIZONTAL_BASE_KEEP_RATIO
-  const targetRatio = clamp(baseTargetRatio + pacingRatioOffset, 0.46, 0.88)
-  const minimumKeepSeconds = safeDuration >= LONGFORM_DURATION_SECONDS
-    ? Math.max(95, safeDuration * targetRatio)
-    : Math.max(45, safeDuration * targetRatio)
+  const isHorizontal = mode === 'horizontal'
+  const pacingRatioOffset = isHorizontal
+    ? (
+        pacingPreset === 'aggressive'
+          ? -0.1
+          : pacingPreset === 'cinematic'
+            ? 0.1
+            : pacingPreset === 'chill'
+              ? 0.06
+              : 0
+      )
+    : (
+        pacingPreset === 'aggressive'
+          ? -0.07
+          : pacingPreset === 'cinematic'
+            ? 0.08
+            : pacingPreset === 'chill'
+              ? 0.05
+              : 0
+      )
+  const baseTargetRatio = isHorizontal
+    ? (
+        safeDuration >= LONGFORM_DURATION_SECONDS
+          ? HORIZONTAL_LONGFORM_KEEP_RATIO
+          : HORIZONTAL_BASE_KEEP_RATIO
+      )
+    : (
+        safeDuration >= LONGFORM_DURATION_SECONDS
+          ? 0.44
+          : 0.32
+      )
+  const targetRatio = isHorizontal
+    ? clamp(baseTargetRatio + pacingRatioOffset, 0.46, 0.88)
+    : clamp(baseTargetRatio + pacingRatioOffset, 0.28, 0.84)
+  const minimumKeepSeconds = isHorizontal
+    ? (
+        safeDuration >= LONGFORM_DURATION_SECONDS
+          ? Math.max(95, safeDuration * targetRatio)
+          : Math.max(45, safeDuration * targetRatio)
+      )
+    : (
+        safeDuration >= LONGFORM_DURATION_SECONDS
+          ? Math.max(110, safeDuration * targetRatio)
+          : Math.max(30, safeDuration * targetRatio)
+      )
 
   let currentKeepSeconds = getSegmentDurationSeconds(normalized)
   if (currentKeepSeconds >= minimumKeepSeconds - 0.2) return normalized
 
-  const fillSpan = clamp(
-    pacingPreset === 'aggressive'
-      ? 9
-      : pacingPreset === 'cinematic'
-        ? 18
-        : pacingPreset === 'chill'
-          ? 16
-          : 13,
-    6,
-    28
-  )
+  const fillSpan = isHorizontal
+    ? clamp(
+        pacingPreset === 'aggressive'
+          ? 9
+          : pacingPreset === 'cinematic'
+            ? 18
+            : pacingPreset === 'chill'
+              ? 16
+              : 13,
+        6,
+        28
+      )
+    : clamp(
+        pacingPreset === 'aggressive'
+          ? 7
+          : pacingPreset === 'cinematic'
+            ? 13
+            : pacingPreset === 'chill'
+              ? 11
+              : 9,
+        5,
+        22
+      )
   const fillGap = clamp(fillSpan * 0.34, 2, 6)
   const filler: Array<{ start: number; end: number }> = []
   for (let cursor = 0; cursor < safeDuration && currentKeepSeconds < minimumKeepSeconds; cursor += fillSpan + fillGap) {
