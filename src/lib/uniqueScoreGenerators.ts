@@ -64,17 +64,113 @@ export type RenderTitleOption = {
   confidence: number
 }
 
+export type PlannerHookComparisonLike = {
+  id?: string
+  start: number
+  end: number
+  predictedRetentionLift: number
+  reason: string
+}
+
+export type PlannerSegmentInsightLike = {
+  id?: string
+  start: number
+  end: number
+  predictedRetention: number
+  reason: string
+  fix?: string
+}
+
+export type PlannerPacingAdjustmentLike = {
+  start: number
+  end: number
+  action: 'trim' | 'speed_up' | 'transition_boost'
+  intensity: number
+  speedMultiplier?: number
+  reason: string
+}
+
+export type PlannerTitleSuggestionLike = {
+  id?: string
+  title: string
+  explanation: string
+  confidence: number
+}
+
+export type PlannerDrivenRetentionLike = {
+  selectedHook?: {
+    start: number
+    end: number
+    reason: string
+    score: number
+  } | null
+  hookComparison?: PlannerHookComparisonLike[]
+  weakSegments?: PlannerSegmentInsightLike[]
+  strongSegments?: PlannerSegmentInsightLike[]
+  pacingAdjustments?: PlannerPacingAdjustmentLike[]
+  predictedAverageRetention?: number
+  predictionConfidence?: number
+  titleSuggestions?: PlannerTitleSuggestionLike[]
+}
+
+export type RenderRuthlessAudit = {
+  selectedOpener: {
+    start: number
+    end: number
+    reason: string
+  } | null
+  hookComparison: Array<{
+    start: number
+    end: number
+    predictedRetentionLift: number
+    reason: string
+  }>
+  cutsAndSpeed: Array<{
+    start: number
+    end: number
+    action: 'trim' | 'speed_up' | 'transition_boost'
+    intensity: number
+    speedMultiplier?: number
+    reason: string
+  }>
+  weakSegments: Array<{
+    start: number
+    end: number
+    predictedRetention: number
+    reason: string
+    fix?: string
+  }>
+  strongSegments: Array<{
+    start: number
+    end: number
+    predictedRetention: number
+    reason: string
+  }>
+  prediction: {
+    score: number
+    confidence: number
+  }
+}
+
 export type RenderInsightsPayload = {
   predictedAverageRetention: number
+  predictionConfidence: number
   targetAverageRetention: number
   iterationCount: number
   metadataStats: VideoInsightStat[]
   editInsights: RenderEditInsight[]
   hookExplanation: RenderHookExplanation
   titleOptions: RenderTitleOption[]
+  ruthlessAudit: RenderRuthlessAudit
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+const toNum = (value: unknown, fallback = 0) => {
+  const resolved = Number(value)
+  return Number.isFinite(resolved) ? resolved : fallback
+}
+const round = (value: number, digits = 1) => Number(value.toFixed(digits))
+const clipText = (value: string, maxChars = 220) => String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxChars)
 
 const hashSeed = (value: string) => {
   let hash = 2166136261
@@ -111,6 +207,100 @@ const cleanTitleBase = (value: string) =>
     .replace(/[_-]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim() || 'This Clip'
+
+const sanitizePlannerSegments = (
+  rows: PlannerSegmentInsightLike[] | undefined,
+  kind: 'weak' | 'strong'
+) => {
+  if (!Array.isArray(rows)) return []
+  return rows
+    .map((row, index) => {
+      const start = clamp(toNum(row.start, 0), 0, 1_000_000)
+      const end = Math.max(start + 0.4, toNum(row.end, start + 0.4))
+      return {
+        id: row.id || `${kind}_${String(index + 1).padStart(2, '0')}`,
+        start: round(start, 3),
+        end: round(end, 3),
+        predictedRetention: round(clamp(toNum(row.predictedRetention, kind === 'weak' ? 42 : 86), 8, 99), 1),
+        reason: clipText(row.reason || (kind === 'weak' ? 'Weak retention zone.' : 'Strong retention zone.'), 220),
+        fix: row.fix ? clipText(row.fix, 180) : undefined
+      }
+    })
+    .filter((row) => row.end - row.start >= 0.35)
+    .slice(0, 8)
+}
+
+const sanitizeHookComparison = (rows: PlannerHookComparisonLike[] | undefined) => {
+  if (!Array.isArray(rows)) return []
+  return rows
+    .map((row, index) => {
+      const start = clamp(toNum(row.start, 0), 0, 1_000_000)
+      const end = Math.max(start + 0.4, toNum(row.end, start + 0.4))
+      return {
+        id: row.id || `runner_up_${String(index + 1).padStart(2, '0')}`,
+        start: round(start, 3),
+        end: round(end, 3),
+        predictedRetentionLift: round(clamp(toNum(row.predictedRetentionLift, 72), 8, 99), 1),
+        reason: clipText(row.reason || 'Runner-up opener had weaker curiosity pull.', 220)
+      }
+    })
+    .filter((row) => row.end - row.start >= 0.35)
+    .slice(0, 5)
+}
+
+const sanitizePacingAdjustments = (rows: PlannerPacingAdjustmentLike[] | undefined) => {
+  if (!Array.isArray(rows)) return []
+  return rows
+    .map((row) => {
+      const start = clamp(toNum(row.start, 0), 0, 1_000_000)
+      const end = Math.max(start + 0.35, toNum(row.end, start + 0.35))
+      const action: 'trim' | 'speed_up' | 'transition_boost' =
+        row.action === 'trim' || row.action === 'speed_up' ? row.action : 'transition_boost'
+      const speedMultiplier = action === 'speed_up'
+        ? round(clamp(toNum(row.speedMultiplier, 1.35), 1.2, 1.8), 3)
+        : undefined
+      return {
+        start: round(start, 3),
+        end: round(end, 3),
+        action,
+        intensity: round(clamp(toNum(row.intensity, 0.45), 0.05, 1), 3),
+        speedMultiplier,
+        reason: clipText(row.reason || 'Pacing adjustment.', 180)
+      }
+    })
+    .filter((row) => row.end - row.start >= 0.35)
+    .slice(0, 16)
+}
+
+const buildFallbackWeakSegments = (points: RetentionPointLike[]) => {
+  return points
+    .slice()
+    .sort((left, right) => left.watchedPct - right.watchedPct)
+    .slice(0, 2)
+    .map((point, index) => ({
+      id: `weak_${String(index + 1).padStart(2, '0')}`,
+      start: round(Math.max(0, point.timestamp - 3.2), 2),
+      end: round(point.timestamp + 3.2, 2),
+      predictedRetention: round(clamp(point.watchedPct, 8, 62), 1),
+      reason: `Segment around ${point.timestamp.toFixed(1)}s is bad - predicted drop-off from low novelty.`,
+      fix: 'Compress setup, add speed-up, and tease next payoff.'
+    }))
+}
+
+const buildFallbackStrongSegments = (points: RetentionPointLike[]) => {
+  return points
+    .slice()
+    .sort((left, right) => right.watchedPct - left.watchedPct)
+    .slice(0, 2)
+    .map((point, index) => ({
+      id: `strong_${String(index + 1).padStart(2, '0')}`,
+      start: round(Math.max(0, point.timestamp - 2.8), 2),
+      end: round(point.timestamp + 2.8, 2),
+      predictedRetention: round(clamp(point.watchedPct, 55, 99), 1),
+      reason: `Segment around ${point.timestamp.toFixed(1)}s is excellent - high retention hold from payoff momentum.`,
+      fix: undefined
+    }))
+}
 
 export const generateMetadataStats = ({
   videoId,
@@ -172,83 +362,138 @@ export const generateMetadataStats = ({
   ]
 }
 
-export const analyzeWhyGoodBad = ({
+const analyzeWhyGoodBad = ({
   points,
-  predictedAverageRetention
+  predictedAverageRetention,
+  planner
 }: {
   points: RetentionPointLike[]
   predictedAverageRetention: number
+  planner?: PlannerDrivenRetentionLike | null
 }): RenderEditInsight[] => {
   const best = bestPoint(points)
   const worst = worstPoint(points)
+  const weakSegments = sanitizePlannerSegments(planner?.weakSegments, 'weak')
+  const strongSegments = sanitizePlannerSegments(planner?.strongSegments, 'strong')
+  const selectedHook = planner?.selectedHook
   const bestPct = Math.round(best?.watchedPct || predictedAverageRetention)
   const worstPct = Math.round(worst?.watchedPct || Math.max(18, predictedAverageRetention - 20))
+  const weak = weakSegments[0]
+  const strong = strongSegments[0]
 
   return [
     {
       id: 'insight-good',
       kind: 'good',
-      headline: `High Energy Peak at ${(best?.timestamp || 0).toFixed(1)}s`,
-      detail: `Viewers engaged ${bestPct}% here due to dynamic motion and faster narrative payoff.`,
-      timestamp: Number((best?.timestamp || 0).toFixed(2)),
-      predictedRetention: bestPct
+      headline: strong
+        ? `Retention Gold at ${strong.start.toFixed(1)}s-${strong.end.toFixed(1)}s`
+        : `High Energy Peak at ${(best?.timestamp || 0).toFixed(1)}s`,
+      detail: strong
+        ? `Segment is excellent - ${strong.reason} (${Math.round(strong.predictedRetention)}% hold).`
+        : `Viewers engaged ${bestPct}% here due to dynamic motion and faster narrative payoff.`,
+      timestamp: Number((strong?.start ?? best?.timestamp ?? 0).toFixed(2)),
+      predictedRetention: Math.round(strong?.predictedRetention ?? bestPct)
     },
     {
       id: 'insight-bad',
       kind: 'bad',
-      headline: `Dull Segment at ${(worst?.timestamp || 0).toFixed(1)}s`,
-      detail: `Predicted ${worstPct}% drop risk from low audio sentiment and delayed context delivery.`,
-      timestamp: Number((worst?.timestamp || 0).toFixed(2)),
-      predictedRetention: worstPct
+      headline: weak
+        ? `Drop Risk at ${weak.start.toFixed(1)}s-${weak.end.toFixed(1)}s`
+        : `Dull Segment at ${(worst?.timestamp || 0).toFixed(1)}s`,
+      detail: weak
+        ? `Segment is bad - predicted ${Math.round(100 - weak.predictedRetention)}% drop-off due to ${weak.reason}.${weak.fix ? ` Suggested fix: ${weak.fix}.` : ''}`
+        : `Predicted ${worstPct}% drop risk from low audio sentiment and delayed context delivery.`,
+      timestamp: Number((weak?.start ?? worst?.timestamp ?? 0).toFixed(2)),
+      predictedRetention: Math.round(weak?.predictedRetention ?? worstPct)
     },
     {
       id: 'insight-choice',
       kind: 'choice',
-      headline: 'Part Chosen: 0:00-0:08 Hook',
-      detail: 'Selected for surprise element + a transcript question that increased opening watch depth.',
-      timestamp: 0,
+      headline: selectedHook
+        ? `Part Chosen: ${selectedHook.start.toFixed(1)}-${selectedHook.end.toFixed(1)}s Opener`
+        : 'Part Chosen: 0:00-0:08 Hook',
+      detail: selectedHook?.reason
+        ? clipText(selectedHook.reason, 210)
+        : 'Selected for surprise element + a transcript question that increased opening watch depth.',
+      timestamp: Number((selectedHook?.start ?? 0).toFixed(2)),
       predictedRetention: Math.round(clamp(predictedAverageRetention + 6, 45, 99))
     }
   ]
 }
 
-export const explainHookChoice = ({
+const explainHookChoice = ({
   points,
   transcriptExcerpt,
-  seed
+  seed,
+  planner
 }: {
   points: RetentionPointLike[]
   transcriptExcerpt: string
   seed: number
+  planner?: PlannerDrivenRetentionLike | null
 }): RenderHookExplanation => {
   const best = bestPoint(points)
-  const winnerScore = Math.round(clamp((best?.watchedPct || 74) + seeded(seed, 9) * 4, 48, 99))
-  const runnerUpScore = Math.round(clamp(winnerScore - (8 + seeded(seed, 10) * 9), 24, 94))
+  const winnerScoreDefault = Math.round(clamp((best?.watchedPct || 74) + seeded(seed, 9) * 4, 48, 99))
+  const runnerUpScoreDefault = Math.round(clamp(winnerScoreDefault - (8 + seeded(seed, 10) * 9), 24, 94))
   const containsQuestion = /\?/.test(String(transcriptExcerpt || ''))
+  const hookComparison = sanitizeHookComparison(planner?.hookComparison)
+  const selectedHook = planner?.selectedHook
+  const winnerScore = selectedHook
+    ? Math.round(clamp(toNum(selectedHook.score, winnerScoreDefault) * 100, 24, 99))
+    : winnerScoreDefault
+  const runnerUp = hookComparison[0]
+  const runnerUpScore = runnerUp
+    ? Math.round(clamp(runnerUp.predictedRetentionLift, 18, 98))
+    : runnerUpScoreDefault
 
   return {
-    winnerLabel: 'Hook Candidate A',
+    winnerLabel: selectedHook
+      ? `Selected ${selectedHook.start.toFixed(1)}s-${selectedHook.end.toFixed(1)}s`
+      : 'Hook Candidate A',
     winnerScore,
-    runnerUpLabel: 'Runner-Up Candidate B',
+    runnerUpLabel: runnerUp
+      ? `Runner-Up ${runnerUp.start.toFixed(1)}s-${runnerUp.end.toFixed(1)}s`
+      : 'Runner-Up Candidate B',
     runnerUpScore,
-    reason: `Chosen over alternatives for highest energy score (${winnerScore}%) and stronger opening curiosity.`,
+    reason: selectedHook?.reason
+      ? clipText(selectedHook.reason, 220)
+      : `Chosen over alternatives for highest energy score (${winnerScore}%) and stronger opening curiosity.`,
     transcriptSignal: containsQuestion
       ? 'Question-led transcript beat out neutral-sentiment alternatives.'
       : 'Transcript momentum beat alternatives with weaker opener clarity.'
   }
 }
 
-export const generateTitleOptions = ({
+const generateTitleOptions = ({
   fileName,
   predictedAverageRetention,
-  seed
+  seed,
+  planner
 }: {
   fileName: string
   predictedAverageRetention: number
   seed: number
+  planner?: PlannerDrivenRetentionLike | null
 }): RenderTitleOption[] => {
+  const fromPlanner = Array.isArray(planner?.titleSuggestions)
+    ? planner?.titleSuggestions
+        .map((row, index) => {
+          const title = clipText(row.title || '', 120)
+          if (!title) return null
+          return {
+            id: row.id || `title-${index + 1}`,
+            title,
+            explanation: clipText(row.explanation || 'Optimized for retention + curiosity in 2026.', 180),
+            confidence: Math.round(clamp(toNum(row.confidence, predictedAverageRetention + 3), 16, 99))
+          } satisfies RenderTitleOption
+        })
+        .filter((row): row is RenderTitleOption => Boolean(row))
+        .slice(0, 5)
+    : []
+  if (fromPlanner.length >= 5) return fromPlanner
+
   const base = cleanTitleBase(fileName)
-  return [
+  const fallback: RenderTitleOption[] = [
     {
       id: 'title-1',
       title: `${base}: The Retention Formula That Keeps Viewers Watching`,
@@ -266,8 +511,70 @@ export const generateTitleOptions = ({
       title: `${base} but Tuned for 2026 Retention`,
       explanation: 'Balanced clarity and novelty for click-through + watch depth.',
       confidence: Math.round(clamp(predictedAverageRetention - 1 + seeded(seed, 13) * 5, 34, 96))
+    },
+    {
+      id: 'title-4',
+      title: `Why Everyone Watches This Until the End (${base})`,
+      explanation: 'Curiosity-first language and completion promise.',
+      confidence: Math.round(clamp(predictedAverageRetention + seeded(seed, 14) * 6, 32, 97))
+    },
+    {
+      id: 'title-5',
+      title: `${base}: The 8-Second Hook Method (2026 Edition)`,
+      explanation: 'Specific hook framework + trend-year specificity.',
+      confidence: Math.round(clamp(predictedAverageRetention + 1 + seeded(seed, 15) * 6, 32, 97))
     }
   ]
+  return [...fromPlanner, ...fallback].slice(0, 5)
+}
+
+const buildRuthlessAudit = ({
+  planner,
+  predictedAverageRetention,
+  predictionConfidence,
+  points
+}: {
+  planner?: PlannerDrivenRetentionLike | null
+  predictedAverageRetention: number
+  predictionConfidence: number
+  points: RetentionPointLike[]
+}): RenderRuthlessAudit => {
+  const weakSegments = sanitizePlannerSegments(planner?.weakSegments, 'weak')
+  const strongSegments = sanitizePlannerSegments(planner?.strongSegments, 'strong')
+  const hookComparison = sanitizeHookComparison(planner?.hookComparison)
+  const cutsAndSpeed = sanitizePacingAdjustments(planner?.pacingAdjustments)
+  const fallbackWeak = weakSegments.length ? weakSegments : buildFallbackWeakSegments(points)
+  const fallbackStrong = strongSegments.length ? strongSegments : buildFallbackStrongSegments(points)
+  const selectedHook = planner?.selectedHook && Number.isFinite(Number(planner?.selectedHook?.start))
+    ? {
+        start: round(toNum(planner?.selectedHook?.start), 3),
+        end: round(Math.max(toNum(planner?.selectedHook?.end, 0), toNum(planner?.selectedHook?.start, 0) + 0.4), 3),
+        reason: clipText(String(planner?.selectedHook?.reason || 'Highest opener energy and curiosity profile.'), 220)
+      }
+    : null
+
+  return {
+    selectedOpener: selectedHook,
+    hookComparison,
+    cutsAndSpeed,
+    weakSegments: fallbackWeak.map((row) => ({
+      start: row.start,
+      end: row.end,
+      predictedRetention: row.predictedRetention,
+      reason: row.reason,
+      fix: row.fix
+    })),
+    strongSegments: fallbackStrong.map((row) => ({
+      start: row.start,
+      end: row.end,
+      predictedRetention: row.predictedRetention,
+      reason: row.reason
+    })),
+    prediction: {
+      score: round(predictedAverageRetention, 1),
+      confidence: round(predictionConfidence, 1)
+    }
+  }
 }
 
 export const generateUniqueRetention = ({
@@ -278,6 +585,7 @@ export const generateUniqueRetention = ({
   frameScan,
   transcript,
   points,
+  planner,
   targetAverageRetention = 70,
   iterationCount = 1
 }: {
@@ -288,36 +596,71 @@ export const generateUniqueRetention = ({
   frameScan: FrameScanLike
   transcript: TranscriptLike
   points: RetentionPointLike[]
+  planner?: PlannerDrivenRetentionLike | null
   targetAverageRetention?: number
   iterationCount?: number
 }): RenderInsightsPayload => {
   const seed = hashSeed(`${videoId}:${fileName}:${mode}:${points.length}`)
   const baseAverage = averageRetention(points)
   const modeBias = mode === 'vertical' ? 4.8 : 2.4
-  const predictedAverageRetention = Number(
+  const heuristicPredictedAverageRetention = Number(
     clamp(baseAverage + modeBias + seeded(seed, 8) * 5.4 - 2.2, 34, 96).toFixed(1)
+  )
+  const plannerPredicted = toNum(planner?.predictedAverageRetention, NaN)
+  const plannerConfidence = toNum(planner?.predictionConfidence, NaN)
+  const predictedAverageRetention = Number(
+    clamp(
+      Number.isFinite(plannerPredicted)
+        ? plannerPredicted * 0.72 + heuristicPredictedAverageRetention * 0.28
+        : heuristicPredictedAverageRetention,
+      18,
+      98
+    ).toFixed(1)
+  )
+  const predictionConfidence = Number(
+    clamp(
+      Number.isFinite(plannerConfidence)
+        ? plannerConfidence
+        : 52 + seeded(seed, 16) * 30,
+      12,
+      99
+    ).toFixed(1)
   )
 
   const metadataStats = generateMetadataStats({ videoId, metadata, frameScan, transcript, mode })
-  const editInsights = analyzeWhyGoodBad({ points, predictedAverageRetention })
+  const editInsights = analyzeWhyGoodBad({
+    points,
+    predictedAverageRetention,
+    planner
+  })
   const hookExplanation = explainHookChoice({
     points,
     transcriptExcerpt: transcript.excerpt,
-    seed
+    seed,
+    planner
   })
   const titleOptions = generateTitleOptions({
     fileName,
     predictedAverageRetention,
-    seed
+    seed,
+    planner
+  })
+  const ruthlessAudit = buildRuthlessAudit({
+    planner,
+    predictedAverageRetention,
+    predictionConfidence,
+    points
   })
 
   return {
     predictedAverageRetention,
+    predictionConfidence,
     targetAverageRetention,
     iterationCount,
     metadataStats,
     editInsights,
     hookExplanation,
-    titleOptions
+    titleOptions,
+    ruthlessAudit
   }
 }

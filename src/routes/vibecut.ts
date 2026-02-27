@@ -5,9 +5,9 @@ import os from 'os'
 import crypto from 'crypto'
 import { spawn } from 'child_process'
 import multer from 'multer'
-import fetch from 'node-fetch'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
+import { queryRetentionModel } from '../services/aiService'
 import {
   generateMetadataStats,
   generateUniqueRetention,
@@ -248,7 +248,7 @@ type TranscriptSummary = {
   language: string | null
 }
 
-type ClaudeRetentionOutput = {
+type LlamaRetentionOutput = {
   hookStrength: number
   emotionLift: number
   pacingRisk: number
@@ -1470,7 +1470,7 @@ const readTranscriptSummary = async (inputPath: string, jobDir: string): Promise
   }
 }
 
-const parseClaudeJson = (value: string): ClaudeRetentionOutput => {
+const parseLlamaJson = (value: string): LlamaRetentionOutput => {
   const parsed = tryParseJson(value)
   if (!parsed || typeof parsed !== 'object') return null
   const hookStrength = clamp(Number((parsed as any).hookStrength ?? (parsed as any).hook_strength ?? 0.5), 0, 1)
@@ -1481,11 +1481,11 @@ const parseClaudeJson = (value: string): ClaudeRetentionOutput => {
     hookStrength,
     emotionLift,
     pacingRisk,
-    summary: summary || 'Claude model predicted moderate retention behavior.'
+    summary: summary || 'Llama model predicted moderate retention behavior.'
   }
 }
 
-const runClaudeRetentionModel = async ({
+const runLlamaRetentionModel = async ({
   metadata,
   frameScan,
   transcript,
@@ -1495,10 +1495,7 @@ const runClaudeRetentionModel = async ({
   frameScan: FrameScanSummary
   transcript: TranscriptSummary
   mode: RenderMode
-}): Promise<ClaudeRetentionOutput> => {
-  const apiKey = String(process.env.ANTHROPIC_API_KEY || '').trim()
-  if (!apiKey) return null
-
+}): Promise<LlamaRetentionOutput> => {
   const prompt = `You are AutoEditor's ruthless retention-maximizing AI brain.
 Mission: maximize average retention percent and full-watch completion, not runtime.
 In 2026 ranking behavior, shorter videos with much higher retention usually beat longer videos with weak retention.
@@ -1519,36 +1516,20 @@ Context:
 `
 
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model: process.env.CLAUDE_MODEL || 'claude-3-5-sonnet-20241022',
-        max_tokens: 300,
-        messages: [{ role: 'user', content: prompt }]
-      })
+    const response = await queryRetentionModel({
+      prompt,
+      maxNewTokens: 300,
+      temperature: 0.15
     })
 
-    if (!response.ok) {
-      const errorText = await response.text().catch(() => '')
-      console.warn('claude request failed', response.status, errorText)
+    if (!response.ok || !response.text) {
+      console.warn('llama retention request failed', response.reason || 'unknown')
       return null
     }
 
-    const payload = await response.json().catch(() => null) as any
-    const textParts = Array.isArray(payload?.content)
-      ? payload.content
-          .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
-          .join('\n')
-      : ''
-
-    return parseClaudeJson(textParts)
+    return parseLlamaJson(response.text)
   } catch (error) {
-    console.warn('claude request exception', error)
+    console.warn('llama retention request exception', error)
     return null
   }
 }
@@ -1556,21 +1537,21 @@ Context:
 const buildRetentionSignals = ({
   duration,
   frameScan,
-  claude,
+  llama,
   mode
 }: {
   duration: number
   frameScan: FrameScanSummary
-  claude: ClaudeRetentionOutput
+  llama: LlamaRetentionOutput
   mode: RenderMode
 }) => {
   const pointCount = 14
   const points: RetentionPoint[] = []
   const heatmap: RetentionHeatCell[] = []
 
-  const hookBoost = claude?.hookStrength ?? (mode === 'vertical' ? 0.78 : 0.55)
-  const emotionLift = claude?.emotionLift ?? 0.5
-  const pacingRisk = claude?.pacingRisk ?? 0.42
+  const hookBoost = llama?.hookStrength ?? (mode === 'vertical' ? 0.78 : 0.55)
+  const emotionLift = llama?.emotionLift ?? 0.5
+  const pacingRisk = llama?.pacingRisk ?? 0.42
 
   for (let index = 0; index < pointCount; index += 1) {
     const timestamp = (duration * index) / Math.max(1, pointCount - 1)
@@ -1646,7 +1627,7 @@ const buildRetentionSignals = ({
     point.description = 'Retention is stable around this beat.'
   }
 
-  const summary = claude?.summary || 'Retention curve generated from Whisper peaks, OpenCV motion, and heuristic sentiment prediction.'
+  const summary = llama?.summary || 'Retention curve generated from Whisper peaks, OpenCV motion, and heuristic sentiment prediction.'
 
   return { points, heatmap, summary }
 }
@@ -1672,7 +1653,7 @@ const buildPostEditRetentionSignals = ({
     return buildRetentionSignals({
       duration: safeDuration,
       frameScan,
-      claude: null,
+      llama: null,
       mode
     })
   }
@@ -2787,23 +2768,17 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       transcriptExcerpt: transcript.excerpt
     })
 
-    const shouldUseClaudeFallback =
-      freeAiPlan.provider === 'heuristic' &&
-      Boolean(String(process.env.ANTHROPIC_API_KEY || '').trim())
-
-    const claude = shouldUseClaudeFallback
-      ? await runClaudeRetentionModel({
-          metadata: source.metadata,
-          frameScan,
-          transcript,
-          mode
-        })
-      : null
+    const llamaRetention = await runLlamaRetentionModel({
+      metadata: source.metadata,
+      frameScan,
+      transcript,
+      mode
+    })
 
     const retention = buildRetentionSignals({
       duration: source.metadata.duration,
       frameScan,
-      claude,
+      llama: llamaRetention,
       mode
     })
 
@@ -3045,7 +3020,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         insights: generatedInsights,
         summary: [
           `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
-          `Free AI planner: ${freeAiPlan.provider}${freeAiPlan.model ? ` (${freeAiPlan.model})` : ''}${shouldUseClaudeFallback ? ' + Claude fallback' : ''}.`,
+          `Free AI planner: ${freeAiPlan.provider}${freeAiPlan.model ? ` (${freeAiPlan.model})` : ''}${llamaRetention ? ' + Llama retention refinement' : ''}.`,
           freeAiPlan.selectedHook && shouldApplyHookAndPacing
             ? `Hook opener: ${freeAiPlan.selectedHook.start.toFixed(1)}s-${freeAiPlan.selectedHook.end.toFixed(1)}s moved to timeline start (${hookRangeLabel}).`
             : manualSegments.length > 0

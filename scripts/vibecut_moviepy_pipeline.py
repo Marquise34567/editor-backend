@@ -16,12 +16,12 @@ def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def parse_segments(raw: str, duration: float) -> list[tuple[float, float]]:
+def parse_segments(raw: str, duration: float) -> list[dict[str, float]]:
     try:
         parsed = json.loads(raw)
     except Exception:
         parsed = []
-    out: list[tuple[float, float]] = []
+    out: list[dict[str, float]] = []
     if not isinstance(parsed, list):
         return out
     for item in parsed:
@@ -29,10 +29,11 @@ def parse_segments(raw: str, duration: float) -> list[tuple[float, float]]:
             continue
         start = clamp(float(item.get("start", 0.0) or 0.0), 0.0, duration)
         end = clamp(float(item.get("end", 0.0) or 0.0), 0.0, duration)
+        speed = clamp(float(item.get("speed", 1.0) or 1.0), 1.0, 1.8)
         if end - start < 0.35:
             continue
-        out.append((round(start, 3), round(end, 3)))
-    out.sort(key=lambda pair: pair[0])
+        out.append({"start": round(start, 3), "end": round(end, 3), "speed": round(speed, 3)})
+    out.sort(key=lambda row: row["start"])
     return out
 
 
@@ -99,7 +100,7 @@ def main() -> int:
         return 0
 
     try:
-        from moviepy.editor import VideoFileClip, concatenate_videoclips
+        from moviepy.editor import VideoFileClip, concatenate_videoclips, vfx
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"moviepy_import_failed:{exc}", "clipPaths": []}))
         return 0
@@ -122,8 +123,14 @@ def main() -> int:
                 segments = segments[:3]
 
             built_clips = []
-            for idx, (start, end) in enumerate(segments, start=1):
+            for idx, segment in enumerate(segments, start=1):
+                start = float(segment["start"])
+                end = float(segment["end"])
+                speed = float(segment.get("speed", 1.0) or 1.0)
+
                 sub = source.subclip(start, end)
+                if speed > 1.001:
+                    sub = sub.fx(vfx.speedx, factor=speed)
                 processed = fit_clip_vertical(sub) if args.mode == "vertical" else fit_clip_horizontal(sub)
 
                 out_path = output_dir / f"clip_{idx:02d}.mp4"

@@ -1,4 +1,5 @@
 import fetch from 'node-fetch'
+import { queryRetentionModel } from '../services/aiService'
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
@@ -84,7 +85,7 @@ export type RetentionTitleSuggestion = {
 export type PredictionConfidenceLevel = 'low' | 'medium' | 'high'
 
 export type FreeAiHookPlan = {
-  provider: 'huggingface' | 'heuristic' | 'huggingface_with_heuristic'
+  provider: 'llama_local' | 'llama_local_with_heuristic' | 'huggingface' | 'heuristic' | 'huggingface_with_heuristic'
   model: string | null
   selectedHook: HookCandidate | null
   rankedHooks: HookCandidate[]
@@ -472,79 +473,6 @@ const buildScoredCandidates = ({
       }
     }
   })
-}
-
-const coerceGeneratedText = (payload: any): string => {
-  if (!payload) return ''
-  if (typeof payload === 'string') return payload
-  if (Array.isArray(payload)) {
-    return payload
-      .map((item) => {
-        if (typeof item === 'string') return item
-        if (typeof item?.generated_text === 'string') return item.generated_text
-        if (typeof item?.summary_text === 'string') return item.summary_text
-        return ''
-      })
-      .join('\n')
-      .trim()
-  }
-  if (typeof payload.generated_text === 'string') return payload.generated_text
-  if (typeof payload.summary_text === 'string') return payload.summary_text
-  if (typeof payload.error === 'string') return payload.error
-  return ''
-}
-
-const requestHuggingFaceText = async ({
-  token,
-  model,
-  prompt,
-  maxNewTokens
-}: {
-  token: string
-  model: string
-  prompt: string
-  maxNewTokens: number
-}): Promise<{ text: string; ok: boolean; reason?: string }> => {
-  const endpoint = String(process.env.HF_TEXT_ENDPOINT || '').trim() || `https://api-inference.huggingface.co/models/${model}`
-  try {
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${token}`
-      },
-      body: JSON.stringify({
-        inputs: prompt,
-        parameters: {
-          max_new_tokens: clamp(Math.round(maxNewTokens), 64, 650),
-          temperature: 0.2,
-          top_p: 0.9,
-          return_full_text: false
-        },
-        options: {
-          wait_for_model: true,
-          use_cache: false
-        }
-      })
-    })
-
-    const payload: any = await response.json().catch(() => null)
-    if (!response.ok) {
-      return {
-        text: '',
-        ok: false,
-        reason: typeof payload?.error === 'string' ? payload.error : `hf_status_${response.status}`
-      }
-    }
-
-    const text = coerceGeneratedText(payload)
-    if (!text) {
-      return { text: '', ok: false, reason: 'hf_empty_response' }
-    }
-    return { text, ok: true }
-  } catch (error: any) {
-    return { text: '', ok: false, reason: error?.message || 'hf_exception' }
-  }
 }
 
 const requestHuggingFaceSentiment = async ({
@@ -1158,6 +1086,7 @@ const buildPrompts = ({
       start: window.start,
       end: window.end,
       transcript: window.transcript,
+      energy_score: window.transcriptEnergy,
       words_per_second: window.wordsPerSecond,
       transcript_energy: window.transcriptEnergy,
       motion_score: window.motionScore
@@ -1175,7 +1104,8 @@ ${context}`
 
   const rankingPrompt = `${STRICT_RETENTION_PREFIX}
 ${RUTHLESS_RETENTION_PLAYBOOK}
-Select exactly one 8-second opener and compare it against 2-3 runner-ups.
+Rank these hook candidates by predicted retention as opener. Select exactly one 8-second opener and compare it against 2-3 runner-ups.
+Explain why the selected opener beats alternatives in retention terms.
 Return JSON only:
 {
   "ranked_ids":["id1","id2","id3"],
@@ -1194,6 +1124,8 @@ ${RUTHLESS_RETENTION_PLAYBOOK}
 Run full-video ruthless retention analysis and output cut/pacing/insight/title plan.
 If any segment predicts >15-20% drop-off, cut or compress it.
 Prefer shorter final runtime when it increases average retention.
+For weak segments, explain why retention drops and suggest concrete fixes.
+For strong segments, explain why retention holds.
 Return JSON only:
 {
   "cuts":[{"start":12.4,"end":15.2,"action":"trim","intensity":0.7,"reason":"dead air"},
@@ -1216,7 +1148,7 @@ Return JSON only:
     {"title":"...", "explanation":"...", "confidence_percent":75}
   ]
 }
-At the end, generate 5 title variations optimized for retention + curiosity in 2026.
+Predict average % watched for this edited structure and generate 5 title variations optimized for retention + curiosity in 2026.
 ${context}`
 
   return {
@@ -1281,7 +1213,6 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   })
 
   const hfToken = String(process.env.HUGGINGFACE_API_KEY || process.env.HF_API_TOKEN || '').trim()
-  const hfModel = String(process.env.HF_RETENTION_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct').trim()
   const hfSentimentModel = String(process.env.HF_SENTIMENT_MODEL || 'distilbert-base-uncased-finetuned-sst-2-english').trim()
 
   const prompts = buildPrompts({
@@ -1296,48 +1227,55 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   let provider: FreeAiHookPlan['provider'] = 'heuristic'
   let model: string | null = null
 
-  if (hfToken && candidates.length > 0) {
-    model = hfModel
+  if (candidates.length > 0) {
     const sampleForSentiment = candidates
       .filter((candidate) => candidate.transcript.length > 0)
       .slice(0, 10)
 
-    for (const candidate of sampleForSentiment) {
-      const sentiment = await requestHuggingFaceSentiment({
-        token: hfToken,
-        model: hfSentimentModel,
-        text: candidate.transcript
-      })
-      if (sentiment === null) continue
-      candidate.scores.sentiment = Number(sentiment.toFixed(4))
-      candidate.scores.combined = Number(
-        clamp(candidate.scores.motion * 0.42 + candidate.scores.audio * 0.3 + sentiment * 0.28, 0, 1).toFixed(4)
-      )
+    if (hfToken) {
+      for (const candidate of sampleForSentiment) {
+        const sentiment = await requestHuggingFaceSentiment({
+          token: hfToken,
+          model: hfSentimentModel,
+          text: candidate.transcript
+        })
+        if (sentiment === null) continue
+        candidate.scores.sentiment = Number(sentiment.toFixed(4))
+        candidate.scores.combined = Number(
+          clamp(candidate.scores.motion * 0.42 + candidate.scores.audio * 0.3 + sentiment * 0.28, 0, 1).toFixed(4)
+        )
+      }
     }
 
-    const eligibility = await requestHuggingFaceText({
-      token: hfToken,
-      model: hfModel,
+    const eligibility = await queryRetentionModel({
       prompt: prompts.eligibilityPrompt,
-      maxNewTokens: 360
+      maxNewTokens: 360,
+      temperature: 0.1
     })
-    const ranking = await requestHuggingFaceText({
-      token: hfToken,
-      model: hfModel,
+    const ranking = await queryRetentionModel({
       prompt: prompts.rankingPrompt,
-      maxNewTokens: 640
+      maxNewTokens: 640,
+      temperature: 0.15
     })
-    const pacing = await requestHuggingFaceText({
-      token: hfToken,
-      model: hfModel,
+    const pacing = await queryRetentionModel({
       prompt: prompts.pacingPrompt,
-      maxNewTokens: 900
+      maxNewTokens: 900,
+      temperature: 0.2
     })
 
     if (eligibility.ok || ranking.ok || pacing.ok) {
-      provider = (ranking.ok && pacing.ok) ? 'huggingface' : 'huggingface_with_heuristic'
+      const providersUsed = new Set(
+        [eligibility.provider, ranking.provider, pacing.provider].filter((entry) => entry !== 'none')
+      )
+      const fullModelCoverage = ranking.ok && pacing.ok
+      if (providersUsed.has('local')) {
+        provider = fullModelCoverage ? 'llama_local' : 'llama_local_with_heuristic'
+      } else {
+        provider = fullModelCoverage ? 'huggingface' : 'huggingface_with_heuristic'
+      }
+      model = ranking.model || pacing.model || eligibility.model || model
     } else {
-      notes.push(`huggingface_unavailable:${eligibility.reason || ranking.reason || pacing.reason || 'unknown'}`)
+      notes.push(`llm_unavailable:${eligibility.reason || ranking.reason || pacing.reason || 'unknown'}`)
     }
 
     const eligibilityJson = extractJson(eligibility.text)
