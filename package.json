@@ -30,6 +30,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",
     "@aws-sdk/s3-request-presigner": "^3.995.0",
+    "@huggingface/inference": "^2.8.1",
     "@prisma/client": "^5.0.0",
     "@supabase/supabase-js": "^2.14.0",
     "body-parser": "^1.20.2",

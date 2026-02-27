@@ -7,7 +7,7 @@ import { spawn } from 'child_process'
 import multer from 'multer'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
-import { queryRetentionModel } from '../services/aiService'
+import { queryRetentionModel } from '../lib/aiService'
 import {
   generateMetadataStats,
   generateUniqueRetention,

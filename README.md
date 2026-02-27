@@ -40,6 +40,41 @@ Notes:
 - The backend expects Supabase `SERVICE_ROLE_KEY` to validate JWTs server-side and to access Storage.
 - Stripe webhooks endpoint is `/webhooks/stripe` and expects the raw body to validate signature. Set `STRIPE_WEBHOOK_SECRET` accordingly.
 
+## Llama 3.1 Retention Reasoning
+
+AutoEditor now uses Llama 3.1 as the core retention model path.
+
+Hosted Hugging Face (recommended):
+
+1. Set `HUGGINGFACE_API_KEY` (or `HF_API_TOKEN`) in `.env`.
+2. Primary model defaults to `meta-llama/Meta-Llama-3.1-405B-Instruct`.
+3. Fallback defaults to `meta-llama/Meta-Llama-3.1-70B-Instruct`.
+4. Optional overrides:
+   - `HF_LLAMA_PRIMARY_MODEL`
+   - `HF_LLAMA_FALLBACK_MODELS`
+   - `LLAMA_MAX_RETRIES`
+   - `LLAMA_BACKOFF_BASE_MS`
+
+Local setup (optional):
+
+```bash
+npm run llama:setup-local
+# and when ready:
+npm run llama:setup-local -- --download
+```
+
+Optional local 4-bit endpoint:
+
+```bash
+python scripts/llama_local_4bit_server.py
+# then set LLAMA_PROVIDER=local and LLAMA_LOCAL_INFERENCE_URL=http://127.0.0.1:8000/v1/completions
+```
+
+Warning for local 405B:
+- Expect 800+ GB model footprint.
+- Practical inference target is approximately 8x A100 80GB GPUs.
+- For this project, hosted HF inference is the default production recommendation.
+
 R2 (Cloudflare) configuration:
 
 - Add the following environment variables to use Cloudflare R2 for storage:

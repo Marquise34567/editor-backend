@@ -1,4 +1,4 @@
-import { gemmaQuery } from './aiService'
+import { gemmaQuery } from '../lib/aiService'
 
 const RUTHLESS_RETENTION_PREFIX = `You are AutoEditor's ruthless retention-maximizing AI brain.
 Goal: maximize average retention and completion rate over raw runtime.

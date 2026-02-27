@@ -1,5 +1,5 @@
 import fetch from 'node-fetch'
-import { queryRetentionModel } from '../services/aiService'
+import { queryRetentionModel } from './aiService'
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 
