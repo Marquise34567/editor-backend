@@ -898,6 +898,8 @@ type HookAuditResult = {
   understandable: boolean
   curiosity: boolean
   payoff: boolean
+  teaserStrength: number
+  spoilerRisk: number
   reasons: string[]
 }
 type HookCandidate = {
@@ -1721,12 +1723,12 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
 }
 const ULTRA_MODE_PLAYBOOK_PROMPT = `Dynamic Binge Editor Prompt
 Step 1: Analyze content type quickly, detect weak spots, then adapt edits dynamically.
-Step 2: Ruthless cuts, no dead air, lock an 8-second opener window at 0:00 (target 6-8 seconds, never a 4-second teaser), make the first 3 seconds impossible to scroll past, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
+Step 2: Ruthless cuts, no dead air, lock an 8-second opener window at 0:00 (target 6-8 seconds), make the first 3 seconds impossible to scroll past, keep the opener teaser-first without revealing the full payoff, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
 Step 3: Apply type-specific adaptation (challenge, story, tutorial, reaction, list, gaming, ASMR, humor, documentary, hybrid) with pacing and visual pattern interrupts tuned to that type.
 Universal boosters: bold timed subtitles, constant visual/audio changes, re-hooks, and test for any >20% drop-off risk windows.`
 const RETENTION_KING_PLAYBOOK_PROMPT = `Retention Engineer Prompt
 Objective: maximize watch time, completion rate, and emotional momentum while eliminating drop-off.
-Rules: opener hook must run 6-8 seconds at the beginning (do not use 4-second openers), with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay; remove filler/dead air/repetition; compress aggressively without losing clarity.
+Rules: opener hook must run 6-8 seconds at the beginning, with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay, while still withholding the full payoff as a teaser; remove filler/dead air/repetition; compress aggressively without losing clarity.
 Every 5-12 seconds introduce a pacing shift, visual change, pattern interrupt, or tension spike.
 Use curiosity looping, emotional escalation, and micro-payoffs; adapt behavior by format (educational, story, commentary, vlog, talking head, tutorial).
 Before final render, re-test intro strength, 3-second scroll risk windows, and ending satisfaction/anticipation.`
@@ -9114,16 +9116,32 @@ const extractHookText = (start: number, end: number, transcriptCues: TranscriptC
     .trim()
 }
 
+const scoreHookSpoilerRisk = (text: string) => {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) return 0
+  let score = 0
+  if (/\b(the answer is|here(?:'s| is) what happened|in the end|turns out|the result is|results are|exactly what happened)\b/.test(normalized)) score += 0.44
+  if (/\b(i|we)\s+(won|lost|proved|showed|revealed)\b/.test(normalized)) score += 0.24
+  if (/\b(finally|step by step|full breakdown|complete guide)\b/.test(normalized)) score += 0.2
+  if (normalized.split(/\s+/).length >= 20) score += 0.12
+  if (!/[?]/.test(normalized) && !/\b(wait|watch|before|until|next|later|soon|why|how|what happens)\b/.test(normalized)) {
+    score += 0.1
+  }
+  return clamp01(score)
+}
+
 const scoreHookOpenLoopSignal = (text: string) => {
   const normalized = String(text || '').trim().toLowerCase()
   if (!normalized) return 0
   let score = 0
   if (/\?/.test(normalized)) score += 0.18
   if (/\b(wait|watch|see|before|after|until|why|how|what happens|you won't)\b/.test(normalized)) score += 0.22
-  if (/\b(reveal|result|truth|mistake|secret|warning|proof|finally)\b/.test(normalized)) score += 0.2
+  if (/\b(reveal|mistake|secret|warning)\b/.test(normalized)) score += 0.12
+  if (/\b(result|truth|proof|finally)\b/.test(normalized)) score += 0.04
   if (/\b(but|then|and then|so)\b/.test(normalized)) score += 0.08
   if (/\b(i|you|we)\b/.test(normalized)) score += 0.05
-  return clamp01(score)
+  const spoilerRisk = scoreHookSpoilerRisk(normalized)
+  return clamp01(score - 0.32 * spoilerRisk)
 }
 
 const computeHookInstantHoldScore = ({
@@ -9257,31 +9275,51 @@ const runHookAudit = ({
     /\b(changed|reveal|result|mistake|warning|proof|won|lost)\b/.test(text) ||
     (!hasTranscriptSupport && nonVerbalClarity >= 0.64)
   )
+  const spoilerRisk = scoreHookSpoilerRisk(text)
+  const teaserStrength = clamp01(
+    0.44 * scoreHookOpenLoopSignal(text) +
+    0.3 * curiositySignal +
+    0.18 * transcriptSignals.curiosityTrigger +
+    0.08 * (1 - transcriptSignals.fillerDensity) -
+    0.34 * spoilerRisk
+  )
+  const teaserThreshold = hasTranscriptSupport ? 0.26 : 0.22
+  const teaserPass = teaserStrength >= teaserThreshold
+  const spoilerLimit = hasTranscriptSupport ? 0.58 : 0.66
+  const noOverReveal = spoilerRisk <= spoilerLimit
   const auditScore = hasTranscriptSupport
     ? clamp01(
-        0.34 * (understandable ? 1 : 0) +
-        0.28 * (curiosity ? 1 : 0) +
-        0.28 * (payoff ? 1 : 0) +
-        0.1 * (1 - contextPenalty)
+        0.28 * (understandable ? 1 : 0) +
+        0.22 * (curiosity ? 1 : 0) +
+        0.18 * (payoff ? 1 : 0) +
+        0.18 * teaserStrength +
+        0.1 * (1 - contextPenalty) +
+        0.08 * (1 - spoilerRisk)
       )
     : clamp01(
-        0.32 * (understandable ? 1 : 0) +
-        0.3 * (curiosity ? 1 : 0) +
-        0.28 * (payoff ? 1 : 0) +
-        0.1 * (1 - contextPenalty)
+        0.28 * (understandable ? 1 : 0) +
+        0.2 * (curiosity ? 1 : 0) +
+        0.18 * (payoff ? 1 : 0) +
+        0.2 * teaserStrength +
+        0.08 * (1 - contextPenalty) +
+        0.06 * (1 - spoilerRisk)
       )
-  const passThreshold = hasTranscriptSupport ? 0.72 : 0.58
+  const passThreshold = hasTranscriptSupport ? 0.68 : 0.55
   const reasons: string[] = []
   if (!understandable) reasons.push(hasTranscriptSupport ? 'Not understandable in isolation' : 'Non-verbal hook beat is too context-dependent')
   if (!curiosity) reasons.push(hasTranscriptSupport ? 'Does not trigger curiosity strongly enough' : 'Visual/audio peak does not trigger enough curiosity')
   if (!payoff) reasons.push(hasTranscriptSupport ? 'Payoff signal is weak' : 'Peak moment does not imply a clear payoff')
+  if (!teaserPass) reasons.push('Hook reveals too much or has weak teaser pressure')
+  if (!noOverReveal) reasons.push('Reveals too much too early; keep the opener as a curiosity teaser')
   if (contextPenalty > (hasTranscriptSupport ? 0.34 : 0.55)) reasons.push('Requires too much prior context')
   return {
-    passed: understandable && curiosity && payoff && auditScore >= passThreshold,
+    passed: understandable && curiosity && payoff && teaserPass && noOverReveal && auditScore >= passThreshold,
     auditScore: Number(auditScore.toFixed(4)),
     understandable,
     curiosity,
     payoff,
+    teaserStrength: Number(teaserStrength.toFixed(4)),
+    spoilerRisk: Number(spoilerRisk.toFixed(4)),
     reasons
   }
 }
@@ -9326,7 +9364,9 @@ const buildSyntheticHookCandidate = ({
   let finalEnd = aligned.end
   let finalAudit = firstAudit
   if (!firstAudit.passed) {
-    const teaserStart = Math.max(0, aligned.start - 0.8)
+    const overRevealFail = firstAudit.spoilerRisk > 0.6 || firstAudit.reasons.some((reason) => /reveals too much/i.test(reason))
+    const teaserLeadSeconds = overRevealFail ? 1.4 : 0.8
+    const teaserStart = Math.max(0, aligned.start - teaserLeadSeconds)
     const repaired = alignHookToSentenceBoundaries(teaserStart, teaserStart + targetDuration, transcriptCues, durationSeconds)
     if (isRangeCoveredBySegments(repaired.start, repaired.end, segments)) {
       finalStart = repaired.start
@@ -9569,6 +9609,7 @@ const pickTopHookCandidates = ({
         transcriptCues,
         windows
       })
+      const teaserReserve = clamp01(1 - audit.spoilerRisk)
       const totalScore = clamp01(
         0.14 * baseHookScore +
         0.11 * speechImpact +
@@ -9577,14 +9618,17 @@ const pickTopHookCandidates = ({
         0.1 * emotionImpact +
         0.09 * emotionalHookPull +
         0.08 * boostedCuriosityAcceleration +
-        0.06 * openLoopSignal +
+        0.05 * openLoopSignal +
+        0.05 * teaserReserve +
+        0.03 * audit.teaserStrength +
         0.1 * instantHoldScore +
         0.09 * introClarityScore +
         0.04 * durationAlignment +
-        0.12 * audit.auditScore +
+        0.11 * audit.auditScore +
         0.06 * dynamicLift.score +
         0.04 * dynamicLift.peakDensity -
-        0.14 * tunedContextPenalty
+        0.13 * tunedContextPenalty -
+        0.08 * audit.spoilerRisk
       )
       evaluated.push({
         start: aligned.start,
