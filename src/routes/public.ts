@@ -1,6 +1,8 @@
 import express from 'express'
 import fetch from 'node-fetch'
 import { getFounderAvailability } from '../services/founder'
+import { getRequestIpAddress } from '../services/ipBan'
+import { canCreateSignupFromIp, claimSignupIp } from '../services/signupIpGuard'
 
 const router = express.Router()
 
@@ -134,6 +136,43 @@ router.get('/title-trends', async (_req, res) => {
     res.json(payload)
   } catch {
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/signup/ip-check', async (req, res) => {
+  try {
+    const ip = getRequestIpAddress(req)
+    const result = await canCreateSignupFromIp(ip)
+    if (!result.allowed) {
+      return res.status(429).json({
+        allowed: false,
+        error: result.code,
+        message: 'Only one account can be created from this IP address.'
+      })
+    }
+    return res.json({ allowed: true })
+  } catch (error) {
+    console.warn('public signup ip-check failed', error)
+    return res.status(500).json({ allowed: false, error: 'server_error' })
+  }
+})
+
+router.post('/signup/ip-claim', async (req, res) => {
+  try {
+    const ip = getRequestIpAddress(req)
+    const email = typeof req.body?.email === 'string' ? req.body.email : null
+    const result = await claimSignupIp({ ip, email })
+    if (!result.allowed) {
+      return res.status(429).json({
+        allowed: false,
+        error: result.code,
+        message: 'Only one account can be created from this IP address.'
+      })
+    }
+    return res.json({ allowed: true })
+  } catch (error) {
+    console.warn('public signup ip-claim failed', error)
+    return res.status(500).json({ allowed: false, error: 'server_error' })
   }
 })
 
