@@ -43,6 +43,10 @@ type FeedbackSignalEvent = {
   job_id: string
   created_at: string
   source_type: 'platform' | 'internal'
+  source: string | null
+  notes: string | null
+  creator_feedback_category: string | null
+  creator_feedback_notes: string | null
   signal_outcome: number
   watch_percent: number | null
   hook_hold_percent: number | null
@@ -237,6 +241,29 @@ const normalizeHookSelectionMode = (value: unknown): string | null => {
   return normalized.length > 80 ? normalized.slice(0, 80) : normalized
 }
 
+const normalizeFeedbackSource = (value: unknown): string | null => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+  if (!normalized) return null
+  return normalized.length > 120 ? normalized.slice(0, 120) : normalized
+}
+
+const normalizeFeedbackNotes = (value: unknown): string | null => {
+  const normalized = String(value || '').trim()
+  if (!normalized) return null
+  return normalized.length > 240 ? normalized.slice(0, 240) : normalized
+}
+
+const normalizeCreatorFeedbackCategory = (value: unknown): string | null => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+  if (!normalized) return null
+  return normalized.length > 80 ? normalized.slice(0, 80) : normalized
+}
+
 const parseSettings = (value: unknown): FeedbackLoopSettings => {
   const payload = asObject(value)
   const enabled = payload.enabled
@@ -427,6 +454,8 @@ const pullFeedbackSignals = (analysis: Record<string, any>) => {
     .trim() === 'platform'
     ? 'platform'
     : 'internal'
+  const source = normalizeFeedbackSource(feedback.source)
+  const notes = normalizeFeedbackNotes(feedback.notes)
 
   return {
     hasFeedback: watchPercent !== null
@@ -440,6 +469,8 @@ const pullFeedbackSignals = (analysis: Record<string, any>) => {
       || likesPerView !== null
       || commentsPerView !== null,
     sourceType,
+    source,
+    notes,
     watchPercent,
     hookHoldPercent,
     completionPercent,
@@ -481,6 +512,11 @@ const selectRecentFeedbackSignals = async (limit: number): Promise<FeedbackSigna
     const renderSettings = asObject((row as any)?.render_settings)
     const feedback = pullFeedbackSignals(analysis)
     if (!feedback.hasFeedback) continue
+    const creatorFeedback = asObject(analysis?.creator_feedback)
+    const creatorFeedbackCategory = normalizeCreatorFeedbackCategory(
+      creatorFeedback.category ?? creatorFeedback.feedback
+    )
+    const creatorFeedbackNotes = normalizeFeedbackNotes(creatorFeedback.notes)
 
     const modelRetentionScore = normalizeModelScore(
       analysis?.retention_score ??
@@ -515,6 +551,10 @@ const selectRecentFeedbackSignals = async (limit: number): Promise<FeedbackSigna
       job_id: String((row as any)?.id || ''),
       created_at: toIsoOrNow((row as any)?.updated_at || (row as any)?.created_at),
       source_type: feedback.sourceType,
+      source: feedback.source,
+      notes: feedback.notes,
+      creator_feedback_category: creatorFeedbackCategory,
+      creator_feedback_notes: creatorFeedbackNotes,
       signal_outcome: outcome,
       watch_percent: feedback.watchPercent,
       hook_hold_percent: feedback.hookHoldPercent,
