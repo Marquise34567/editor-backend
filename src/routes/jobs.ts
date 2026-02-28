@@ -1369,6 +1369,8 @@ const HOOK_MIN = EDITOR_RETENTION_CONFIG.hookMin
 const HOOK_MAX = EDITOR_RETENTION_CONFIG.hookMax
 const AUTO_HOOK_DURATION_MIN_SECONDS = 5
 const AUTO_HOOK_DURATION_MAX_SECONDS = 8
+const HOOK_OPENER_FIRST_SECONDS = 3
+const HOOK_STANDARD_INSTANT_HOLD_MIN = 0.56
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -1719,12 +1721,12 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
 }
 const ULTRA_MODE_PLAYBOOK_PROMPT = `Dynamic Binge Editor Prompt
 Step 1: Analyze content type quickly, detect weak spots, then adapt edits dynamically.
-Step 2: Ruthless cuts, no dead air, micro-hooks every 5-15 seconds, front-load value in first 10-20 seconds, and close with verbal tease + preview + playlist/end-screen push.
+Step 2: Ruthless cuts, no dead air, lock an 8-second opener window at 0:00 (target 6-8 seconds, never a 4-second teaser), make the first 3 seconds impossible to scroll past, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
 Step 3: Apply type-specific adaptation (challenge, story, tutorial, reaction, list, gaming, ASMR, humor, documentary, hybrid) with pacing and visual pattern interrupts tuned to that type.
 Universal boosters: bold timed subtitles, constant visual/audio changes, re-hooks, and test for any >20% drop-off risk windows.`
 const RETENTION_KING_PLAYBOOK_PROMPT = `Retention Engineer Prompt
 Objective: maximize watch time, completion rate, and emotional momentum while eliminating drop-off.
-Rules: first 5-8 seconds must deliver strongest curiosity or emotional spike; remove filler/dead air/repetition; compress aggressively without losing clarity.
+Rules: opener hook must run 6-8 seconds at the beginning (do not use 4-second openers), with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay; remove filler/dead air/repetition; compress aggressively without losing clarity.
 Every 5-12 seconds introduce a pacing shift, visual change, pattern interrupt, or tension spike.
 Use curiosity looping, emotional escalation, and micro-payoffs; adapt behavior by format (educational, story, commentary, vlog, talking head, tutorial).
 Before final render, re-test intro strength, 3-second scroll risk windows, and ending satisfaction/anticipation.`
@@ -1745,7 +1747,7 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Ultra mode playbook active: dynamic binge editing profile enabled.',
         'Ultra mode enforces fast-mode processing and upload acceleration.',
-        'Ultra mode front-loads hooks and forces frequent micro-interrupts.'
+        'Ultra mode front-loads 6-8s hooks and optimizes first-3-second hold with frequent micro-interrupts.'
       ]
     }
   }
@@ -1757,7 +1759,7 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Retention King playbook active: retention-engineering profile enabled.',
         'Retention King aggressively removes drop-off windows and low-energy stretches.',
-        'Retention King injects curiosity loops and emotional momentum checkpoints.'
+        'Retention King enforces 6-8s openers and first-3-second retention pressure with curiosity loops.'
       ]
     }
   }
@@ -7714,13 +7716,15 @@ const selectRenderableHookCandidate = ({
   aggressionLevel,
   hasTranscript,
   signalStrength,
-  thresholdOffset = 0
+  thresholdOffset = 0,
+  windows = []
 }: {
   candidates: HookCandidate[]
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
   thresholdOffset?: number
+  windows?: EngagementWindow[]
 }): HookSelectionDecision | null => {
   const deduped = candidates.filter((candidate, index) => (
     candidate &&
@@ -7735,15 +7739,52 @@ const selectRenderableHookCandidate = ({
   ))
   if (!deduped.length) return null
   const ranked = deduped
-    .map((candidate) => ({ candidate, confidence: getHookCandidateConfidence(candidate) }))
-    .sort((a, b) => b.confidence - a.confidence || b.candidate.score - a.candidate.score)
+    .map((candidate) => {
+      const confidence = getHookCandidateConfidence(candidate)
+      const instantHold = windows.length
+        ? computeHookInstantHoldScore({
+          start: candidate.start,
+          end: candidate.start + candidate.duration,
+          windows
+        })
+        : clamp01(0.64 * candidate.score + 0.36 * candidate.auditScore)
+      const introText = String(candidate.text || '').trim()
+      const introSignals = introText
+        ? scoreTranscriptSignals(introText.toLowerCase())
+        : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0 }
+      const introClarity = introText
+        ? clamp01(
+          0.4 * scoreHookOpenLoopSignal(introText) +
+          0.24 * introSignals.keywordIntensity +
+          0.22 * introSignals.curiosityTrigger +
+          0.14 * (1 - introSignals.fillerDensity)
+        )
+        : clamp01(0.86 * candidate.auditScore + 0.08)
+      const openerQuality = clamp01(0.72 * instantHold + 0.28 * introClarity)
+      const selectionScore = clamp01(0.68 * confidence + 0.32 * openerQuality)
+      return { candidate, confidence, openerQuality, selectionScore }
+    })
+    .sort((a, b) => (
+      b.selectionScore - a.selectionScore ||
+      b.confidence - a.confidence ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
+    ))
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
     hasTranscript,
     signalStrength,
     thresholdOffset
   })
-  const strict = ranked.find((entry) => entry.candidate.auditPassed && entry.confidence >= threshold)
+  const strictWithInstantHold = ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    entry.confidence >= threshold &&
+    entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN
+  ))
+  const strict = strictWithInstantHold || ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    entry.confidence >= threshold
+  ))
   if (strict) {
     return {
       candidate: strict.candidate,
@@ -7758,7 +7799,16 @@ const selectRenderableHookCandidate = ({
     0.4,
     threshold
   )
+  const relaxedInstantHoldFloor = clamp(
+    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.08 : 0.14) - (signalStrength < 0.5 ? 0.05 : 0),
+    0.34,
+    HOOK_STANDARD_INSTANT_HOLD_MIN
+  )
   const relaxed = ranked.find((entry) => (
+    entry.confidence >= relaxedThreshold &&
+    entry.openerQuality >= relaxedInstantHoldFloor &&
+    (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
+  )) || ranked.find((entry) => (
     entry.confidence >= relaxedThreshold &&
     (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
   ))
@@ -7769,8 +7819,8 @@ const selectRenderableHookCandidate = ({
       threshold,
       usedFallback: true,
       reason: hasTranscript
-        ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment (no fixed timestamp).'
-        : 'Hook fallback selected from this video\'s strongest non-verbal peak due missing transcript context (no fixed timestamp).'
+        ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment with better first-3-second hold (no fixed timestamp).'
+        : 'Hook fallback selected from this video\'s strongest non-verbal peak with higher first-3-second hold due missing transcript context (no fixed timestamp).'
     }
   }
   return null
@@ -7927,6 +7977,11 @@ const buildFallbackHookCandidateFromStorySegments = ({
         windows,
         baseline: dynamicBaseline
       })
+      const instantHold = computeHookInstantHoldScore({
+        start: hookStart,
+        end: hookEnd,
+        windows
+      })
       const peakImpact = peakWindow?.impact ?? clamp01(
         0.36 * hookSignal +
         0.24 * energy +
@@ -7936,19 +7991,20 @@ const buildFallbackHookCandidateFromStorySegments = ({
         0.05 * curiosity
       )
       const score = clamp01(
-        0.2 * hookSignal +
-        0.19 * energy +
-        0.12 * emotion +
-        0.1 * vocal +
-        0.08 * action +
+        0.16 * hookSignal +
+        0.14 * energy +
+        0.1 * emotion +
+        0.08 * vocal +
+        0.07 * action +
         0.06 * curiosity +
         0.04 * speech +
-        0.04 * scene +
-        0.19 * peakImpact +
-        0.1 * spikeDensity +
-        0.1 * dynamicLift.score +
-        0.07 * dynamicLift.peakDensity -
-        0.05 * silenceRatio
+        0.03 * scene +
+        0.15 * peakImpact +
+        0.09 * spikeDensity +
+        0.08 * dynamicLift.score +
+        0.05 * dynamicLift.peakDensity +
+        0.15 * instantHold -
+        0.06 * silenceRatio
       )
       return {
         start: hookStart,
@@ -7976,7 +8032,7 @@ const buildFallbackHookCandidateFromStorySegments = ({
     auditScore: Number(clamp01(confidence - 0.02).toFixed(4)),
     auditPassed: false,
     text: '',
-    reason: 'Fallback hook selected from this video\'s highest-impact energy peak after weak candidate pool (no fixed timestamp).',
+    reason: 'Fallback hook selected from this video\'s highest-impact energy peak with strongest first-3-second hold after weak candidate pool (no fixed timestamp).',
     synthetic: true
   } as HookCandidate
 }
@@ -9070,6 +9126,87 @@ const scoreHookOpenLoopSignal = (text: string) => {
   return clamp01(score)
 }
 
+const computeHookInstantHoldScore = ({
+  start,
+  end,
+  windows,
+  introSeconds = HOOK_OPENER_FIRST_SECONDS
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  introSeconds?: number
+}) => {
+  const introWindowSeconds = Math.max(0.6, Number(introSeconds || HOOK_OPENER_FIRST_SECONDS))
+  const introEnd = Math.min(end, start + introWindowSeconds)
+  if (introEnd - start <= 0.2 || !windows.length) return 0
+  const introHook = averageWindowMetric(windows, start, introEnd, (window) => window.hookScore ?? window.score)
+  const introCuriosity = averageWindowMetric(windows, start, introEnd, (window) => (window.curiosityTrigger ?? 0))
+  const introEmotion = averageWindowMetric(windows, start, introEnd, (window) => window.emotionIntensity)
+  const introVocal = averageWindowMetric(windows, start, introEnd, (window) => window.vocalExcitement)
+  const introAction = averageWindowMetric(windows, start, introEnd, (window) => window.actionSpike ?? 0)
+  const introSpeech = averageWindowMetric(windows, start, introEnd, (window) => window.speechIntensity)
+  const firstBeatEnd = Math.min(introEnd, start + Math.min(1.2, Math.max(0.4, introWindowSeconds * 0.45)))
+  const firstBeatSignal = averageWindowMetric(windows, start, firstBeatEnd, (window) => (
+    0.45 * (window.hookScore ?? window.score) +
+    0.2 * (window.curiosityTrigger ?? 0) +
+    0.14 * window.emotionIntensity +
+    0.12 * window.vocalExcitement +
+    0.09 * (window.actionSpike ?? 0)
+  ))
+  const secondBeatSignal = firstBeatEnd < introEnd
+    ? averageWindowMetric(windows, firstBeatEnd, introEnd, (window) => (
+      0.42 * (window.hookScore ?? window.score) +
+      0.22 * (window.curiosityTrigger ?? 0) +
+      0.16 * window.emotionIntensity +
+      0.12 * window.vocalExcitement +
+      0.08 * (window.actionSpike ?? 0)
+    ))
+    : firstBeatSignal
+  const momentum = clamp01(0.5 + (secondBeatSignal - firstBeatSignal) * 1.45)
+  return Number(clamp01(
+    0.3 * introHook +
+    0.2 * introCuriosity +
+    0.16 * introEmotion +
+    0.12 * introVocal +
+    0.1 * introAction +
+    0.06 * introSpeech +
+    0.06 * momentum
+  ).toFixed(4))
+}
+
+const computeHookIntroClarityScore = ({
+  start,
+  end,
+  transcriptCues
+}: {
+  start: number
+  end: number
+  transcriptCues: TranscriptCue[]
+}) => {
+  const introEnd = Math.min(end, start + HOOK_OPENER_FIRST_SECONDS)
+  const introText = extractHookText(start, introEnd, transcriptCues).trim()
+  if (!introText) return transcriptCues.length ? 0.46 : 0.52
+  const words = introText.split(/\s+/).filter(Boolean)
+  if (!words.length) return 0.46
+  const signals = scoreTranscriptSignals(introText.toLowerCase())
+  const contextPenalty = evaluateHookContextDependency(start, introEnd, transcriptCues)
+  const leadWordPenalty = /^(and|but|so|then|because|this|that|it|they|we)\b/i.test(words[0] || '')
+    ? 0.12
+    : 0
+  const wordDensity = clamp01(words.length / 8)
+  const openLoop = scoreHookOpenLoopSignal(introText)
+  return Number(clamp01(
+    0.32 * wordDensity +
+    0.24 * signals.keywordIntensity +
+    0.18 * signals.curiosityTrigger +
+    0.14 * openLoop +
+    0.12 * (1 - signals.fillerDensity) -
+    0.34 * contextPenalty -
+    leadWordPenalty
+  ).toFixed(4))
+}
+
 const runHookAudit = ({
   start,
   end,
@@ -9245,11 +9382,13 @@ const buildHookPartitions = (durationSeconds: number) => {
 const scoreHookFaceoffCandidate = ({
   candidate,
   windows,
-  hookCalibration
+  hookCalibration,
+  transcriptCues
 }: {
   candidate: HookCandidate
   windows: EngagementWindow[]
   hookCalibration?: HookCalibrationProfile | null
+  transcriptCues?: TranscriptCue[]
 }) => {
   const computeEmotionalHookPull = (start: number, end: number) => {
     const duration = Math.max(0.5, end - start)
@@ -9301,13 +9440,25 @@ const scoreHookFaceoffCandidate = ({
     0.16 * (window.actionSpike ?? 0) +
     0.2 * emotionalPull
   ))
+  const instantHold = computeHookInstantHoldScore({
+    start,
+    end,
+    windows
+  })
+  const introClarity = computeHookIntroClarityScore({
+    start,
+    end,
+    transcriptCues: Array.isArray(transcriptCues) ? transcriptCues : []
+  })
   const faceoffScore = clamp01(
     weights.candidateScore * candidate.score +
     weights.auditScore * candidate.auditScore +
     weights.energy * energy +
     weights.curiosity * curiosity +
     weights.emotionalSpike * emotionalSpike +
-    0.12 * emotionalPull
+    0.08 * emotionalPull +
+    0.08 * instantHold +
+    0.06 * introClarity
   )
   return Number(faceoffScore.toFixed(4))
 }
@@ -9402,6 +9553,16 @@ const pickTopHookCandidates = ({
       )
       const boostedCuriosityAcceleration = clamp01(curiosityAcceleration * emotionalTuning.curiosityBoost)
       const tunedContextPenalty = clamp01(contextPenalty * emotionalTuning.contextPenaltyMultiplier)
+      const instantHoldScore = computeHookInstantHoldScore({
+        start: aligned.start,
+        end: aligned.end,
+        windows
+      })
+      const introClarityScore = computeHookIntroClarityScore({
+        start: aligned.start,
+        end: aligned.end,
+        transcriptCues
+      })
       const audit = runHookAudit({
         start: aligned.start,
         end: aligned.end,
@@ -9409,19 +9570,21 @@ const pickTopHookCandidates = ({
         windows
       })
       const totalScore = clamp01(
-        0.17 * baseHookScore +
-        0.14 * speechImpact +
-        0.11 * transcriptImpact +
-        0.1 * visualImpact +
-        0.12 * emotionImpact +
-        0.12 * emotionalHookPull +
-        0.07 * boostedCuriosityAcceleration +
-        0.07 * openLoopSignal +
-        0.05 * durationAlignment +
-        0.14 * audit.auditScore +
-        0.07 * dynamicLift.score +
-        0.06 * dynamicLift.peakDensity -
-        0.16 * tunedContextPenalty
+        0.14 * baseHookScore +
+        0.11 * speechImpact +
+        0.09 * transcriptImpact +
+        0.08 * visualImpact +
+        0.1 * emotionImpact +
+        0.09 * emotionalHookPull +
+        0.08 * boostedCuriosityAcceleration +
+        0.06 * openLoopSignal +
+        0.1 * instantHoldScore +
+        0.09 * introClarityScore +
+        0.04 * durationAlignment +
+        0.12 * audit.auditScore +
+        0.06 * dynamicLift.score +
+        0.04 * dynamicLift.peakDensity -
+        0.14 * tunedContextPenalty
       )
       evaluated.push({
         start: aligned.start,
@@ -9432,8 +9595,8 @@ const pickTopHookCandidates = ({
         auditPassed: audit.passed,
         text: hookText,
         reason: audit.passed
-          ? 'Best-moment candidate passed hook audit after video-specific timeline scoring.'
-          : `${audit.reasons.join('; ')} Evaluated against this video timeline (no fixed timestamp).`
+          ? 'Best-moment candidate passed hook audit and first-3-second instant-hold scoring from this video timeline.'
+          : `${audit.reasons.join('; ')} First-3-second instant-hold score was too weak for priority selection on this video timeline.`
       })
     }
   }
@@ -9459,7 +9622,7 @@ const pickTopHookCandidates = ({
     const key = `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
     const cached = faceoffScoreCache.get(key)
     if (cached !== undefined) return cached
-    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration })
+    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration, transcriptCues })
     faceoffScoreCache.set(key, score)
     return score
   }
@@ -18934,7 +19097,8 @@ const processJob = async (
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength,
-        thresholdOffset: hookThresholdOffset
+        thresholdOffset: hookThresholdOffset,
+        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
       if (!resolvedHookDecision) {
@@ -18956,7 +19120,7 @@ const processJob = async (
           auditScore: 0.44,
           auditPassed: false,
           text: '',
-          reason: 'Fallback hook generated from this video\'s strongest high-energy moment due weak candidate pool (no fixed timestamp).',
+          reason: 'Fallback hook generated from this video\'s strongest high-energy moment with best available first-3-second hold due weak candidate pool (no fixed timestamp).',
           synthetic: true
         }
         resolvedHookDecision = {
