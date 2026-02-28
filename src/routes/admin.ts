@@ -147,6 +147,17 @@ const toMb = (value: number) => Number((Math.max(0, Number(value || 0)) / (1024 
 const toGb = (value: number) => Number((Math.max(0, Number(value || 0)) / (1024 * 1024 * 1024)).toFixed(2))
 const toPct = (numerator: number, denominator: number) =>
   denominator > 0 ? Number(((numerator / denominator) * 100).toFixed(1)) : 0
+const toFixedNumber = (value: number, digits = 2) => Number((Number.isFinite(value) ? value : 0).toFixed(digits))
+
+const medianOfNumbers = (values: number[]) => {
+  const sorted = values
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => a - b)
+  if (!sorted.length) return 0
+  const mid = Math.floor(sorted.length / 2)
+  if (sorted.length % 2 === 0) return (sorted[mid - 1] + sorted[mid]) / 2
+  return sorted[mid]
+}
 
 const parseIpForGeo = (value: unknown) => {
   const raw = String(value || '').trim()
@@ -3400,6 +3411,200 @@ router.get('/live-geo', async (_req, res) => {
 router.get('/command-center', async (_req, res) => {
   const payload = await buildCommandCenterPayload()
   return res.json(payload)
+})
+
+router.get('/analytics', async (_req, res) => {
+  const [users, jobs, eventsRaw] = await Promise.all([
+    getUsers(),
+    prisma.job
+      .findMany({
+        select: { userId: true }
+      })
+      .catch(() => [] as any[]),
+    prisma.siteAnalyticsEvent
+      .findMany({
+        select: {
+          userId: true,
+          sessionId: true,
+          eventName: true,
+          category: true,
+          pagePath: true,
+          createdAt: true
+        },
+        orderBy: { createdAt: 'asc' }
+      })
+      .catch(() => [] as any[])
+  ])
+
+  const events = Array.isArray(eventsRaw) ? eventsRaw : []
+  const allTimeAccounts = users.length
+  const trackedUsers = new Set<string>()
+  const renderUsers = new Set<string>()
+  const sessionMap = new Map<
+    string,
+    {
+      startMs: number
+      endMs: number
+      events: number
+      pageViewCount: number
+      pageEvents: Array<{ ms: number; pagePath: string; userId: string | null }>
+      pages: Set<string>
+    }
+  >()
+  const pageMap = new Map<
+    string,
+    {
+      views: number
+      users: Set<string>
+      dwellTotalSec: number
+      dwellSamples: number
+    }
+  >()
+  const dwellSamplesAllSec: number[] = []
+
+  for (const job of jobs) {
+    const userId = String((job as any)?.userId || '').trim()
+    if (!userId) continue
+    renderUsers.add(userId)
+  }
+
+  for (const event of events) {
+    const userId = String((event as any)?.userId || '').trim()
+    if (userId) trackedUsers.add(userId)
+
+    const pagePathRaw = String((event as any)?.pagePath || '').trim()
+    const pagePath = pagePathRaw || null
+    const createdMs = asMs((event as any)?.createdAt)
+    if (!createdMs) continue
+    const isPageView = isImpressionEvent(event as any)
+
+    if (pagePath && isPageView) {
+      const page = pageMap.get(pagePath) || {
+        views: 0,
+        users: new Set<string>(),
+        dwellTotalSec: 0,
+        dwellSamples: 0
+      }
+      page.views += 1
+      if (userId) page.users.add(userId)
+      pageMap.set(pagePath, page)
+    }
+
+    const sessionId = String((event as any)?.sessionId || '').trim()
+    if (!sessionId) continue
+    const current = sessionMap.get(sessionId) || {
+      startMs: createdMs,
+      endMs: createdMs,
+      events: 0,
+      pageViewCount: 0,
+      pageEvents: [] as Array<{ ms: number; pagePath: string; userId: string | null }>,
+      pages: new Set<string>()
+    }
+    current.startMs = Math.min(current.startMs, createdMs)
+    current.endMs = Math.max(current.endMs, createdMs)
+    current.events += 1
+    if (isPageView) current.pageViewCount += 1
+    if (pagePath) {
+      current.pageEvents.push({ ms: createdMs, pagePath, userId: userId || null })
+      current.pages.add(pagePath)
+    }
+    sessionMap.set(sessionId, current)
+  }
+
+  for (const session of sessionMap.values()) {
+    if (!session.pageEvents.length) continue
+    const timeline = session.pageEvents.sort((a, b) => a.ms - b.ms)
+    for (let index = 0; index < timeline.length; index += 1) {
+      const current = timeline[index]
+      const next = timeline[index + 1]
+      const dwellSec = next && next.ms > current.ms
+        ? clamp((next.ms - current.ms) / 1000, 1, 1800)
+        : 20
+      const page = pageMap.get(current.pagePath) || {
+        views: 0,
+        users: new Set<string>(),
+        dwellTotalSec: 0,
+        dwellSamples: 0
+      }
+      if (current.userId) page.users.add(current.userId)
+      page.dwellTotalSec += dwellSec
+      page.dwellSamples += 1
+      pageMap.set(current.pagePath, page)
+      dwellSamplesAllSec.push(dwellSec)
+    }
+  }
+
+  const sessionDurationsSec = Array.from(sessionMap.values()).map((session) =>
+    clamp((session.endMs - session.startMs) / 1000, 0, 8 * 60 * 60)
+  )
+  const totalPageViews = Array.from(pageMap.values()).reduce((sum, row) => sum + row.views, 0)
+  const totalPagesVisitedAcrossSessions = Array.from(sessionMap.values()).reduce((sum, row) => sum + row.pages.size, 0)
+  const totalPageViewSessions = Array.from(sessionMap.values()).filter((row) => row.pageViewCount > 0).length
+  const bouncedSessions = Array.from(sessionMap.values()).filter((row) => row.pageViewCount <= 1).length
+
+  const avgSessionMinutes = sessionDurationsSec.length
+    ? toFixedNumber(sessionDurationsSec.reduce((sum, value) => sum + value, 0) / sessionDurationsSec.length / 60, 2)
+    : 0
+  const medianSessionMinutes = sessionDurationsSec.length
+    ? toFixedNumber(medianOfNumbers(sessionDurationsSec) / 60, 2)
+    : 0
+  const avgTimeOnPageSeconds = dwellSamplesAllSec.length
+    ? toFixedNumber(dwellSamplesAllSec.reduce((sum, value) => sum + value, 0) / dwellSamplesAllSec.length, 1)
+    : 0
+  const medianTimeOnPageSeconds = dwellSamplesAllSec.length
+    ? toFixedNumber(medianOfNumbers(dwellSamplesAllSec), 1)
+    : 0
+  const avgPagesPerSession = totalPageViewSessions > 0
+    ? toFixedNumber(totalPagesVisitedAcrossSessions / totalPageViewSessions, 2)
+    : 0
+  const avgEventsPerSession = sessionMap.size > 0
+    ? toFixedNumber(events.length / sessionMap.size, 2)
+    : 0
+  const bounceRatePct = totalPageViewSessions > 0
+    ? toFixedNumber((bouncedSessions / totalPageViewSessions) * 100, 1)
+    : 0
+
+  const pages = Array.from(pageMap.entries())
+    .map(([pagePath, row]) => ({
+      pagePath,
+      views: row.views,
+      uniqueUsers: row.users.size,
+      avgTimeSeconds: row.dwellSamples > 0 ? toFixedNumber(row.dwellTotalSec / row.dwellSamples, 1) : 0,
+      totalTimeMinutes: toFixedNumber(row.dwellTotalSec / 60, 2)
+    }))
+    .filter((row) => row.views > 0 || row.totalTimeMinutes > 0)
+
+  const topPagesByViews = pages
+    .slice()
+    .sort((a, b) => b.views - a.views || b.uniqueUsers - a.uniqueUsers || b.avgTimeSeconds - a.avgTimeSeconds)
+    .slice(0, 12)
+  const topPagesByTime = pages
+    .slice()
+    .sort((a, b) => b.avgTimeSeconds - a.avgTimeSeconds || b.views - a.views)
+    .slice(0, 12)
+
+  return res.json({
+    generatedAt: new Date().toISOString(),
+    totals: {
+      allTimeTrackedUsers: trackedUsers.size,
+      allTimeAccounts,
+      allTimeRenderUsers: renderUsers.size,
+      allTimeEvents: events.length,
+      allTimeSessions: sessionMap.size,
+      allTimePageViews: totalPageViews
+    },
+    engagement: {
+      avgSessionMinutes,
+      medianSessionMinutes,
+      avgTimeOnPageSeconds,
+      medianTimeOnPageSeconds,
+      avgPagesPerSession,
+      avgEventsPerSession,
+      bounceRatePct
+    },
+    topPagesByViews,
+    topPagesByTime
+  })
 })
 
 router.post('/ai-self-improvement', async (req: any, res) => {

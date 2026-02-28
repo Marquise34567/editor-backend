@@ -1302,7 +1302,7 @@ type EditOptions = {
   manualTimestampConfig?: ManualTimestampConfig | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
-type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast'
+type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast' | 'ultra' | 'retention-king'
 type HookSelectionMode = 'manual' | 'auto'
 type LongFormPreset = 'auto' | 'balanced' | 'aggressive' | 'ultra'
 type EffectPreviewType = 'transitions' | 'swoosh' | 'zooms' | 'all' | 'auto'
@@ -1340,6 +1340,29 @@ type VideoNicheProfile = {
     transcriptCueCount: number
     durationSeconds: number
   }
+}
+type RetentionKingBlendLevel = 'light' | 'medium' | 'heavy'
+type VideoAutoDetectProfileStage = 'upload' | 'analyze' | 'process'
+type VideoAutoDetectProfile = {
+  version: number
+  updatedAt: string
+  stage: VideoAutoDetectProfileStage
+  preset: LongFormPreset
+  format: RetentionContentFormat
+  style: ContentStyle | 'unknown'
+  contentType: PacingNiche | 'general'
+  confidence: number
+  qualityScoreBefore: number | null
+  qualityScoreAfter: number | null
+  qualityDelta: number | null
+  retentionKingBlendPct: number
+  retentionKingBlendLevel: RetentionKingBlendLevel
+  retentionKingReason: string
+  recommendedStrategyProfile: RetentionStrategyProfile
+  recommendedAggressionLevel: RetentionAggressionLevel
+  retentionKingApplied: boolean
+  thoughtBefore: string
+  thoughtAfter: string | null
 }
 
 const HOOK_MIN = EDITOR_RETENTION_CONFIG.hookMin
@@ -1395,7 +1418,7 @@ const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
 const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
 const EFFECT_PREVIEW_PROXY_WIDTH = 854
 const EFFECT_PREVIEW_PROXY_HEIGHT = 480
-const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'education', 'podcast']
+const EDITOR_MODE_VALUES: EditorModeSelection[] = ['auto', 'reaction', 'commentary', 'savage-roast', 'vlog', 'gaming', 'sports', 'education', 'podcast', 'ultra', 'retention-king']
 const HOOK_SELECTION_MODE_VALUES: HookSelectionMode[] = ['manual', 'auto']
 const MANUAL_TIMESTAMP_MARKER_TYPES: ManualTimestampMarkerType[] = ['keep', 'remove', 'hook', 'zoom']
 const MANUAL_TIMESTAMP_SUGGESTION_TYPES: ManualTimestampSuggestionType[] = ['hook', 'remove', 'cut']
@@ -1408,7 +1431,9 @@ const EDITOR_MODE_TO_STYLE: Record<Exclude<EditorModeSelection, 'auto'>, Content
   gaming: 'gaming',
   sports: 'reaction',
   education: 'tutorial',
-  podcast: 'tutorial'
+  podcast: 'tutorial',
+  ultra: 'reaction',
+  'retention-king': 'story'
 }
 const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingNiche> = {
   reaction: 'high_energy',
@@ -1418,7 +1443,9 @@ const EDITOR_MODE_TO_NICHE: Record<Exclude<EditorModeSelection, 'auto'>, PacingN
   gaming: 'high_energy',
   sports: 'high_energy',
   education: 'education',
-  podcast: 'talking_head'
+  podcast: 'talking_head',
+  ultra: 'high_energy',
+  'retention-king': 'high_energy'
 }
 const resolveLowRetentionRecoveryEditorMode = ({
   contentFormat,
@@ -1686,7 +1713,60 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
   gaming: { target: 70, floor: 61 },
   sports: { target: 70, floor: 61 },
   education: { target: 67, floor: 60 },
-  podcast: { target: 66, floor: 60 }
+  podcast: { target: 66, floor: 60 },
+  ultra: { target: 79, floor: 68 },
+  'retention-king': { target: 82, floor: 70 }
+}
+const ULTRA_MODE_PLAYBOOK_PROMPT = `Dynamic Binge Editor Prompt
+Step 1: Analyze content type quickly, detect weak spots, then adapt edits dynamically.
+Step 2: Ruthless cuts, no dead air, micro-hooks every 5-15 seconds, front-load value in first 10-20 seconds, and close with verbal tease + preview + playlist/end-screen push.
+Step 3: Apply type-specific adaptation (challenge, story, tutorial, reaction, list, gaming, ASMR, humor, documentary, hybrid) with pacing and visual pattern interrupts tuned to that type.
+Universal boosters: bold timed subtitles, constant visual/audio changes, re-hooks, and test for any >20% drop-off risk windows.`
+const RETENTION_KING_PLAYBOOK_PROMPT = `Retention Engineer Prompt
+Objective: maximize watch time, completion rate, and emotional momentum while eliminating drop-off.
+Rules: first 5-8 seconds must deliver strongest curiosity or emotional spike; remove filler/dead air/repetition; compress aggressively without losing clarity.
+Every 5-12 seconds introduce a pacing shift, visual change, pattern interrupt, or tension spike.
+Use curiosity looping, emotional escalation, and micro-payoffs; adapt behavior by format (educational, story, commentary, vlog, talking head, tutorial).
+Before final render, re-test intro strength, 3-second scroll risk windows, and ending satisfaction/anticipation.`
+
+type EditorModePlaybook = {
+  id: 'standard' | 'ultra' | 'retention_king'
+  label: string
+  prompt: string
+  notes: string[]
+}
+
+const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorModePlaybook => {
+  if (mode === 'ultra') {
+    return {
+      id: 'ultra',
+      label: 'Ultra Mode',
+      prompt: ULTRA_MODE_PLAYBOOK_PROMPT,
+      notes: [
+        'Ultra mode playbook active: dynamic binge editing profile enabled.',
+        'Ultra mode enforces fast-mode processing and upload acceleration.',
+        'Ultra mode front-loads hooks and forces frequent micro-interrupts.'
+      ]
+    }
+  }
+  if (mode === 'retention-king') {
+    return {
+      id: 'retention_king',
+      label: 'Retention King',
+      prompt: RETENTION_KING_PLAYBOOK_PROMPT,
+      notes: [
+        'Retention King playbook active: retention-engineering profile enabled.',
+        'Retention King aggressively removes drop-off windows and low-energy stretches.',
+        'Retention King injects curiosity loops and emotional momentum checkpoints.'
+      ]
+    }
+  }
+  return {
+    id: 'standard',
+    label: 'Standard',
+    prompt: '',
+    notes: []
+  }
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
   low: 0.62,
@@ -2074,6 +2154,8 @@ const applyDurationBandSpeedTuning = ({
       target = Math.min(target, band.maxSpeed - 0.05)
     } else if (energyEditorMode === 'podcast') {
       target = Math.min(target, band.maxSpeed - 0.09)
+    } else if (energyEditorMode === 'retention-king') {
+      target = Math.min(target, band.maxSpeed - 0.03)
     }
     if (energyEditorMode === 'sports') {
       target += 0.06
@@ -2081,6 +2163,10 @@ const applyDurationBandSpeedTuning = ({
       target += 0.03
     } else if (energyEditorMode === 'reaction') {
       target += 0.025
+    } else if (energyEditorMode === 'ultra') {
+      target += 0.085
+    } else if (energyEditorMode === 'retention-king') {
+      target += 0.055
     }
     target = clamp(target, band.minSpeed, band.maxSpeed)
     return { ...segment, speed: Number(target.toFixed(3)) }
@@ -2136,6 +2222,8 @@ const resolveClipCandidateTarget = ({
   else if (editorMode === 'savage-roast') target += 5
   else if (editorMode === 'reaction') target += 4
   else if (editorMode === 'gaming') target += 3
+  else if (editorMode === 'ultra') target += 8
+  else if (editorMode === 'retention-king') target += 6
   else if (editorMode === 'podcast') target -= 3
   else if (editorMode === 'commentary') target -= 1
   if (nicheProfile?.niche === 'high_energy') target += 4
@@ -2174,6 +2262,8 @@ const resolveAutoExportClipTarget = ({
   else if (editorMode === 'savage-roast') target += 3
   else if (editorMode === 'reaction') target += 2
   else if (editorMode === 'gaming') target += 1
+  else if (editorMode === 'ultra') target += 4
+  else if (editorMode === 'retention-king') target += 3
   else if (editorMode === 'podcast') target -= 2
   if (nicheProfile?.niche === 'high_energy') target += 2
   return clamp(Math.round(target), CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX)
@@ -2220,6 +2310,12 @@ const resolveInterruptIntervalRange = ({
   } else if (editorMode === 'podcast') {
     minSec = 4
     maxSec = 6.2
+  } else if (editorMode === 'ultra') {
+    minSec = 1.9
+    maxSec = 3.1
+  } else if (editorMode === 'retention-king') {
+    minSec = 2.2
+    maxSec = 3.5
   }
   if (styleProfile?.style === 'tutorial') {
     minSec = Math.max(minSec, 3)
@@ -2289,6 +2385,12 @@ const computeNicheFitScore = ({
   }
   if (mode === 'savage-roast') {
     return clamp01(0.52 * action + 0.32 * emotion + 0.16 * curiosity)
+  }
+  if (mode === 'ultra') {
+    return clamp01(0.5 * action + 0.26 * emotion + 0.24 * curiosity)
+  }
+  if (mode === 'retention-king') {
+    return clamp01(0.31 * speech + 0.27 * action + 0.24 * emotion + 0.18 * curiosity)
   }
   if (mode === 'gaming') {
     return clamp01(0.5 * action + 0.28 * emotion + 0.22 * curiosity)
@@ -5022,6 +5124,7 @@ const buildPersistedRenderSettings = (
     longFormAggression?: number | null
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
+    fastMode?: boolean | null
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
   }
@@ -5045,6 +5148,7 @@ const buildPersistedRenderSettings = (
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
   const tangentKiller = typeof opts?.tangentKiller === 'boolean' ? opts.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const fastMode = typeof opts?.fastMode === 'boolean' ? opts.fastMode : null
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
     ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
@@ -5076,6 +5180,7 @@ const buildPersistedRenderSettings = (
     long_form_clarity_vs_speed: longFormClarityVsSpeed,
     tangentKiller,
     tangent_killer: tangentKiller,
+    ...(fastMode === null ? {} : { fastMode, fast_mode: fastMode }),
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
     ...(smartZoom === null ? {} : { smartZoom }),
     ...(transitions === null ? {} : { transitions }),
@@ -5102,6 +5207,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression,
   longFormClarityVsSpeed,
   tangentKiller,
+  fastMode,
   manualTimestampConfig,
   verticalCaptionConfig,
   retentionTargetPlatform,
@@ -5121,6 +5227,7 @@ const buildPersistedRenderAnalysis = ({
   longFormAggression?: number | null
   longFormClarityVsSpeed?: number | null
   tangentKiller?: boolean | null
+  fastMode?: boolean | null
   manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
@@ -5206,6 +5313,13 @@ const buildPersistedRenderAnalysis = ({
         parseBooleanFlag((existing as any)?.removeTangents)
       )
   ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
+  const resolvedFastMode = typeof fastMode === 'boolean'
+    ? fastMode
+    : (
+      parseBooleanFlag((existing as any)?.fastMode) ??
+      parseBooleanFlag((existing as any)?.fast_mode) ??
+      null
+    )
   const resolvedManualTimestampConfig = (
     parseManualTimestampConfig(manualTimestampConfig) ??
     parseManualTimestampConfig((existing as any)?.manualTimestamp ?? (existing as any)?.manual_timestamp) ??
@@ -5311,6 +5425,10 @@ const buildPersistedRenderAnalysis = ({
   payload.long_form_clarity_vs_speed = resolvedLongFormClarityVsSpeed
   payload.tangentKiller = resolvedTangentKiller
   payload.tangent_killer = resolvedTangentKiller
+  if (resolvedFastMode !== null) {
+    payload.fastMode = resolvedFastMode
+    payload.fast_mode = resolvedFastMode
+  }
   if (resolvedManualTimestampConfig) {
     Object.assign(payload, buildManualTimestampPersistenceFields(resolvedManualTimestampConfig))
   }
@@ -8439,7 +8557,14 @@ const inferHighEnergyVerticalClip = ({
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
 }) => {
-  if (editorMode === 'reaction' || editorMode === 'savage-roast' || editorMode === 'gaming' || editorMode === 'sports') return true
+  if (
+    editorMode === 'reaction' ||
+    editorMode === 'savage-roast' ||
+    editorMode === 'gaming' ||
+    editorMode === 'sports' ||
+    editorMode === 'ultra' ||
+    editorMode === 'retention-king'
+  ) return true
   if (styleProfile?.style === 'reaction' || styleProfile?.style === 'gaming') return true
   if (nicheProfile?.niche === 'high_energy') return true
   const energy = averageWindowMetric(
@@ -8475,6 +8600,12 @@ const buildAutoVerticalCaptionPool = ({
   }
   if (editorMode === 'savage-roast') {
     return ['BRO WHAT?! 😂', 'THAT IS COLD-BLOODED 💀', 'WHAT THE F*** JUST HAPPENED?! 🔥', 'CHAT IS LOSING IT 😭']
+  }
+  if (editorMode === 'ultra') {
+    return ['DON\'T SCROLL 🔥', 'WAIT FOR THE TWIST 👀', 'THIS PART HITS HARD ⚡', 'WATCH THIS ALL THE WAY 😤']
+  }
+  if (editorMode === 'retention-king') {
+    return ['STAY TO THE END 👑', 'EVERY SECOND MATTERS ⏱️', 'THIS PAYOFF IS WORTH IT 🎯']
   }
   if (editorMode === 'gaming' || editorMode === 'sports' || styleProfile?.style === 'gaming') {
     return ['NO WAY 🤯', 'CLUTCH MOMENT 🎯', 'RUN IT BACK 🔁', 'THIS IS WILD 😤']
@@ -10672,6 +10803,7 @@ const buildRetentionMetadataSummary = ({
   contentFormat,
   targetPlatform,
   strategyProfile,
+  autoDetectProfile,
   outcomeMenuProfile,
   outcomeMenuApply
 }: {
@@ -10700,6 +10832,7 @@ const buildRetentionMetadataSummary = ({
   contentFormat?: RetentionContentFormat | null
   targetPlatform?: RetentionTargetPlatform | null
   strategyProfile?: RetentionStrategyProfile | null
+  autoDetectProfile?: VideoAutoDetectProfile | null
   outcomeMenuProfile?: OutcomeMenuProfile | null
   outcomeMenuApply?: OutcomeMenuApplyResult | null
 }) => {
@@ -10877,6 +11010,7 @@ const buildRetentionMetadataSummary = ({
       strategyProfile: strategyProfile ?? judge?.strategy_profile ?? null,
       contentFormat: contentFormat ?? judge?.content_format ?? null,
       targetPlatform: targetPlatform ?? judge?.target_platform ?? null,
+      autoDetect: autoDetectProfile || null,
       hookSelectionSource: hookSelectionSource ?? 'auto',
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
@@ -14095,6 +14229,8 @@ const buildVerticalClipSelection = (
     opts?.editorMode === 'savage-roast' ||
     opts?.editorMode === 'gaming' ||
     opts?.editorMode === 'sports' ||
+    opts?.editorMode === 'ultra' ||
+    opts?.editorMode === 'retention-king' ||
     opts?.nicheProfile?.niche === 'high_energy' ||
     opts?.styleProfile?.style === 'reaction' ||
     opts?.styleProfile?.style === 'gaming'
@@ -14316,6 +14452,8 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   else if (editorMode === 'savage-roast') combined -= 0.32
   else if (editorMode === 'gaming') combined -= 0.24
   else if (editorMode === 'reaction') combined -= 0.18
+  else if (editorMode === 'ultra') combined -= 0.52
+  else if (editorMode === 'retention-king') combined -= 0.4
   else if (editorMode === 'education') combined += 0.28
   else if (editorMode === 'commentary') combined += 0.18
   else if (editorMode === 'podcast') combined += 0.34
@@ -14383,6 +14521,14 @@ const getVerticalModeScoreBias = (
   }
   if (editorMode === 'reaction') {
     bias = addVerticalModeScoreBias(bias, { hook: 0.03, interrupt: 0.05, ending: 0.01, energy: 0.03, caption: -0.01 })
+    return bias
+  }
+  if (editorMode === 'ultra') {
+    bias = addVerticalModeScoreBias(bias, { hook: 0.07, interrupt: 0.1, ending: 0.03, energy: 0.08, caption: -0.02 })
+    return bias
+  }
+  if (editorMode === 'retention-king') {
+    bias = addVerticalModeScoreBias(bias, { hook: 0.09, interrupt: 0.08, ending: 0.06, energy: 0.06, caption: 0.02 })
     return bias
   }
   if (editorMode === 'education') {
@@ -15877,6 +16023,506 @@ const resolveRuntimeRetentionProfile = ({
   }
 }
 
+const parseScore100 = (value: any): number | null => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return Number(clamp(numeric, 0, 100).toFixed(1))
+}
+
+const parseVideoAutoDetectProfile = (value: any): VideoAutoDetectProfile | null => {
+  if (!value || typeof value !== 'object') return null
+  const stageRaw = String((value as any).stage || '').trim().toLowerCase()
+  const stage: VideoAutoDetectProfileStage =
+    stageRaw === 'upload' || stageRaw === 'analyze' || stageRaw === 'process'
+      ? stageRaw
+      : 'upload'
+  const styleRaw = String((value as any).style || '').trim().toLowerCase()
+  const style: ContentStyle | 'unknown' =
+    styleRaw === 'reaction' || styleRaw === 'vlog' || styleRaw === 'tutorial' || styleRaw === 'gaming' || styleRaw === 'story'
+      ? styleRaw
+      : 'unknown'
+  const contentTypeRaw = String((value as any).contentType || (value as any).content_type || '').trim().toLowerCase()
+  const contentType: PacingNiche | 'general' =
+    contentTypeRaw === 'high_energy' || contentTypeRaw === 'education' || contentTypeRaw === 'talking_head' || contentTypeRaw === 'story'
+      ? contentTypeRaw
+      : 'general'
+  const formatRaw = String((value as any).format || (value as any).contentFormat || (value as any).content_format || '').trim().toLowerCase()
+  const format: RetentionContentFormat =
+    formatRaw === 'tiktok_short' || formatRaw === 'podcast_clip' ? formatRaw : 'youtube_long'
+  const levelRaw = String((value as any).retentionKingBlendLevel || (value as any).retention_king_blend_level || '').trim().toLowerCase()
+  const level: RetentionKingBlendLevel =
+    levelRaw === 'light' || levelRaw === 'medium' || levelRaw === 'heavy'
+      ? levelRaw
+      : 'medium'
+  const strategy = parseRetentionStrategyProfile(
+    (value as any).recommendedStrategyProfile ??
+    (value as any).recommended_strategy_profile ??
+    (value as any).retentionStrategyProfile ??
+    'balanced'
+  )
+  const aggression = parseRetentionAggressionLevel(
+    (value as any).recommendedAggressionLevel ??
+    (value as any).recommended_aggression_level ??
+    (value as any).retentionAggressionLevel ??
+    STRATEGY_TO_AGGRESSION[strategy]
+  )
+  const beforeScore = parseScore100((value as any).qualityScoreBefore ?? (value as any).quality_score_before)
+  const afterScore = parseScore100((value as any).qualityScoreAfter ?? (value as any).quality_score_after)
+  const deltaScore = parseScore100((value as any).qualityDelta ?? (value as any).quality_delta)
+  return {
+    version: Number.isFinite(Number((value as any).version)) ? Number((value as any).version) : 1,
+    updatedAt: typeof (value as any).updatedAt === 'string' ? (value as any).updatedAt : toIsoNow(),
+    stage,
+    preset: parseLongFormPreset((value as any).preset || 'balanced'),
+    format,
+    style,
+    contentType,
+    confidence: Number(clamp01(Number((value as any).confidence ?? 0.45)).toFixed(4)),
+    qualityScoreBefore: beforeScore,
+    qualityScoreAfter: afterScore,
+    qualityDelta:
+      beforeScore !== null && afterScore !== null
+        ? Number((afterScore - beforeScore).toFixed(1))
+        : deltaScore,
+    retentionKingBlendPct: Number(clamp(Number((value as any).retentionKingBlendPct ?? (value as any).retention_king_blend_pct ?? 35), 5, 85).toFixed(1)),
+    retentionKingBlendLevel: level,
+    retentionKingReason: String(
+      (value as any).retentionKingReason ??
+      (value as any).retention_king_reason ??
+      'Dynamic retention blend selected from upload quality score.'
+    ).trim(),
+    recommendedStrategyProfile: strategy,
+    recommendedAggressionLevel: aggression,
+    retentionKingApplied: Boolean((value as any).retentionKingApplied ?? (value as any).retention_king_applied),
+    thoughtBefore: String(
+      (value as any).thoughtBefore ??
+      (value as any).thought_before ??
+      'Baseline quality estimated from source signals.'
+    ).trim(),
+    thoughtAfter:
+      typeof (value as any).thoughtAfter === 'string'
+        ? (value as any).thoughtAfter
+        : typeof (value as any).thought_after === 'string'
+          ? (value as any).thought_after
+          : null
+  }
+}
+
+const resolveRetentionKingBlendFromScore = (qualityScore: number | null) => {
+  const score = parseScore100(qualityScore) ?? 62
+  if (score >= 84) {
+    return {
+      pct: 16,
+      level: 'light' as RetentionKingBlendLevel,
+      reason: 'Source quality is already strong, so Retention King runs in a light-touch mode.',
+      recommendedStrategyProfile: 'balanced' as RetentionStrategyProfile,
+      recommendedAggressionLevel: 'medium' as RetentionAggressionLevel
+    }
+  }
+  if (score >= 72) {
+    return {
+      pct: 28,
+      level: 'light' as RetentionKingBlendLevel,
+      reason: 'Good source quality detected; applying moderate Retention King pressure.',
+      recommendedStrategyProfile: 'balanced' as RetentionStrategyProfile,
+      recommendedAggressionLevel: 'high' as RetentionAggressionLevel
+    }
+  }
+  if (score >= 58) {
+    return {
+      pct: 42,
+      level: 'medium' as RetentionKingBlendLevel,
+      reason: 'Mixed baseline quality; enabling medium Retention King cleanup.',
+      recommendedStrategyProfile: 'viral' as RetentionStrategyProfile,
+      recommendedAggressionLevel: 'high' as RetentionAggressionLevel
+    }
+  }
+  return {
+    pct: 60,
+    level: 'heavy' as RetentionKingBlendLevel,
+    reason: 'Low baseline quality; Retention King escalates into rescue mode.',
+    recommendedStrategyProfile: 'viral' as RetentionStrategyProfile,
+    recommendedAggressionLevel: 'viral' as RetentionAggressionLevel
+  }
+}
+
+const resolveAutoDetectStyle = ({
+  styleProfile,
+  editorMode,
+  contentFormat,
+  windows
+}: {
+  styleProfile?: ContentStyleProfile | null
+  editorMode?: EditorModeSelection | null
+  contentFormat: RetentionContentFormat
+  windows?: EngagementWindow[]
+}): ContentStyle | 'unknown' => {
+  if (styleProfile?.style) return styleProfile.style
+  if (editorMode && editorMode !== 'auto') {
+    return EDITOR_MODE_TO_STYLE[editorMode] || 'unknown'
+  }
+  const safeWindows = Array.isArray(windows) ? windows : []
+  if (safeWindows.length) {
+    const avgSpeech = safeWindows.reduce((sum, window) => sum + window.speechIntensity, 0) / safeWindows.length
+    const avgScene = safeWindows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / safeWindows.length
+    const avgEmotion = safeWindows.reduce((sum, window) => sum + window.emotionIntensity, 0) / safeWindows.length
+    if (avgScene >= 0.46 && avgEmotion >= 0.4) return 'reaction'
+    if (avgScene >= 0.44) return 'gaming'
+    if (avgSpeech >= 0.62 && avgScene <= 0.28) return 'tutorial'
+    if (avgEmotion >= 0.52) return 'story'
+    return 'vlog'
+  }
+  if (contentFormat === 'podcast_clip') return 'tutorial'
+  if (contentFormat === 'tiktok_short') return 'reaction'
+  return 'story'
+}
+
+const resolveAutoDetectContentType = ({
+  nicheProfile,
+  style
+}: {
+  nicheProfile?: VideoNicheProfile | null
+  style: ContentStyle | 'unknown'
+}): PacingNiche | 'general' => {
+  if (nicheProfile?.niche) return nicheProfile.niche
+  if (style === 'reaction' || style === 'gaming') return 'high_energy'
+  if (style === 'tutorial') return 'education'
+  if (style === 'story' || style === 'vlog') return 'story'
+  return 'general'
+}
+
+const resolveAutoDetectedPreset = ({
+  runtimeSeconds,
+  renderMode,
+  contentFormat,
+  qualityScore
+}: {
+  runtimeSeconds: number
+  renderMode: RenderMode
+  contentFormat: RetentionContentFormat
+  qualityScore: number
+}): LongFormPreset => {
+  const runtime = Math.max(1, Number(runtimeSeconds || 0))
+  if (renderMode === 'vertical' || contentFormat === 'tiktok_short') {
+    return qualityScore >= 78 ? 'aggressive' : 'ultra'
+  }
+  if (runtime >= 45 * 60 && qualityScore >= 74) return 'balanced'
+  if (qualityScore >= 78) return 'balanced'
+  if (qualityScore >= 60) return 'aggressive'
+  return 'ultra'
+}
+
+const buildQualityThoughtBefore = ({
+  score,
+  contentFormat
+}: {
+  score: number
+  contentFormat: RetentionContentFormat
+}) => {
+  if (score >= 85) {
+    return `Baseline ${score.toFixed(1)}: source quality is strong, so edits should stay light and preserve narrative flow.`
+  }
+  if (score >= 72) {
+    return `Baseline ${score.toFixed(1)}: solid source with a few pacing dips; moderate retention tightening is recommended.`
+  }
+  if (score >= 58) {
+    return `Baseline ${score.toFixed(1)}: mixed retention signals; medium-to-strong cleanup should improve watch-through.`
+  }
+  if (contentFormat === 'podcast_clip') {
+    return `Baseline ${score.toFixed(1)}: podcast-style delivery needs stronger hook framing and strategic pattern interrupts.`
+  }
+  return `Baseline ${score.toFixed(1)}: low retention resilience detected; aggressive rescue pacing is recommended.`
+}
+
+const buildQualityThoughtAfter = ({
+  beforeScore,
+  afterScore
+}: {
+  beforeScore: number | null
+  afterScore: number | null
+}) => {
+  if (afterScore === null) return null
+  if (beforeScore === null) {
+    return `Final ${afterScore.toFixed(1)}: edit quality was scored after render with no source baseline available.`
+  }
+  const delta = Number((afterScore - beforeScore).toFixed(1))
+  if (delta >= 6) {
+    return `Final ${afterScore.toFixed(1)} (+${delta.toFixed(1)}): major retention lift after edits.`
+  }
+  if (delta >= 2) {
+    return `Final ${afterScore.toFixed(1)} (+${delta.toFixed(1)}): clear retention improvement after edits.`
+  }
+  if (delta > -2) {
+    return `Final ${afterScore.toFixed(1)} (${delta >= 0 ? '+' : ''}${delta.toFixed(1)}): retention remained roughly stable after edits.`
+  }
+  return `Final ${afterScore.toFixed(1)} (${delta.toFixed(1)}): retention dropped vs baseline and may need another pass.`
+}
+
+const estimateVideoQualityScore = ({
+  runtimeSeconds,
+  renderMode,
+  targetPlatform,
+  windows,
+  styleProfile,
+  nicheProfile,
+  hookScore,
+  videoWidth,
+  videoHeight,
+  hasAudio,
+  fallbackScore
+}: {
+  runtimeSeconds: number
+  renderMode: RenderMode
+  targetPlatform?: RetentionTargetPlatform | null
+  windows?: EngagementWindow[]
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  hookScore?: number | null
+  videoWidth?: number | null
+  videoHeight?: number | null
+  hasAudio?: boolean | null
+  fallbackScore?: number | null
+}) => {
+  const runtime = Math.max(1, Number(runtimeSeconds || 0))
+  const safeWindows = Array.isArray(windows) ? windows : []
+  const normalizedPlatform = parseRetentionTargetPlatform(targetPlatform || 'auto')
+  let score = parseScore100(fallbackScore) ?? 58
+  if (safeWindows.length > 0) {
+    const avgSpeech = safeWindows.reduce((sum, window) => sum + window.speechIntensity, 0) / safeWindows.length
+    const avgScene = safeWindows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / safeWindows.length
+    const avgEmotion = safeWindows.reduce((sum, window) => sum + window.emotionIntensity, 0) / safeWindows.length
+    const avgScore = safeWindows.reduce((sum, window) => sum + window.score, 0) / safeWindows.length
+    const signal = computeContentSignalStrength(safeWindows)
+    const hook = Number.isFinite(Number(hookScore)) ? clamp01(Number(hookScore)) : clamp01(avgScore)
+    score = 100 * (
+      0.38 * signal +
+      0.2 * clamp01(avgSpeech) +
+      0.15 * clamp01(avgEmotion) +
+      0.12 * clamp01(1 - Math.abs(avgScene - 0.34)) +
+      0.15 * hook
+    )
+    if (styleProfile) {
+      score += (clamp01(styleProfile.confidence) - 0.5) * 8
+    }
+    if (nicheProfile) {
+      score += (clamp01(nicheProfile.confidence) - 0.5) * 6
+    }
+  } else {
+    const runtimeFit = runtime <= 90 ? 0.72 : runtime <= 900 ? 0.78 : 0.7
+    const shortPlatformFit =
+      normalizedPlatform === 'tiktok' || normalizedPlatform === 'instagram_reels'
+        ? (runtime <= 150 ? 0.82 : 0.58)
+        : (runtime >= 90 ? 0.8 : 0.64)
+    let resolutionScore = 0.66
+    if (Number.isFinite(Number(videoWidth)) && Number.isFinite(Number(videoHeight))) {
+      const minEdge = Math.min(Number(videoWidth), Number(videoHeight))
+      resolutionScore = clamp01((minEdge - 540) / 780 + 0.48)
+    }
+    const audioScore = hasAudio === false ? 0.42 : 0.72
+    const orientationFit = renderMode === 'vertical' ? 0.74 : 0.76
+    score = 100 * (
+      0.26 * runtimeFit +
+      0.24 * shortPlatformFit +
+      0.24 * resolutionScore +
+      0.14 * audioScore +
+      0.12 * orientationFit
+    )
+  }
+  return Number(clamp(score, 0, 100).toFixed(1))
+}
+
+const buildVideoAutoDetectProfile = ({
+  stage,
+  existingProfile,
+  runtimeSeconds,
+  renderMode,
+  targetPlatform,
+  contentFormat,
+  windows,
+  styleProfile,
+  nicheProfile,
+  hookScore,
+  videoWidth,
+  videoHeight,
+  hasAudio,
+  editorMode,
+  qualityScoreBefore,
+  qualityScoreAfter,
+  retentionKingApplied
+}: {
+  stage: VideoAutoDetectProfileStage
+  existingProfile?: VideoAutoDetectProfile | null
+  runtimeSeconds: number
+  renderMode: RenderMode
+  targetPlatform?: RetentionTargetPlatform | null
+  contentFormat?: RetentionContentFormat | null
+  windows?: EngagementWindow[]
+  styleProfile?: ContentStyleProfile | null
+  nicheProfile?: VideoNicheProfile | null
+  hookScore?: number | null
+  videoWidth?: number | null
+  videoHeight?: number | null
+  hasAudio?: boolean | null
+  editorMode?: EditorModeSelection | null
+  qualityScoreBefore?: number | null
+  qualityScoreAfter?: number | null
+  retentionKingApplied?: boolean
+}): VideoAutoDetectProfile => {
+  const runtime = Math.max(1, Number(runtimeSeconds || 0))
+  const safeWindows = Array.isArray(windows) ? windows : []
+  const resolvedFormat =
+    contentFormat ||
+    inferRetentionContentFormat({
+      runtimeSeconds: runtime,
+      windows: safeWindows,
+      renderMode,
+      nicheProfile: nicheProfile || null,
+      targetPlatform: targetPlatform || 'auto'
+    })
+  const resolvedStyle = resolveAutoDetectStyle({
+    styleProfile: styleProfile || null,
+    editorMode: editorMode || null,
+    contentFormat: resolvedFormat,
+    windows: safeWindows
+  })
+  const resolvedContentType = resolveAutoDetectContentType({
+    nicheProfile: nicheProfile || null,
+    style: resolvedStyle
+  })
+  const resolvedBefore = parseScore100(qualityScoreBefore) ??
+    estimateVideoQualityScore({
+      runtimeSeconds: runtime,
+      renderMode,
+      targetPlatform: targetPlatform || 'auto',
+      windows: safeWindows,
+      styleProfile: styleProfile || null,
+      nicheProfile: nicheProfile || null,
+      hookScore: hookScore ?? null,
+      videoWidth,
+      videoHeight,
+      hasAudio,
+      fallbackScore: existingProfile?.qualityScoreBefore ?? null
+    })
+  const resolvedAfter = parseScore100(qualityScoreAfter) ??
+    parseScore100(existingProfile?.qualityScoreAfter)
+  const resolvedDelta = resolvedBefore !== null && resolvedAfter !== null
+    ? Number((resolvedAfter - resolvedBefore).toFixed(1))
+    : null
+  const blend = resolveRetentionKingBlendFromScore(resolvedBefore)
+  const preset = resolveAutoDetectedPreset({
+    runtimeSeconds: runtime,
+    renderMode,
+    contentFormat: resolvedFormat,
+    qualityScore: resolvedBefore
+  })
+  let confidence = 0.42
+  if (safeWindows.length) confidence += Math.min(0.2, safeWindows.length / 260)
+  if (styleProfile) confidence += 0.18 * clamp01(styleProfile.confidence)
+  if (nicheProfile) confidence += 0.16 * clamp01(nicheProfile.confidence)
+  if (Number.isFinite(Number(videoWidth)) && Number.isFinite(Number(videoHeight))) confidence += 0.08
+  if (typeof hasAudio === 'boolean') confidence += 0.05
+  if (stage === 'process') confidence += 0.08
+  confidence = clamp(confidence, 0.35, 0.96)
+  const applied = typeof retentionKingApplied === 'boolean'
+    ? retentionKingApplied
+    : Boolean(existingProfile?.retentionKingApplied)
+  return {
+    version: 1,
+    updatedAt: toIsoNow(),
+    stage,
+    preset,
+    format: resolvedFormat,
+    style: resolvedStyle,
+    contentType: resolvedContentType,
+    confidence: Number(confidence.toFixed(4)),
+    qualityScoreBefore: resolvedBefore,
+    qualityScoreAfter: resolvedAfter,
+    qualityDelta: resolvedDelta,
+    retentionKingBlendPct: Number(blend.pct.toFixed(1)),
+    retentionKingBlendLevel: blend.level,
+    retentionKingReason: blend.reason,
+    recommendedStrategyProfile: blend.recommendedStrategyProfile,
+    recommendedAggressionLevel: blend.recommendedAggressionLevel,
+    retentionKingApplied: applied,
+    thoughtBefore: buildQualityThoughtBefore({
+      score: resolvedBefore,
+      contentFormat: resolvedFormat
+    }),
+    thoughtAfter: buildQualityThoughtAfter({
+      beforeScore: resolvedBefore,
+      afterScore: resolvedAfter
+    })
+  }
+}
+
+const buildUploadAutoDetectProfileFromInput = async ({
+  inputPath,
+  targetPlatform,
+  editorMode,
+  fallbackRenderMode,
+  existingProfile
+}: {
+  inputPath?: string | null
+  targetPlatform?: RetentionTargetPlatform | null
+  editorMode?: EditorModeSelection | null
+  fallbackRenderMode: RenderMode
+  existingProfile?: VideoAutoDetectProfile | null
+}) => {
+  let runtimeSeconds = 0
+  let sourceWidth: number | null = null
+  let sourceHeight: number | null = null
+  let hasAudio: boolean | null = null
+  let renderMode = fallbackRenderMode
+  const sourceKey = typeof inputPath === 'string' ? inputPath.trim() : ''
+  if (sourceKey) {
+    const tmpProbe = path.join(os.tmpdir(), `${crypto.randomUUID()}-upload-auto-detect`)
+    try {
+      await downloadObjectToFile({ key: sourceKey, destPath: tmpProbe })
+      runtimeSeconds = Number(getDurationSeconds(tmpProbe) || 0)
+      const stream = probeVideoStream(tmpProbe)
+      if (Number.isFinite(Number(stream?.width)) && Number.isFinite(Number(stream?.height))) {
+        sourceWidth = Number(stream?.width)
+        sourceHeight = Number(stream?.height)
+        renderMode = sourceHeight > sourceWidth ? 'vertical' : 'horizontal'
+      }
+      hasAudio = hasAudioStream(tmpProbe)
+    } catch (error) {
+      console.warn('upload auto-detect probe failed', error)
+    } finally {
+      safeUnlink(tmpProbe)
+    }
+  }
+  const safeRuntime = runtimeSeconds > 0
+    ? runtimeSeconds
+    : Number((existingProfile as any)?.runtimeSeconds || 0) || 90
+  const format = inferRetentionContentFormat({
+    runtimeSeconds: safeRuntime,
+    windows: [],
+    renderMode,
+    nicheProfile: null,
+    targetPlatform: targetPlatform || 'auto'
+  })
+  return buildVideoAutoDetectProfile({
+    stage: 'upload',
+    existingProfile,
+    runtimeSeconds: safeRuntime,
+    renderMode,
+    targetPlatform: targetPlatform || 'auto',
+    contentFormat: format,
+    windows: [],
+    styleProfile: null,
+    nicheProfile: null,
+    hookScore: null,
+    videoWidth: sourceWidth,
+    videoHeight: sourceHeight,
+    hasAudio,
+    editorMode: editorMode || null,
+    qualityScoreBefore: existingProfile?.qualityScoreBefore ?? null,
+    qualityScoreAfter: null,
+    retentionKingApplied: editorMode === 'retention-king'
+  })
+}
+
 const inferRetentionContentFormat = ({
   runtimeSeconds,
   windows,
@@ -15891,25 +16537,41 @@ const inferRetentionContentFormat = ({
   targetPlatform?: RetentionTargetPlatform
 }): RetentionContentFormat => {
   const runtime = Math.max(1, Number(runtimeSeconds || 0))
+  const safeWindows = Array.isArray(windows) ? windows : []
   const normalizedPlatform = parseRetentionTargetPlatform(targetPlatform)
+  const shortFormPlatform = normalizedPlatform === 'tiktok' || normalizedPlatform === 'instagram_reels'
   if (renderMode === 'vertical') return 'tiktok_short'
-  const speechAvg = windows.length
-    ? windows.reduce((sum, window) => sum + window.speechIntensity, 0) / windows.length
+  const speechAvg = safeWindows.length
+    ? safeWindows.reduce((sum, window) => sum + window.speechIntensity, 0) / safeWindows.length
     : 0
-  const sceneAvg = windows.length
-    ? windows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / windows.length
+  const sceneAvg = safeWindows.length
+    ? safeWindows.reduce((sum, window) => sum + window.sceneChangeRate, 0) / safeWindows.length
     : 0
+  const emotionAvg = safeWindows.length
+    ? safeWindows.reduce((sum, window) => sum + window.emotionIntensity, 0) / safeWindows.length
+    : 0
+  const hasWindowSignals = safeWindows.length >= 6
+  if (shortFormPlatform && runtime <= 180) return 'tiktok_short'
+  if (runtime <= 95 && (sceneAvg >= 0.34 || emotionAvg >= 0.52)) {
+    return 'tiktok_short'
+  }
   if (
-    runtime >= 140 &&
-    speechAvg >= 0.55 &&
-    sceneAvg <= 0.28 &&
-    (nicheProfile?.niche === 'talking_head' || nicheProfile?.niche === 'education')
+    runtime >= 180 &&
+    (
+      (speechAvg >= 0.55 && sceneAvg <= 0.3) ||
+      (
+        nicheProfile?.niche &&
+        (nicheProfile.niche === 'talking_head' || nicheProfile.niche === 'education') &&
+        speechAvg >= 0.48 &&
+        sceneAvg <= 0.35
+      ) ||
+      (!hasWindowSignals && runtime >= 14 * 60)
+    )
   ) {
     return 'podcast_clip'
   }
-  if (normalizedPlatform === 'tiktok' || normalizedPlatform === 'instagram_reels') {
-    // Keep horizontal uploads context-safe by default unless creator explicitly chose vertical.
-    return 'youtube_long'
+  if (shortFormPlatform && runtime <= 240) {
+    return 'tiktok_short'
   }
   return 'youtube_long'
 }
@@ -16654,33 +17316,42 @@ const getEditOptionsForUser = async (
     (settings as any)?.editor_mode ??
     (settings as any)?.contentMode
   )
+  const ultraModeRequested = editorMode === 'ultra'
+  const retentionKingModeRequested = editorMode === 'retention-king'
+  if ((ultraModeRequested || retentionKingModeRequested) && !isPaidTier(effectiveTier)) {
+    throw new PlanLimitError(
+      'Upgrade to unlock Ultra Mode and Retention King.',
+      'premiumModes',
+      'starter'
+    )
+  }
   const hookSelectionMode = parseHookSelectionMode(
     overrides?.hookSelectionMode ??
     (settings as any)?.hookSelectionMode ??
     (settings as any)?.hook_selection_mode,
     'auto'
   ) || 'auto'
-  const longFormAggression = parseLongFormAggression(
+  let longFormAggression = parseLongFormAggression(
     overrides?.longFormAggression ??
     (settings as any)?.longFormAggression ??
     (settings as any)?.longformAggression ??
     (settings as any)?.long_form_aggression
   ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
-  const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(
+  let longFormClarityVsSpeed = parseLongFormClarityVsSpeed(
     overrides?.longFormClarityVsSpeed ??
     (settings as any)?.longFormClarityVsSpeed ??
     (settings as any)?.longformClarityVsSpeed ??
     (settings as any)?.long_form_clarity_vs_speed ??
     (settings as any)?.clarityVsSpeed
   ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
-  const longFormPreset = parseLongFormPreset(
+  let longFormPreset = parseLongFormPreset(
     overrides?.longFormPreset ??
     (settings as any)?.longFormPreset ??
     (settings as any)?.longformPreset ??
     (settings as any)?.longform_preset ??
     resolveLongFormPresetByAggression(longFormAggression)
   )
-  const tangentKiller = (
+  let tangentKiller = (
     typeof overrides?.tangentKiller === 'boolean'
       ? overrides.tangentKiller
       : (
@@ -16694,7 +17365,7 @@ const getEditOptionsForUser = async (
     parseManualTimestampConfig((settings as any)?.manualTimestamp ?? (settings as any)?.manual_timestamp)
   )
   const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
-  const requestedStrategy = parseRetentionStrategyProfile(
+  let requestedStrategy = parseRetentionStrategyProfile(
     overrides?.retentionStrategyProfile ??
     strategyFromAggressionLevel(
       parseRetentionAggressionLevel(
@@ -16703,13 +17374,34 @@ const getEditOptionsForUser = async (
       )
     )
   )
-  const requestedAggression = parseRetentionAggressionLevel(
+  let requestedAggression = parseRetentionAggressionLevel(
     overrides?.retentionAggressionLevel ?? STRATEGY_TO_AGGRESSION[requestedStrategy]
   )
+  let resolvedFastMode = fastModeOverride ?? false
+  if (ultraModeRequested) {
+    requestedStrategy = 'viral'
+    requestedAggression = 'viral'
+    longFormPreset = 'ultra'
+    longFormAggression = Math.max(longFormAggression, 92)
+    longFormClarityVsSpeed = Math.min(longFormClarityVsSpeed, 36)
+    tangentKiller = true
+    resolvedFastMode = true
+  } else if (retentionKingModeRequested) {
+    requestedStrategy = 'viral'
+    requestedAggression = 'high'
+    longFormPreset = longFormPreset === 'ultra' ? 'ultra' : 'aggressive'
+    longFormAggression = Math.max(longFormAggression, 88)
+    longFormClarityVsSpeed = Math.min(longFormClarityVsSpeed, 44)
+    tangentKiller = true
+  }
+  const modeBypassesAdvancedCap = ultraModeRequested || retentionKingModeRequested
   const allowedAggression: RetentionAggressionLevel =
-    features.advancedEffects ? requestedAggression : (requestedAggression === 'low' ? 'low' : 'medium')
+    (features.advancedEffects || modeBypassesAdvancedCap)
+      ? requestedAggression
+      : (requestedAggression === 'low' ? 'low' : 'medium')
   const allowedStrategy = strategyFromAggressionLevel(allowedAggression)
   const aggressiveMode = onlyCuts ? false : isAggressiveRetentionLevel(allowedAggression)
+  const modeForcesAdvancedBehavior = ultraModeRequested || retentionKingModeRequested
   const baseOptions: EditOptions = {
     autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
     removeBoring,
@@ -16718,7 +17410,13 @@ const getEditOptionsForUser = async (
     jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
     transitions: onlyCuts ? false : (transitionsOverride ?? settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
     soundFx: onlyCuts ? false : (soundFxOverride ?? settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
-    emotionalBoost: onlyCuts ? false : (features.advancedEffects ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost) : false),
+    emotionalBoost: onlyCuts
+      ? false
+      : (
+        (features.advancedEffects || modeForcesAdvancedBehavior)
+          ? (settings?.emotionalBoost ?? DEFAULT_EDIT_OPTIONS.emotionalBoost)
+          : false
+      ),
     aggressiveMode,
     autoCaptions: subtitlesEnabled
       ? (autoCaptionsOverride ?? settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions)
@@ -16736,12 +17434,12 @@ const getEditOptionsForUser = async (
     longFormClarityVsSpeed,
     tangentKiller,
     manualTimestampConfig,
-    fastMode: fastModeOverride ?? false
+    fastMode: resolvedFastMode
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
     strategy: allowedStrategy,
-    allowAdvancedEffects: Boolean(features.advancedEffects)
+    allowAdvancedEffects: Boolean(features.advancedEffects || modeForcesAdvancedBehavior)
   })
   return {
     options,
@@ -16836,6 +17534,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     })
     const strategyProfile = runtimeRetentionProfile.strategy
     const aggressionLevel = runtimeRetentionProfile.aggression
+    const editorModePlaybook = resolveEditorModePlaybook(options.editorMode ?? null)
+    const playbookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
 
     const transcriptCues = await runRetentionStep({
@@ -16872,6 +17572,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
                 ...options,
                 retentionAggressionLevel: aggressionLevel,
                 retentionStrategyProfile: strategyProfile,
+                fastMode: editorModePlaybook.id === 'ultra' ? true : options.fastMode,
                 aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
               },
               async (stage) => {
@@ -17033,12 +17734,37 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       analysis: existingAnalysis,
       renderSettings: latestRenderSettings
     })
+    const existingAutoDetectProfile = parseVideoAutoDetectProfile(
+      existingAnalysis?.video_auto_detect ??
+      existingAnalysis?.videoAutoDetect ??
+      existingAnalysis?.metadata_summary?.retention?.autoDetect
+    )
+    const analyzeEditorMode = options.editorMode ?? getEditorModeFromJob({
+      analysis: existingAnalysis,
+      renderSettings: latestRenderSettings
+    })
     const analyzeContentFormat = inferRetentionContentFormat({
       runtimeSeconds: duration,
       windows: editPlan?.engagementWindows ?? [],
       renderMode: renderConfig.mode,
       nicheProfile: editPlan?.nicheProfile ?? null,
       targetPlatform: resolvedTargetPlatform
+    })
+    const analyzeAutoDetectProfile = buildVideoAutoDetectProfile({
+      stage: 'analyze',
+      existingProfile: existingAutoDetectProfile,
+      runtimeSeconds: duration,
+      renderMode: renderConfig.mode,
+      targetPlatform: resolvedTargetPlatform,
+      contentFormat: analyzeContentFormat,
+      windows: editPlan?.engagementWindows ?? [],
+      styleProfile: editPlan?.styleProfile ?? null,
+      nicheProfile: editPlan?.nicheProfile ?? null,
+      hookScore: editPlan?.hook?.score ?? null,
+      editorMode: analyzeEditorMode,
+      qualityScoreBefore: existingAutoDetectProfile?.qualityScoreBefore ?? null,
+      qualityScoreAfter: null,
+      retentionKingApplied: analyzeEditorMode === 'retention-king'
     })
     const analyzeMetadataSummary = buildRetentionMetadataSummary({
       durationSeconds: duration,
@@ -17056,7 +17782,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       boredomRemovedRatio: editPlan?.boredomRemovedRatio ?? 0,
       contentFormat: analyzeContentFormat,
       targetPlatform: resolvedTargetPlatform,
-      strategyProfile
+      strategyProfile,
+      autoDetectProfile: analyzeAutoDetectProfile
     })
     const analyzePreScan = buildLongFormPreScanSummary({
       durationSeconds: duration,
@@ -17099,17 +17826,27 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         retentionPlatform: resolvedTargetPlatform,
         targetPlatform: resolvedTargetPlatform,
         platform: resolvedTargetPlatform,
+        retentionKingBlendPct: analyzeAutoDetectProfile.retentionKingBlendPct,
+        retention_king_blend_pct: analyzeAutoDetectProfile.retentionKingBlendPct,
+        retentionKingBlendLevel: analyzeAutoDetectProfile.retentionKingBlendLevel,
+        retention_king_blend_level: analyzeAutoDetectProfile.retentionKingBlendLevel,
         platformProfile: resolvedPlatformProfile,
         platform_profile: resolvedPlatformProfile,
         retentionContentFormat: analyzeContentFormat,
         retention_content_format: analyzeContentFormat,
+        videoAutoDetect: analyzeAutoDetectProfile,
+        video_auto_detect: analyzeAutoDetectProfile,
         retention_runtime_profile: {
           strategy: strategyProfile,
           aggression: aggressionLevel,
           isLongForm: runtimeRetentionProfile.isLongForm,
           isVerticalShortForm: runtimeRetentionProfile.isVerticalShortForm,
-          notes: runtimeRetentionProfile.notes
+          notes: [...runtimeRetentionProfile.notes, ...playbookNotes]
         },
+        pipeline_mode_playbook: editorModePlaybook.id,
+        pipeline_mode_prompt: editorModePlaybook.prompt || null,
+        pipelinePowerMode: editorModePlaybook.id,
+        pipeline_power_mode: editorModePlaybook.id,
         style_profile: editPlan?.styleProfile ?? null,
         niche_profile: editPlan?.nicheProfile ?? null,
         beat_anchors: editPlan?.beatAnchors ?? [],
@@ -17144,6 +17881,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       longFormAggression: options.longFormAggression,
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
+      fastMode: options.fastMode,
       verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
@@ -17169,6 +17907,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
+        fastMode: options.fastMode,
         verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
       analysis: analysis
@@ -17243,6 +17982,12 @@ const processJob = async (
     parseManualTimestampConfig(options.manualTimestampConfig) ??
     getManualTimestampConfigFromJob(job)
   )
+  const existingAutoDetectProfile = parseVideoAutoDetectProfile(
+    (job.analysis as any)?.video_auto_detect ??
+    (job.analysis as any)?.videoAutoDetect ??
+    (job.analysis as any)?.metadata_summary?.retention?.autoDetect
+  )
+  let retentionKingBlendDecision = resolveRetentionKingBlendFromScore(existingAutoDetectProfile?.qualityScoreBefore ?? null)
   if (requestedManualTimestampConfig?.enabled) {
     requestedHookSelectionMode = 'manual'
   }
@@ -17290,12 +18035,31 @@ const processJob = async (
     }
   }
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
+  const editorModePlaybook = resolveEditorModePlaybook(editorModeForRender)
+  const editorModePlaybookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
+  if (editorModePlaybook.id === 'ultra') {
+    requestedStrategyProfile = 'viral'
+    requestedAggressionLevel = 'viral'
+    options.fastMode = true
+  } else if (editorModePlaybook.id === 'retention_king') {
+    retentionKingBlendDecision = resolveRetentionKingBlendFromScore(existingAutoDetectProfile?.qualityScoreBefore ?? null)
+    requestedStrategyProfile = retentionKingBlendDecision.recommendedStrategyProfile
+    requestedAggressionLevel = retentionKingBlendDecision.recommendedAggressionLevel
+    outcomeAutomationNotes.push(
+      `Retention King dynamic blend ${retentionKingBlendDecision.pct.toFixed(1)}% (${retentionKingBlendDecision.level}) from upload quality score ${Number(existingAutoDetectProfile?.qualityScoreBefore ?? 62).toFixed(1)}.`
+    )
+  }
+  if (editorModePlaybookNotes.length) {
+    outcomeAutomationNotes.push(...editorModePlaybookNotes)
+  }
   let modeRetentionTargets = resolveModeRetentionTargets(editorModeForRender)
   const hookSelectionModeForRender: HookSelectionMode = requestedHookSelectionMode
   options.hookSelectionMode = hookSelectionModeForRender
   options.manualTimestampConfig = requestedManualTimestampConfig
   requestedAggressionLevel = parseRetentionAggressionLevel(
-    STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel
+    editorModePlaybook.id === 'retention_king'
+      ? requestedAggressionLevel
+      : (STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel)
   )
   let platformProfile = PLATFORM_EDIT_PROFILES[platformProfileId] || PLATFORM_EDIT_PROFILES.auto
   let strategyProfile = requestedStrategyProfile
@@ -17350,7 +18114,8 @@ const processJob = async (
       throw new PlanLimitError('Upgrade to unlock higher auto zoom limits.', 'autoZoomMax', requiredPlan)
     }
     const wantsAdvanced = Boolean(options.emotionalBoost) || Boolean(options.aggressiveMode)
-    if (wantsAdvanced && !features.advancedEffects) {
+    const premiumModeBypassesAdvancedEffects = editorModeForRender === 'ultra' || editorModeForRender === 'retention-king'
+    if (wantsAdvanced && !features.advancedEffects && !premiumModeBypassesAdvancedEffects) {
       const requiredPlan = getRequiredPlanForAdvancedEffects()
       throw new PlanLimitError('Upgrade to unlock advanced effects.', 'advancedEffects', requiredPlan)
     }
@@ -17766,6 +18531,22 @@ const processJob = async (
         nicheProfile: verticalNicheProfile,
         targetPlatform: retentionTargetPlatform
       })
+      const verticalAutoDetectProfile = buildVideoAutoDetectProfile({
+        stage: 'process',
+        existingProfile: existingAutoDetectProfile,
+        runtimeSeconds: durationSeconds,
+        renderMode: finalRenderConfig.mode,
+        targetPlatform: retentionTargetPlatform,
+        contentFormat: verticalContentFormat,
+        windows: verticalWindows,
+        styleProfile: verticalStyleProfile,
+        nicheProfile: verticalNicheProfile,
+        hookScore: null,
+        editorMode: editorModeForRender,
+        qualityScoreBefore: existingAutoDetectProfile?.qualityScoreBefore ?? null,
+        qualityScoreAfter: verticalPredictedRetention,
+        retentionKingApplied: editorModeForRender === 'retention-king'
+      })
       const nextAnalysis = buildPersistedRenderAnalysis({
         existing: {
           ...((job.analysis as any) || {}),
@@ -17779,10 +18560,16 @@ const processJob = async (
           retentionPlatform: retentionTargetPlatform,
           targetPlatform: retentionTargetPlatform,
           platform: retentionTargetPlatform,
+          retentionKingBlendPct: verticalAutoDetectProfile.retentionKingBlendPct,
+          retention_king_blend_pct: verticalAutoDetectProfile.retentionKingBlendPct,
+          retentionKingBlendLevel: verticalAutoDetectProfile.retentionKingBlendLevel,
+          retention_king_blend_level: verticalAutoDetectProfile.retentionKingBlendLevel,
           platformProfile: platformProfileId,
           platform_profile: platformProfileId,
           retentionContentFormat: verticalContentFormat,
           retention_content_format: verticalContentFormat,
+          videoAutoDetect: verticalAutoDetectProfile,
+          video_auto_detect: verticalAutoDetectProfile,
           retention_runtime_profile: {
             strategy: strategyProfile,
             aggression: aggressionLevel,
@@ -17790,6 +18577,10 @@ const processJob = async (
             isVerticalShortForm: runtimeRetentionProfile.isVerticalShortForm,
             notes: [...runtimeRetentionNotes, ...outcomeAutomationNotes]
           },
+          pipeline_mode_playbook: editorModePlaybook.id,
+          pipeline_mode_prompt: editorModePlaybook.prompt || null,
+          pipelinePowerMode: editorModePlaybook.id,
+          pipeline_power_mode: editorModePlaybook.id,
           outcome_menu_profile: outcomeMenuProfile,
           outcome_menu_applied: outcomeMenuApply,
           outcome_menu_effective: {
@@ -17843,6 +18634,7 @@ const processJob = async (
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
+        fastMode: options.fastMode,
         verticalCaptionConfig,
         outputPaths
       })
@@ -17905,6 +18697,7 @@ const processJob = async (
           longFormAggression: options.longFormAggression,
           longFormClarityVsSpeed: options.longFormClarityVsSpeed,
           tangentKiller: options.tangentKiller,
+          fastMode: options.fastMode,
           manualTimestampConfig: requestedManualTimestampConfig,
           verticalCaptionConfig
         }),
@@ -19736,6 +20529,22 @@ const processJob = async (
       throw new Error('output_upload_missing')
     }
 
+    const processAutoDetectProfile = buildVideoAutoDetectProfile({
+      stage: 'process',
+      existingProfile: existingAutoDetectProfile,
+      runtimeSeconds: durationSeconds,
+      renderMode: renderConfig.mode,
+      targetPlatform: retentionTargetPlatform,
+      contentFormat: selectedContentFormat,
+      windows: engagementWindowsForAnalysis,
+      styleProfile: styleProfileForAnalysis,
+      nicheProfile: nicheProfileForAnalysis,
+      hookScore: selectedHook?.score ?? null,
+      editorMode: editorModeForRender,
+      qualityScoreBefore: retentionScoreBeforeEdit ?? existingAutoDetectProfile?.qualityScoreBefore ?? null,
+      qualityScoreAfter: retentionScoreAfterEdit,
+      retentionKingApplied: editorModeForRender === 'retention-king'
+    })
     const retentionMetadataSummary = buildRetentionMetadataSummary({
       durationSeconds,
       segments: finalSegmentsForAnalysis.length
@@ -19768,6 +20577,7 @@ const processJob = async (
       contentFormat: selectedContentFormat,
       targetPlatform: retentionTargetPlatform,
       strategyProfile,
+      autoDetectProfile: processAutoDetectProfile,
       outcomeMenuProfile,
       outcomeMenuApply
     })
@@ -19864,10 +20674,16 @@ const processJob = async (
         retentionPlatform: retentionTargetPlatform,
         targetPlatform: retentionTargetPlatform,
         platform: retentionTargetPlatform,
+        retentionKingBlendPct: processAutoDetectProfile.retentionKingBlendPct,
+        retention_king_blend_pct: processAutoDetectProfile.retentionKingBlendPct,
+        retentionKingBlendLevel: processAutoDetectProfile.retentionKingBlendLevel,
+        retention_king_blend_level: processAutoDetectProfile.retentionKingBlendLevel,
         platformProfile: platformProfileId,
         platform_profile: platformProfileId,
         retentionContentFormat: selectedContentFormat,
         retention_content_format: selectedContentFormat,
+        videoAutoDetect: processAutoDetectProfile,
+        video_auto_detect: processAutoDetectProfile,
         retention_runtime_profile: {
           strategy: strategyProfile,
           aggression: aggressionLevel,
@@ -19875,6 +20691,10 @@ const processJob = async (
           isVerticalShortForm: runtimeRetentionProfile.isVerticalShortForm,
           notes: [...runtimeRetentionNotes, ...outcomeAutomationNotes]
         },
+        pipeline_mode_playbook: editorModePlaybook.id,
+        pipeline_mode_prompt: editorModePlaybook.prompt || null,
+        pipelinePowerMode: editorModePlaybook.id,
+        pipeline_power_mode: editorModePlaybook.id,
         outcome_menu_profile: outcomeMenuProfile,
         outcome_menu_applied: outcomeMenuApply,
         outcome_menu_effective: {
@@ -19900,6 +20720,7 @@ const processJob = async (
       longFormAggression: options.longFormAggression,
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
+      fastMode: options.fastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
       outputPaths
@@ -19932,6 +20753,7 @@ const processJob = async (
         longFormAggression: options.longFormAggression,
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
+        fastMode: options.fastMode,
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: persistedVerticalCaptionConfig
       }),
@@ -20376,6 +21198,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -20385,8 +21208,8 @@ const handleCreateJob = async (req: any, res: any) => {
       payload: req.body,
       fallbackPlatform: 'auto'
     })
-    const retentionAggressionLevel = retentionTuning.aggression
-    const retentionStrategyProfile = retentionTuning.strategy
+    let retentionAggressionLevel = retentionTuning.aggression
+    let retentionStrategyProfile = retentionTuning.strategy
     const retentionTargetPlatform = retentionPlatformTuning.targetPlatform
     const platformProfile = getPlatformProfileFromPayload(
       req.body,
@@ -20413,6 +21236,25 @@ const handleCreateJob = async (req: any, res: any) => {
     const devBypass = isDevAccount(userId, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
     const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
+    const premiumModeRequested = editorModeOverride === 'ultra' || editorModeOverride === 'retention-king'
+    if (premiumModeRequested && !isPaidTier(effectiveTier)) {
+      return res.status(403).json({
+        error: 'PLAN_LIMIT_EXCEEDED',
+        feature: 'premiumModes',
+        requiredPlan: 'starter',
+        message: 'Upgrade to unlock Ultra Mode and Retention King.'
+      })
+    }
+    if (editorModeOverride === 'ultra') {
+      retentionAggressionLevel = 'viral'
+      retentionStrategyProfile = 'viral'
+    } else if (editorModeOverride === 'retention-king') {
+      retentionAggressionLevel = retentionAggressionLevel === 'low' ? 'high' : retentionAggressionLevel
+      retentionStrategyProfile = 'viral'
+    }
+    const effectiveFastMode = typeof requestedFastMode === 'boolean'
+      ? requestedFastMode
+      : editorModeOverride === 'ultra'
     const renderLimitViolation = await getRenderLimitViolation({
       userId,
       email: req.user?.email,
@@ -20455,6 +21297,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
     const desiredQuality = getRequestedQuality(requestedQuality, settings?.exportQuality)
     const configSelection = await chooseConfigForJobCreation()
+    const createModePlaybook = resolveEditorModePlaybook(editorModeOverride)
 
     const job = await prisma.job.create({
       data: {
@@ -20483,6 +21326,7 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormAggression: longFormAggressionOverride,
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
             tangentKiller: tangentKillerOverride,
+            fastMode: effectiveFastMode,
             manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride
           }),
@@ -20505,6 +21349,10 @@ const handleCreateJob = async (req: any, res: any) => {
             platformProfile,
             platform_profile: platformProfile,
             style_archetype_blend_override: styleBlendOverride,
+            pipeline_mode_playbook: createModePlaybook.id,
+            pipeline_mode_prompt: createModePlaybook.prompt || null,
+            pipelinePowerMode: createModePlaybook.id,
+            pipeline_power_mode: createModePlaybook.id,
             algorithm_config_version_id: configSelection.config_version_id,
             algorithm_experiment_id: configSelection.experiment_id,
             algorithm_config_source: configSelection.source,
@@ -20539,6 +21387,7 @@ const handleCreateJob = async (req: any, res: any) => {
           longFormAggression: longFormAggressionOverride,
           longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
           tangentKiller: tangentKillerOverride,
+          fastMode: effectiveFastMode,
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
           outputPaths: null
@@ -21065,11 +21914,12 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const resolvedEditorMode = editorModeOverride ?? getEditorModeFromJob(job)
     const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'auto'
-    const resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
+    let resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
     const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
     const resolvedLongFormClarityVsSpeed = longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job)
     const resolvedTangentKiller = tangentKillerOverride ?? getTangentKillerFromJob(job)
@@ -21083,12 +21933,33 @@ const handleCompleteUpload = async (req: any, res: any) => {
       payload: req.body,
       fallbackPlatform: getRetentionTargetPlatformFromJob(job)
     })
-    const requestedAggressionLevel = tuning.aggression
-    const requestedStrategyProfile = tuning.strategy
+    let requestedAggressionLevel = tuning.aggression
+    let requestedStrategyProfile = tuning.strategy
     const requestedTargetPlatform = platformTuning.targetPlatform
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const existingAutoDetectProfile = parseVideoAutoDetectProfile(
+      ((job.analysis as any)?.video_auto_detect) ??
+      ((job.analysis as any)?.videoAutoDetect) ??
+      ((job.analysis as any)?.metadata_summary?.retention?.autoDetect)
+    )
+    const persistedRenderConfig = parseRenderConfigFromAnalysis((job.analysis as any) || {}, (job as any)?.renderSettings)
+    const uploadAutoDetectProfile = await buildUploadAutoDetectProfileFromInput({
+      inputPath,
+      targetPlatform: requestedTargetPlatform,
+      editorMode: resolvedEditorMode,
+      fallbackRenderMode: persistedRenderConfig.mode,
+      existingProfile: existingAutoDetectProfile
+    })
+    if (resolvedEditorMode === 'retention-king') {
+      requestedStrategyProfile = uploadAutoDetectProfile.recommendedStrategyProfile
+      requestedAggressionLevel = uploadAutoDetectProfile.recommendedAggressionLevel
+    }
+    const shouldAutoSetPreset = !longFormPresetOverride || parseLongFormPreset(longFormPresetOverride) === 'auto'
+    if (shouldAutoSetPreset) {
+      resolvedLongFormPreset = uploadAutoDetectProfile.preset
+    }
     const styleBlendOverride =
       parseStyleArchetypeBlendFromPayload(req.body) ??
       parseStyleArchetypeBlendFromPayload((job.analysis as any) || {})
@@ -21114,8 +21985,14 @@ const handleCompleteUpload = async (req: any, res: any) => {
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
+      retentionKingBlendPct: uploadAutoDetectProfile.retentionKingBlendPct,
+      retention_king_blend_pct: uploadAutoDetectProfile.retentionKingBlendPct,
+      retentionKingBlendLevel: uploadAutoDetectProfile.retentionKingBlendLevel,
+      retention_king_blend_level: uploadAutoDetectProfile.retentionKingBlendLevel,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      videoAutoDetect: uploadAutoDetectProfile,
+      video_auto_detect: uploadAutoDetectProfile,
       hookSelectionMode: resolvedHookSelectionMode,
       hook_selection_mode: resolvedHookSelectionMode,
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
@@ -21146,8 +22023,14 @@ const handleCompleteUpload = async (req: any, res: any) => {
       retentionPlatform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
       platform: requestedTargetPlatform,
+      retentionKingBlendPct: uploadAutoDetectProfile.retentionKingBlendPct,
+      retention_king_blend_pct: uploadAutoDetectProfile.retentionKingBlendPct,
+      retentionKingBlendLevel: uploadAutoDetectProfile.retentionKingBlendLevel,
+      retention_king_blend_level: uploadAutoDetectProfile.retentionKingBlendLevel,
       platformProfile: requestedPlatformProfile,
       platform_profile: requestedPlatformProfile,
+      videoAutoDetect: uploadAutoDetectProfile,
+      video_auto_detect: uploadAutoDetectProfile,
       hookSelectionMode: resolvedHookSelectionMode,
       hook_selection_mode: resolvedHookSelectionMode,
       style_archetype_blend_override: styleBlendOverride,
@@ -21249,6 +22132,17 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const { tier } = await getUserPlan(req.user.id)
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+    if ((requestedEditorMode === 'ultra' || requestedEditorMode === 'retention-king') && !isPaidTier(effectiveTier)) {
+      return res.status(403).json({
+        error: 'PLAN_LIMIT_EXCEEDED',
+        feature: 'premiumModes',
+        requiredPlan: 'starter',
+        message: 'Upgrade to unlock Ultra Mode and Retention King.'
+      })
+    }
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
@@ -21256,6 +22150,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra' ? true : analyzeRequestedFastMode
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -21283,7 +22178,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(analyzeRequestedFastMode === null ? {} : { fastMode: analyzeRequestedFastMode, fast_mode: analyzeRequestedFastMode }),
+      ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -21320,7 +22215,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(analyzeRequestedFastMode === null ? {} : { fastMode: analyzeRequestedFastMode, fast_mode: analyzeRequestedFastMode }),
+      ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -21338,7 +22233,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      fastMode: analyzeRequestedFastMode,
+      fastMode: effectiveAnalyzeFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -21347,12 +22242,23 @@ router.post('/:id/analyze', async (req: any, res) => {
     options.retentionStrategyProfile = tuning.strategy
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
-    if (analyzeRequestedFastMode !== null) {
-      options.fastMode = analyzeRequestedFastMode
+    if (requestedEditorMode === 'ultra') {
+      options.fastMode = true
+    } else if (effectiveAnalyzeFastMode !== null) {
+      options.fastMode = effectiveAnalyzeFastMode
     }
     const analysis = await analyzeJob(id, options, req.requestId)
     res.json({ ok: true, analysis })
   } catch (err) {
+    if (err instanceof PlanLimitError) {
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
+    }
     if (err instanceof HookGateError) {
       return res.status(422).json({
         error: 'FAILED_HOOK',
@@ -21412,6 +22318,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const effectiveProcessFastMode = requestedEditorMode === 'ultra' ? true : processRequestedFastMode
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: tuning.aggression,
@@ -21439,7 +22346,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(processRequestedFastMode === null ? {} : { fastMode: processRequestedFastMode, fast_mode: processRequestedFastMode }),
+      ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -21476,7 +22383,7 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(processRequestedFastMode === null ? {} : { fastMode: processRequestedFastMode, fast_mode: processRequestedFastMode }),
+      ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     await updateJob(id, {
@@ -21494,7 +22401,7 @@ router.post('/:id/process', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
-      fastMode: processRequestedFastMode,
+      fastMode: effectiveProcessFastMode,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -21525,8 +22432,10 @@ router.post('/:id/process', async (req: any, res) => {
     options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
     options.styleArchetypeBlend = styleBlendOverride
     // Allow client to override fast-mode for this run.
-    if (processRequestedFastMode !== null) {
-      options.fastMode = processRequestedFastMode
+    if (requestedEditorMode === 'ultra') {
+      options.fastMode = true
+    } else if (effectiveProcessFastMode !== null) {
+      options.fastMode = effectiveProcessFastMode
     }
     await processJob(id, { id: user.id, email: user.email }, requestedQuality as ExportQuality | undefined, options, req.requestId)
     res.json({ ok: true })
@@ -21661,6 +22570,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedHookSelectionModeRaw = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedHookSelectionMode = requestedManualTimestampConfig?.enabled ? 'manual' : requestedHookSelectionModeRaw
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const effectiveRequestedFastMode = requestedEditorMode === 'ultra' ? true : requestedFastMode
 
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -21685,7 +22595,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       }),
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
-      ...(requestedFastMode === null ? {} : { fastMode: requestedFastMode, fast_mode: requestedFastMode })
+      ...(effectiveRequestedFastMode === null ? {} : { fastMode: effectiveRequestedFastMode, fast_mode: effectiveRequestedFastMode })
     }
 
     const nowIso = toIsoNow()
@@ -21724,9 +22634,9 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     }) as Record<string, any>
     if (autoCaptionsOverride !== null) nextAnalysis.autoCaptions = autoCaptionsOverride
     if (subtitleStyleOverride) nextAnalysis.subtitleStyle = subtitleStyleOverride
-    if (requestedFastMode !== null) {
-      nextAnalysis.fastMode = requestedFastMode
-      nextAnalysis.fast_mode = requestedFastMode
+    if (effectiveRequestedFastMode !== null) {
+      nextAnalysis.fastMode = effectiveRequestedFastMode
+      nextAnalysis.fast_mode = effectiveRequestedFastMode
     }
     nextAnalysis.style_archetype_blend_override = styleBlendOverride
     nextAnalysis.live_settings_updated_at = nowIso
@@ -21981,6 +22891,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
     const reprocessRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const effectiveReprocessFastMode = requestedEditorMode === 'ultra' ? true : reprocessRequestedFastMode
 
     const hasPreferredHookPayload =
       req.body?.preferredHook !== undefined ||
@@ -22036,7 +22947,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(reprocessRequestedFastMode === null ? {} : { fastMode: reprocessRequestedFastMode, fast_mode: reprocessRequestedFastMode }),
+      ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
     const nextAnalysis = {
@@ -22078,7 +22989,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
-      ...(reprocessRequestedFastMode === null ? {} : { fastMode: reprocessRequestedFastMode, fast_mode: reprocessRequestedFastMode }),
+      ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: preferredHookCandidate ?? null,
       preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null

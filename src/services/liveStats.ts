@@ -195,6 +195,8 @@ const inferNicheLabel = (job: any) => {
     || formatNiche(analysis?.topic)
   if (explicit) return explicit
   if (editorMode === 'savage-roast') return 'Gen Z Pranks'
+  if (editorMode === 'ultra') return 'Ultra Binge Mode'
+  if (editorMode === 'retention-king') return 'Retention King'
   if (editorMode === 'gaming') return 'Gaming Clips'
   if (editorMode === 'sports') return 'Sports Highlights'
   if (editorMode === 'education') return 'Study Hacks'

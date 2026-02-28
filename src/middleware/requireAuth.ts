@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
+import { getLocalhostBypassUser, shouldBypassAuthForLocalhost } from '../lib/localhostAuthBypass'
 
 declare global {
   namespace Express {
@@ -11,6 +12,11 @@ declare global {
 
 export async function requireAuth(req: Request, res: Response, next: NextFunction) {
   try {
+    if (shouldBypassAuthForLocalhost(req)) {
+      req.user = getLocalhostBypassUser()
+      return next()
+    }
+
     const auth = req.headers.authorization
     let token = ''
     if (auth && auth.startsWith('Bearer ')) {

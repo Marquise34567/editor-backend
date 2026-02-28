@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
 import { isControlPanelOwnerEmail } from '../lib/devAccounts'
+import { getLocalhostBypassUser, shouldBypassAuthForLocalhost } from '../lib/localhostAuthBypass'
 
 declare global {
   namespace Express {
@@ -78,6 +79,18 @@ const auditAccessAttempt = async ({
 
 export const requireDevAdmin = async (req: Request, res: Response, next: NextFunction) => {
   try {
+    if (shouldBypassAuthForLocalhost(req)) {
+      req.user = getLocalhostBypassUser()
+      await auditAccessAttempt({
+        req,
+        allowed: true,
+        email: req.user.email || null,
+        userId: req.user.id,
+        reason: 'localhost_bypass'
+      })
+      return next()
+    }
+
     const token = getTokenFromRequest(req)
     if (!token) {
       await auditAccessAttempt({ req, allowed: false, reason: 'missing_token' })

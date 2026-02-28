@@ -689,7 +689,14 @@ const computeDeltaMap = ({
 const resolveSuggestedSubtitleMode = (editorMode: string | null): string | null => {
   if (!editorMode) return null
   if (editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary') return 'premium_clean'
-  if (editorMode === 'sports' || editorMode === 'reaction' || editorMode === 'gaming' || editorMode === 'savage-roast') return 'viral_pop'
+  if (
+    editorMode === 'sports' ||
+    editorMode === 'reaction' ||
+    editorMode === 'gaming' ||
+    editorMode === 'savage-roast' ||
+    editorMode === 'ultra' ||
+    editorMode === 'retention-king'
+  ) return 'viral_pop'
   if (editorMode === 'vlog') return 'clean_high_contrast'
   return null
 }
