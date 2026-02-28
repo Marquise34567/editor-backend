@@ -1,13 +1,15 @@
 import express from 'express'
 import { createCheckoutUrlForUser, createPortalUrlForUser, type BillingInterval } from '../services/billing'
 import { getOrCreateUser } from '../services/users'
-import { activateManualFreeTrial, getSubscriptionForUser, getUserPlan } from '../services/plans'
+import { getSubscriptionForUser, getUserPlan } from '../services/plans'
 import { ensureFounderAvailable, FounderSoldOutError } from '../services/founder'
 import { PLAN_CONFIG, PLAN_TIERS, type PlanTier } from '../shared/planConfig'
 import { isPaidTier, getPlanFeatures } from '../shared/planConfig'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
+import { getStripeConfig } from '../lib/stripeConfig'
 
 const router = express.Router()
+const MANUAL_TRIAL_PRICE_ID = 'manual_free_trial_3d'
 
 const parseTier = (value: any): PlanTier | null => {
   const raw = String(value || '').toLowerCase()
@@ -46,54 +48,39 @@ const handleCheckout = async (req: any, res: any) => {
     const useTrial = tier === 'starter' && wantTrial
     if (useTrial) {
       const existingSubscription = await getSubscriptionForUser(user.id)
-      if (existingSubscription?.status === 'active') {
+      const existingStatus = String(existingSubscription?.status || '').toLowerCase()
+      const trialPriceId = getStripeConfig().priceIds.trial
+      const hasUsedTrialPrice =
+        existingSubscription?.priceId === trialPriceId || existingSubscription?.priceId === MANUAL_TRIAL_PRICE_ID
+      if (existingStatus === 'active') {
         return res.status(409).json({
           error: 'already_subscribed',
           message: 'Active subscription already has unlocked features. Manage billing to change plans.'
         })
       }
-      const activated = await activateManualFreeTrial(user.id)
-      if (activated.alreadyUsed && !activated.alreadyActive) {
+      if (existingStatus === 'trialing') {
         return res.status(409).json({
-          error: 'trial_already_used',
-          message: 'Free trial already used. Upgrade to keep full access.',
-          trial: {
-            tier: activated.tier,
-            active: activated.trial.active,
-            startedAt: activated.trial.startedAt,
-            endsAt: activated.trial.endsAt,
-            daysRemaining: activated.trial.daysRemaining,
-            alreadyActive: activated.alreadyActive,
-            alreadyUsed: activated.alreadyUsed
-          }
+          error: 'trial_already_active',
+          message: 'Free trial is already active on this account.'
         })
       }
-      const baseUrl = process.env.APP_URL || process.env.FRONTEND_URL || 'http://localhost:3000'
-      const trialStatus = activated.alreadyActive ? 'active' : 'started'
-      const trialUrl = new URL('/editor', baseUrl)
-      trialUrl.searchParams.set('success', 'true')
-      trialUrl.searchParams.set('source', 'trial')
-      trialUrl.searchParams.set('trial', trialStatus)
-      trialUrl.searchParams.set('tier', activated.tier)
-      if (activated.trial.endsAt) trialUrl.searchParams.set('endsAt', activated.trial.endsAt)
-      return res.json({
-        url: trialUrl.toString(),
-        trial: {
-          tier: activated.tier,
-          active: activated.trial.active,
-          startedAt: activated.trial.startedAt,
-          endsAt: activated.trial.endsAt,
-          daysRemaining: activated.trial.daysRemaining,
-          alreadyActive: activated.alreadyActive,
-          alreadyUsed: activated.alreadyUsed
-        }
-      })
+      if (hasUsedTrialPrice) {
+        return res.status(409).json({
+          error: 'trial_already_used',
+          message: 'Free trial already used. Upgrade to keep full access.'
+        })
+      }
     }
     if (tier === 'founder') {
       await ensureFounderAvailable()
     }
     const url = await createCheckoutUrlForUser(user.id, tier, user.email, interval, useTrial)
-    if (!url) return res.status(500).json({ error: 'Missing price config' })
+    if (!url) {
+      return res.status(500).json({
+        error: useTrial ? 'trial_checkout_not_configured' : 'missing_price_config',
+        message: useTrial ? 'Free trial checkout is not configured.' : 'Missing price config'
+      })
+    }
     res.json({ url })
   } catch (err: any) {
     if (err instanceof FounderSoldOutError) {

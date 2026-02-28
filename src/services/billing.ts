@@ -44,7 +44,8 @@ const getBucketPriceId = (
 const getPriceIdForTier = (tier: PlanTier, interval: BillingInterval, useTrial: boolean) => {
   const { priceIds } = getStripeConfig()
   if (tier === 'founder') return priceIds.founder || ''
-  if (useTrial && tier === 'starter' && priceIds.trial) return priceIds.trial
+  if (useTrial && tier === 'starter') return priceIds.trial || ''
+  if (useTrial) return ''
   return getBucketPriceId(tier, interval, priceIds)
 }
 
