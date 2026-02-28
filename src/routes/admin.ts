@@ -16,6 +16,7 @@ import {
   subscribeToAdminErrorStream
 } from '../services/adminTelemetry'
 import {
+  getConnectedRealtimeClientCount,
   getRealtimeActiveUsersCount,
   getRealtimeActiveUsersSeries,
   getRealtimePresenceSessions
@@ -130,6 +131,12 @@ let cpuSample: { usage: NodeJS.CpuUsage; hrtime: bigint } | null = null
 
 const parseRange = (raw: unknown, fallback: keyof typeof RANGE_MS) =>
   RANGE_MS[String(raw || fallback).trim().toLowerCase()] ?? RANGE_MS[fallback]
+
+const parseStreamIntervalMs = (raw: unknown) => {
+  const parsed = Number.parseInt(String(raw || '4000'), 10)
+  if (!Number.isFinite(parsed)) return 4000
+  return Math.max(2000, Math.min(parsed, 15000))
+}
 
 const asMs = (value: unknown) => {
   const ms = new Date(value as any).getTime()
@@ -3896,6 +3903,8 @@ router.get('/stream', async (req, res) => {
   res.setHeader('X-Accel-Buffering', 'no')
   ;(res as any).flushHeaders?.()
 
+  const intervalMs = parseStreamIntervalMs((req as any)?.query?.intervalMs)
+
   let closed = false
   const send = (eventName: string, payload: any) => {
     if (closed || res.writableEnded || (res as any).destroyed) return
@@ -3907,13 +3916,66 @@ router.get('/stream', async (req, res) => {
     }
   }
   const realtimePayload = async () => {
-    const jobs = await getJobsSince(RANGE_MS['24h'])
+    const [jobs, jobsInQueue, websiteImpressions5m, websiteImpressions24h] = await Promise.all([
+      getJobsSince(RANGE_MS['24h']),
+      countQueue(),
+      getImpressionCountSince(5 * 60 * 1000),
+      getImpressionCountSince(RANGE_MS['24h'])
+    ])
+    const activeUsers = getRealtimeActiveUsersCount()
+    const sessions = getRealtimePresenceSessions()
+    const sessionsByUser = sessions.reduce((map, session: any) => {
+      const userId = String(session?.userId || '').trim()
+      if (!userId) return map
+      const existing = map.get(userId) || []
+      existing.push(session)
+      map.set(userId, existing)
+      return map
+    }, new Map<string, any[]>())
+    const latestJobByUser = jobs.reduce((map, job: any) => {
+      const userId = String(job?.userId || '').trim()
+      if (!userId) return map
+      const existing = map.get(userId)
+      if (!existing || asMs(job?.updatedAt || job?.createdAt) > asMs(existing?.updatedAt || existing?.createdAt)) {
+        map.set(userId, job)
+      }
+      return map
+    }, new Map<string, any>())
+    const usersRendering = Array.from(sessionsByUser.keys()).filter((userId) => {
+      const latest = latestJobByUser.get(userId)
+      return QUEUE_STATUSES.has(String(latest?.status || '').toLowerCase())
+    }).length
+    const exportWindowMs = 12 * 60 * 1000
+    const usersExporting = Array.from(sessionsByUser.keys()).filter((userId) => {
+      const latest = latestJobByUser.get(userId)
+      const status = String(latest?.status || '').toLowerCase()
+      const updatedMs = asMs(latest?.updatedAt || latest?.createdAt)
+      return status === 'completed' && updatedMs > Date.now() - exportWindowMs
+    }).length
+    const averageSessionMinutes = sessions.length
+      ? Number(
+          (
+            sessions.reduce((sum, session: any) => {
+              const connectedMs = asMs(session?.connectedAt)
+              if (!connectedMs) return sum
+              return sum + Math.max(0, (Date.now() - connectedMs) / 60_000)
+            }, 0) / sessions.length
+          ).toFixed(1)
+        )
+      : 0
     return {
-      activeUsers: getRealtimeActiveUsersCount(),
-      jobsInQueue: await countQueue(),
+      activeUsers,
+      connectedRealtimeClients: getConnectedRealtimeClientCount(),
+      jobsInQueue,
       jobsFailed24h: jobs.filter((job) => String(job?.status || '').toLowerCase() === 'failed').length,
-      websiteImpressions5m: await getImpressionCountSince(5 * 60 * 1000),
-      websiteImpressions24h: await getImpressionCountSince(RANGE_MS['24h']),
+      websiteImpressions5m,
+      websiteImpressions24h,
+      liveUsers: {
+        usersOnSite: activeUsers,
+        usersRendering,
+        usersExporting,
+        averageSessionMinutes
+      },
       t: new Date().toISOString()
     }
   }
@@ -3928,7 +3990,7 @@ router.get('/stream', async (req, res) => {
     }
   }
 
-  send('ready', { ok: true, t: new Date().toISOString() })
+  send('ready', { ok: true, intervalMs, t: new Date().toISOString() })
   await sendRealtime()
 
   const unsubscribe = subscribeToAdminErrorStream((entry) => {
@@ -3945,7 +4007,7 @@ router.get('/stream', async (req, res) => {
 
   const realtimeTimer = setInterval(() => {
     void sendRealtime()
-  }, 10_000)
+  }, intervalMs)
   const keepaliveTimer = setInterval(() => {
     if (!closed && !res.writableEnded && !(res as any).destroyed) {
       res.write(':keepalive\n\n')

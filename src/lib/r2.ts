@@ -129,8 +129,20 @@ export const r2 = {
     const cmd = new PutObjectCommand({ Bucket: bucket, Key, Body: body, ContentType })
     return getClient().send(cmd)
   },
-  getPresignedGetUrl: async ({ Key, expiresIn = 600 }: { Key: string; expiresIn?: number }) => {
-    const cmd = new GetObjectCommand({ Bucket: bucket, Key })
+  getPresignedGetUrl: async ({
+    Key,
+    expiresIn = 600,
+    responseContentDisposition
+  }: {
+    Key: string
+    expiresIn?: number
+    responseContentDisposition?: string
+  }) => {
+    const cmd = new GetObjectCommand({
+      Bucket: bucket,
+      Key,
+      ResponseContentDisposition: responseContentDisposition
+    })
     return getSignedUrl(getClient(), cmd, { expiresIn })
   },
   deleteObject: async ({ Key }: { Key: string }) => {

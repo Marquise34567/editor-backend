@@ -167,9 +167,32 @@ const uploadFileToOutput = async ({ key, filePath, contentType }: { key: string;
   })
 }
 
-const getSignedOutputUrl = async ({ key, expiresIn }: { key: string; expiresIn: number }) => {
-  if (r2.isConfigured) return r2.getPresignedGetUrl({ Key: key, expiresIn })
-  const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).createSignedUrl(key, expiresIn)
+const getSignedOutputUrl = async ({
+  key,
+  expiresIn,
+  downloadFileName
+}: {
+  key: string
+  expiresIn: number
+  downloadFileName?: string | null
+}) => {
+  const sanitizedFileName =
+    typeof downloadFileName === 'string' && downloadFileName.trim()
+      ? downloadFileName.trim().replace(/[\r\n"]/g, '')
+      : null
+  const contentDisposition = sanitizedFileName
+    ? `attachment; filename="${sanitizedFileName}"`
+    : undefined
+  if (r2.isConfigured) {
+    return r2.getPresignedGetUrl({
+      Key: key,
+      expiresIn,
+      responseContentDisposition: contentDisposition
+    })
+  }
+  const { data, error } = await supabaseAdmin.storage
+    .from(OUTPUT_BUCKET)
+    .createSignedUrl(key, expiresIn, sanitizedFileName ? { download: sanitizedFileName } : undefined)
   if (error || !data?.signedUrl) throw error || new Error('signed_url_failed')
   return data.signedUrl
 }
@@ -5469,10 +5492,18 @@ const buildAbsoluteApiUrl = (req: any, pathname: string) => {
   return `${protocol}://${host}${pathname}`
 }
 
-const buildLocalOutputFallbackUrl = (req: any, jobId: string, clipIndex: number) => {
+const buildLocalOutputFallbackUrl = (
+  req: any,
+  jobId: string,
+  clipIndex: number,
+  forceDownload = false
+) => {
   const clip = Math.max(1, clipIndex + 1)
-  const query = clip > 1 ? `?clip=${clip}` : ''
-  return buildAbsoluteApiUrl(req, `/api/jobs/${jobId}/local-output${query}`)
+  const params = new URLSearchParams()
+  if (clip > 1) params.set('clip', String(clip))
+  if (forceDownload) params.set('download', '1')
+  const query = params.toString()
+  return buildAbsoluteApiUrl(req, `/api/jobs/${jobId}/local-output${query ? `?${query}` : ''}`)
 }
 
 const resolveOutputUrlWithLocalFallback = async ({
@@ -5480,17 +5511,23 @@ const resolveOutputUrlWithLocalFallback = async ({
   job,
   outputPath,
   clipIndex,
-  expiresIn = 60 * 10
+  expiresIn = 60 * 10,
+  forceDownload = false
 }: {
   req: any
   job: any
   outputPath: string
   clipIndex: number
   expiresIn?: number
+  forceDownload?: boolean
 }) => {
   try {
     await ensureBucket(OUTPUT_BUCKET, false)
-    const signed = await getSignedOutputUrl({ key: outputPath, expiresIn })
+    const signed = await getSignedOutputUrl({
+      key: outputPath,
+      expiresIn,
+      downloadFileName: forceDownload ? path.basename(outputPath) : null
+    })
     return {
       url: signed,
       source: 'remote' as const
@@ -5499,7 +5536,7 @@ const resolveOutputUrlWithLocalFallback = async ({
     const local = getLocalOutputFileInfo(job, clipIndex)
     if (local) {
       return {
-        url: buildLocalOutputFallbackUrl(req, job.id, clipIndex),
+        url: buildLocalOutputFallbackUrl(req, job.id, clipIndex, forceDownload),
         source: 'local' as const
       }
     }
@@ -20829,7 +20866,8 @@ router.post('/:id/download-url', async (req: any, res) => {
         req,
         job,
         outputPath: selectedOutputPath,
-        clipIndex
+        clipIndex,
+        forceDownload: true
       })
 
       // schedule auto-delete 1 minute after user requests download
