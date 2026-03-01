@@ -1765,7 +1765,7 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Ultra mode playbook active: dynamic binge editing profile enabled.',
         'Ultra mode enforces fast-mode processing and upload acceleration.',
-        'Ultra mode front-loads 6-8s hooks and optimizes first-3-second hold with frequent micro-interrupts.'
+        'Ultra mode favors velocity: heavier hook pressure, denser pattern interrupts, and faster pacing resets.'
       ]
     }
   }
@@ -1776,8 +1776,8 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       prompt: RETENTION_KING_PLAYBOOK_PROMPT,
       notes: [
         'Retention King playbook active: retention-engineering profile enabled.',
-        'Retention King aggressively removes drop-off windows and low-energy stretches.',
-        'Retention King enforces 6-8s openers and first-3-second retention pressure with curiosity loops.'
+        'Retention King prioritizes watch-time stability: stronger narrative coherence and stricter quality-gate checks.',
+        'Retention King enforces 6-8s openers while protecting context clarity and payoff sequencing.'
       ]
     }
   }
@@ -2242,8 +2242,8 @@ const resolveClipCandidateTarget = ({
   else if (editorMode === 'savage-roast') target += 5
   else if (editorMode === 'reaction') target += 4
   else if (editorMode === 'gaming') target += 3
-  else if (editorMode === 'ultra') target += 8
-  else if (editorMode === 'retention-king') target += 6
+  else if (editorMode === 'ultra') target += 10
+  else if (editorMode === 'retention-king') target += 4
   else if (editorMode === 'podcast') target -= 3
   else if (editorMode === 'commentary') target -= 1
   if (nicheProfile?.niche === 'high_energy') target += 4
@@ -2275,10 +2275,13 @@ const resolveAutoExportClipTarget = ({
     editorMode === 'savage-roast' ||
     editorMode === 'reaction' ||
     editorMode === 'gaming' ||
-    editorMode === 'ultra' ||
-    editorMode === 'retention-king'
+    editorMode === 'ultra'
   ) {
     target = 4
+  }
+
+  if (editorMode === 'retention-king') {
+    target = Math.max(3, target - 1)
   }
 
   if (nicheProfile?.niche === 'high_energy') {
@@ -2334,11 +2337,11 @@ const resolveInterruptIntervalRange = ({
     minSec = 4
     maxSec = 6.2
   } else if (editorMode === 'ultra') {
-    minSec = 1.9
-    maxSec = 3.1
+    minSec = 1.7
+    maxSec = 2.8
   } else if (editorMode === 'retention-king') {
-    minSec = 2.2
-    maxSec = 3.5
+    minSec = 2.6
+    maxSec = 4.2
   }
   if (styleProfile?.style === 'tutorial') {
     minSec = Math.max(minSec, 3)
@@ -2952,14 +2955,121 @@ type EmotionalTuningProfile = {
   contextPenaltyMultiplier: number
 }
 
+type EditorModeEmotionalTuning = {
+  thresholdOffset: number
+  spacingMultiplier: number
+  leadTrimMultiplier: number
+  splitLenBias: number
+  openLoopBoost: number
+  curiosityBoost: number
+  contextPenaltyMultiplier: number
+}
+
+type EditorModeHookScoringProfile = {
+  instantHoldMultiplier: number
+  auditMultiplier: number
+  curiosityMultiplier: number
+  dynamicLiftMultiplier: number
+  teaserReserveMultiplier: number
+  contextPenaltyMultiplier: number
+  spoilerPenaltyMultiplier: number
+  faceoffAuditMultiplier: number
+  faceoffInstantHoldMultiplier: number
+  faceoffCuriosityMultiplier: number
+  faceoffContextPenaltyMultiplier: number
+  faceoffSpoilerPenaltyMultiplier: number
+  baseBias: number
+}
+
+const EDITOR_MODE_EMOTIONAL_TUNING: Partial<Record<EditorModeSelection, EditorModeEmotionalTuning>> = {
+  ultra: {
+    thresholdOffset: -0.04,
+    spacingMultiplier: 0.82,
+    leadTrimMultiplier: 0.84,
+    splitLenBias: 0.9,
+    openLoopBoost: 1.15,
+    curiosityBoost: 1.2,
+    contextPenaltyMultiplier: 0.88
+  },
+  'retention-king': {
+    thresholdOffset: -0.01,
+    spacingMultiplier: 0.96,
+    leadTrimMultiplier: 1.08,
+    splitLenBias: 1.12,
+    openLoopBoost: 1.08,
+    curiosityBoost: 1.06,
+    contextPenaltyMultiplier: 1.18
+  }
+}
+
+const DEFAULT_EDITOR_MODE_HOOK_SCORING_PROFILE: EditorModeHookScoringProfile = {
+  instantHoldMultiplier: 1,
+  auditMultiplier: 1,
+  curiosityMultiplier: 1,
+  dynamicLiftMultiplier: 1,
+  teaserReserveMultiplier: 1,
+  contextPenaltyMultiplier: 1,
+  spoilerPenaltyMultiplier: 1,
+  faceoffAuditMultiplier: 1,
+  faceoffInstantHoldMultiplier: 1,
+  faceoffCuriosityMultiplier: 1,
+  faceoffContextPenaltyMultiplier: 1,
+  faceoffSpoilerPenaltyMultiplier: 1,
+  baseBias: 0
+}
+
+const EDITOR_MODE_HOOK_SCORING_PROFILE: Partial<Record<EditorModeSelection, EditorModeHookScoringProfile>> = {
+  ultra: {
+    instantHoldMultiplier: 1.24,
+    auditMultiplier: 0.94,
+    curiosityMultiplier: 1.2,
+    dynamicLiftMultiplier: 1.18,
+    teaserReserveMultiplier: 0.92,
+    contextPenaltyMultiplier: 0.76,
+    spoilerPenaltyMultiplier: 0.88,
+    faceoffAuditMultiplier: 0.92,
+    faceoffInstantHoldMultiplier: 1.22,
+    faceoffCuriosityMultiplier: 1.16,
+    faceoffContextPenaltyMultiplier: 0.78,
+    faceoffSpoilerPenaltyMultiplier: 0.9,
+    baseBias: 0.012
+  },
+  'retention-king': {
+    instantHoldMultiplier: 1.06,
+    auditMultiplier: 1.24,
+    curiosityMultiplier: 1.08,
+    dynamicLiftMultiplier: 0.92,
+    teaserReserveMultiplier: 1.2,
+    contextPenaltyMultiplier: 1.22,
+    spoilerPenaltyMultiplier: 1.3,
+    faceoffAuditMultiplier: 1.25,
+    faceoffInstantHoldMultiplier: 1.04,
+    faceoffCuriosityMultiplier: 1.08,
+    faceoffContextPenaltyMultiplier: 1.22,
+    faceoffSpoilerPenaltyMultiplier: 1.28,
+    baseBias: 0.008
+  }
+}
+
+const getEditorModeHookScoringProfile = (editorMode?: EditorModeSelection | null): EditorModeHookScoringProfile => {
+  const patch = editorMode ? EDITOR_MODE_HOOK_SCORING_PROFILE[editorMode] : null
+  if (!patch) return DEFAULT_EDITOR_MODE_HOOK_SCORING_PROFILE
+  return {
+    ...DEFAULT_EDITOR_MODE_HOOK_SCORING_PROFILE,
+    ...patch
+  }
+}
+
 const resolveEmotionalTuningProfile = ({
   styleProfile,
   nicheProfile,
-  aggressionLevel
+  aggressionLevel,
+  editorMode
 }: {
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
   aggressionLevel?: RetentionAggressionLevel
+  editorMode?: EditorModeSelection | null
 }): EmotionalTuningProfile => {
   const nicheKey = nicheProfile?.niche || 'story'
   const styleKey = styleProfile?.style || 'story'
@@ -2975,7 +3085,8 @@ const resolveEmotionalTuningProfile = ({
   else if (aggressionLevel === 'high') thresholdShiftByAggression = -0.02
   else if (aggressionLevel === 'viral') thresholdShiftByAggression = -0.05
 
-  return {
+  const modePatch = editorMode ? EDITOR_MODE_EMOTIONAL_TUNING[editorMode] : null
+  const tuned = {
     thresholdOffset: Number(clamp(
       base.thresholdOffset * nicheWeight +
       style.thresholdOffset * styleWeight +
@@ -3012,6 +3123,20 @@ const resolveEmotionalTuningProfile = ({
       base.contextPenaltyMultiplier * (1 + (style.contextPenaltyMultiplier - 1) * styleWeight),
       0.8,
       1.35
+    ).toFixed(4))
+  }
+  if (!modePatch) return tuned
+  return {
+    thresholdOffset: Number(clamp(tuned.thresholdOffset + modePatch.thresholdOffset, -0.24, 0.24).toFixed(4)),
+    spacingMultiplier: Number(clamp(tuned.spacingMultiplier * modePatch.spacingMultiplier, 0.68, 1.52).toFixed(4)),
+    leadTrimMultiplier: Number(clamp(tuned.leadTrimMultiplier * modePatch.leadTrimMultiplier, 0.56, 1.58).toFixed(4)),
+    splitLenBias: Number(clamp(tuned.splitLenBias * modePatch.splitLenBias, 0.68, 1.62).toFixed(4)),
+    openLoopBoost: Number(clamp(tuned.openLoopBoost * modePatch.openLoopBoost, 0.72, 1.56).toFixed(4)),
+    curiosityBoost: Number(clamp(tuned.curiosityBoost * modePatch.curiosityBoost, 0.78, 1.62).toFixed(4)),
+    contextPenaltyMultiplier: Number(clamp(
+      tuned.contextPenaltyMultiplier * modePatch.contextPenaltyMultiplier,
+      0.68,
+      1.52
     ).toFixed(4))
   }
 }
@@ -4415,15 +4540,15 @@ const resolveVerticalCaptionConfig = (
     if (preset === 'rage_mode') {
       return {
         fontId: 'impact' as SubtitleFontId,
-        textColor: 'FF4D4D',
-        accentColor: 'FFD74A',
+        textColor: 'FDE68A',
+        accentColor: 'FB923C',
         outlineColor: '1A0202',
         outlineWidth: 14,
         shadowEnabled: true,
-        shadowColor: '120000',
+        shadowColor: '050505',
         shadowBlur: 18,
-        boxEnabled: false,
-        boxColor: '240202',
+        boxEnabled: true,
+        boxColor: '111111',
         animationEnabled: true,
         animation: 'bounce' as VerticalClipCaptionAnimation
       }
@@ -7671,19 +7796,22 @@ const detectEmotionalBeatAnchors = ({
   durationSeconds,
   styleProfile,
   nicheProfile,
-  aggressionLevel
+  aggressionLevel,
+  editorMode
 }: {
   windows: EngagementWindow[]
   durationSeconds: number
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
   aggressionLevel?: RetentionAggressionLevel
+  editorMode?: EditorModeSelection | null
 }) => {
   if (!windows.length) return [] as number[]
   const tuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
-    aggressionLevel
+    aggressionLevel,
+    editorMode
   })
   const beatStrength = (window: EngagementWindow) => clamp01(
     0.34 * window.emotionIntensity +
@@ -7766,7 +7894,8 @@ const applyEmotionalBeatCuts = ({
   aggressionLevel,
   hookRange,
   styleProfile,
-  nicheProfile
+  nicheProfile,
+  editorMode
 }: {
   segments: Segment[]
   windows: EngagementWindow[]
@@ -7774,6 +7903,7 @@ const applyEmotionalBeatCuts = ({
   hookRange: TimeRange | null
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
+  editorMode?: EditorModeSelection | null
 }) => {
   if (!segments.length || !windows.length) {
     return {
@@ -7786,7 +7916,8 @@ const applyEmotionalBeatCuts = ({
   const tuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
-    aggressionLevel
+    aggressionLevel,
+    editorMode
   })
   const beatStrength = (window: EngagementWindow) => clamp01(
     0.34 * window.emotionIntensity +
@@ -9902,12 +10033,14 @@ const scoreHookFaceoffCandidate = ({
   candidate,
   windows,
   hookCalibration,
-  transcriptCues
+  transcriptCues,
+  editorMode
 }: {
   candidate: HookCandidate
   windows: EngagementWindow[]
   hookCalibration?: HookCalibrationProfile | null
   transcriptCues?: TranscriptCue[]
+  editorMode?: EditorModeSelection | null
 }) => {
   const computeEmotionalHookPull = (start: number, end: number) => {
     const duration = Math.max(0.5, end - start)
@@ -9969,15 +10102,21 @@ const scoreHookFaceoffCandidate = ({
     end,
     transcriptCues: Array.isArray(transcriptCues) ? transcriptCues : []
   })
+  const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
+  const contextPenalty = evaluateHookContextDependency(start, end, Array.isArray(transcriptCues) ? transcriptCues : [])
+  const spoilerRisk = scoreHookSpoilerRisk(candidate.text || '')
   const faceoffScore = clamp01(
     weights.candidateScore * candidate.score +
-    weights.auditScore * candidate.auditScore +
+    weights.auditScore * candidate.auditScore * modeHookProfile.faceoffAuditMultiplier +
     weights.energy * energy +
-    weights.curiosity * curiosity +
+    weights.curiosity * curiosity * modeHookProfile.faceoffCuriosityMultiplier +
     weights.emotionalSpike * emotionalSpike +
     0.08 * emotionalPull +
-    0.08 * instantHold +
-    0.06 * introClarity
+    0.08 * instantHold * modeHookProfile.faceoffInstantHoldMultiplier +
+    0.06 * introClarity -
+    0.06 * contextPenalty * modeHookProfile.faceoffContextPenaltyMultiplier -
+    0.05 * spoilerRisk * modeHookProfile.faceoffSpoilerPenaltyMultiplier +
+    modeHookProfile.baseBias
   )
   return Number(faceoffScore.toFixed(4))
 }
@@ -9990,7 +10129,8 @@ const pickTopHookCandidates = ({
   hookCalibration,
   styleProfile,
   nicheProfile,
-  aggressionLevel
+  aggressionLevel,
+  editorMode
 }: {
   durationSeconds: number
   segments: TimeRange[]
@@ -10000,14 +10140,17 @@ const pickTopHookCandidates = ({
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
   aggressionLevel?: RetentionAggressionLevel
+  editorMode?: EditorModeSelection | null
 }) => {
   // Analyze each uploaded video independently and choose the strongest hook from
   // that video's own pacing/signal profile (never a predetermined timestamp).
   const emotionalTuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
-    aggressionLevel
+    aggressionLevel,
+    editorMode
   })
+  const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
   const hookCandidateTarget = resolveHookCandidateTarget(durationSeconds)
   const dynamicBaseline = computeHookDynamicBaseline(windows)
   const starts = new Set<number>()
@@ -10096,18 +10239,19 @@ const pickTopHookCandidates = ({
         0.08 * visualImpact +
         0.1 * emotionImpact +
         0.09 * emotionalHookPull +
-        0.08 * boostedCuriosityAcceleration +
+        0.08 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier +
         0.05 * openLoopSignal +
-        0.05 * teaserReserve +
+        0.05 * teaserReserve * modeHookProfile.teaserReserveMultiplier +
         0.03 * audit.teaserStrength +
-        0.1 * instantHoldScore +
+        0.1 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
         0.09 * introClarityScore +
         0.04 * durationAlignment +
-        0.11 * audit.auditScore +
-        0.06 * dynamicLift.score +
+        0.11 * audit.auditScore * modeHookProfile.auditMultiplier +
+        0.06 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
         0.04 * dynamicLift.peakDensity -
-        0.13 * tunedContextPenalty -
-        0.08 * audit.spoilerRisk
+        0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
+        0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier +
+        modeHookProfile.baseBias
       )
       evaluated.push({
         start: aligned.start,
@@ -10145,7 +10289,7 @@ const pickTopHookCandidates = ({
     const key = `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
     const cached = faceoffScoreCache.get(key)
     if (cached !== undefined) return cached
-    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration, transcriptCues })
+    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration, transcriptCues, editorMode })
     faceoffScoreCache.set(key, score)
     return score
   }
@@ -10362,13 +10506,33 @@ const buildMicroCutRangesFromSilences = ({
   return { ranges: mergeRanges(ranges), actions }
 }
 
+type EditorModeCutProfile = {
+  candidateThresholdDelta: number
+  hardCutThresholdDelta: number
+  compressionBoost: number
+}
+
+const EDITOR_MODE_CUT_PROFILES: Partial<Record<EditorModeSelection, EditorModeCutProfile>> = {
+  ultra: {
+    candidateThresholdDelta: -0.06,
+    hardCutThresholdDelta: -0.04,
+    compressionBoost: 1.2
+  },
+  'retention-king': {
+    candidateThresholdDelta: -0.01,
+    hardCutThresholdDelta: 0.03,
+    compressionBoost: 1.06
+  }
+}
+
 const applyBoredomModelToSegments = ({
   segments,
   windows,
   aggressionLevel,
   hookRange,
   silences,
-  tuning
+  tuning,
+  editorMode
 }: {
   segments: Segment[]
   windows: EngagementWindow[]
@@ -10376,6 +10540,7 @@ const applyBoredomModelToSegments = ({
   hookRange: TimeRange | null
   silences: TimeRange[]
   tuning: LongFormRuntimeTuning
+  editorMode?: EditorModeSelection | null
 }) => {
   if (!segments.length || !windows.length) {
     return {
@@ -10386,14 +10551,23 @@ const applyBoredomModelToSegments = ({
     }
   }
   const preset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
+  const modeCutProfile = editorMode
+    ? EDITOR_MODE_CUT_PROFILES[editorMode] || null
+    : null
   const candidateThreshold = tuning.isLongForm ? tuning.boredomCandidateThreshold : preset.boredomThreshold
   const hardCutThreshold = tuning.isLongForm
     ? Math.max(candidateThreshold + 0.08, tuning.boredomHardCutThreshold)
     : Math.min(0.92, preset.boredomThreshold + 0.16)
+  const effectiveCandidateThreshold = modeCutProfile
+    ? clamp(candidateThreshold + modeCutProfile.candidateThresholdDelta, 0.42, 0.9)
+    : candidateThreshold
+  const effectiveHardCutThreshold = modeCutProfile
+    ? clamp(hardCutThreshold + modeCutProfile.hardCutThresholdDelta, effectiveCandidateThreshold + 0.04, 0.95)
+    : hardCutThreshold
   const boredom = buildBoredomRangesFromScores(
     windows,
-    candidateThreshold,
-    hardCutThreshold
+    effectiveCandidateThreshold,
+    effectiveHardCutThreshold
   )
   const protectedRanges: TimeRange[] = []
   if (hookRange) protectedRanges.push(hookRange)
@@ -10446,8 +10620,9 @@ const applyBoredomModelToSegments = ({
     const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
     const overlapBoredom = getBoredomScoreForRange(windows, segmentRange)
     const compressionNudge = 0.04 * clamp01(overlapRatio * 1.25) + 0.05 * clamp01(overlapBoredom)
+    const modeCompressionBoost = modeCutProfile ? modeCutProfile.compressionBoost : 1
     const targetSpeed = clamp(
-      baseSpeed + compressionNudge * preset.cutMultiplier,
+      baseSpeed + compressionNudge * preset.cutMultiplier * modeCompressionBoost,
       tuning.compressionSpeed.min,
       tuning.compressionSpeed.max
     )
@@ -12569,7 +12744,8 @@ const buildEditPlan = async (
   const emotionalTuning = resolveEmotionalTuningProfile({
     styleProfile,
     nicheProfile,
-    aggressionLevel: styleAdjustedAggressionLevel
+    aggressionLevel: styleAdjustedAggressionLevel,
+    editorMode: options.editorMode
   })
   const silenceTrimCuts = options.removeBoring
     ? buildSilenceTrimCuts(
@@ -12673,7 +12849,8 @@ const buildEditPlan = async (
       : null,
     styleProfile,
     nicheProfile,
-    aggressionLevel: styleAdjustedAggressionLevel
+    aggressionLevel: styleAdjustedAggressionLevel,
+    editorMode: options.editorMode
   })
   const hookVariants = [
     topHookCandidates.selected,
@@ -12706,7 +12883,8 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel,
     hookRange,
     silences,
-    tuning: longFormRuntimeTuning
+    tuning: longFormRuntimeTuning,
+    editorMode: options.editorMode
   })
   const emotionalBeatAdjusted = applyEmotionalBeatCuts({
     segments: boredomApplied.segments,
@@ -12714,7 +12892,8 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel,
     hookRange,
     styleProfile,
-    nicheProfile
+    nicheProfile,
+    editorMode: options.editorMode
   })
   const styleInterruptTargetSeconds = resolveInterruptTargetSeconds({
     strategyProfile: options.retentionStrategyProfile,
@@ -12746,7 +12925,8 @@ const buildEditPlan = async (
     durationSeconds,
     styleProfile,
     nicheProfile,
-    aggressionLevel: styleAdjustedAggressionLevel
+    aggressionLevel: styleAdjustedAggressionLevel,
+    editorMode: options.editorMode
   })
   const mergedBeatAnchors = mergeBeatAnchorSets({
     rhythmAnchors: beatAnchors,
@@ -13888,8 +14068,8 @@ const buildVerticalCaptionSubtitleStyle = ({
     }
     if (preset === 'rage_mode') {
       return {
-        textColor: 'FF4D4D',
-        accentColor: 'FFD74A',
+        textColor: 'FDE68A',
+        accentColor: 'FB923C',
         outlineColor: '1A0202',
         outlineWidth: 14,
         animation: 'pop' as const
@@ -15339,8 +15519,8 @@ const getVerticalInterruptTargetIntervalSeconds = ({
   else if (editorMode === 'savage-roast') combined -= 0.32
   else if (editorMode === 'gaming') combined -= 0.24
   else if (editorMode === 'reaction') combined -= 0.18
-  else if (editorMode === 'ultra') combined -= 0.52
-  else if (editorMode === 'retention-king') combined -= 0.4
+  else if (editorMode === 'ultra') combined -= 0.62
+  else if (editorMode === 'retention-king') combined -= 0.16
   else if (editorMode === 'education') combined += 0.28
   else if (editorMode === 'commentary') combined += 0.18
   else if (editorMode === 'podcast') combined += 0.34
@@ -15411,11 +15591,11 @@ const getVerticalModeScoreBias = (
     return bias
   }
   if (editorMode === 'ultra') {
-    bias = addVerticalModeScoreBias(bias, { hook: 0.07, interrupt: 0.1, ending: 0.03, energy: 0.08, caption: -0.02 })
+    bias = addVerticalModeScoreBias(bias, { hook: 0.11, interrupt: 0.13, ending: -0.01, energy: 0.12, caption: -0.04 })
     return bias
   }
   if (editorMode === 'retention-king') {
-    bias = addVerticalModeScoreBias(bias, { hook: 0.09, interrupt: 0.08, ending: 0.06, energy: 0.06, caption: 0.02 })
+    bias = addVerticalModeScoreBias(bias, { hook: 0.07, interrupt: 0.05, ending: 0.12, energy: 0.04, caption: 0.08 })
     return bias
   }
   if (editorMode === 'education') {
