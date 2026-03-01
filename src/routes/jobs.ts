@@ -65,6 +65,7 @@ import { applyWatermarkOverride, getFeatureLabControls } from '../services/featu
 import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
 import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
+import { buildFullAutoYoutubePreset, parseFullAutoYoutubeRequest } from '../services/fullAutoYoutube'
 
 const router = express.Router()
 
@@ -893,6 +894,19 @@ type TranscriptCue = {
   keywordIntensity: number
   curiosityTrigger: number
   fillerDensity: number
+  words?: TranscriptWord[]
+  speaker?: string | null
+  language?: string | null
+}
+type TranscriptWord = {
+  text: string
+  start: number
+  end: number
+  confidence: number | null
+  emphasis?: boolean
+  isFiller?: boolean
+  emoji?: string | null
+  speaker?: string | null
 }
 type HookAuditResult = {
   passed: boolean
@@ -1077,6 +1091,11 @@ type VerticalCaptionConfig = {
   preset: VerticalCaptionPreset
   animationEnabled: boolean
   animation: VerticalClipCaptionAnimation
+  animationSpeed: number
+  highlightWords: boolean
+  autoEmphasis: boolean
+  autoEmoji: boolean
+  removeFillers: boolean
   fontId: SubtitleFontId
   fontSize: number | null
   text: string
@@ -1098,6 +1117,8 @@ type VerticalClipCaptionOverlay = {
   end: number
   animation: VerticalClipCaptionAnimation
   position: 'center' | 'bottom'
+  emphasisWords?: string[]
+  emoji?: string | null
 }
 type VerticalRetentionSelectionResult = {
   accepted: VerticalRetentionCandidate[]
@@ -4157,7 +4178,14 @@ const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null =>
     glitch_pop: 'glitch_pop',
     glitch: 'glitch_pop',
     cinema_punch: 'cinema_punch',
-    cinema: 'cinema_punch'
+    cinema: 'cinema_punch',
+    shadow_strike: 'cinema_punch',
+    opus_pop: 'mrbeast_animated',
+    opus: 'mrbeast_animated',
+    capcut_kinetic: 'rage_mode',
+    capcut: 'rage_mode',
+    high_energy_neon: 'neon_glow',
+    minimal_bold: 'basic_clean'
   }
   if (aliases[compact]) return aliases[compact]
   const normalizedSubtitle = normalizeSubtitlePreset(token)
@@ -4195,7 +4223,10 @@ const parseVerticalCaptionOutlineWidth = (value: any): number | null => {
 const parseVerticalCaptionShadowBlur = (value: any): number | null => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return null
-  return Math.round(clamp(parsed, VERTICAL_CAPTION_SHADOW_BLUR_MIN, VERTICAL_CAPTION_SHADOW_BLUR_MAX))
+  const normalized = parsed > VERTICAL_CAPTION_SHADOW_BLUR_MAX && parsed <= 100
+    ? (parsed / 100) * VERTICAL_CAPTION_SHADOW_BLUR_MAX
+    : parsed
+  return Math.round(clamp(normalized, VERTICAL_CAPTION_SHADOW_BLUR_MIN, VERTICAL_CAPTION_SHADOW_BLUR_MAX))
 }
 
 const parseVerticalCaptionPosition = (value: any): number | null => {
@@ -4227,6 +4258,12 @@ const parseVerticalCaptionAnimationMode = (value: any): VerticalClipCaptionAnima
   if (['bounce', 'spring'].includes(normalized)) return 'bounce'
   if (['glitch', 'jitter'].includes(normalized)) return 'glitch'
   return null
+}
+
+const parseVerticalCaptionAnimationSpeed = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Number(clamp(parsed, 0.5, 2.2).toFixed(2))
 }
 
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
@@ -4336,10 +4373,16 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const shadowBlurCandidate = pickFirstDefinedValue(
     (payload as any).shadowBlur,
     (payload as any).shadow_blur,
+    (payload as any).shadowStrength,
+    (payload as any).shadow_strength,
     (payload as any).verticalCaptionShadowBlur,
     (payload as any).vertical_caption_shadow_blur,
+    (payload as any).verticalCaptionShadowStrength,
+    (payload as any).vertical_caption_shadow_strength,
     nested?.shadowBlur,
-    nested?.shadow_blur
+    nested?.shadow_blur,
+    nested?.shadowStrength,
+    nested?.shadow_strength
   )
   const boxColorCandidate = pickFirstDefinedValue(
     (payload as any).boxColor,
@@ -4367,6 +4410,14 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.animation,
     nested?.captionAnimation,
     nested?.caption_animation
+  )
+  const animationSpeedCandidate = pickFirstDefinedValue(
+    (payload as any).animationSpeed,
+    (payload as any).animation_speed,
+    (payload as any).verticalCaptionAnimationSpeed,
+    (payload as any).vertical_caption_animation_speed,
+    nested?.animationSpeed,
+    nested?.animation_speed
   )
   const positionXCandidate = pickFirstDefinedValue(
     (payload as any).positionX,
@@ -4424,6 +4475,58 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
       nested?.box_enabled
     )
   )
+  const highlightWordsCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).highlightWords,
+      (payload as any).highlight_words,
+      (payload as any).wordHighlight,
+      (payload as any).word_highlight,
+      (payload as any).verticalCaptionHighlightWords,
+      (payload as any).vertical_caption_highlight_words,
+      nested?.highlightWords,
+      nested?.highlight_words,
+      nested?.wordHighlight,
+      nested?.word_highlight
+    )
+  )
+  const autoEmphasisCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).autoEmphasis,
+      (payload as any).auto_emphasis,
+      (payload as any).emphasis,
+      (payload as any).verticalCaptionAutoEmphasis,
+      (payload as any).vertical_caption_auto_emphasis,
+      nested?.autoEmphasis,
+      nested?.auto_emphasis,
+      nested?.emphasis
+    )
+  )
+  const autoEmojiCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).autoEmoji,
+      (payload as any).auto_emoji,
+      (payload as any).emoji,
+      (payload as any).verticalCaptionAutoEmoji,
+      (payload as any).vertical_caption_auto_emoji,
+      nested?.autoEmoji,
+      nested?.auto_emoji,
+      nested?.emoji
+    )
+  )
+  const removeFillersCandidate = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (payload as any).removeFillers,
+      (payload as any).remove_fillers,
+      (payload as any).fillerRemoval,
+      (payload as any).filler_removal,
+      (payload as any).verticalCaptionRemoveFillers,
+      (payload as any).vertical_caption_remove_fillers,
+      nested?.removeFillers,
+      nested?.remove_fillers,
+      nested?.fillerRemoval,
+      nested?.filler_removal
+    )
+  )
   if (
     textCandidate === undefined &&
     presetCandidate === undefined &&
@@ -4437,12 +4540,17 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     shadowBlurCandidate === undefined &&
     boxColorCandidate === undefined &&
     animationCandidate === undefined &&
+    animationSpeedCandidate === undefined &&
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
     autoGenerateCandidate === null &&
     enabledCandidate === null &&
     shadowEnabledCandidate === null &&
-    boxEnabledCandidate === null
+    boxEnabledCandidate === null &&
+    highlightWordsCandidate === null &&
+    autoEmphasisCandidate === null &&
+    autoEmojiCandidate === null &&
+    removeFillersCandidate === null
   ) {
     return null
   }
@@ -4458,6 +4566,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedBoxColor = parseVerticalCaptionHexColor(boxColorCandidate)
   const parsedAnimation = parseVerticalCaptionAnimationMode(animationCandidate)
   const parsedAnimationEnabled = parseVerticalCaptionAnimationEnabled(animationCandidate)
+  const parsedAnimationSpeed = parseVerticalCaptionAnimationSpeed(animationSpeedCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   return {
@@ -4476,6 +4585,11 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedBoxColor ? { boxColor: parsedBoxColor } : {}),
     ...(parsedAnimation ? { animation: parsedAnimation } : {}),
     ...(parsedAnimationEnabled === null ? {} : { animationEnabled: parsedAnimationEnabled }),
+    ...(parsedAnimationSpeed === null ? {} : { animationSpeed: parsedAnimationSpeed }),
+    ...(highlightWordsCandidate === null ? {} : { highlightWords: highlightWordsCandidate }),
+    ...(autoEmphasisCandidate === null ? {} : { autoEmphasis: autoEmphasisCandidate }),
+    ...(autoEmojiCandidate === null ? {} : { autoEmoji: autoEmojiCandidate }),
+    ...(removeFillersCandidate === null ? {} : { removeFillers: removeFillersCandidate }),
     ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
     ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
     ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
@@ -4502,7 +4616,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: true,
         boxColor: '020617',
         animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation
+        animation: 'none' as VerticalClipCaptionAnimation,
+        animationSpeed: 1,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: false,
+        removeFillers: true
       }
     }
     if (preset === 'neon_glow') {
@@ -4518,7 +4637,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: false,
         boxColor: '0A0F1E',
         animationEnabled: true,
-        animation: 'slide' as VerticalClipCaptionAnimation
+        animation: 'slide' as VerticalClipCaptionAnimation,
+        animationSpeed: 1.08,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: true,
+        removeFillers: false
       }
     }
     if (preset === 'bold_clean_box') {
@@ -4534,7 +4658,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: true,
         boxColor: '111827',
         animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation
+        animation: 'none' as VerticalClipCaptionAnimation,
+        animationSpeed: 0.96,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: false,
+        removeFillers: true
       }
     }
     if (preset === 'rage_mode') {
@@ -4550,7 +4679,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: true,
         boxColor: '111111',
         animationEnabled: true,
-        animation: 'bounce' as VerticalClipCaptionAnimation
+        animation: 'bounce' as VerticalClipCaptionAnimation,
+        animationSpeed: 1.2,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: true,
+        removeFillers: false
       }
     }
     if (preset === 'ice_pop') {
@@ -4566,7 +4700,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: false,
         boxColor: '041426',
         animationEnabled: true,
-        animation: 'pop' as VerticalClipCaptionAnimation
+        animation: 'pop' as VerticalClipCaptionAnimation,
+        animationSpeed: 1.08,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: true,
+        removeFillers: false
       }
     }
     if (preset === 'retro_wave') {
@@ -4582,7 +4721,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: false,
         boxColor: '240046',
         animationEnabled: true,
-        animation: 'slide' as VerticalClipCaptionAnimation
+        animation: 'slide' as VerticalClipCaptionAnimation,
+        animationSpeed: 1.06,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: true,
+        removeFillers: false
       }
     }
     if (preset === 'glitch_pop') {
@@ -4598,7 +4742,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: false,
         boxColor: '020617',
         animationEnabled: true,
-        animation: 'glitch' as VerticalClipCaptionAnimation
+        animation: 'glitch' as VerticalClipCaptionAnimation,
+        animationSpeed: 1.14,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: true,
+        removeFillers: false
       }
     }
     if (preset === 'cinema_punch') {
@@ -4614,7 +4763,12 @@ const resolveVerticalCaptionConfig = (
         boxEnabled: true,
         boxColor: '1F172A',
         animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation
+        animation: 'none' as VerticalClipCaptionAnimation,
+        animationSpeed: 0.92,
+        highlightWords: true,
+        autoEmphasis: true,
+        autoEmoji: false,
+        removeFillers: true
       }
     }
     return {
@@ -4629,7 +4783,12 @@ const resolveVerticalCaptionConfig = (
       boxEnabled: false,
       boxColor: '000000',
       animationEnabled: true,
-      animation: 'pop' as VerticalClipCaptionAnimation
+      animation: 'pop' as VerticalClipCaptionAnimation,
+      animationSpeed: 1.1,
+      highlightWords: true,
+      autoEmphasis: true,
+      autoEmoji: true,
+      removeFillers: false
     }
   }
   const fallbackPreset = parseVerticalCaptionPreset(defaults?.preset) || 'mrbeast_animated'
@@ -4674,7 +4833,12 @@ const resolveVerticalCaptionConfig = (
     boxEnabled: typeof defaults?.boxEnabled === 'boolean' ? defaults.boxEnabled : fallbackPresetStyle.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor,
     animation: resolvedFallbackAnimation,
-    animationEnabled: resolvedFallbackAnimation !== 'none'
+    animationEnabled: resolvedFallbackAnimation !== 'none',
+    animationSpeed: parseVerticalCaptionAnimationSpeed(defaults?.animationSpeed) ?? fallbackPresetStyle.animationSpeed,
+    highlightWords: typeof defaults?.highlightWords === 'boolean' ? defaults.highlightWords : fallbackPresetStyle.highlightWords,
+    autoEmphasis: typeof defaults?.autoEmphasis === 'boolean' ? defaults.autoEmphasis : fallbackPresetStyle.autoEmphasis,
+    autoEmoji: typeof defaults?.autoEmoji === 'boolean' ? defaults.autoEmoji : fallbackPresetStyle.autoEmoji,
+    removeFillers: typeof defaults?.removeFillers === 'boolean' ? defaults.removeFillers : fallbackPresetStyle.removeFillers
   }
   const styleBaseline = requestedPreset && requestedPreset !== fallbackPreset
     ? getPresetStyleDefaults(requestedPreset)
@@ -4695,6 +4859,7 @@ const resolveVerticalCaptionConfig = (
   } else if (overrideAnimationEnabled === true && resolvedAnimation === 'none') {
     resolvedAnimation = 'pop'
   }
+  const resolvedAnimationSpeed = parseVerticalCaptionAnimationSpeed(override.animationSpeed) ?? styleBaseline.animationSpeed
 
   return {
     enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
@@ -4714,6 +4879,11 @@ const resolveVerticalCaptionConfig = (
     boxColor: parseVerticalCaptionHexColor(override.boxColor) || styleBaseline.boxColor,
     animationEnabled: resolvedAnimation !== 'none',
     animation: resolvedAnimation,
+    animationSpeed: resolvedAnimationSpeed,
+    highlightWords: typeof override.highlightWords === 'boolean' ? override.highlightWords : styleBaseline.highlightWords,
+    autoEmphasis: typeof override.autoEmphasis === 'boolean' ? override.autoEmphasis : styleBaseline.autoEmphasis,
+    autoEmoji: typeof override.autoEmoji === 'boolean' ? override.autoEmoji : styleBaseline.autoEmoji,
+    removeFillers: typeof override.removeFillers === 'boolean' ? override.removeFillers : styleBaseline.removeFillers,
     positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
     positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY
   }
@@ -4727,6 +4897,11 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     preset,
     animationEnabled: true,
     animation: 'pop',
+    animationSpeed: 1.1,
+    highlightWords: true,
+    autoEmphasis: true,
+    autoEmoji: true,
+    removeFillers: false,
     fontId: 'impact',
     fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
     text: '',
@@ -4777,12 +4952,18 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
   } else if (requestedAnimationEnabled === true && resolvedAnimation === 'none') {
     resolvedAnimation = 'pop'
   }
+  const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? defaults.animationSpeed
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
     preset,
     animationEnabled: resolvedAnimation !== 'none',
     animation: resolvedAnimation,
+    animationSpeed,
+    highlightWords: typeof config.highlightWords === 'boolean' ? config.highlightWords : defaults.highlightWords,
+    autoEmphasis: typeof config.autoEmphasis === 'boolean' ? config.autoEmphasis : defaults.autoEmphasis,
+    autoEmoji: typeof config.autoEmoji === 'boolean' ? config.autoEmoji : defaults.autoEmoji,
+    removeFillers: typeof config.removeFillers === 'boolean' ? config.removeFillers : defaults.removeFillers,
     fontId: parseVerticalCaptionFontId(config.fontId) || defaults.fontId,
     fontSize,
     text,
@@ -4809,6 +4990,16 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       animation: animationMode,
       animationMode: animationMode,
       animation_mode: animationMode,
+      animationSpeed: normalized.animationSpeed,
+      animation_speed: normalized.animationSpeed,
+      highlightWords: normalized.highlightWords,
+      highlight_words: normalized.highlightWords,
+      autoEmphasis: normalized.autoEmphasis,
+      auto_emphasis: normalized.autoEmphasis,
+      autoEmoji: normalized.autoEmoji,
+      auto_emoji: normalized.autoEmoji,
+      removeFillers: normalized.removeFillers,
+      remove_fillers: normalized.removeFillers,
       fontId: normalized.fontId,
       fontSize,
       text,
@@ -4835,6 +5026,16 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     vertical_caption_animation_enabled: normalized.animationEnabled,
     verticalCaptionAnimation: animationMode,
     vertical_caption_animation: animationMode,
+    verticalCaptionAnimationSpeed: normalized.animationSpeed,
+    vertical_caption_animation_speed: normalized.animationSpeed,
+    verticalCaptionHighlightWords: normalized.highlightWords,
+    vertical_caption_highlight_words: normalized.highlightWords,
+    verticalCaptionAutoEmphasis: normalized.autoEmphasis,
+    vertical_caption_auto_emphasis: normalized.autoEmphasis,
+    verticalCaptionAutoEmoji: normalized.autoEmoji,
+    vertical_caption_auto_emoji: normalized.autoEmoji,
+    verticalCaptionRemoveFillers: normalized.removeFillers,
+    vertical_caption_remove_fillers: normalized.removeFillers,
     verticalCaptionFontId: normalized.fontId,
     vertical_caption_font_id: normalized.fontId,
     verticalCaptionFontSize: fontSize,
@@ -22388,19 +22589,19 @@ const handleCreateJob = async (req: any, res: any) => {
     const safeName = filename ? path.basename(filename) : path.basename(providedPath)
     const inputPath = providedPath || `${userId}/${id}/${safeName}`
     const renderConfig = parseRenderConfigFromRequest(req.body)
-    const onlyCutsOverride = getOnlyCutsFromPayload(req.body)
-    const smartZoomOverride = getSmartZoomFromPayload(req.body)
-    const transitionsOverride = getTransitionsFromPayload(req.body)
-    const soundFxOverride = getSoundFxFromPayload(req.body)
-    const maxCutsOverride = getMaxCutsFromPayload(req.body)
-    const editorModeOverride = getEditorModeFromPayload(req.body)
-    const hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
-    const longFormPresetOverride = getLongFormPresetFromPayload(req.body)
-    const longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
-    const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
-    const tangentKillerOverride = getTangentKillerFromPayload(req.body)
+    let onlyCutsOverride = getOnlyCutsFromPayload(req.body)
+    let smartZoomOverride = getSmartZoomFromPayload(req.body)
+    let transitionsOverride = getTransitionsFromPayload(req.body)
+    let soundFxOverride = getSoundFxFromPayload(req.body)
+    let maxCutsOverride = getMaxCutsFromPayload(req.body)
+    let editorModeOverride = getEditorModeFromPayload(req.body)
+    let hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
+    let longFormPresetOverride = getLongFormPresetFromPayload(req.body)
+    let longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
+    let longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
+    let tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
-    const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    let requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -22412,16 +22613,67 @@ const handleCreateJob = async (req: any, res: any) => {
     })
     let retentionAggressionLevel = retentionTuning.aggression
     let retentionStrategyProfile = retentionTuning.strategy
-    const retentionTargetPlatform = retentionPlatformTuning.targetPlatform
-    const platformProfile = getPlatformProfileFromPayload(
+    let retentionTargetPlatform = retentionPlatformTuning.targetPlatform
+    let platformProfile = getPlatformProfileFromPayload(
       req.body,
       parsePlatformProfile(retentionTargetPlatform, 'auto')
     )
     const styleBlendOverride = parseStyleArchetypeBlendFromPayload(req.body)
-    const autoCaptionsOverride = getAutoCaptionsFromPayload(req.body)
-    const subtitleStyleOverride = getSubtitleStyleFromPayload(req.body)
+    let autoCaptionsOverride = getAutoCaptionsFromPayload(req.body)
+    let subtitleStyleOverride = getSubtitleStyleFromPayload(req.body)
     const verticalCaptionConfigOverride = renderConfig.mode === 'vertical'
       ? resolveVerticalCaptionConfig(req.body, getDefaultVerticalCaptionConfig())
+      : null
+    const fullAutoYoutubeRequest = parseFullAutoYoutubeRequest(req.body, renderConfig.mode)
+    const fullAutoYoutubePreset = fullAutoYoutubeRequest
+      ? buildFullAutoYoutubePreset(fullAutoYoutubeRequest)
+      : null
+    if (fullAutoYoutubePreset) {
+      const defaults = fullAutoYoutubePreset.defaults
+      if (!retentionTuning.hasStrategyOverride) retentionStrategyProfile = defaults.retentionStrategyProfile
+      if (!retentionTuning.hasAggressionOverride) retentionAggressionLevel = defaults.retentionAggressionLevel
+      if (!retentionPlatformTuning.hasOverride) retentionTargetPlatform = defaults.retentionTargetPlatform
+      if (!hasPlatformProfileOverride(req.body)) platformProfile = defaults.platformProfile
+      if (onlyCutsOverride === null) onlyCutsOverride = defaults.onlyCuts
+      if (smartZoomOverride === null) smartZoomOverride = defaults.smartZoom
+      if (transitionsOverride === null) transitionsOverride = defaults.transitions
+      if (soundFxOverride === null) soundFxOverride = defaults.soundFx
+      if (maxCutsOverride === null) maxCutsOverride = defaults.maxCuts
+      if (editorModeOverride === null) editorModeOverride = defaults.editorMode
+      if (hookSelectionModeOverride === null) hookSelectionModeOverride = defaults.hookSelectionMode
+      if (longFormPresetOverride === null) longFormPresetOverride = defaults.longFormPreset
+      if (longFormAggressionOverride === null) longFormAggressionOverride = defaults.longFormAggression
+      if (longFormClarityVsSpeedOverride === null) longFormClarityVsSpeedOverride = defaults.longFormClarityVsSpeed
+      if (tangentKillerOverride === null) tangentKillerOverride = defaults.tangentKiller
+      if (requestedFastMode === null) requestedFastMode = defaults.fastMode
+      if (autoCaptionsOverride === null) autoCaptionsOverride = defaults.autoCaptions
+      if (!subtitleStyleOverride) subtitleStyleOverride = defaults.subtitleStyle
+    }
+    const fullAutoYoutubeProfile = fullAutoYoutubePreset
+      ? {
+          ...fullAutoYoutubePreset.profile,
+          appliedSettings: {
+            renderMode: renderConfig.mode,
+            retentionStrategyProfile,
+            retentionAggressionLevel,
+            retentionTargetPlatform,
+            platformProfile,
+            onlyCuts: onlyCutsOverride,
+            smartZoom: smartZoomOverride,
+            transitions: transitionsOverride,
+            soundFx: soundFxOverride,
+            maxCuts: maxCutsOverride,
+            editorMode: editorModeOverride,
+            hookSelectionMode: hookSelectionModeOverride,
+            longFormPreset: longFormPresetOverride,
+            longFormAggression: longFormAggressionOverride,
+            longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
+            tangentKiller: tangentKillerOverride,
+            fastMode: requestedFastMode,
+            autoCaptions: autoCaptionsOverride,
+            subtitleStyle: subtitleStyleOverride
+          }
+        }
       : null
 
     // Ensure Supabase admin client envs are present for signed upload URLs
@@ -22535,6 +22787,9 @@ const handleCreateJob = async (req: any, res: any) => {
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
           algorithm_config_source: configSelection.source,
+          ...(fullAutoYoutubeProfile
+            ? { fullAutoYoutube: fullAutoYoutubeProfile, full_auto_youtube: fullAutoYoutubeProfile }
+            : {}),
           ...(verticalCaptionConfigOverride ? buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride) : {})
         },
         analysis: buildPersistedRenderAnalysis({
@@ -22555,6 +22810,9 @@ const handleCreateJob = async (req: any, res: any) => {
             pipeline_mode_prompt: createModePlaybook.prompt || null,
             pipelinePowerMode: createModePlaybook.id,
             pipeline_power_mode: createModePlaybook.id,
+            ...(fullAutoYoutubeProfile
+              ? { fullAutoYoutube: fullAutoYoutubeProfile, full_auto_youtube: fullAutoYoutubeProfile }
+              : {}),
             algorithm_config_version_id: configSelection.config_version_id,
             algorithm_experiment_id: configSelection.experiment_id,
             algorithm_config_source: configSelection.source,
@@ -22802,6 +23060,34 @@ router.get('/automation-profile', async (req: any, res) => {
     return res.json({
       profile,
       preview
+    })
+  } catch (err) {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/full-auto-youtube/profile', async (req: any, res) => {
+  try {
+    const payload = req.body && typeof req.body === 'object' ? req.body : {}
+    const requestedRenderMode = parseRenderMode(payload?.renderMode)
+    const request = parseFullAutoYoutubeRequest(
+      {
+        ...payload,
+        fullAutoYoutube: {
+          ...((payload?.fullAutoYoutube && typeof payload.fullAutoYoutube === 'object')
+            ? payload.fullAutoYoutube
+            : {}),
+          enabled: true
+        }
+      },
+      requestedRenderMode
+    )
+    if (!request) return res.status(400).json({ error: 'invalid_full_auto_payload' })
+    const preset = buildFullAutoYoutubePreset(request)
+    return res.json({
+      enabled: true,
+      defaults: preset.defaults,
+      profile: preset.profile
     })
   } catch (err) {
     return res.status(500).json({ error: 'server_error' })
