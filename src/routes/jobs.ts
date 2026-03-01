@@ -20942,14 +20942,18 @@ const processJob = async (
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
 
-      // Prefer a dedicated free-plan watermark image. Keep env override support,
-      // then fall back to historical favicon behavior.
+      // Prefer a dedicated watermark image. Keep env override support,
+      // then fall back to legacy names and historical favicon behavior.
       const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
       const watermarkImageCandidates = [
         configuredWatermarkImage,
+        path.join(process.cwd(), 'assets', 'watermark.png'),
         path.join(process.cwd(), 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
         path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
         path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
         path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
         path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
       ].filter(Boolean)
