@@ -540,6 +540,7 @@ const run = () => {
     renderConfig: {
       mode: 'horizontal',
       verticalClipCount: 1,
+      verticalClipDurationSeconds: 45,
       horizontalMode: { output: 'quality', fit: 'contain' },
       verticalMode: null
     },
