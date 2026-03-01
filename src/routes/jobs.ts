@@ -3913,19 +3913,34 @@ const normalizeVerticalCaptionPhraseInput = (value: any): string => {
     .join(' ')
 }
 
+const normalizeVerticalCaptionLineInput = (value: any): string =>
+  String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 240)
+
 const normalizeVerticalCaptionTextInput = (value: any): string => {
   const normalized = String(value ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/[ \t]+\n/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
     .split('\n')
-    .map((line) => normalizeVerticalCaptionPhraseInput(line))
+    .map((line) => normalizeVerticalCaptionLineInput(line))
     .filter(Boolean)
     .slice(0, 18)
     .join('\n')
     .trim()
   if (!normalized) return ''
   return normalized.slice(0, 1_800)
+}
+
+const MAX_MANUAL_VERTICAL_CAPTION_LINES = 4
+const MAX_MANUAL_VERTICAL_CAPTION_CHARS = 320
+const isLikelyManualVerticalCaptionText = (value: string) => {
+  const normalized = normalizeVerticalCaptionTextInput(value)
+  if (!normalized) return false
+  const lineCount = normalized.split(/\n+/).filter(Boolean).length
+  return lineCount <= MAX_MANUAL_VERTICAL_CAPTION_LINES && normalized.length <= MAX_MANUAL_VERTICAL_CAPTION_CHARS
 }
 
 const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null => {
@@ -9057,7 +9072,27 @@ const buildVerticalClipCaptionOverlays = ({
 }): VerticalClipCaptionOverlay[] => {
   const clipDuration = Math.max(0, Number(range.end) - Number(range.start))
   if (clipDuration <= 0.35) return []
-  const userPhrases = splitVerticalCaptionPhrases(userCaptionText)
+  const normalizedUserCaptionText = normalizeVerticalCaptionTextInput(userCaptionText)
+  const preferredAnimation = parseVerticalCaptionAnimationMode(animationMode)
+  if (!autoGenerateFromTranscript && isLikelyManualVerticalCaptionText(normalizedUserCaptionText)) {
+    const resolvedAnimation: VerticalClipCaptionAnimation = (
+      animationEnabled === false || preferredAnimation === 'none'
+    )
+      ? 'none'
+      : preferredAnimation || 'none'
+    const start = Number(Math.min(0.16, Math.max(0, clipDuration - 0.41)).toFixed(3))
+    const end = Number(Math.max(start + 0.05, clipDuration - 0.04).toFixed(3))
+    return [
+      {
+        text: normalizedUserCaptionText,
+        start,
+        end,
+        animation: resolvedAnimation,
+        position: 'center'
+      }
+    ]
+  }
+  const userPhrases = splitVerticalCaptionPhrases(normalizedUserCaptionText)
   const highEnergy = inferHighEnergyVerticalClip({
     range,
     windows,
@@ -9134,7 +9169,6 @@ const buildVerticalClipCaptionOverlays = ({
     .slice(0, 6)
   const fallbackAnchors = [0.16, 0.45, 0.72]
   const maxStart = Math.max(0, clipDuration - 0.4)
-  const preferredAnimation = parseVerticalCaptionAnimationMode(animationMode)
   const animations: VerticalClipCaptionAnimation[] = (
     animationEnabled === false || preferredAnimation === 'none'
   )
@@ -9168,12 +9202,15 @@ const buildVerticalClipCaptionOverlays = ({
   return overlays
 }
 
+const normalizeVerticalCaptionCueText = (value: any): string =>
+  normalizeVerticalCaptionTextInput(value).slice(0, MAX_MANUAL_VERTICAL_CAPTION_CHARS)
+
 const overlaysToTranscriptCues = (overlays: VerticalClipCaptionOverlay[]) => (
   overlays
     .map((overlay) => {
       const start = Number(overlay.start)
       const end = Number(overlay.end)
-      const text = sanitizeCaptionPhrase(overlay.text)
+      const text = normalizeVerticalCaptionCueText(overlay.text)
       if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
       return {
         start,
@@ -9197,7 +9234,7 @@ const mergeTranscriptCueLayers = (layers: TranscriptCue[][]) => {
       ...cue,
       start: Number(cue.start.toFixed(3)),
       end: Number(cue.end.toFixed(3)),
-      text: sanitizeCaptionPhrase(cue.text)
+      text: normalizeVerticalCaptionCueText(cue.text)
     }))
     .sort((left, right) => left.start - right.start || left.end - right.end)
   const merged: TranscriptCue[] = []
@@ -13882,7 +13919,9 @@ const buildVerticalCaptionAss = ({
   const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
   const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
     (config.animationEnabled ? 'pop' : 'none')
+  const preserveManualText = !config.autoGenerate && isLikelyManualVerticalCaptionText(config.text)
   const useUppercase = (
+    !preserveManualText &&
     config.preset !== 'basic_clean' &&
     config.preset !== 'bold_clean_box' &&
     config.preset !== 'cinema_punch'
@@ -13907,7 +13946,9 @@ const buildVerticalCaptionAss = ({
     const start = Number.isFinite(cue.start) ? cue.start : 0
     const end = Number.isFinite(cue.end) ? cue.end : start + 0.8
     if (end <= start + 0.03) continue
-    const phrase = sanitizeCaptionPhrase(String(cue.text || ''))
+    const phrase = preserveManualText
+      ? normalizeVerticalCaptionCueText(cue.text)
+      : sanitizeCaptionPhrase(String(cue.text || ''))
     if (!phrase) continue
     const text = escapeAssDialogueText(useUppercase ? phrase.toUpperCase() : phrase)
     const animationTag = (() => {
@@ -16404,6 +16445,94 @@ const buildVerticalSmartZoomFilters = ({
   ]
 }
 
+const shouldApplyVerticalStabilization = ({
+  windows,
+  start,
+  end
+}: {
+  windows: EngagementWindow[]
+  start: number
+  end: number
+}) => {
+  const relevant = windows.filter((window) => window.time >= start && window.time < end)
+  if (relevant.length < 6) return false
+  const motionStats = computeHookSignalStats(relevant.map((window) => window.motionScore))
+  const sceneStats = computeHookSignalStats(relevant.map((window) => window.sceneChangeRate))
+  const jitterScore = motionStats.std * 0.72 + sceneStats.std * 0.28
+  return jitterScore >= 0.14 && motionStats.mean >= 0.4
+}
+
+const probeVerticalClipAverageLuma = async ({
+  inputPath,
+  start,
+  end
+}: {
+  inputPath: string
+  start: number
+  end: number
+}) => {
+  if (!hasFfmpegFilter('signalstats')) return null
+  const safeDuration = Math.max(0, end - start)
+  if (safeDuration < 0.25) return null
+  const sampleDuration = Number(clamp(safeDuration, 2, 14).toFixed(3))
+  const sampleFps = safeDuration >= 30 ? 1 : 2
+  try {
+    const output = await runFfmpegCapture([
+      '-hide_banner',
+      '-nostdin',
+      '-loglevel',
+      'error',
+      '-ss',
+      String(Math.max(0, Number(start.toFixed(3)))),
+      '-t',
+      String(sampleDuration),
+      '-i',
+      inputPath,
+      '-vf',
+      `fps=${sampleFps},signalstats,metadata=print:key=lavfi.signalstats.YAVG`,
+      '-an',
+      '-f',
+      'null',
+      '-'
+    ])
+    const values = Array.from(output.matchAll(/lavfi\.signalstats\.YAVG=([0-9.]+)/g))
+      .map((match) => Number.parseFloat(match[1] || ''))
+      .filter((value) => Number.isFinite(value) && value >= 0)
+    if (!values.length) return null
+    const average = values.reduce((sum, value) => sum + value, 0) / values.length
+    return Number(average.toFixed(3))
+  } catch {
+    return null
+  }
+}
+
+const buildVerticalAutoColorFilter = (averageLuma?: number | null) => {
+  const luma = Number(averageLuma)
+  if (!Number.isFinite(luma)) {
+    return `eq=brightness=${toFilterNumber(0.012)}:contrast=${toFilterNumber(1.04)}:saturation=${toFilterNumber(1.03)}`
+  }
+  const normalized = clamp01((luma - 16) / 219)
+  const brightness = clamp((0.5 - normalized) * 0.09, -0.055, 0.07)
+  const contrast = clamp(1.03 + Math.abs(0.52 - normalized) * 0.16, 1.02, 1.17)
+  const saturation = clamp(1.02 + Math.max(0, 0.44 - normalized) * 0.1, 1.01, 1.12)
+  return `eq=brightness=${toFilterNumber(brightness)}:contrast=${toFilterNumber(contrast)}:saturation=${toFilterNumber(saturation)}`
+}
+
+const buildVerticalEnhancementFilters = ({
+  applyStabilization,
+  averageLuma
+}: {
+  applyStabilization: boolean
+  averageLuma?: number | null
+}) => {
+  const filters: string[] = []
+  if (applyStabilization && hasFfmpegFilter('deshake')) {
+    filters.push('deshake=x=24:y=24:w=48:h=48:rx=12:ry=12:edge=mirror')
+  }
+  filters.push(buildVerticalAutoColorFilter(averageLuma))
+  return filters
+}
+
 const renderVerticalClip = async ({
   inputPath,
   outputPath,
@@ -16421,6 +16550,8 @@ const renderVerticalClip = async ({
   enableTransitions,
   enableSmartZoom,
   enableSoundFx,
+  applyStabilization,
+  averageLuma,
   autoZoomMax,
   subtitlePath,
   subtitleIsAss,
@@ -16442,6 +16573,8 @@ const renderVerticalClip = async ({
   enableTransitions: boolean
   enableSmartZoom: boolean
   enableSoundFx: boolean
+  applyStabilization: boolean
+  averageLuma?: number | null
   autoZoomMax: number
   subtitlePath?: string | null
   subtitleIsAss?: boolean
@@ -16498,8 +16631,12 @@ const renderVerticalClip = async ({
   const resolvedZoomIntensity = parseVerticalZoomIntensity(verticalMode.zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
   const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none'
   const shouldApplyClipTransitions = Boolean(enableTransitions)
-  if (shouldApplySmartZoom || shouldApplyClipTransitions) {
-    const videoFx: string[] = []
+  const enhancementFx = buildVerticalEnhancementFilters({
+    applyStabilization: Boolean(applyStabilization),
+    averageLuma
+  })
+  if (enhancementFx.length || shouldApplySmartZoom || shouldApplyClipTransitions) {
+    const videoFx: string[] = [...enhancementFx]
     if (shouldApplySmartZoom) {
       videoFx.push(...buildVerticalSmartZoomFilters({
         outputWidth,
@@ -19179,6 +19316,16 @@ const processJob = async (
             }
           }
         }
+        const applyClipStabilization = shouldApplyVerticalStabilization({
+          windows: verticalWindows,
+          start: range.start,
+          end: range.end
+        })
+        const clipAverageLuma = await probeVerticalClipAverageLuma({
+          inputPath: tmpIn,
+          start: range.start,
+          end: range.end
+        })
         await renderVerticalClip({
           inputPath: tmpIn,
           outputPath: localClipPath,
@@ -19196,6 +19343,8 @@ const processJob = async (
           enableTransitions: options.transitions,
           enableSmartZoom: options.smartZoom,
           enableSoundFx: options.soundFx,
+          applyStabilization: applyClipStabilization,
+          averageLuma: clipAverageLuma,
           autoZoomMax: options.autoZoomMax,
           subtitlePath: clipSubtitlePath,
           subtitleIsAss: clipSubtitleIsAss,
