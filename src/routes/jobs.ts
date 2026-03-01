@@ -18996,7 +18996,7 @@ const processJob = async (
   }
   const runtimeControls = await getFeatureLabControls().catch(() => null)
   const watermarkEnabled = applyWatermarkOverride(
-    renderConfig.mode === 'horizontal' ? features.watermark : false,
+    features.watermark,
     runtimeControls?.watermarkOverride
   )
 
@@ -20942,12 +20942,19 @@ const processJob = async (
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
 
-      // Prefer an image watermark if available (uses favicon from frontend/public),
-      // otherwise fall back to a subtle text watermark. The image will be overlaid
-      // at bottom-right with a small inset.
-      const defaultWatermarkImage = path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
-      const watermarkImagePath = process.env.WATERMARK_IMAGE_PATH || defaultWatermarkImage
-      const watermarkImageExists = watermarkEnabled && fs.existsSync(watermarkImagePath)
+      // Prefer a dedicated free-plan watermark image. Keep env override support,
+      // then fall back to historical favicon behavior.
+      const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
+      const watermarkImageCandidates = [
+        configuredWatermarkImage,
+        path.join(process.cwd(), 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
+      ].filter(Boolean)
+      const watermarkImagePath = watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || ''
+      const watermarkImageExists = watermarkEnabled && Boolean(watermarkImagePath)
       const watermarkFilter = watermarkImageExists
         ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
         : watermarkEnabled
