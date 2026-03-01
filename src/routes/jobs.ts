@@ -60,6 +60,7 @@ import {
   type StyleArchetypeBlend,
   type TimelineFeatureSnapshot
 } from '../lib/multiStyleRetention'
+import { planRetentionEditsWithFreeAi } from '../lib/freeAiRetentionPlanner'
 import { applyWatermarkOverride, getFeatureLabControls } from '../services/featureLab'
 import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
@@ -1274,6 +1275,16 @@ type EditPlan = {
   boredomActions?: Array<{ type: 'hard_cut' | 'micro_cut' | 'compress' | 'bridge'; start: number; end: number; score: number; reason: string }>
   pacingGovernorAdjustments?: number
   redundancyPrunedSeconds?: number
+  planner?: {
+    provider: 'ruthless_retention_prompt' | 'heuristic'
+    model: string | null
+    predictedAverageRetention: number
+    predictionConfidence: number
+    predictionConfidenceLevel: 'low' | 'medium' | 'high'
+    pacingAdjustmentCount: number
+    retentionProtectionChanges: string[]
+    notes: string[]
+  }
 }
 type EditOptions = {
   autoHookMove: boolean
@@ -6755,6 +6766,332 @@ const probeVideoStream = (filePath: string) => {
   }
 }
 
+const parseFrameRateFromProbe = (value: unknown) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (raw.includes('/')) {
+    const [numRaw, denRaw] = raw.split('/')
+    const numerator = Number(numRaw)
+    const denominator = Number(denRaw)
+    if (Number.isFinite(numerator) && Number.isFinite(denominator) && denominator > 0) {
+      const resolved = numerator / denominator
+      return Number.isFinite(resolved) && resolved > 0 ? resolved : null
+    }
+  }
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null
+}
+
+const buildPlannerTranscriptSegments = (cues: TranscriptCue[]) => {
+  return cues
+    .map((cue) => ({
+      start: Number(cue.start),
+      end: Number(cue.end),
+      text: String(cue.text || '').replace(/\s+/g, ' ').trim(),
+      confidence: null as number | null
+    }))
+    .filter((cue) => (
+      cue.text.length > 0 &&
+      Number.isFinite(cue.start) &&
+      Number.isFinite(cue.end) &&
+      cue.end > cue.start
+    ))
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+}
+
+const buildPlannerTranscriptExcerpt = (
+  transcriptSegments: Array<{ text: string }>,
+  maxChars = 1200
+) => {
+  const excerpt = transcriptSegments
+    .map((segment) => String(segment.text || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!excerpt) return ''
+  if (excerpt.length <= maxChars) return excerpt
+  return `${excerpt.slice(0, maxChars).trim()}...`
+}
+
+const derivePlannerFrameScanFromWindows = ({
+  windows,
+  durationSeconds,
+  renderMode,
+  videoWidth,
+  videoHeight
+}: {
+  windows: EngagementWindow[]
+  durationSeconds: number
+  renderMode: RenderMode
+  videoWidth: number | null
+  videoHeight: number | null
+}) => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  if (!windows.length) {
+    return {
+      portraitSignal: renderMode === 'vertical' ? 0.74 : 0.36,
+      landscapeSignal: renderMode === 'horizontal' ? 0.74 : 0.36,
+      centeredFaceVerticalSignal: 0.52,
+      horizontalMotionSignal: 0.42,
+      highMotionShortClipSignal: 0.38,
+      motionPeaks: [] as number[]
+    }
+  }
+
+  const ordered = windows
+    .filter((window) => Number.isFinite(window.time))
+    .slice()
+    .sort((a, b) => a.time - b.time)
+  const motionScores = ordered.map((window) => clamp01(
+    0.56 * window.motionScore +
+    0.24 * window.sceneChangeRate +
+    0.2 * (window.actionSpike ?? 0)
+  ))
+  const avgMotion = motionScores.length
+    ? motionScores.reduce((sum, score) => sum + score, 0) / motionScores.length
+    : 0
+  const sortedMotion = motionScores.slice().sort((a, b) => b - a)
+  const topBucketCount = Math.max(1, Math.floor(sortedMotion.length * 0.22))
+  const highMotion = sortedMotion.slice(0, topBucketCount).reduce((sum, score) => sum + score, 0) / topBucketCount
+  const avgActionSpike = ordered.length
+    ? ordered.reduce((sum, window) => sum + clamp01(window.actionSpike ?? 0), 0) / ordered.length
+    : 0
+
+  const horizontalMotionSignal = Number(clamp01(
+    0.58 * avgMotion +
+    0.24 * highMotion +
+    0.18 * avgActionSpike
+  ).toFixed(4))
+  const highMotionShortClipSignal = Number(clamp01(
+    0.54 * highMotion +
+    0.28 * avgActionSpike +
+    0.18 * avgMotion
+  ).toFixed(4))
+
+  const faceSamples = ordered.filter((window) => (
+    (window.facePresence ?? 0) > 0.1 &&
+    Number.isFinite(window.faceCenterX) &&
+    Number.isFinite(window.faceCenterY)
+  ))
+  const centeredFaceVerticalSignal = Number(clamp01(
+    faceSamples.length
+      ? faceSamples.reduce((sum, window) => {
+          const centeredY = 1 - Math.min(1, Math.abs((window.faceCenterY ?? 0.5) - 0.5) * 2)
+          const centeredX = 1 - Math.min(1, Math.abs((window.faceCenterX ?? 0.5) - 0.5) * 2)
+          const weight = clamp01((window.facePresence ?? 0) * 0.65 + (window.faceIntensity ?? 0) * 0.35)
+          return sum + (0.62 * centeredY + 0.38 * centeredX) * Math.max(0.15, weight)
+        }, 0) / faceSamples.length
+      : 0.52
+  ).toFixed(4))
+
+  const hasDimensions = Number.isFinite(videoWidth) && Number.isFinite(videoHeight) && Number(videoHeight) > 0
+  const aspectRatio = hasDimensions ? Number(videoWidth) / Number(videoHeight) : null
+  const baseLandscape = aspectRatio === null
+    ? (renderMode === 'horizontal' ? 0.72 : 0.38)
+    : aspectRatio > 1.08
+      ? 0.82
+      : aspectRatio < 0.92
+        ? 0.2
+        : 0.55
+  const basePortrait = aspectRatio === null
+    ? (renderMode === 'vertical' ? 0.72 : 0.38)
+    : aspectRatio < 0.92
+      ? 0.82
+      : aspectRatio > 1.08
+        ? 0.2
+        : 0.55
+
+  let landscapeSignal = clamp01(
+    0.66 * baseLandscape +
+    0.22 * horizontalMotionSignal +
+    0.12 * (renderMode === 'horizontal' ? 1 : 0)
+  )
+  let portraitSignal = clamp01(
+    0.62 * basePortrait +
+    0.26 * centeredFaceVerticalSignal +
+    0.12 * (1 - horizontalMotionSignal)
+  )
+
+  if (renderMode === 'vertical') {
+    portraitSignal = clamp01(portraitSignal + 0.07)
+    landscapeSignal = clamp01(landscapeSignal - 0.04)
+  } else {
+    landscapeSignal = clamp01(landscapeSignal + 0.06)
+    portraitSignal = clamp01(portraitSignal - 0.03)
+  }
+
+  const motionPeakThreshold = clamp(avgMotion * 1.18 + 0.09, 0.24, 0.82)
+  const motionPeaks: number[] = []
+  for (let index = 0; index < ordered.length; index += 1) {
+    const current = motionScores[index] ?? 0
+    const prev = index > 0 ? (motionScores[index - 1] ?? current) : current
+    const next = index < ordered.length - 1 ? (motionScores[index + 1] ?? current) : current
+    if (current < motionPeakThreshold || current < prev || current < next) continue
+    const peak = Number(clamp((ordered[index].time || 0) + 0.5, 0, safeDuration).toFixed(3))
+    if (motionPeaks.length && Math.abs(peak - motionPeaks[motionPeaks.length - 1]) < 0.35) continue
+    motionPeaks.push(peak)
+    if (motionPeaks.length >= 26) break
+  }
+
+  if (!motionPeaks.length) {
+    const fallback = ordered
+      .map((window, index) => ({ time: window.time, score: motionScores[index] ?? 0 }))
+      .sort((left, right) => right.score - left.score || left.time - right.time)
+      .slice(0, Math.min(10, ordered.length))
+      .map((entry) => Number(clamp(entry.time + 0.5, 0, safeDuration).toFixed(3)))
+      .sort((a, b) => a - b)
+    for (const peak of fallback) {
+      if (motionPeaks.some((existing) => Math.abs(existing - peak) < 0.35)) continue
+      motionPeaks.push(peak)
+    }
+  }
+
+  return {
+    portraitSignal: Number(clamp01(portraitSignal).toFixed(4)),
+    landscapeSignal: Number(clamp01(landscapeSignal).toFixed(4)),
+    centeredFaceVerticalSignal,
+    horizontalMotionSignal,
+    highMotionShortClipSignal,
+    motionPeaks
+  }
+}
+
+const normalizePlannerAdjustedSegments = (segments: Segment[], durationSeconds: number) => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const ordered = segments
+    .map((segment) => {
+      const start = clamp(Number(segment.start || 0), 0, Math.max(0, safeDuration - 0.1))
+      const end = clamp(Number(segment.end || 0), start + 0.05, safeDuration)
+      const speed = Number(segment.speed)
+      return {
+        ...segment,
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        speed: Number.isFinite(speed) && speed > 0 ? Number(speed.toFixed(3)) : 1
+      }
+    })
+    .filter((segment) => segment.end - segment.start > 0.18)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  if (!ordered.length) return [] as Segment[]
+
+  const normalized: Segment[] = []
+  for (const segment of ordered) {
+    const previous = normalized[normalized.length - 1]
+    let start = segment.start
+    const end = segment.end
+    if (previous && start < previous.end - 0.01) {
+      if (end <= previous.end + 0.01) {
+        if ((segment.speed ?? 1) > (previous.speed ?? 1)) {
+          previous.speed = Number((segment.speed ?? previous.speed ?? 1).toFixed(3))
+        }
+        continue
+      }
+      start = Number(previous.end.toFixed(3))
+    }
+    if (end - start <= 0.18) continue
+    normalized.push({
+      ...segment,
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3))
+    })
+  }
+  return normalized
+}
+
+const applyPlannerPacingAdjustmentsToSegments = ({
+  segments,
+  adjustments,
+  durationSeconds,
+  allowSpeedChanges,
+  speedCap
+}: {
+  segments: Segment[]
+  adjustments: Array<{
+    start: number
+    end: number
+    action: 'trim' | 'speed_up' | 'transition_boost'
+    intensity: number
+    speedMultiplier?: number
+  }>
+  durationSeconds: number
+  allowSpeedChanges: boolean
+  speedCap: number
+}) => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  let next = normalizePlannerAdjustedSegments(segments, safeDuration)
+
+  const trimWindow = (segment: Segment, start: number, end: number) => {
+    if (end <= segment.start || start >= segment.end) return [{ ...segment }]
+    const windows: Segment[] = []
+    if (start > segment.start + 0.22) {
+      windows.push({
+        ...segment,
+        start: Number(segment.start.toFixed(3)),
+        end: Number(start.toFixed(3))
+      })
+    }
+    if (end < segment.end - 0.22) {
+      windows.push({
+        ...segment,
+        start: Number(end.toFixed(3)),
+        end: Number(segment.end.toFixed(3))
+      })
+    }
+    return windows
+  }
+
+  for (const adjustment of adjustments.slice(0, 14)) {
+    const start = clamp(Number(adjustment.start || 0), 0, Math.max(0, safeDuration - 0.25))
+    const end = clamp(Number(adjustment.end || 0), start + 0.2, safeDuration)
+    const intensity = clamp(Number(adjustment.intensity || 0.4), 0.05, 1)
+
+    if (adjustment.action === 'trim') {
+      next = next.flatMap((segment) => trimWindow(segment, start, end))
+      next = normalizePlannerAdjustedSegments(next, safeDuration)
+      continue
+    }
+
+    if (adjustment.action === 'speed_up') {
+      if (!allowSpeedChanges) continue
+      next = next.map((segment) => {
+        if (segment.end <= start || segment.start >= end) return segment
+        const overlapStart = Math.max(segment.start, start)
+        const overlapEnd = Math.min(segment.end, end)
+        const overlapRatio = (overlapEnd - overlapStart) / Math.max(0.22, segment.end - segment.start)
+        if (overlapRatio <= 0.12) return segment
+        const currentSpeed = Number(segment.speed && segment.speed > 0 ? segment.speed : 1)
+        const requestedSpeed = Number(adjustment.speedMultiplier || 1 + intensity * 0.72)
+        const resolvedSpeed = clamp(Math.max(currentSpeed, requestedSpeed), 1, speedCap)
+        return {
+          ...segment,
+          speed: Number(resolvedSpeed.toFixed(3))
+        }
+      })
+      continue
+    }
+
+    if (adjustment.action === 'transition_boost') {
+      next = next.map((segment) => {
+        if (segment.end <= start || segment.start >= end) return segment
+        const overlapStart = Math.max(segment.start, start)
+        const overlapEnd = Math.min(segment.end, end)
+        const overlapRatio = (overlapEnd - overlapStart) / Math.max(0.22, segment.end - segment.start)
+        if (overlapRatio <= 0.08) return segment
+        const currentSpeed = Number(segment.speed && segment.speed > 0 ? segment.speed : 1)
+        const requestedSpeed = 1.04 + intensity * 0.24
+        return {
+          ...segment,
+          speed: allowSpeedChanges ? Number(clamp(Math.max(currentSpeed, requestedSpeed), 1, Math.max(1.08, speedCap)).toFixed(3)) : currentSpeed,
+          transitionStyle: 'smooth'
+        }
+      })
+    }
+  }
+
+  return normalizePlannerAdjustedSegments(next, safeDuration)
+}
+
 const detectAudioEnergy = async (filePath: string, durationSeconds: number) => {
   if (!hasFfmpeg() || !hasAudioStream(filePath)) return [] as { time: number; rms: number }[]
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
@@ -12003,6 +12340,7 @@ const buildEditPlan = async (
     transcriptCues?: TranscriptCue[]
     aggressionLevel?: RetentionAggressionLevel
     hookCalibration?: HookCalibrationProfile | null
+    renderMode?: RenderMode
   }
 ) => {
   const aggressionLevel = parseRetentionAggressionLevel(
@@ -12310,7 +12648,126 @@ const buildEditPlan = async (
     clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
     enabled: longFormRuntimeTuning.isLongForm
   })
-  const finalTimelineSegments = pacingGoverned.segments
+  let finalTimelineSegments = pacingGoverned.segments.map((segment) => ({ ...segment }))
+  let plannerSummary: EditPlan['planner'] | undefined
+  try {
+    const videoProbe = probeVideoStream(filePath)
+    const probedWidth = Number(videoProbe?.width)
+    const probedHeight = Number(videoProbe?.height)
+    const inferredRenderMode: RenderMode = (
+      context?.renderMode === 'horizontal' || context?.renderMode === 'vertical'
+    )
+      ? context.renderMode
+      : Number.isFinite(probedWidth) && Number.isFinite(probedHeight) && probedWidth > 0 && probedHeight > 0
+        ? probedWidth > probedHeight * 1.02
+          ? 'horizontal'
+          : 'vertical'
+        : 'horizontal'
+    const resolvedWidth = Number.isFinite(probedWidth) && probedWidth > 0
+      ? Math.round(probedWidth)
+      : inferredRenderMode === 'vertical'
+        ? 1080
+        : 1920
+    const resolvedHeight = Number.isFinite(probedHeight) && probedHeight > 0
+      ? Math.round(probedHeight)
+      : inferredRenderMode === 'vertical'
+        ? 1920
+        : 1080
+    const resolvedFps = parseFrameRateFromProbe(videoProbe?.frameRate) ?? 30
+
+    const plannerTranscriptSegments = buildPlannerTranscriptSegments(transcriptCues)
+    const plannerTranscriptExcerpt = buildPlannerTranscriptExcerpt(plannerTranscriptSegments)
+    const plannerFrameScan = derivePlannerFrameScanFromWindows({
+      windows,
+      durationSeconds,
+      renderMode: inferredRenderMode,
+      videoWidth: resolvedWidth,
+      videoHeight: resolvedHeight
+    })
+
+    const freeAiPlan = await planRetentionEditsWithFreeAi({
+      mode: inferredRenderMode,
+      metadata: {
+        width: resolvedWidth,
+        height: resolvedHeight,
+        duration: Math.max(0.1, durationSeconds),
+        fps: resolvedFps
+      },
+      frameScan: plannerFrameScan,
+      transcriptSegments: plannerTranscriptSegments,
+      transcriptExcerpt: plannerTranscriptExcerpt
+    })
+
+    const plannerAdjustments = freeAiPlan.pacingAdjustments.map((adjustment) => ({
+      start: adjustment.start,
+      end: adjustment.end,
+      action: adjustment.action,
+      intensity: adjustment.intensity,
+      speedMultiplier: adjustment.speedMultiplier
+    }))
+    if (plannerAdjustments.length) {
+      const plannerAdjustedSegments = applyPlannerPacingAdjustmentsToSegments({
+        segments: finalTimelineSegments,
+        adjustments: plannerAdjustments,
+        durationSeconds,
+        allowSpeedChanges: !options.onlyCuts,
+        speedCap: clamp(pacingProfile.speedCap + 0.22, 1.12, 1.8)
+      })
+      if (plannerAdjustedSegments.length) {
+        const lengthGovernedSegments = enforceSegmentLengths(plannerAdjustedSegments, minLen, maxLen, windows)
+        finalTimelineSegments = options.onlyCuts
+          ? lengthGovernedSegments
+          : stabilizeSpeechIntensity(
+              maintainSceneChangeFrequency(lengthGovernedSegments, windows, options.aggressiveMode),
+              windows,
+              options.aggressiveMode
+            )
+      }
+    }
+
+    if (freeAiPlan.selectedHook) {
+      const plannerHookStart = clamp(
+        Number(freeAiPlan.selectedHook.start || 0),
+        0,
+        Math.max(0, durationSeconds - 0.2)
+      )
+      const plannerHookEnd = clamp(
+        Number(freeAiPlan.selectedHook.end || plannerHookStart + 8),
+        plannerHookStart + 0.2,
+        Math.max(plannerHookStart + 0.2, durationSeconds)
+      )
+      const plannerHookDuration = Number((plannerHookEnd - plannerHookStart).toFixed(3))
+      const plannerHookScore = clamp01(Number(freeAiPlan.selectedHook.scores?.combined ?? 0.58))
+      const plannerHookCandidate: HookCandidate = {
+        start: Number(plannerHookStart.toFixed(3)),
+        duration: plannerHookDuration,
+        score: Number(plannerHookScore.toFixed(4)),
+        auditScore: Number(clamp01(plannerHookScore * 0.9 + 0.1).toFixed(4)),
+        auditPassed: plannerHookScore >= 0.56,
+        text: String(freeAiPlan.selectedHook.transcript || '').trim(),
+        reason: String(freeAiPlan.selectedHook.reason || 'Retention planner selected hook candidate.').trim(),
+        synthetic: true
+      }
+      const alreadyPresent = hookVariants.some((candidate) => (
+        Math.abs(candidate.start - plannerHookCandidate.start) < 0.01 &&
+        Math.abs(candidate.duration - plannerHookCandidate.duration) < 0.01
+      ))
+      if (!alreadyPresent) hookVariants.push(plannerHookCandidate)
+    }
+
+    plannerSummary = {
+      provider: freeAiPlan.provider,
+      model: freeAiPlan.model,
+      predictedAverageRetention: Number(clamp(freeAiPlan.predictedAverageRetention, 8, 99).toFixed(1)),
+      predictionConfidence: Number(clamp(freeAiPlan.predictionConfidence, 8, 99).toFixed(1)),
+      predictionConfidenceLevel: freeAiPlan.predictionConfidenceLevel,
+      pacingAdjustmentCount: plannerAdjustments.length,
+      retentionProtectionChanges: (freeAiPlan.retentionProtectionChanges || []).slice(0, 6),
+      notes: (freeAiPlan.notes || []).slice(0, 6)
+    }
+  } catch (error) {
+    console.warn('retention planner integration failed, continuing with base timeline', error)
+  }
   const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
   const totalPatternInterruptDensity = Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
@@ -12377,7 +12834,8 @@ const buildEditPlan = async (
     behaviorStyleProfile,
     autoEscalationEvents: autoEscalationResult.events,
     editDecisionTimeline: decisionTimeline,
-    styleFeatureSnapshot
+    styleFeatureSnapshot,
+    planner: plannerSummary
   }
 }
 
@@ -17839,7 +18297,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
                   await updateJob(jobId, { status: 'pacing', progress: 44 })
                 }
               },
-              { transcriptCues, aggressionLevel, hookCalibration }
+              {
+                transcriptCues,
+                aggressionLevel,
+                hookCalibration,
+                renderMode: initialRenderConfig.mode
+              }
             )
             return plan
           },
@@ -19021,7 +19484,8 @@ const processJob = async (
             aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
           }, undefined, {
             aggressionLevel,
-            hookCalibration
+            hookCalibration,
+            renderMode: renderConfig.mode
           })
         } catch (err) {
           console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process, using deterministic fallback`, err)
@@ -19049,6 +19513,11 @@ const processJob = async (
       if (editPlan?.emotionalTuning) {
         optimizationNotes.push(
           `Emotional tuning profile: threshold ${Number(editPlan.emotionalTuning.thresholdOffset).toFixed(2)}, spacing x${Number(editPlan.emotionalTuning.spacingMultiplier).toFixed(2)}, lead-trim x${Number(editPlan.emotionalTuning.leadTrimMultiplier).toFixed(2)}.`
+        )
+      }
+      if (editPlan?.planner) {
+        optimizationNotes.push(
+          `Retention planner (${editPlan.planner.provider}) predicted ${Number(editPlan.planner.predictedAverageRetention).toFixed(1)}% average retention (${editPlan.planner.predictionConfidenceLevel} confidence) and proposed ${editPlan.planner.pacingAdjustmentCount} pacing adjustment${editPlan.planner.pacingAdjustmentCount === 1 ? '' : 's'}.`
         )
       }
       engagementWindowsForAnalysis = editPlan?.engagementWindows ?? []
