@@ -2608,6 +2608,23 @@ const applyPacingAdjustmentsToSegments = ({
       })
       continue
     }
+
+    if (adjustment.action === 'transition_boost') {
+      next = next.map((segment) => {
+        if (segment.end <= start || segment.start >= end) return segment
+        const overlapStart = Math.max(segment.start, start)
+        const overlapEnd = Math.min(segment.end, end)
+        const overlapRatio = (overlapEnd - overlapStart) / Math.max(0.4, segment.end - segment.start)
+        if (overlapRatio <= 0.08) return segment
+        const requestedSpeed = 1.04 + intensity * 0.24
+        const speed = clamp(Math.max(Number(segment.speed || 1), requestedSpeed), 1, 1.32)
+        return {
+          start: segment.start,
+          end: segment.end,
+          speed: Number(speed.toFixed(3))
+        }
+      })
+    }
   }
 
   return normalizeSegments(next, safeDuration)

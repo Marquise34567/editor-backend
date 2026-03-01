@@ -162,6 +162,26 @@ const NEGATIVE_WORDS = [
   'worse'
 ]
 
+const FILLER_PHRASES = [
+  'uh',
+  'um',
+  'erm',
+  'ah',
+  'you know',
+  'i mean',
+  'like',
+  'sort of',
+  'kind of',
+  'basically',
+  'actually',
+  'literally'
+]
+
+const HESITATION_PATTERN = /\b(uh+|um+|er+|ah+|hmm+|mm+)\b/gi
+const WORD_PATTERN = /[a-z0-9']+/gi
+const SENTENCE_END_PATTERN = /[.!?]["')\]]*$/i
+const FRAME_ALIGNMENT_FALLBACK_FPS = 30
+
 const STRICT_RETENTION_PREFIX = 'Follow the exact retention-maximizing process above. Do NOT deviate. Output must be structured.'
 
 const RUTHLESS_RETENTION_PLAYBOOK = `You are AutoEditor's ruthless retention-maximizing AI brain.
@@ -207,6 +227,174 @@ const countKeywordHits = (value: string, keywords: string[]) => {
     if (text.includes(token)) hits += 1
   }
   return hits
+}
+
+const countWords = (text: string) => {
+  const matches = normalizeText(text).match(WORD_PATTERN)
+  return matches ? matches.length : 0
+}
+
+const countFillerHits = (text: string) => {
+  const normalized = ` ${normalizeText(text)} `
+  if (!normalized.trim()) return 0
+  let total = 0
+  for (const phrase of FILLER_PHRASES) {
+    const escaped = phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const regex = new RegExp(`\\b${escaped}\\b`, 'gi')
+    const matches = normalized.match(regex)
+    if (matches) total += matches.length
+  }
+  return total
+}
+
+const computeRepetitionScore = (text: string) => {
+  const words = normalizeText(text).split(/\s+/).filter(Boolean)
+  if (words.length < 6) return 0
+  const biGrams = new Map<string, number>()
+  for (let i = 0; i < words.length - 1; i += 1) {
+    const key = `${words[i]} ${words[i + 1]}`
+    biGrams.set(key, (biGrams.get(key) || 0) + 1)
+  }
+  const repeated = Array.from(biGrams.values()).reduce((sum, count) => sum + Math.max(0, count - 1), 0)
+  return clamp(repeated / Math.max(1, words.length * 0.45), 0, 1)
+}
+
+const normalizeTranscriptSignals = ({
+  segments,
+  duration
+}: {
+  segments: PlannerTranscriptSegment[]
+  duration: number
+}): TranscriptSignalSegment[] =>
+  segments
+    .map((segment) => {
+      const safeStart = clamp(Number(segment.start || 0), 0, Math.max(0, duration - 0.15))
+      const safeEnd = clamp(Number(segment.end || 0), safeStart + 0.1, duration)
+      const text = clipText(String(segment.text || ''), 420)
+      const words = countWords(text)
+      const span = Math.max(0.1, safeEnd - safeStart)
+      const wordsPerSecond = words / span
+      const confidenceRaw = Number(segment.confidence)
+      const confidenceNorm = clamp(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.72, 0.05, 0.99)
+      const fillerCount = countFillerHits(text)
+      const fillerDensity = words > 0 ? fillerCount / words : 0
+      const hesitationMatches = text.match(HESITATION_PATTERN)
+      const hesitationScore = clamp(
+        (hesitationMatches ? hesitationMatches.length : 0) / Math.max(1, Math.ceil(words / 5)),
+        0,
+        1
+      )
+      const repetitionScore = computeRepetitionScore(text)
+      const sentenceTerminal = SENTENCE_END_PATTERN.test(String(segment.text || '').trim())
+      return {
+        ...segment,
+        start: Number(safeStart.toFixed(3)),
+        end: Number(safeEnd.toFixed(3)),
+        text,
+        duration: Number(span.toFixed(3)),
+        words,
+        wordsPerSecond: Number(wordsPerSecond.toFixed(3)),
+        confidenceNorm: Number(confidenceNorm.toFixed(4)),
+        fillerCount,
+        fillerDensity: Number(clamp(fillerDensity, 0, 1).toFixed(4)),
+        hesitationScore: Number(hesitationScore.toFixed(4)),
+        repetitionScore: Number(repetitionScore.toFixed(4)),
+        sentenceTerminal
+      }
+    })
+    .filter((segment) => segment.end - segment.start >= 0.1)
+    .sort((left, right) => left.start - right.start)
+
+const roundToMsPrecision = (value: number) => Number(value.toFixed(3))
+
+const snapToFrame = ({
+  time,
+  fps,
+  mode
+}: {
+  time: number
+  fps: number
+  mode: 'floor' | 'ceil' | 'nearest'
+}) => {
+  const safeFps = clamp(Number.isFinite(fps) ? fps : FRAME_ALIGNMENT_FALLBACK_FPS, 12, 120)
+  const rawFrame = time * safeFps
+  let frameIndex =
+    mode === 'floor'
+      ? Math.floor(rawFrame)
+      : mode === 'ceil'
+        ? Math.ceil(rawFrame)
+        : Math.round(rawFrame)
+  if (frameIndex % 2 !== 0) frameIndex += mode === 'floor' ? -1 : 1
+  if (frameIndex < 0) frameIndex = 0
+  return Number((frameIndex / safeFps).toFixed(3))
+}
+
+const snapTimeToAnchors = ({
+  time,
+  anchors,
+  tolerance
+}: {
+  time: number
+  anchors: number[]
+  tolerance: number
+}) => {
+  if (!anchors.length) return time
+  let best = time
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const anchor of anchors) {
+    const distance = Math.abs(anchor - time)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      best = anchor
+    }
+  }
+  return bestDistance <= tolerance ? best : time
+}
+
+const buildBeatAndBoundaryAnchors = ({
+  transcriptSignals,
+  motionPeaks,
+  duration,
+  fps
+}: {
+  transcriptSignals: TranscriptSignalSegment[]
+  motionPeaks: number[]
+  duration: number
+  fps: number
+}) => {
+  const rawAnchors = new Set<number>()
+  for (const peak of motionPeaks) {
+    const value = Number(peak)
+    if (!Number.isFinite(value)) continue
+    rawAnchors.add(roundToMsPrecision(clamp(value, 0, duration)))
+  }
+  for (const segment of transcriptSignals) {
+    if (segment.sentenceTerminal || segment.hesitationScore >= 0.42 || segment.fillerDensity >= 0.15) {
+      rawAnchors.add(roundToMsPrecision(segment.end))
+    }
+    if (segment.words <= 2 && segment.duration <= 0.9) {
+      rawAnchors.add(roundToMsPrecision((segment.start + segment.end) / 2))
+    }
+  }
+  const sorted = Array.from(rawAnchors.values())
+    .filter((value) => Number.isFinite(value) && value >= 0 && value <= duration)
+    .sort((left, right) => left - right)
+  return sorted.map((value) => snapToFrame({ time: value, fps, mode: 'nearest' }))
+}
+
+const scoreMotionContinuity = ({
+  start,
+  end,
+  motionPeaks
+}: {
+  start: number
+  end: number
+  motionPeaks: number[]
+}) => {
+  if (!motionPeaks.length) return 0
+  const span = Math.max(0.25, end - start)
+  const count = motionPeaks.filter((peak) => peak >= start - 0.16 && peak <= end + 0.16).length
+  return clamp((count * 0.65) / Math.max(1, span * 1.9), 0, 1)
 }
 
 const buildCandidateId = (prefix: string, index: number) => `${prefix}_${String(index + 1).padStart(2, '0')}`
@@ -261,6 +449,20 @@ type TimelineWindow = {
   wordsPerSecond: number
   transcriptEnergy: number
   motionScore: number
+  confidenceScore: number
+  fillerDensity: number
+}
+
+type TranscriptSignalSegment = PlannerTranscriptSegment & {
+  duration: number
+  words: number
+  wordsPerSecond: number
+  confidenceNorm: number
+  fillerCount: number
+  fillerDensity: number
+  hesitationScore: number
+  repetitionScore: number
+  sentenceTerminal: boolean
 }
 
 const dedupeCandidates = (candidates: HookCandidate[]) => {
@@ -381,11 +583,11 @@ const computeAudioDensityForWindow = (
 
 const buildTimelineWindows = ({
   duration,
-  transcriptSegments,
+  transcriptSignals,
   motionPeaks
 }: {
   duration: number
-  transcriptSegments: PlannerTranscriptSegment[]
+  transcriptSignals: TranscriptSignalSegment[]
   motionPeaks: number[]
 }): TimelineWindow[] => {
   const safeDuration = Math.max(1, Number(duration || 0))
@@ -397,11 +599,14 @@ const buildTimelineWindows = ({
   while (cursor < safeDuration && index < 36) {
     const start = clamp(cursor, 0, Math.max(0, safeDuration - 0.4))
     const end = clamp(start + span, start + 0.4, safeDuration)
-    const transcript = mergeTranscriptForWindow(transcriptSegments, start, end)
+    const transcript = mergeTranscriptForWindow(transcriptSignals, start, end)
+    const overlappingSignals = transcriptSignals.filter((segment) => segment.end > start && segment.start < end)
     const transcriptEnergy = computeTranscriptEnergy(transcript)
     const words = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0
     const wordsPerSecond = words / Math.max(0.6, end - start)
     const motionScore = computeMotionScoreForWindow(start, end, motionPeaks)
+    const confidenceScore = avg(overlappingSignals.map((segment) => segment.confidenceNorm), 0.72)
+    const fillerDensity = avg(overlappingSignals.map((segment) => segment.fillerDensity), 0)
     windows.push({
       id: `window_${String(index + 1).padStart(2, '0')}`,
       start: Number(start.toFixed(3)),
@@ -409,7 +614,9 @@ const buildTimelineWindows = ({
       transcript: clipText(transcript, 140),
       wordsPerSecond: Number(wordsPerSecond.toFixed(3)),
       transcriptEnergy: Number(transcriptEnergy.toFixed(3)),
-      motionScore: Number(motionScore.toFixed(3))
+      motionScore: Number(motionScore.toFixed(3)),
+      confidenceScore: Number(confidenceScore.toFixed(3)),
+      fillerDensity: Number(fillerDensity.toFixed(4))
     })
     cursor += span * 0.88
     index += 1
@@ -421,21 +628,30 @@ const buildTimelineWindows = ({
 const buildScoredCandidates = ({
   candidates,
   frameScan,
-  transcriptSegments
+  transcriptSignals
 }: {
   candidates: HookCandidate[]
   frameScan: PlannerFrameScan
-  transcriptSegments: PlannerTranscriptSegment[]
+  transcriptSignals: TranscriptSignalSegment[]
 }) => {
   const peaks = Array.isArray(frameScan.motionPeaks) ? frameScan.motionPeaks : []
   return candidates.map((candidate) => {
     const motionScore = computeMotionScoreForWindow(candidate.start, candidate.end, peaks)
-    const audioScore = Math.max(candidate.scores.audio, computeAudioDensityForWindow(candidate.start, candidate.end, transcriptSegments))
+    const audioScore = Math.max(candidate.scores.audio, computeAudioDensityForWindow(candidate.start, candidate.end, transcriptSignals))
+    const overlappingSignals = transcriptSignals.filter((segment) => segment.end > candidate.start && segment.start < candidate.end)
+    const confidenceScore = avg(overlappingSignals.map((segment) => segment.confidenceNorm), 0.72)
+    const fillerPenalty = clamp(avg(overlappingSignals.map((segment) => segment.fillerDensity), 0) * 0.45, 0, 0.25)
     const sentimentScore = candidate.scores.sentiment || computeLexiconSentiment(candidate.transcript)
     const faceCenterBoost = clamp(frameScan.centeredFaceVerticalSignal, 0, 1) * 0.08
     const openerBias = candidate.start <= 2.5 ? 0.08 : 0
     const heuristicScore = clamp(
-      motionScore * 0.42 + audioScore * 0.3 + sentimentScore * 0.2 + faceCenterBoost + openerBias,
+      motionScore * 0.36 +
+        audioScore * 0.28 +
+        sentimentScore * 0.16 +
+        confidenceScore * 0.18 +
+        faceCenterBoost +
+        openerBias -
+        fillerPenalty,
       0,
       1
     )
@@ -465,7 +681,17 @@ const buildCandidateContext = (candidates: HookCandidate[]) =>
     reason: candidate.reason
   }))
 
-const parsePacingAdjustments = (payload: any, duration: number): PacingAdjustment[] => {
+const parsePacingAdjustments = ({
+  payload,
+  duration,
+  fps,
+  anchors
+}: {
+  payload: any
+  duration: number
+  fps: number
+  anchors: number[]
+}): PacingAdjustment[] => {
   const rows = Array.isArray(payload?.cuts)
     ? payload.cuts
     : Array.isArray(payload?.pacing_adjustments)
@@ -473,8 +699,20 @@ const parsePacingAdjustments = (payload: any, duration: number): PacingAdjustmen
       : []
   return rows
     .map((row: any) => {
-      const start = clamp(Number(row?.start || 0), 0, Math.max(0, duration - 0.4))
-      const end = clamp(Number(row?.end || start + 0.4), start + 0.4, duration)
+      const rawStart = clamp(Number(row?.start || 0), 0, Math.max(0, duration - 0.4))
+      const rawEnd = clamp(Number(row?.end || rawStart + 0.4), rawStart + 0.4, duration)
+      const snappedStart = snapToFrame({
+        time: snapTimeToAnchors({ time: rawStart, anchors, tolerance: 0.14 }),
+        fps,
+        mode: 'floor'
+      })
+      const snappedEnd = snapToFrame({
+        time: snapTimeToAnchors({ time: rawEnd, anchors, tolerance: 0.14 }),
+        fps,
+        mode: 'ceil'
+      })
+      const start = clamp(snappedStart, 0, Math.max(0, duration - 0.35))
+      const end = clamp(snappedEnd, start + 0.35, duration)
       const actionRaw = String(row?.action || '').trim().toLowerCase()
       const action: PacingAdjustmentAction =
         actionRaw === 'trim' ? 'trim' : actionRaw === 'speed_up' ? 'speed_up' : 'transition_boost'
@@ -497,65 +735,535 @@ const parsePacingAdjustments = (payload: any, duration: number): PacingAdjustmen
     .slice(0, 12)
 }
 
-const buildHeuristicPacingAdjustments = ({
+const overlapSeconds = (left: PacingAdjustment, right: PacingAdjustment) =>
+  Math.max(0, Math.min(left.end, right.end) - Math.max(left.start, right.start))
+
+const dedupeAdjustmentsByWindow = (adjustments: PacingAdjustment[]) => {
+  if (!adjustments.length) return adjustments
+  const ranked = adjustments
+    .slice()
+    .sort((left, right) => left.start - right.start || right.intensity - left.intensity)
+  const output: PacingAdjustment[] = []
+  for (const candidate of ranked) {
+    const duplicate = output.find((existing) => {
+      if (existing.action !== candidate.action) return false
+      const overlap = overlapSeconds(existing, candidate)
+      if (overlap <= 0) return false
+      const shortest = Math.max(0.25, Math.min(existing.end - existing.start, candidate.end - candidate.start))
+      return overlap / shortest >= 0.62
+    })
+    if (!duplicate) {
+      output.push(candidate)
+      continue
+    }
+    if (candidate.intensity > duplicate.intensity) {
+      duplicate.start = Number(Math.min(duplicate.start, candidate.start).toFixed(3))
+      duplicate.end = Number(Math.max(duplicate.end, candidate.end).toFixed(3))
+      duplicate.intensity = Number(candidate.intensity.toFixed(3))
+      duplicate.speedMultiplier = candidate.speedMultiplier ?? duplicate.speedMultiplier
+      duplicate.reason = candidate.reason
+    }
+  }
+  return output
+}
+
+const alignAdjustmentToAnchorsAndFrames = ({
+  adjustment,
   duration,
-  transcriptSegments,
-  windows
+  anchors,
+  fps
 }: {
+  adjustment: PacingAdjustment
   duration: number
-  transcriptSegments: PlannerTranscriptSegment[]
-  windows: TimelineWindow[]
+  anchors: number[]
+  fps: number
+}): PacingAdjustment | null => {
+  const snappedStart = snapToFrame({
+    time: snapTimeToAnchors({ time: adjustment.start, anchors, tolerance: 0.16 }),
+    fps,
+    mode: 'floor'
+  })
+  const snappedEnd = snapToFrame({
+    time: snapTimeToAnchors({ time: adjustment.end, anchors, tolerance: 0.16 }),
+    fps,
+    mode: 'ceil'
+  })
+  const start = clamp(snappedStart, 0, Math.max(0, duration - 0.3))
+  const end = clamp(snappedEnd, start + 0.3, duration)
+  if (end - start < 0.3) return null
+  return {
+    ...adjustment,
+    start: Number(start.toFixed(3)),
+    end: Number(end.toFixed(3)),
+    intensity: Number(clamp(adjustment.intensity, 0.05, 1).toFixed(3)),
+    speedMultiplier:
+      adjustment.action === 'speed_up'
+        ? Number(clamp(Number(adjustment.speedMultiplier || 1.3), 1.08, 1.8).toFixed(3))
+        : undefined
+  }
+}
+
+const derivePauseGapAdjustments = ({
+  transcriptSignals,
+  duration
+}: {
+  transcriptSignals: TranscriptSignalSegment[]
+  duration: number
 }) => {
   const adjustments: PacingAdjustment[] = []
-  const sorted = transcriptSegments
-    .slice()
-    .sort((left, right) => left.start - right.start)
-    .slice(0, 120)
-
-  for (let index = 1; index < sorted.length; index += 1) {
-    const previous = sorted[index - 1]
-    const current = sorted[index]
-    const gap = Number(current.start) - Number(previous.end)
-    if (gap < 1.8) continue
-    const start = clamp(previous.end + 0.12, 0, Math.max(0, duration - 0.4))
-    const end = clamp(current.start - 0.08, start + 0.4, duration)
-    if (end - start < 0.4) continue
+  for (let index = 1; index < transcriptSignals.length; index += 1) {
+    const previous = transcriptSignals[index - 1]
+    const current = transcriptSignals[index]
+    const gap = current.start - previous.end
+    if (!Number.isFinite(gap)) continue
+    const confidenceAverage = (previous.confidenceNorm + current.confidenceNorm) / 2
+    const strictMinGap = confidenceAverage >= 0.82 ? 0.82 : 0.56
+    if (gap < strictMinGap) continue
+    if (gap < 0.95 && previous.sentenceTerminal && current.sentenceTerminal && confidenceAverage > 0.86) continue
+    const buffer = gap >= 1.2 ? 0.1 : 0.06
+    const start = clamp(previous.end + buffer, 0, Math.max(0, duration - 0.3))
+    const end = clamp(current.start - buffer, start + 0.3, duration)
+    if (end - start < 0.3) continue
+    const confidenceWeight = clamp(confidenceAverage, 0.15, 1)
+    const intensity = clamp((gap / 1.9) * confidenceWeight, 0.26, 0.88)
     adjustments.push({
       start: Number(start.toFixed(3)),
       end: Number(end.toFixed(3)),
       action: 'trim',
-      intensity: clamp(gap / 4.5, 0.2, 0.85),
-      reason: 'Speech dead-air gap detected by Whisper timestamps.'
+      intensity: Number(intensity.toFixed(3)),
+      reason:
+        gap >= 1
+          ? 'Speech pause >1s detected; trim with sentence-safe buffers.'
+          : 'Sub-second hesitation gap detected; micro-trim dead air with buffer.'
     })
     if (adjustments.length >= 6) break
   }
-
-  const lowEnergy = windows
-    .filter((window) => window.end - window.start >= 8 && window.wordsPerSecond < 1.05 && window.motionScore < 0.42)
-    .slice(0, 3)
-
-  for (const item of lowEnergy) {
-    adjustments.push({
-      start: item.start,
-      end: item.end,
-      action: 'speed_up',
-      intensity: Number(clamp(0.38 + (1 - item.motionScore) * 0.45, 0.2, 0.9).toFixed(3)),
-      speedMultiplier: Number(clamp(1.28 + (1 - item.wordsPerSecond / 2.2) * 0.42, 1.2, 1.8).toFixed(3)),
-      reason: 'Low novelty zone: apply compression to avoid retention dip.'
-    })
-  }
-
-  if (adjustments.length === 0) {
-    adjustments.push({
-      start: Number(clamp(duration * 0.42, 0, Math.max(0, duration - 1.2)).toFixed(3)),
-      end: Number(clamp(duration * 0.42 + 0.9, 0.4, duration).toFixed(3)),
-      action: 'transition_boost',
-      intensity: 0.42,
-      reason: 'Heuristic pacing lift at mid-video plateau.'
-    })
-  }
-
   return adjustments
+}
+
+const deriveHesitationTrimAdjustments = ({
+  transcriptSignals,
+  duration
+}: {
+  transcriptSignals: TranscriptSignalSegment[]
+  duration: number
+}) => {
+  const output: PacingAdjustment[] = []
+  for (const segment of transcriptSignals.slice(0, 160)) {
+    if (segment.duration < 0.35) continue
+    const confidencePenalty = clamp(1 - segment.confidenceNorm, 0, 1)
+    const fillerSignal = clamp(segment.fillerDensity * 2.8 + segment.hesitationScore * 0.7, 0, 1)
+    const repetitionSignal = clamp(segment.repetitionScore * 0.92, 0, 1)
+    const hesitationScore = clamp(
+      confidencePenalty * 0.42 + fillerSignal * 0.42 + repetitionSignal * 0.16,
+      0,
+      1
+    )
+    if (hesitationScore < 0.58) continue
+    const buffer = 0.06
+    let start = segment.start + buffer
+    let end = segment.end - buffer
+    if (fillerSignal < 0.6 && segment.duration > 1.1) {
+      const center = (segment.start + segment.end) / 2
+      const span = clamp(segment.duration * (0.28 + hesitationScore * 0.24), 0.28, 1.35)
+      start = center - span / 2
+      end = center + span / 2
+    }
+    start = clamp(start, 0, Math.max(0, duration - 0.3))
+    end = clamp(end, start + 0.3, duration)
+    if (end - start < 0.3) continue
+    output.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'trim',
+      intensity: Number(clamp(0.3 + hesitationScore * 0.58, 0.28, 0.94).toFixed(3)),
+      reason: 'Low-confidence hesitation/filler phrase detected by transcript confidence + NLP signal.'
+    })
+    if (output.length >= 6) break
+  }
+  return output
+}
+
+const deriveFillerPhraseTrimAdjustments = ({
+  transcriptSignals,
+  duration
+}: {
+  transcriptSignals: TranscriptSignalSegment[]
+  duration: number
+}) => {
+  const output: PacingAdjustment[] = []
+  for (const segment of transcriptSignals) {
+    if (segment.duration < 0.55) continue
+    const fillerSignal = clamp(segment.fillerDensity * 3.4 + segment.hesitationScore * 0.8, 0, 1)
+    if (fillerSignal < 0.38) continue
+    const trimSpan = clamp(segment.duration * (0.55 + fillerSignal * 0.2), 0.34, 2.4)
+    const center = (segment.start + segment.end) / 2
+    const start = clamp(center - trimSpan / 2, segment.start + 0.04, Math.max(segment.start + 0.3, duration - 0.3))
+    const end = clamp(center + trimSpan / 2, start + 0.3, Math.min(segment.end - 0.04, duration))
+    if (end - start < 0.3) continue
+    output.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'trim',
+      intensity: Number(clamp(0.34 + fillerSignal * 0.52, 0.32, 0.9).toFixed(3)),
+      reason: 'High filler-density phrase detected; trim center while preserving sentence edges.'
+    })
+    if (output.length >= 5) break
+  }
+  return output
+}
+
+const deriveLowEnergyCompressionAdjustments = ({
+  windows,
+  duration
+}: {
+  windows: TimelineWindow[]
+  duration: number
+}): PacingAdjustment[] => {
+  const lowEnergy = windows
+    .filter((window) => {
+      const lowInfoDensity = window.wordsPerSecond < 1.35
+      const lowMotion = window.motionScore < 0.62
+      const weakNarrativeEnergy = window.transcriptEnergy < 0.4
+      const softConfidence = window.confidenceScore < 0.84 || window.fillerDensity > 0.06
+      return window.end - window.start >= 6.5 && lowInfoDensity && (lowMotion || weakNarrativeEnergy || softConfidence)
+    })
+    .map((window) => ({
+      window,
+      weakness:
+        (1 - window.motionScore) * 0.38 +
+        (1 - window.transcriptEnergy) * 0.34 +
+        (1 - window.confidenceScore) * 0.2 +
+        clamp(0.22 - window.wordsPerSecond / 10, 0, 0.22)
+    }))
+    .sort((left, right) => right.weakness - left.weakness || left.window.start - right.window.start)
+    .slice(0, 5)
+    .map((entry) => entry.window)
+
+  const direct = lowEnergy.map((window) => {
+    const intensity = clamp(
+      0.38 + (1 - window.motionScore) * 0.32 + (1 - window.confidenceScore) * 0.16,
+      0.28,
+      0.92
+    )
+    const speedMultiplier = clamp(
+      1.24 + (1 - window.motionScore) * 0.28 + (1 - Math.min(1.6, window.wordsPerSecond) / 1.6) * 0.2,
+      1.2,
+      1.8
+    )
+    return {
+      start: window.start,
+      end: window.end,
+      action: 'speed_up' as const,
+      intensity: Number(intensity.toFixed(3)),
+      speedMultiplier: Number(speedMultiplier.toFixed(3)),
+      reason: 'Low-energy valley detected; compress section to restore pacing momentum.'
+    }
+  })
+
+  if (direct.length > 0) return direct
+
+  const fallbackWindow = windows
+    .slice()
+    .sort(
+      (left, right) =>
+        (left.transcriptEnergy + left.motionScore + left.confidenceScore) -
+        (right.transcriptEnergy + right.motionScore + right.confidenceScore)
+    )[0]
+
+  if (!fallbackWindow || duration < 22) return []
+
+  const start = clamp((fallbackWindow.start + fallbackWindow.end) / 2 - 3.4, 0, Math.max(0, duration - 1.2))
+  const end = clamp(start + 6.8, start + 0.4, duration)
+  return [
+    {
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'speed_up' as const,
+      intensity: 0.44,
+      speedMultiplier: 1.32,
+      reason: 'Fallback compression on weakest timeline window to avoid pacing valley.'
+    }
+  ]
+}
+
+const deriveMotionGapCompressionAdjustments = ({
+  motionPeaks,
+  duration
+}: {
+  motionPeaks: number[]
+  duration: number
+}): PacingAdjustment[] => {
+  const sortedPeaks = (Array.isArray(motionPeaks) ? motionPeaks : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value >= 0 && value <= duration)
+    .sort((left, right) => left - right)
+  if (sortedPeaks.length < 2) return []
+  const adjustments: PacingAdjustment[] = []
+  for (let index = 1; index < sortedPeaks.length; index += 1) {
+    const previous = sortedPeaks[index - 1]
+    const current = sortedPeaks[index]
+    const gap = current - previous
+    if (gap < 8.5) continue
+    const start = clamp(previous + gap * 0.18, 0, Math.max(0, duration - 0.8))
+    const end = clamp(current - gap * 0.18, start + 0.4, duration)
+    if (end - start < 0.8) continue
+    adjustments.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'speed_up' as const,
+      intensity: Number(clamp(0.38 + (gap - 8.5) * 0.03, 0.32, 0.78).toFixed(3)),
+      speedMultiplier: Number(clamp(1.24 + (gap - 8.5) * 0.025, 1.24, 1.62).toFixed(3)),
+      reason: 'Long motion-gap lull detected; compress middle span to maintain momentum.'
+    })
+    if (adjustments.length >= 4) break
+  }
+  return adjustments
+}
+
+const derivePatternInterruptAdjustments = ({
+  windows,
+  duration
+}: {
+  windows: TimelineWindow[]
+  duration: number
+}) => {
+  const spacingTarget = clamp(duration < 75 ? 11.5 : 13.5, 10, 15)
+  const timelineInterrupts: PacingAdjustment[] = []
+  const maxInterrupts = Math.max(2, Math.min(8, Math.ceil(duration / spacingTarget)))
+  let cursor = Math.max(6, spacingTarget * 0.72)
+  while (cursor < duration - 1.2 && timelineInterrupts.length < maxInterrupts) {
+    const match = windows.find((window) => cursor >= window.start && cursor <= window.end) || null
+    const lowPulse = !match || (match.transcriptEnergy < 0.35 && match.motionScore < 0.58)
+    const start = clamp(cursor - 0.26, 0, Math.max(0, duration - 0.65))
+    const end = clamp(start + 0.58, start + 0.3, duration)
+    const intensity = match
+      ? (
+          lowPulse
+            ? clamp(0.34 + (1 - match.motionScore) * 0.27, 0.28, 0.82)
+            : clamp(0.24 + (1 - match.transcriptEnergy) * 0.16, 0.18, 0.54)
+        )
+      : 0.38
+    timelineInterrupts.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'transition_boost',
+      intensity: Number(intensity.toFixed(3)),
+      reason: lowPulse
+        ? 'Pattern interrupt inserted at predicted boredom point (10-15s cadence).'
+        : 'Cadence interrupt added to maintain attention rhythm.'
+    })
+    cursor += spacingTarget
+  }
+  return timelineInterrupts
+}
+
+const preserveMotionContinuity = ({
+  adjustments,
+  motionPeaks
+}: {
+  adjustments: PacingAdjustment[]
+  motionPeaks: number[]
+}): PacingAdjustment[] =>
+  adjustments.map((adjustment): PacingAdjustment => {
+    if (adjustment.action !== 'trim') return adjustment
+    const motionContinuity = scoreMotionContinuity({
+      start: adjustment.start,
+      end: adjustment.end,
+      motionPeaks
+    })
+    const textReason = adjustment.reason.toLowerCase()
+    const isSpeechDrivenTrim =
+      textReason.includes('pause') ||
+      textReason.includes('hesitation') ||
+      textReason.includes('filler') ||
+      textReason.includes('confidence')
+    if (motionContinuity < 0.62 || isSpeechDrivenTrim) return adjustment
+    return {
+      ...adjustment,
+      action: 'speed_up' as const,
+      speedMultiplier: Number(clamp(1.18 + motionContinuity * 0.26, 1.2, 1.5).toFixed(3)),
+      intensity: Number(clamp(adjustment.intensity * 0.78, 0.2, 0.82).toFixed(3)),
+      reason: 'High motion continuity detected; switched hard trim to compression to avoid visual mismatch.'
+    }
+  })
+
+const rebalanceForHighMotionShortForm = ({
+  adjustments,
+  motionPeaks,
+  duration
+}: {
+  adjustments: PacingAdjustment[]
+  motionPeaks: number[]
+  duration: number
+}) => {
+  const density = (Array.isArray(motionPeaks) ? motionPeaks.length : 0) / Math.max(1, duration / 7.5)
+  if (duration > 90 || density < 0.95) return adjustments
+  let protectedTrimCount = 0
+  return adjustments.map((adjustment) => {
+    if (adjustment.action !== 'trim') return adjustment
+    const textReason = adjustment.reason.toLowerCase()
+    const keepAsTrim =
+      (textReason.includes('filler') || textReason.includes('pause >1s') || textReason.includes('dead air')) &&
+      protectedTrimCount < 2
+    if (keepAsTrim) {
+      protectedTrimCount += 1
+      return adjustment
+    }
+    return {
+      ...adjustment,
+      action: 'speed_up' as const,
+      speedMultiplier: Number(clamp(Number(adjustment.speedMultiplier || 1.34), 1.24, 1.55).toFixed(3)),
+      intensity: Number(clamp(adjustment.intensity * 0.82, 0.26, 0.78).toFixed(3)),
+      reason: 'High-motion short-form profile: swapped hard trim to compression for continuity.'
+    }
+  })
+}
+
+const ensureMinimumCompressionCoverage = ({
+  adjustments,
+  windows,
+  duration
+}: {
+  adjustments: PacingAdjustment[]
+  windows: TimelineWindow[]
+  duration: number
+}) => {
+  const hasSpeedUp = adjustments.some((adjustment) => adjustment.action === 'speed_up')
+  if (hasSpeedUp || duration < 20) return adjustments
+  const weakest = windows
+    .slice()
+    .sort(
+      (left, right) =>
+        (left.transcriptEnergy + left.motionScore + left.confidenceScore) -
+        (right.transcriptEnergy + right.motionScore + right.confidenceScore)
+    )
+    .slice(0, 2)
+  if (!weakest.length) return adjustments
+  const supplements = weakest.map((window) => {
+    const start = clamp(window.start + 0.2, 0, Math.max(0, duration - 0.7))
+    const end = clamp(Math.min(window.end, start + 7.4), start + 0.4, duration)
+    return {
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'speed_up' as const,
+      intensity: 0.4,
+      speedMultiplier: 1.3,
+      reason: 'Guarantee compression coverage in at least one low-energy window.'
+    }
+  })
+  return [...adjustments, ...supplements]
+}
+
+const alignAndLimitAdjustments = ({
+  adjustments,
+  duration,
+  anchors,
+  fps
+}: {
+  adjustments: PacingAdjustment[]
+  duration: number
+  anchors: number[]
+  fps: number
+}) => {
+  const aligned = adjustments
+    .map((adjustment) =>
+      alignAdjustmentToAnchorsAndFrames({
+        adjustment,
+        duration,
+        anchors,
+        fps
+      })
+    )
+    .filter((adjustment): adjustment is PacingAdjustment => Boolean(adjustment))
+  return dedupeAdjustmentsByWindow(aligned)
+    .slice(0, 16)
+    .sort((left, right) => left.start - right.start || right.intensity - left.intensity)
+}
+
+const buildHeuristicPacingAdjustments = ({
+  duration,
+  transcriptSignals,
+  windows,
+  motionPeaks,
+  fps
+}: {
+  duration: number
+  transcriptSignals: TranscriptSignalSegment[]
+  windows: TimelineWindow[]
+  motionPeaks: number[]
+  fps: number
+}): PacingAdjustment[] => {
+  const anchors = buildBeatAndBoundaryAnchors({
+    transcriptSignals,
+    motionPeaks,
+    duration,
+    fps
+  })
+  const pauseGapAdjustments = derivePauseGapAdjustments({ transcriptSignals, duration })
+  const hesitationTrims = deriveHesitationTrimAdjustments({ transcriptSignals, duration })
+  const fillerTrims = deriveFillerPhraseTrimAdjustments({ transcriptSignals, duration })
+  const lowEnergyCompressions = deriveLowEnergyCompressionAdjustments({ windows, duration })
+  const motionGapCompressions = deriveMotionGapCompressionAdjustments({ motionPeaks, duration })
+  const interrupts = derivePatternInterruptAdjustments({ windows, duration })
+
+  const preliminary = dedupeAdjustmentsByWindow([
+    ...pauseGapAdjustments,
+    ...hesitationTrims,
+    ...fillerTrims,
+    ...lowEnergyCompressions,
+    ...motionGapCompressions,
+    ...interrupts
+  ])
+  const motionSafe = preserveMotionContinuity({
+    adjustments: preliminary,
+    motionPeaks
+  })
+  const motionProfileBalanced = rebalanceForHighMotionShortForm({
+    adjustments: motionSafe,
+    motionPeaks,
+    duration
+  })
+  const withCompressionGuarantee = ensureMinimumCompressionCoverage({
+    adjustments: motionProfileBalanced,
+    windows,
+    duration
+  })
+  const finalList = alignAndLimitAdjustments({
+    adjustments: withCompressionGuarantee,
+    duration,
+    anchors,
+    fps
+  })
+
+  if (finalList.length > 0) return finalList
+
+  const fallbackStartRaw = Number(clamp(duration * 0.42, 0, Math.max(0, duration - 1.2)).toFixed(3))
+  const fallbackStart = snapToFrame({
+    time: snapTimeToAnchors({ time: fallbackStartRaw, anchors, tolerance: 0.18 }),
+    fps,
+    mode: 'floor'
+  })
+  const fallbackEnd = snapToFrame({
+    time: snapTimeToAnchors(
+      {
+        time: clamp(fallbackStart + 0.9, fallbackStart + 0.3, duration),
+        anchors,
+        tolerance: 0.18
+      }
+    ),
+    fps,
+    mode: 'ceil'
+  })
+  return [
+    {
+      start: fallbackStart,
+      end: Number(clamp(fallbackEnd, fallbackStart + 0.3, duration).toFixed(3)),
+      action: 'transition_boost' as const,
+      intensity: 0.42,
+      reason: 'Fallback pacing lift at mid-video plateau.'
+    }
+  ]
 }
 
 const parseHookComparisons = (payload: any, candidates: HookCandidate[]) => {
@@ -1003,7 +1711,9 @@ const buildPrompts = ({
       energy_score: window.transcriptEnergy,
       words_per_second: window.wordsPerSecond,
       transcript_energy: window.transcriptEnergy,
-      motion_score: window.motionScore
+      motion_score: window.motionScore,
+      confidence_score: window.confidenceScore,
+      filler_density: window.fillerDensity
     }))
   )
   const context = `Context: mode=${mode}, duration_seconds=${duration.toFixed(2)}, transcript_excerpt="${clipText(transcriptExcerpt, 320)}".
@@ -1092,21 +1802,30 @@ const estimateFallbackRetention = ({
 export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise<FreeAiHookPlan> => {
   const mode = input.mode
   const duration = Math.max(1, Number(input.metadata.duration || 0))
+  const safeFps = clamp(
+    Number.isFinite(Number(input.metadata.fps)) ? Number(input.metadata.fps) : FRAME_ALIGNMENT_FALLBACK_FPS,
+    12,
+    120
+  )
   const transcriptSegments = Array.isArray(input.transcriptSegments) ? input.transcriptSegments : []
+  const transcriptSignals = normalizeTranscriptSignals({
+    segments: transcriptSegments,
+    duration
+  })
   const candidatesSeed = buildInitialCandidates({
     mode,
     duration,
     frameScan: input.frameScan,
-    transcriptSegments
+    transcriptSegments: transcriptSignals
   })
   let candidates = buildScoredCandidates({
     candidates: candidatesSeed,
     frameScan: input.frameScan,
-    transcriptSegments
+    transcriptSignals
   })
   const windows = buildTimelineWindows({
     duration,
-    transcriptSegments,
+    transcriptSignals,
     motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : []
   })
 
@@ -1131,8 +1850,37 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
         llm: Number(clamp(1 - index * 0.08, 0.2, 1).toFixed(4))
       }
     }))
-  const selected = candidates[0] ? toAIDurationHook(candidates[0], duration, 8) : null
-  const pacingAdjustments = buildHeuristicPacingAdjustments({ duration, transcriptSegments, windows })
+  const strongest = candidates[0] || null
+  const strongestEarlyCandidate =
+    candidates
+      .filter((candidate) => candidate.start <= 3.2)
+      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
+  const introAnchorCandidate =
+    candidates
+      .filter((candidate) => candidate.start <= 1.2)
+      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
+  const selectedCandidate = (
+    strongest &&
+    introAnchorCandidate &&
+    introAnchorCandidate.scores.combined >= strongest.scores.combined * 0.84
+  )
+    ? introAnchorCandidate
+    : (
+        strongest &&
+        strongestEarlyCandidate &&
+        strongest.start > 3.5 &&
+        strongestEarlyCandidate.scores.combined >= strongest.scores.combined * 0.9
+      )
+      ? strongestEarlyCandidate
+      : strongest
+  const selected = selectedCandidate ? toAIDurationHook(selectedCandidate, duration, 8) : null
+  const pacingAdjustments = buildHeuristicPacingAdjustments({
+    duration,
+    transcriptSignals,
+    windows,
+    motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : [],
+    fps: safeFps
+  })
   const weakSegments = buildHeuristicWeakSegments({ duration, windows, pacingAdjustments })
   const strongSegments = buildHeuristicStrongSegments({ rankedHooks: candidates, windows })
   const fallbackRetention = estimateFallbackRetention({
@@ -1142,7 +1890,8 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   })
   const predictionConfidenceLevel = deriveConfidenceLevel(fallbackRetention.predictionConfidence)
   const hookComparison = candidates
-    .slice(1, 4)
+    .filter((candidate) => candidate.id !== selectedCandidate?.id)
+    .slice(0, 3)
     .map((candidate) => ({
       id: candidate.id,
       start: candidate.start,
@@ -1165,7 +1914,11 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       ? {
           ...selected,
           reason:
-            `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.`
+            selectedCandidate?.id === introAnchorCandidate?.id && introAnchorCandidate?.id !== strongest?.id
+              ? `Selected this 8-second opener over alternatives because it anchors at timeline start while preserving comparable retention strength (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
+              : selectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
+              ? `Selected this 8-second opener over alternatives because its early-timeline placement preserves first-3s hold while matching top retention score (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
+              : `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),
