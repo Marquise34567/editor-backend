@@ -1405,8 +1405,8 @@ const DEFAULT_VERTICAL_ZOOM_PROFILE: VerticalZoomProfile = 'smooth'
 const DEFAULT_VERTICAL_ZOOM_INTENSITY = 0.62
 const DEFAULT_VERTICAL_CLIP_COUNT_BY_SELECTION_MODE: Record<VerticalSelectionMode, number> = {
   best_moments: 3,
-  story_arc: 2,
-  hook_storm: 5,
+  story_arc: 3,
+  hook_storm: 4,
   loop_builder: 4
 }
 const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = [
@@ -1613,15 +1613,16 @@ const RENDER_FILTER_THREADS = (() => {
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
-const MAX_VERTICAL_CLIPS = 20
+const MIN_VERTICAL_CLIPS = 3
+const MAX_VERTICAL_CLIPS = 4
 const MIN_PREDICTED_COMPLETION_PERCENT = 70
 const LONG_CLIP_PREDICTION_FLOOR = 75
 const LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS = 45
 const LONG_FORM_PRESCAN_MAX_CHUNK_SECONDS = 75
 const CLIP_CANDIDATE_POOL_MIN = 15
 const CLIP_CANDIDATE_POOL_MAX = 50
-const CLIP_EXPORT_TARGET_MIN = 8
-const CLIP_EXPORT_TARGET_MAX = 20
+const CLIP_EXPORT_TARGET_MIN = 3
+const CLIP_EXPORT_TARGET_MAX = 4
 const HOOK_INTRO_RETENTION_MIN = 0.7
 const HOOK_SELECTION_MIN_SCORE = 0.8
 const STRICT_INTERRUPT_MAX_GAP_SECONDS = 5
@@ -2260,27 +2261,30 @@ const resolveAutoExportClipTarget = ({
     ? parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
     : null
   const minutes = Math.max(0, Number(durationSeconds || 0) / 60)
-  if (resolvedSelectionMode) {
-    let target = getVerticalSelectionDefaultClipCount(resolvedSelectionMode)
-    if (minutes >= 180) target += 2
-    else if (minutes >= 90) target += 1
-    if (resolvedSelectionMode === 'hook_storm' && nicheProfile?.niche === 'high_energy') target += 1
-    if (resolvedSelectionMode === 'story_arc' && minutes < 8) target -= 1
-    return clamp(Math.round(target), 1, MAX_VERTICAL_CLIPS)
+  let target = 3
+
+  if (minutes >= 18) target = 4
+  if (resolvedSelectionMode === 'hook_storm' || resolvedSelectionMode === 'loop_builder') target = 4
+
+  if (
+    editorMode === 'sports' ||
+    editorMode === 'savage-roast' ||
+    editorMode === 'reaction' ||
+    editorMode === 'gaming' ||
+    editorMode === 'ultra' ||
+    editorMode === 'retention-king'
+  ) {
+    target = 4
   }
-  let target = 8
-  if (minutes >= 120) target = 20
-  else if (minutes >= 90) target = 18
-  else if (minutes >= 60) target = 15
-  else if (minutes >= 40) target = 12
-  if (editorMode === 'sports') target += 3
-  else if (editorMode === 'savage-roast') target += 3
-  else if (editorMode === 'reaction') target += 2
-  else if (editorMode === 'gaming') target += 1
-  else if (editorMode === 'ultra') target += 4
-  else if (editorMode === 'retention-king') target += 3
-  else if (editorMode === 'podcast') target -= 2
-  if (nicheProfile?.niche === 'high_energy') target += 2
+
+  if (nicheProfile?.niche === 'high_energy') {
+    target = 4
+  }
+
+  if (editorMode === 'podcast' && minutes < 24) {
+    target = 3
+  }
+
   return clamp(Math.round(target), CLIP_EXPORT_TARGET_MIN, CLIP_EXPORT_TARGET_MAX)
 }
 const resolveInterruptIntervalRange = ({
@@ -3201,9 +3205,12 @@ const parseVerticalClipCount = (
 ) => {
   const parsed = Number.parseInt(String(value ?? ''), 10)
   if (!Number.isFinite(parsed)) {
-    return clamp(Math.round(fallback), 0, MAX_VERTICAL_CLIPS)
+    const roundedFallback = Math.round(fallback)
+    if (roundedFallback <= 0) return 0
+    return clamp(roundedFallback, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS)
   }
-  return clamp(parsed, 0, MAX_VERTICAL_CLIPS)
+  if (parsed <= 0) return 0
+  return clamp(parsed, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS)
 }
 
 const parseMaxCutsPreference = (value: any): number | null => {
@@ -11707,7 +11714,7 @@ const buildVerticalMetadataSummary = ({
       paddingCount: Number(selectionResult.paddingCount || 0),
       paddingReason: selectionResult.paddingReason || null,
       targetRange: {
-        min: 1,
+        min: MIN_VERTICAL_CLIPS,
         max: MAX_VERTICAL_CLIPS
       }
     },
@@ -14026,11 +14033,15 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
 }
 
 const FASTER_WHISPER_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/faster_whisper_transcribe.py')
+const VERTICAL_CLIP_PREVIEW_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/vertical_clip_preview.py')
 const FASTER_WHISPER_TIMEOUT_MS = (() => {
   const raw = Number(process.env.FASTER_WHISPER_TIMEOUT_MS || 300_000)
   if (!Number.isFinite(raw)) return 300_000
   return Math.max(20_000, Math.min(900_000, Math.round(raw)))
 })()
+const ENABLE_VERTICAL_DESKTOP_PREVIEW = /^(1|true|yes|on)$/i.test(
+  String(process.env.VERTICAL_DESKTOP_PREVIEW || '').trim()
+)
 const ALLOW_OPENAI_TRANSCRIPTION_FALLBACK = /^(1|true|yes)$/i.test(
   String(process.env.ALLOW_OPENAI_TRANSCRIPTION_FALLBACK || '').trim()
 )
@@ -14055,6 +14066,68 @@ const buildFasterWhisperAttempts = () => {
   add('py', ['-3'], 'py -3')
   add('py', [], 'py')
   return attempts
+}
+
+const launchVerticalDesktopPreview = ({
+  clipPaths,
+  jobId,
+  requestId
+}: {
+  clipPaths: string[]
+  jobId: string
+  requestId?: string
+}) => {
+  if (!ENABLE_VERTICAL_DESKTOP_PREVIEW) return
+  if (!clipPaths.length) return
+  if (!fs.existsSync(VERTICAL_CLIP_PREVIEW_SCRIPT_PATH)) {
+    console.warn(`[${requestId || 'noid'}] vertical preview script missing`, VERTICAL_CLIP_PREVIEW_SCRIPT_PATH)
+    return
+  }
+
+  const configuredPython = String(
+    process.env.VERTICAL_PREVIEW_PYTHON ||
+    process.env.FASTER_WHISPER_PYTHON ||
+    process.env.PYTHON_BIN ||
+    ''
+  ).trim()
+  const attempts = buildFasterWhisperAttempts()
+  const preferredAttempt =
+    (configuredPython ? { command: configuredPython, preArgs: [] as string[] } : null) ||
+    attempts[0] ||
+    { command: 'python', preArgs: [] as string[] }
+  const invocationArgs = [
+    ...preferredAttempt.preArgs,
+    VERTICAL_CLIP_PREVIEW_SCRIPT_PATH,
+    '--clips-json',
+    JSON.stringify(clipPaths)
+  ]
+  const ffmpegDir = path.dirname(FFMPEG_PATH)
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+    PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+  }
+  if (ffmpegDir && ffmpegDir !== '.' && ffmpegDir !== FFMPEG_PATH) {
+    env.PATH = prependPathEntry(process.env.PATH, ffmpegDir)
+  }
+  try {
+    const child = spawn(preferredAttempt.command, invocationArgs, {
+      env,
+      windowsHide: false,
+      detached: true,
+      stdio: 'ignore'
+    })
+    child.unref()
+    console.log(
+      `[${requestId || 'noid'}] launched vertical desktop preview for ${clipPaths.length} clip(s)`,
+      { jobId, command: preferredAttempt.command }
+    )
+  } catch (error: any) {
+    console.warn(
+      `[${requestId || 'noid'}] failed to launch vertical desktop preview`,
+      error?.message || error
+    )
+  }
 }
 
 const parseFasterWhisperResult = (stdout: string): { srtPath?: string | null } => {
@@ -14878,7 +14951,9 @@ const buildVerticalClipSelection = (
   const requested = Number.isFinite(Number(requestedCount)) ? Number(requestedCount) : 0
   let exportTarget = requested > 0 ? Math.round(requested) : recommendedExportTarget
   const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(8, platformProfile.verticalMinClipSeconds)))
-  exportTarget = clamp(exportTarget, 1, Math.min(MAX_VERTICAL_CLIPS, maxFeasibleByLength))
+  const minFeasibleTarget = Math.max(1, Math.min(MIN_VERTICAL_CLIPS, maxFeasibleByLength))
+  const maxFeasibleTarget = Math.max(minFeasibleTarget, Math.min(MAX_VERTICAL_CLIPS, maxFeasibleByLength))
+  exportTarget = clamp(exportTarget, minFeasibleTarget, maxFeasibleTarget)
   const buildFallbackRanges = (count: number) => {
     const chunk = total / Math.max(1, count)
     const ranges: TimeRange[] = []
@@ -15483,20 +15558,8 @@ const scoreVerticalRetentionCandidate = ({
   const start = Number(range.start.toFixed(3))
   const end = Number(range.end.toFixed(3))
   const duration = Math.max(0.1, end - start)
-  const minDuration = resolvedSelectionMode === 'hook_storm'
-    ? 12
-    : resolvedSelectionMode === 'loop_builder'
-      ? 14
-      : resolvedSelectionMode === 'story_arc'
-        ? 20
-        : 15
-  const maxDuration = resolvedSelectionMode === 'story_arc'
-    ? 75
-    : resolvedSelectionMode === 'hook_storm'
-      ? 45
-      : resolvedSelectionMode === 'loop_builder'
-        ? 55
-        : 60
+  const minDuration = 15
+  const maxDuration = 60
   if (duration < minDuration) {
     return { candidate: null, rejectReason: 'clip_too_short' }
   }
@@ -15771,8 +15834,8 @@ const buildVerticalRetentionCandidates = ({
     selectionMode: resolvedSelectionMode
   })
   const outputTarget = exactCountRequested
-    ? Math.round(clamp(normalizedRequestedCount, 1, MAX_VERTICAL_CLIPS))
-    : Math.round(clamp(modeAwareAutoExportTarget, 1, MAX_VERTICAL_CLIPS))
+    ? Math.round(clamp(normalizedRequestedCount, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS))
+    : Math.round(clamp(modeAwareAutoExportTarget, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS))
   const modeAwareCandidateTarget = resolveClipCandidateTarget({
     durationSeconds: total,
     editorMode: editorMode ?? null,
@@ -15838,22 +15901,16 @@ const buildVerticalRetentionCandidates = ({
       paddingReason: 'Generated fallback clip windows because analysis peaks were unavailable.'
     }
   }
-  const minDuration = resolvedSelectionMode === 'hook_storm'
-    ? 12
-    : resolvedSelectionMode === 'loop_builder'
-      ? 14
-      : resolvedSelectionMode === 'story_arc'
-        ? 20
-        : 15
+  const minDuration = 15
   const clipDurations = (
     resolvedSelectionMode === 'story_arc'
-      ? [20, 24, 28, 34, 42, 50, 60, 72]
+      ? [15, 20, 24, 30, 36, 44, 52, 60]
       : resolvedSelectionMode === 'hook_storm'
-        ? [12, 15, 18, 22, 26, 30, 36, 42]
+        ? [15, 18, 22, 26, 30, 36, 44, 52]
         : resolvedSelectionMode === 'loop_builder'
-          ? [14, 18, 22, 26, 30, 35, 40, 48]
+          ? [15, 18, 22, 26, 30, 36, 45, 54]
           : [15, 18, 22, 26, 30, 35, 45, 60]
-  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total)
+  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total && seconds <= 60)
   const stepSeconds = total >= 3600
     ? 6
     : total >= 1800
@@ -19152,6 +19209,11 @@ const processJob = async (
       }
 
       await updateJob(jobId, { progress: 95 })
+      launchVerticalDesktopPreview({
+        clipPaths: renderedClipPaths,
+        jobId,
+        requestId
+      })
 
       for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
         const clipPath = renderedClipPaths[idx]
