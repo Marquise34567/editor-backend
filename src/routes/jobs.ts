@@ -819,6 +819,7 @@ type RenderMode = 'horizontal' | 'vertical'
 type RenderConfig = {
   mode: RenderMode
   verticalClipCount: number
+  verticalClipDurationSeconds: number
   horizontalMode: HorizontalModeSettings
   verticalMode: VerticalModeSettings | null
 }
@@ -1615,6 +1616,9 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MIN_VERTICAL_CLIPS = 3
 const MAX_VERTICAL_CLIPS = 4
+const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 30
+const VERTICAL_CLIP_DURATION_LONG_SECONDS = 60
+const DEFAULT_VERTICAL_CLIP_DURATION_SECONDS = VERTICAL_CLIP_DURATION_SHORT_SECONDS
 const MIN_PREDICTED_COMPLETION_PERCENT = 70
 const LONG_CLIP_PREDICTION_FLOOR = 75
 const LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS = 45
@@ -3213,6 +3217,20 @@ const parseVerticalClipCount = (
   return clamp(parsed, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS)
 }
 
+const parseVerticalClipDurationSeconds = (
+  value?: any,
+  fallback = DEFAULT_VERTICAL_CLIP_DURATION_SECONDS
+) => {
+  const normalizedFallback = Number(fallback) >= VERTICAL_CLIP_DURATION_LONG_SECONDS
+    ? VERTICAL_CLIP_DURATION_LONG_SECONDS
+    : VERTICAL_CLIP_DURATION_SHORT_SECONDS
+  const parsed = Number.parseFloat(String(value ?? ''))
+  if (!Number.isFinite(parsed) || parsed <= 0) return normalizedFallback
+  return parsed >= 45
+    ? VERTICAL_CLIP_DURATION_LONG_SECONDS
+    : VERTICAL_CLIP_DURATION_SHORT_SECONDS
+}
+
 const parseMaxCutsPreference = (value: any): number | null => {
   if (value === null || value === undefined || value === '') return null
   const parsed = Number.parseInt(String(value), 10)
@@ -3400,8 +3418,25 @@ const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
   const legacyVerticalMode = body?.verticalMode?.enabled === true
   const mode: RenderMode = hasExplicitMode ? explicitMode : (legacyVerticalMode ? 'vertical' : 'horizontal')
   const horizontalMode = buildHorizontalModeSettings(body?.horizontalMode)
+  const verticalClipDurationSeconds = parseVerticalClipDurationSeconds(
+    body?.verticalClipDurationSeconds ??
+    body?.vertical_clip_duration_seconds ??
+    body?.verticalClipDuration ??
+    body?.vertical_clip_duration ??
+    body?.clipDurationSeconds ??
+    body?.clip_duration_seconds ??
+    body?.clipDuration ??
+    body?.clip_duration,
+    DEFAULT_VERTICAL_CLIP_DURATION_SECONDS
+  )
   if (mode !== 'vertical') {
-    return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
+    return {
+      mode: 'horizontal',
+      verticalClipCount: 1,
+      verticalClipDurationSeconds,
+      horizontalMode,
+      verticalMode: null
+    }
   }
   const legacyCrop = parseLegacyVerticalCrop(body?.webcamCrop)
   const verticalMode = buildVerticalModeSettings({
@@ -3412,6 +3447,7 @@ const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
   return {
     mode: 'vertical',
     verticalClipCount: parseVerticalClipCount(body?.verticalClipCount, fallbackClipCount),
+    verticalClipDurationSeconds,
     horizontalMode,
     verticalMode
   }
@@ -3424,8 +3460,29 @@ const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): Re
     ? parseRenderMode(modeSource)
     : (renderSettings?.verticalMode?.enabled === true || analysis?.verticalMode?.enabled === true ? 'vertical' : 'horizontal')
   const horizontalMode = buildHorizontalModeSettings(renderSettings?.horizontalMode ?? analysis?.horizontalMode)
+  const verticalClipDurationSeconds = parseVerticalClipDurationSeconds(
+    renderSettings?.verticalClipDurationSeconds ??
+    renderSettings?.vertical_clip_duration_seconds ??
+    renderSettings?.verticalClipDuration ??
+    renderSettings?.vertical_clip_duration ??
+    analysis?.verticalClipDurationSeconds ??
+    analysis?.vertical_clip_duration_seconds ??
+    analysis?.verticalClipDuration ??
+    analysis?.vertical_clip_duration ??
+    analysis?.vertical?.clipDurationSeconds ??
+    analysis?.vertical?.clip_duration_seconds ??
+    analysis?.vertical?.clipDuration ??
+    analysis?.vertical?.clip_duration,
+    DEFAULT_VERTICAL_CLIP_DURATION_SECONDS
+  )
   if (mode !== 'vertical') {
-    return { mode: 'horizontal', verticalClipCount: 1, horizontalMode, verticalMode: null }
+    return {
+      mode: 'horizontal',
+      verticalClipCount: 1,
+      verticalClipDurationSeconds,
+      horizontalMode,
+      verticalMode: null
+    }
   }
   const legacyCrop = parseLegacyVerticalCrop(analysis?.vertical?.webcamCrop)
   const verticalMode = buildVerticalModeSettings({
@@ -3439,6 +3496,7 @@ const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): Re
       renderSettings?.verticalClipCount ?? analysis?.verticalClipCount ?? analysis?.vertical?.clipCount,
       fallbackClipCount
     ),
+    verticalClipDurationSeconds,
     horizontalMode,
     verticalMode
   }
@@ -3452,6 +3510,10 @@ const hasRenderConfigOverrideInPayload = (payload?: any) => Boolean(
     payload?.horizontalMode !== undefined ||
     payload?.verticalMode !== undefined ||
     payload?.verticalClipCount !== undefined ||
+    payload?.verticalClipDurationSeconds !== undefined ||
+    payload?.vertical_clip_duration_seconds !== undefined ||
+    payload?.verticalClipDuration !== undefined ||
+    payload?.vertical_clip_duration !== undefined ||
     payload?.webcamCrop !== undefined
   )
 )
@@ -5194,6 +5256,18 @@ const buildPersistedRenderSettings = (
     renderMode: renderConfig.mode,
     horizontalMode: renderConfig.horizontalMode,
     verticalClipCount: renderConfig.mode === 'vertical' ? renderConfig.verticalClipCount : 1,
+    verticalClipDurationSeconds: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    vertical_clip_duration_seconds: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    verticalClipDuration: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    vertical_clip_duration: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
     verticalMode: renderConfig.mode === 'vertical' ? renderConfig.verticalMode : null,
     retentionAggressionLevel: retentionLevel,
     retentionLevel,
@@ -5379,10 +5453,24 @@ const buildPersistedRenderAnalysis = ({
     horizontalMode: renderConfig.horizontalMode,
     verticalMode: renderConfig.mode === 'vertical' ? renderConfig.verticalMode : null,
     verticalClipCount: renderConfig.mode === 'vertical' ? renderConfig.verticalClipCount : 1,
+    verticalClipDurationSeconds: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    vertical_clip_duration_seconds: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    verticalClipDuration: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    vertical_clip_duration: renderConfig.mode === 'vertical'
+      ? renderConfig.verticalClipDurationSeconds
+      : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
     // Legacy fields kept for backward-compatible clients.
     vertical: renderConfig.mode === 'vertical'
       ? {
           clipCount: outputPaths?.length ?? renderConfig.verticalClipCount,
+          clipDurationSeconds: renderConfig.verticalClipDurationSeconds,
+          clip_duration_seconds: renderConfig.verticalClipDurationSeconds,
           webcamCrop: verticalCrop,
           mode: renderConfig.verticalMode
         }
@@ -14963,9 +15051,14 @@ const buildVerticalClipSelection = (
     styleProfile?: ContentStyleProfile | null
     nicheProfile?: VideoNicheProfile | null
     platformProfile?: PlatformProfile
+    clipDurationMaxSeconds?: number
   }
 ): VerticalClipSelectionResult => {
   const total = Math.max(0, durationSeconds || 0)
+  const maxClipDuration = parseVerticalClipDurationSeconds(
+    opts?.clipDurationMaxSeconds,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  )
   if (total <= 0) {
     return {
       clipRanges: [{ start: 0, end: 0 }],
@@ -15000,7 +15093,9 @@ const buildVerticalClipSelection = (
     const ranges: TimeRange[] = []
     for (let index = 0; index < count; index += 1) {
       const start = Number((index * chunk).toFixed(3))
-      const end = Number((index === count - 1 ? total : (index + 1) * chunk).toFixed(3))
+      const naturalEnd = index === count - 1 ? total : (index + 1) * chunk
+      const cappedEnd = Math.min(naturalEnd, start + maxClipDuration)
+      const end = Number(cappedEnd.toFixed(3))
       if (end - start > 0.2) ranges.push({ start, end })
     }
     return ranges.length ? ranges : [{ start: 0, end: total }]
@@ -15031,7 +15126,7 @@ const buildVerticalClipSelection = (
   if (highEnergyMode || opts?.strategyProfile === 'viral') durationSet.add(38)
   if (total >= 45) [45, 50, 55, 60].forEach((duration) => durationSet.add(duration))
   const candidateDurations = Array.from(durationSet)
-    .filter((duration) => duration <= Math.min(60, total))
+    .filter((duration) => duration <= Math.min(maxClipDuration, total))
     .filter((duration) => duration >= Math.max(12, Math.min(15, platformProfile.verticalMinClipSeconds)))
     .sort((a, b) => a - b)
   const timelineStep = total >= 7_200
@@ -15208,6 +15303,7 @@ const buildVerticalClipRanges = (
     styleProfile?: ContentStyleProfile | null
     nicheProfile?: VideoNicheProfile | null
     platformProfile?: PlatformProfile
+    clipDurationMaxSeconds?: number
   }
 ) => (
   buildVerticalClipSelection(durationSeconds, requestedCount, opts).clipRanges
@@ -15759,16 +15855,22 @@ const buildSyntheticVerticalRetentionCandidate = ({
 
 const buildVerticalPaddingRanges = ({
   durationSeconds,
-  count
+  count,
+  clipDurationMaxSeconds
 }: {
   durationSeconds: number
   count: number
+  clipDurationMaxSeconds?: number
 }) => {
   const total = Math.max(0, Number(durationSeconds) || 0)
   const target = Math.max(0, Math.round(count))
   if (total <= 0 || target <= 0) return [] as TimeRange[]
-  const minClip = total >= 15 ? 15 : Math.max(4, Math.min(total, 14.8))
-  const maxClip = Math.max(minClip, Math.min(60, total))
+  const maxDuration = parseVerticalClipDurationSeconds(
+    clipDurationMaxSeconds,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  )
+  const minClip = total >= 15 ? 15 : Math.max(4, Math.min(total, 14.8, maxDuration))
+  const maxClip = Math.max(minClip, Math.min(maxDuration, total))
   const durationTarget = clamp(
     total / Math.max(1, Math.min(target, 4)),
     minClip,
@@ -15847,7 +15949,8 @@ const buildVerticalRetentionCandidates = ({
   editorMode,
   styleProfile,
   nicheProfile,
-  selectionMode
+  selectionMode,
+  clipDurationMaxSeconds
 }: {
   durationSeconds: number
   requestedCount: number
@@ -15858,8 +15961,13 @@ const buildVerticalRetentionCandidates = ({
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
   selectionMode?: VerticalSelectionMode
+  clipDurationMaxSeconds?: number
 }): VerticalRetentionSelectionResult => {
   const total = Math.max(0, durationSeconds || 0)
+  const maxClipDuration = parseVerticalClipDurationSeconds(
+    clipDurationMaxSeconds,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  )
   const resolvedSelectionMode = parseVerticalSelectionMode(selectionMode, DEFAULT_VERTICAL_SELECTION_MODE)
   const modeDefaultClipCount = getVerticalSelectionDefaultClipCount(resolvedSelectionMode)
   const normalizedRequestedCount = Math.round(clamp(
@@ -15906,7 +16014,8 @@ const buildVerticalRetentionCandidates = ({
   if (!windows.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: outputTarget
+      count: outputTarget,
+      clipDurationMaxSeconds: maxClipDuration
     })
     const fallbackCandidates = fallbackRanges
       .slice(0, outputTarget)
@@ -15951,7 +16060,7 @@ const buildVerticalRetentionCandidates = ({
         : resolvedSelectionMode === 'loop_builder'
           ? [15, 18, 22, 26, 30, 36, 45, 54]
           : [15, 18, 22, 26, 30, 35, 45, 60]
-  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total && seconds <= 60)
+  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total && seconds <= maxClipDuration)
   const stepSeconds = total >= 3600
     ? 6
     : total >= 1800
@@ -16039,7 +16148,8 @@ const buildVerticalRetentionCandidates = ({
   if (!preScored.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: outputTarget || modeDefaultClipCount
+      count: outputTarget || modeDefaultClipCount,
+      clipDurationMaxSeconds: maxClipDuration
     })
     const fallbackCandidates = fallbackRanges
       .slice(0, outputTarget)
@@ -16093,7 +16203,8 @@ const buildVerticalRetentionCandidates = ({
   if (!evaluated.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: outputTarget
+      count: outputTarget,
+      clipDurationMaxSeconds: maxClipDuration
     })
     const fallbackCandidates = fallbackRanges
       .slice(0, outputTarget)
@@ -16172,7 +16283,8 @@ const buildVerticalRetentionCandidates = ({
   if (selected.length < outputTarget) {
     const paddingRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
-      count: Math.max(outputTarget, modeDefaultClipCount)
+      count: Math.max(outputTarget, modeDefaultClipCount),
+      clipDurationMaxSeconds: maxClipDuration
     })
     let index = 0
     while (selected.length < outputTarget && paddingRanges.length) {
@@ -19191,6 +19303,7 @@ const processJob = async (
       const verticalSelection = buildVerticalRetentionCandidates({
         durationSeconds: durationSeconds || 0,
         requestedCount: renderConfig.verticalClipCount,
+        clipDurationMaxSeconds: renderConfig.verticalClipDurationSeconds,
         windows: verticalWindows,
         platformProfile: platformProfileId,
         strategyProfile,
@@ -23430,7 +23543,13 @@ router.patch('/:id/live-settings', async (req: any, res) => {
           mode: req.body?.mode ?? req.body?.renderMode ?? persistedRenderConfig.mode,
           horizontalMode: req.body?.horizontalMode ?? persistedRenderConfig.horizontalMode,
           verticalMode: requestedVerticalModeOverride,
-          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount
+          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount,
+          verticalClipDurationSeconds:
+            req.body?.verticalClipDurationSeconds ??
+            req.body?.vertical_clip_duration_seconds ??
+            req.body?.verticalClipDuration ??
+            req.body?.vertical_clip_duration ??
+            persistedRenderConfig.verticalClipDurationSeconds
         })
       : persistedRenderConfig
 
@@ -23754,7 +23873,13 @@ router.post('/:id/reprocess', async (req: any, res) => {
           mode: req.body?.mode ?? req.body?.renderMode ?? persistedRenderConfig.mode,
           horizontalMode: req.body?.horizontalMode ?? persistedRenderConfig.horizontalMode,
           verticalMode: requestedVerticalModeOverride,
-          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount
+          verticalClipCount: req.body?.verticalClipCount ?? persistedRenderConfig.verticalClipCount,
+          verticalClipDurationSeconds:
+            req.body?.verticalClipDurationSeconds ??
+            req.body?.vertical_clip_duration_seconds ??
+            req.body?.verticalClipDuration ??
+            req.body?.vertical_clip_duration ??
+            persistedRenderConfig.verticalClipDurationSeconds
         })
       : persistedRenderConfig
     const tuning = buildRetentionTuningFromPayload({
@@ -23825,6 +23950,18 @@ router.post('/:id/reprocess', async (req: any, res) => {
       renderMode: effectiveRenderConfig.mode,
       horizontalMode: effectiveRenderConfig.horizontalMode,
       verticalClipCount: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalClipCount : 1,
+      verticalClipDurationSeconds: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      vertical_clip_duration_seconds: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      verticalClipDuration: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      vertical_clip_duration: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
       verticalMode: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalMode : null,
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
@@ -23865,6 +24002,18 @@ router.post('/:id/reprocess', async (req: any, res) => {
       horizontalMode: effectiveRenderConfig.horizontalMode,
       verticalMode: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalMode : null,
       verticalClipCount: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalClipCount : 1,
+      verticalClipDurationSeconds: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      vertical_clip_duration_seconds: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      verticalClipDuration: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+      vertical_clip_duration: effectiveRenderConfig.mode === 'vertical'
+        ? effectiveRenderConfig.verticalClipDurationSeconds
+        : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
       retentionAggressionLevel: requestedAggressionLevel,
       retentionLevel: requestedAggressionLevel,
       retentionStrategyProfile: requestedStrategyProfile,
