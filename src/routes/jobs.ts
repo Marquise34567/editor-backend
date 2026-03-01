@@ -9177,6 +9177,7 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
     const cueStart = Number(cue.start)
     const cueEnd = Number(cue.end)
     if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart) continue
+    const cueWords = Array.isArray(cue.words) ? cue.words : []
     for (const segment of timeline) {
       const overlapStart = Math.max(cueStart, segment.sourceStart)
       const overlapEnd = Math.min(cueEnd, segment.sourceEnd)
@@ -9184,10 +9185,32 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
       const mappedStart = segment.outputStart + (overlapStart - segment.sourceStart) / segment.speed
       const mappedEnd = segment.outputStart + (overlapEnd - segment.sourceStart) / segment.speed
       if (!Number.isFinite(mappedStart) || !Number.isFinite(mappedEnd) || mappedEnd - mappedStart <= 0.01) continue
+      const remappedWords = cueWords
+        .map((word) => {
+          const wordStart = Number(word.start)
+          const wordEnd = Number(word.end)
+          if (!Number.isFinite(wordStart) || !Number.isFinite(wordEnd) || wordEnd <= wordStart) return null
+          const overlapWordStart = Math.max(wordStart, overlapStart)
+          const overlapWordEnd = Math.min(wordEnd, overlapEnd)
+          if (overlapWordEnd - overlapWordStart <= 0.01) return null
+          const mappedWordStart = segment.outputStart + (overlapWordStart - segment.sourceStart) / segment.speed
+          const mappedWordEnd = segment.outputStart + (overlapWordEnd - segment.sourceStart) / segment.speed
+          if (!Number.isFinite(mappedWordStart) || !Number.isFinite(mappedWordEnd) || mappedWordEnd - mappedWordStart <= 0.01) return null
+          return {
+            ...word,
+            start: Number(mappedWordStart.toFixed(3)),
+            end: Number(mappedWordEnd.toFixed(3))
+          } as TranscriptWord
+        })
+        .filter((word: TranscriptWord | null): word is TranscriptWord => Boolean(word))
+        .sort((left, right) => left.start - right.start || left.end - right.end)
+      const remappedText = remappedWords.length ? formatCueTextFromWords(remappedWords) : cue.text
       remapped.push({
         ...cue,
         start: Number(mappedStart.toFixed(3)),
-        end: Number(mappedEnd.toFixed(3))
+        end: Number(mappedEnd.toFixed(3)),
+        text: remappedText || cue.text,
+        words: remappedWords.length ? remappedWords : undefined
       })
     }
   }
@@ -9203,6 +9226,19 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
       cue.start - previous.end <= 0.08
     ) {
       previous.end = Number(Math.max(previous.end, cue.end).toFixed(3))
+      if (Array.isArray(previous.words) || Array.isArray(cue.words)) {
+        const mergedWords = [
+          ...(Array.isArray(previous.words) ? previous.words : []),
+          ...(Array.isArray(cue.words) ? cue.words : [])
+        ]
+          .filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end > word.start)
+          .sort((left, right) => left.start - right.start || left.end - right.end)
+        previous.words = mergedWords.length ? mergedWords : undefined
+        const textFromWords = formatCueTextFromWords(mergedWords)
+        if (textFromWords) previous.text = textFromWords
+      }
+      if (!previous.speaker && cue.speaker) previous.speaker = cue.speaker
+      if (!previous.language && cue.language) previous.language = cue.language
       continue
     }
     merged.push({ ...cue })
@@ -9255,12 +9291,224 @@ const scoreTranscriptSignals = (text: string) => {
   }
 }
 
-const parseTranscriptCues = (srtPath: string | null) => {
+const CAPTION_EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u
+const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯']
+const VIRAL_KEYWORD_PATTERN = /\b(crazy|insane|what|no way|can't believe|cant believe|bro|wild|shocking|wtf)\b/i
+const CAPTION_FILLER_TOKEN_SET = new Set(['um', 'uh', 'like', 'basically', 'literally', 'actually', 'honestly', 'seriously'])
+const CAPTION_EMPHASIS_TOKEN_SET = new Set([
+  'crazy', 'insane', 'wild', 'shocking', 'secret', 'proof', 'never', 'always', 'must', 'now', 'stop',
+  'wait', 'watch', 'listen', 'important', 'viral', 'breaking', 'unbelievable', 'cannot', "can't", 'cant',
+  'no', 'way', 'how', 'why', 'what'
+])
+const CAPTION_EMOJI_RULES: Array<{ pattern: RegExp; emoji: string }> = [
+  { pattern: /(crazy|insane|wild|shocking|wtf|no\s*way)/i, emoji: '🤯' },
+  { pattern: /(fire|hot|viral|legend|win|clutch|hype)/i, emoji: '🔥' },
+  { pattern: /(laugh|funny|lol|lmao|joke)/i, emoji: '😂' },
+  { pattern: /(money|cash|million|deal|profit|sales)/i, emoji: '💸' },
+  { pattern: /(love|heart|cute)/i, emoji: '❤️' },
+  { pattern: /(watch|look|wait|listen|secret|proof)/i, emoji: '👀' }
+]
+
+const normalizeCaptionToken = (value: string) => (
+  String(value || '')
+    .toLowerCase()
+    .trim()
+    .replace(/(^[^a-z0-9']+|[^a-z0-9']+$)/g, '')
+)
+
+const isCaptionFillerToken = (token: string, previousToken = '', nextToken = '') => {
+  if (!token) return false
+  if (CAPTION_FILLER_TOKEN_SET.has(token)) return true
+  if (token === 'you' && nextToken === 'know') return true
+  if (token === 'know' && previousToken === 'you') return true
+  if ((token === 'kind' || token === 'sort') && nextToken === 'of') return true
+  if (token === 'of' && (previousToken === 'kind' || previousToken === 'sort')) return true
+  if (token === 'i' && nextToken === 'mean') return true
+  if (token === 'mean' && previousToken === 'i') return true
+  return false
+}
+
+const shouldEmphasizeCaptionWord = (value: string) => {
+  const token = normalizeCaptionToken(value)
+  if (!token) return false
+  if (CAPTION_EMPHASIS_TOKEN_SET.has(token)) return true
+  if (/\d/.test(token)) return true
+  if (String(value || '').trim().toUpperCase() === String(value || '').trim() && token.length >= 3) return true
+  if (token.length >= 8 && /(est|ever|ing)$/.test(token)) return true
+  return false
+}
+
+const inferCaptionEmoji = (value: string): string | null => {
+  const sample = String(value || '').trim()
+  if (!sample) return null
+  for (const rule of CAPTION_EMOJI_RULES) {
+    if (rule.pattern.test(sample)) return rule.emoji
+  }
+  return null
+}
+
+const formatCueTextFromWords = (words: TranscriptWord[]) => {
+  if (!Array.isArray(words) || !words.length) return ''
+  return words
+    .map((word) => String(word.text || '').trim())
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+([,.!?;:])/g, '$1')
+    .replace(/([(\[])\s+/g, '$1')
+    .replace(/\s+([)\]])/g, '$1')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+const resolveTranscriptSidecarPath = (srtPath: string, overridePath?: string | null) => {
+  const explicit = String(overridePath || '').trim()
+  if (explicit && fs.existsSync(explicit)) return explicit
+  const parsed = path.parse(srtPath)
+  const candidates = [
+    path.join(parsed.dir, `${parsed.name}.transcript.json`),
+    path.join(parsed.dir, `${parsed.base}.json`)
+  ]
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate
+  }
+  return null
+}
+
+const parseTranscriptWordRows = (value: any, cueStart: number, cueEnd: number): TranscriptWord[] => {
+  if (!Array.isArray(value) || !value.length) return []
+  const cueDuration = Math.max(0.05, cueEnd - cueStart)
+  const estimatedWordDuration = cueDuration / Math.max(1, value.length)
+  const words = value
+    .map((entry, index) => {
+      const rawText = String(entry?.text ?? entry?.word ?? '').replace(/\s+/g, ' ').trim()
+      if (!rawText) return null
+      const fallbackStart = cueStart + estimatedWordDuration * index
+      const fallbackEnd = Math.min(cueEnd, fallbackStart + estimatedWordDuration)
+      const startRaw = Number(entry?.start)
+      const endRaw = Number(entry?.end)
+      const start = Number.isFinite(startRaw) ? startRaw : fallbackStart
+      const end = Number.isFinite(endRaw) ? endRaw : fallbackEnd
+      const boundedStart = Number(clamp(start, cueStart, cueEnd).toFixed(3))
+      const boundedEnd = Number(clamp(end, boundedStart + 0.02, cueEnd).toFixed(3))
+      if (boundedEnd <= boundedStart) return null
+      const token = normalizeCaptionToken(rawText)
+      const confidenceRaw = Number(entry?.confidence)
+      const confidence = Number.isFinite(confidenceRaw) ? Number(clamp(confidenceRaw, -1, 1).toFixed(4)) : null
+      const emphasis = parseBooleanFlag(entry?.emphasis) ?? shouldEmphasizeCaptionWord(rawText)
+      const emoji = (
+        typeof entry?.emoji === 'string' && entry.emoji.trim().length
+          ? entry.emoji.trim().slice(0, 2)
+          : inferCaptionEmoji(rawText)
+      )
+      return {
+        text: rawText,
+        start: boundedStart,
+        end: boundedEnd,
+        confidence,
+        emphasis,
+        isFiller: isCaptionFillerToken(token),
+        emoji: emoji || null,
+        speaker: typeof entry?.speaker === 'string' && entry.speaker.trim().length ? entry.speaker.trim().slice(0, 24) : null
+      } as TranscriptWord
+    })
+    .filter((word: TranscriptWord | null): word is TranscriptWord => Boolean(word))
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  if (!words.length) return []
+  for (let index = 0; index < words.length; index += 1) {
+    const current = words[index]
+    const previousToken = index > 0 ? normalizeCaptionToken(words[index - 1].text) : ''
+    const nextToken = index + 1 < words.length ? normalizeCaptionToken(words[index + 1].text) : ''
+    const token = normalizeCaptionToken(current.text)
+    current.isFiller = Boolean(current.isFiller || isCaptionFillerToken(token, previousToken, nextToken))
+    current.emphasis = Boolean(current.emphasis || shouldEmphasizeCaptionWord(current.text))
+    if (!current.emoji) {
+      current.emoji = inferCaptionEmoji(current.text)
+    }
+  }
+  return words
+}
+
+const parseTranscriptSidecar = (srtPath: string, options?: { sidecarPath?: string | null }) => {
+  const sidecarPath = resolveTranscriptSidecarPath(srtPath, options?.sidecarPath)
+  if (!sidecarPath) {
+    return {
+      language: null as string | null,
+      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null }>
+    }
+  }
+  try {
+    const parsed = JSON.parse(String(fs.readFileSync(sidecarPath, 'utf8') || '{}')) as any
+    const language = typeof parsed?.language === 'string' && parsed.language.trim().length ? parsed.language.trim().slice(0, 16) : null
+    const segmentsRaw = Array.isArray(parsed?.segments) ? parsed.segments : []
+    const segments = segmentsRaw
+      .map((segment) => {
+        const start = Number(segment?.start)
+        const end = Number(segment?.end)
+        if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null
+        const words = parseTranscriptWordRows(segment?.words, start, end)
+        const textFromWords = formatCueTextFromWords(words)
+        const text = String(segment?.text || textFromWords || '')
+          .replace(/<[^>]+>/g, '')
+          .replace(/\s+/g, ' ')
+          .trim()
+        if (!text) return null
+        const speaker = typeof segment?.speaker === 'string' && segment.speaker.trim().length
+          ? segment.speaker.trim().slice(0, 24)
+          : null
+        return {
+          start: Number(start.toFixed(3)),
+          end: Number(end.toFixed(3)),
+          text,
+          words,
+          speaker
+        }
+      })
+      .filter((segment: { start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null } | null): segment is {
+        start: number
+        end: number
+        text: string
+        words: TranscriptWord[]
+        speaker: string | null
+      } => Boolean(segment))
+      .sort((left, right) => left.start - right.start || left.end - right.end)
+    return { language, segments }
+  } catch {
+    return {
+      language: null as string | null,
+      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null }>
+    }
+  }
+}
+
+const computeTranscriptTextOverlapScore = (leftText: string, rightText: string) => {
+  const left = String(leftText || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => normalizeCaptionToken(token))
+    .filter(Boolean)
+  const right = String(rightText || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => normalizeCaptionToken(token))
+    .filter(Boolean)
+  if (!left.length || !right.length) return 0
+  const leftSet = new Set(left)
+  const rightSet = new Set(right)
+  let overlap = 0
+  for (const token of leftSet) {
+    if (rightSet.has(token)) overlap += 1
+  }
+  return clamp01(overlap / Math.max(1, Math.max(leftSet.size, rightSet.size)))
+}
+
+const parseTranscriptCues = (srtPath: string | null, options?: { sidecarPath?: string | null }) => {
   if (!srtPath || !fs.existsSync(srtPath)) return [] as TranscriptCue[]
   const content = String(fs.readFileSync(srtPath, 'utf8') || '')
   const blocks = content.split(/\r?\n\r?\n/)
+  const sidecar = parseTranscriptSidecar(srtPath, options)
   const cues: TranscriptCue[] = []
-  for (const block of blocks) {
+  for (let blockIndex = 0; blockIndex < blocks.length; blockIndex += 1) {
+    const block = blocks[blockIndex]
     const lines = block.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
     if (lines.length < 2) continue
     const timingLine = lines.find((line) => line.includes('-->'))
@@ -9270,22 +9518,60 @@ const parseTranscriptCues = (srtPath: string | null) => {
     const end = parseSrtTimestamp(endRaw)
     if (start === null || end === null || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) continue
     const textLines = lines.filter((line) => !line.includes('-->') && !/^\d+$/.test(line))
-    const text = textLines.join(' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    const srtText = textLines.join(' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim()
+    const directSidecar = sidecar.segments[blockIndex]
+    const matchedSidecar = (() => {
+      if (directSidecar) {
+        const startDelta = Math.abs(directSidecar.start - start)
+        const endDelta = Math.abs(directSidecar.end - end)
+        if (startDelta <= 1.2 && endDelta <= 1.4) return directSidecar
+      }
+      let best: typeof sidecar.segments[number] | null = null
+      let bestScore = -1
+      for (const segment of sidecar.segments) {
+        const overlapSeconds = Math.max(0, Math.min(end, segment.end) - Math.max(start, segment.start))
+        const span = Math.max(end - start, segment.end - segment.start, 0.001)
+        const overlapScore = clamp01(overlapSeconds / span)
+        const startDelta = Math.abs(segment.start - start)
+        const endDelta = Math.abs(segment.end - end)
+        const timingScore = clamp01(1 - (0.55 * (startDelta / 1.8) + 0.45 * (endDelta / 2.2)))
+        const textScore = computeTranscriptTextOverlapScore(srtText, segment.text)
+        const score = 0.58 * overlapScore + 0.28 * timingScore + 0.14 * textScore
+        if (score > bestScore) {
+          bestScore = score
+          best = segment
+        }
+      }
+      return bestScore >= 0.26 ? best : null
+    })()
+    const sidecarWords = Array.isArray(matchedSidecar?.words)
+      ? matchedSidecar!.words
+          .map((word) => ({
+            ...word,
+            start: Number(clamp(word.start, start, end).toFixed(3)),
+            end: Number(clamp(word.end, start, end).toFixed(3))
+          }))
+          .filter((word) => word.end > word.start + 0.01)
+          .sort((left, right) => left.start - right.start || left.end - right.end)
+      : []
+    const textFromWords = formatCueTextFromWords(sidecarWords)
+    const text = (srtText || matchedSidecar?.text || textFromWords || '')
+      .replace(/\s+/g, ' ')
+      .trim()
     if (!text) continue
     const scored = scoreTranscriptSignals(text)
     cues.push({
       start: Number(start.toFixed(3)),
       end: Number(end.toFixed(3)),
       text,
-      ...scored
+      ...scored,
+      words: sidecarWords.length ? sidecarWords : undefined,
+      speaker: matchedSidecar?.speaker ?? null,
+      language: sidecar.language
     })
   }
   return cues.sort((a, b) => a.start - b.start)
 }
-
-const CAPTION_EMOJI_PATTERN = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u
-const VIRAL_EMOJI_POOL = ['😱', '🔥', '💀', '😂', '🤯']
-const VIRAL_KEYWORD_PATTERN = /\b(crazy|insane|what|no way|can't believe|cant believe|bro|wild|shocking|wtf)\b/i
 
 const sanitizeCaptionPhrase = (value: string) => (
   normalizeVerticalCaptionPhraseInput(
@@ -9340,6 +9626,99 @@ const hypeVerticalCaptionPhrase = (
     phrase = `${phrase} ${pickViralEmoji(opts?.seed ?? phrase.length)}`
   }
   return sanitizeCaptionPhrase(phrase)
+}
+
+const extractCaptionEmphasisWords = (text: string, limit = 3): string[] => {
+  const tokens = String(text || '')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter(Boolean)
+  if (!tokens.length) return []
+  const emphasisTokens = tokens
+    .filter((token) => shouldEmphasizeCaptionWord(token))
+    .map((token) => token.replace(/(^[^A-Za-z0-9']+|[^A-Za-z0-9']+$)/g, ''))
+    .filter(Boolean)
+  const unique: string[] = []
+  for (const token of emphasisTokens) {
+    if (unique.some((entry) => entry.toLowerCase() === token.toLowerCase())) continue
+    unique.push(token)
+    if (unique.length >= Math.max(1, limit)) break
+  }
+  return unique
+}
+
+const buildSyntheticTranscriptWords = ({
+  text,
+  start,
+  end,
+  autoEmphasis,
+  autoEmoji,
+  removeFillers,
+  speaker
+}: {
+  text: string
+  start: number
+  end: number
+  autoEmphasis?: boolean
+  autoEmoji?: boolean
+  removeFillers?: boolean
+  speaker?: string | null
+}) => {
+  const rawTokens = String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .map((token) => token.trim())
+    .filter(Boolean)
+  if (!rawTokens.length) return [] as TranscriptWord[]
+  const annotated = rawTokens.map((surface, index) => {
+    const token = normalizeCaptionToken(surface)
+    const previousToken = index > 0 ? normalizeCaptionToken(rawTokens[index - 1]) : ''
+    const nextToken = index + 1 < rawTokens.length ? normalizeCaptionToken(rawTokens[index + 1]) : ''
+    return {
+      surface,
+      token,
+      isFiller: isCaptionFillerToken(token, previousToken, nextToken),
+      emphasis: shouldEmphasizeCaptionWord(surface)
+    }
+  })
+  const filtered = removeFillers
+    ? annotated.filter((entry) => !entry.isFiller)
+    : annotated
+  const active = filtered.length ? filtered : annotated
+  if (!active.length) return [] as TranscriptWord[]
+  const safeStart = Number.isFinite(start) ? start : 0
+  const safeEnd = Number.isFinite(end) ? end : safeStart + 1
+  const safeDuration = Math.max(0.08, safeEnd - safeStart)
+  const weights = active.map((entry) => Math.max(1, normalizeCaptionToken(entry.surface).length || 1))
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0) || active.length
+  let cursor = safeStart
+  const words: TranscriptWord[] = []
+  for (let index = 0; index < active.length; index += 1) {
+    const entry = active[index]
+    const isLast = index === active.length - 1
+    const share = weights[index] / totalWeight
+    const idealDuration = safeDuration * share
+    const nextCursor = isLast ? safeEnd : Math.min(safeEnd, cursor + Math.max(0.05, idealDuration))
+    const boundedStart = Number(clamp(cursor, safeStart, safeEnd).toFixed(3))
+    const boundedEnd = Number(clamp(nextCursor, boundedStart + 0.02, safeEnd).toFixed(3))
+    const emphasis = Boolean((autoEmphasis ?? true) && entry.emphasis)
+    const emoji = (autoEmoji ?? true) && emphasis
+      ? inferCaptionEmoji(entry.surface)
+      : null
+    words.push({
+      text: entry.surface,
+      start: boundedStart,
+      end: boundedEnd,
+      confidence: null,
+      emphasis,
+      isFiller: entry.isFiller,
+      emoji,
+      speaker: speaker || null
+    })
+    cursor = boundedEnd
+  }
+  return words.filter((word) => word.end > word.start + 0.01)
 }
 
 const buildTranscriptDrivenVerticalCaptionPool = ({
@@ -9473,6 +9852,9 @@ const buildVerticalClipCaptionOverlays = ({
   animationEnabled,
   animationMode,
   autoGenerateFromTranscript,
+  autoEmphasis,
+  autoEmoji,
+  removeFillers,
   editorMode,
   styleProfile,
   nicheProfile
@@ -9486,6 +9868,9 @@ const buildVerticalClipCaptionOverlays = ({
   animationEnabled?: boolean
   animationMode?: VerticalClipCaptionAnimation | null
   autoGenerateFromTranscript?: boolean
+  autoEmphasis?: boolean
+  autoEmoji?: boolean
+  removeFillers?: boolean
   editorMode?: EditorModeSelection | null
   styleProfile?: ContentStyleProfile | null
   nicheProfile?: VideoNicheProfile | null
@@ -9502,13 +9887,17 @@ const buildVerticalClipCaptionOverlays = ({
       : preferredAnimation || 'none'
     const start = Number(Math.min(0.16, Math.max(0, clipDuration - 0.41)).toFixed(3))
     const end = Number(Math.max(start + 0.05, clipDuration - 0.04).toFixed(3))
+    const emphasisWords = autoEmphasis ? extractCaptionEmphasisWords(normalizedUserCaptionText, 4) : []
+    const emoji = autoEmoji ? inferCaptionEmoji(normalizedUserCaptionText) : null
     return [
       {
         text: normalizedUserCaptionText,
         start,
         end,
         animation: resolvedAnimation,
-        position: 'center'
+        position: 'center',
+        emphasisWords: emphasisWords.length ? emphasisWords : undefined,
+        emoji
       }
     ]
   }
@@ -9601,7 +9990,19 @@ const buildVerticalClipCaptionOverlays = ({
   const overlays: VerticalClipCaptionOverlay[] = []
   let cursor = 0
   for (let index = 0; index < selectedPhrases.length; index += 1) {
-    const phrase = sanitizeCaptionPhrase(selectedPhrases[index] || '')
+    const rawPhrase = sanitizeCaptionPhrase(selectedPhrases[index] || '')
+    if (!rawPhrase) continue
+    const filteredPhrase = removeFillers
+      ? formatCueTextFromWords(buildSyntheticTranscriptWords({
+          text: rawPhrase,
+          start: 0,
+          end: 1,
+          autoEmphasis: false,
+          autoEmoji: false,
+          removeFillers: true
+        })) || rawPhrase
+      : rawPhrase
+    const phrase = sanitizeCaptionPhrase(filteredPhrase)
     if (!phrase) continue
     const ranked = rankedWindows[index]
     const anchor = ranked
@@ -9615,7 +10016,9 @@ const buildVerticalClipCaptionOverlays = ({
       start: Number(start.toFixed(3)),
       end: Number(end.toFixed(3)),
       animation: animations[index % animations.length],
-      position: highEnergy || index === 0 ? 'center' : 'bottom'
+      position: highEnergy || index === 0 ? 'center' : 'bottom',
+      emphasisWords: autoEmphasis ? extractCaptionEmphasisWords(phrase, 3) : undefined,
+      emoji: autoEmoji ? inferCaptionEmoji(phrase) : null
     })
     cursor = Math.min(maxStart, end + 0.12)
   }
@@ -9625,18 +10028,48 @@ const buildVerticalClipCaptionOverlays = ({
 const normalizeVerticalCaptionCueText = (value: any): string =>
   normalizeVerticalCaptionTextInput(value).slice(0, MAX_MANUAL_VERTICAL_CAPTION_CHARS)
 
-const overlaysToTranscriptCues = (overlays: VerticalClipCaptionOverlay[]) => (
+const overlaysToTranscriptCues = (
+  overlays: VerticalClipCaptionOverlay[],
+  options?: { autoEmphasis?: boolean; autoEmoji?: boolean; removeFillers?: boolean }
+) => (
   overlays
     .map((overlay) => {
       const start = Number(overlay.start)
       const end = Number(overlay.end)
-      const text = normalizeVerticalCaptionCueText(overlay.text)
-      if (!text || !Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
+      if (!Number.isFinite(start) || !Number.isFinite(end) || end - start <= 0.05) return null
+      const rawText = normalizeVerticalCaptionCueText(overlay.text)
+      if (!rawText) return null
+      const words = buildSyntheticTranscriptWords({
+        text: rawText,
+        start,
+        end,
+        autoEmphasis: options?.autoEmphasis ?? true,
+        autoEmoji: options?.autoEmoji ?? true,
+        removeFillers: options?.removeFillers ?? false
+      })
+      if (Array.isArray(overlay.emphasisWords) && overlay.emphasisWords.length) {
+        const emphasisLookup = new Set(overlay.emphasisWords.map((word) => normalizeCaptionToken(word)).filter(Boolean))
+        for (const word of words) {
+          if (emphasisLookup.has(normalizeCaptionToken(word.text))) {
+            word.emphasis = true
+          }
+        }
+      }
+      if ((options?.autoEmoji ?? true) && overlay.emoji) {
+        const emphasisIndex = words.findIndex((word) => Boolean(word.emphasis))
+        const targetIndex = emphasisIndex >= 0 ? emphasisIndex : Math.max(0, words.length - 1)
+        if (words[targetIndex]) {
+          words[targetIndex].emoji = overlay.emoji
+        }
+      }
+      const text = formatCueTextFromWords(words) || rawText
+      if (!text) return null
       return {
         start,
         end,
         text,
-        ...scoreTranscriptSignals(text)
+        ...scoreTranscriptSignals(text),
+        words: words.length ? words : undefined
       } as TranscriptCue
     })
     .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
@@ -9654,7 +10087,17 @@ const mergeTranscriptCueLayers = (layers: TranscriptCue[][]) => {
       ...cue,
       start: Number(cue.start.toFixed(3)),
       end: Number(cue.end.toFixed(3)),
-      text: normalizeVerticalCaptionCueText(cue.text)
+      text: normalizeVerticalCaptionCueText(cue.text),
+      words: Array.isArray(cue.words)
+        ? cue.words
+            .map((word) => ({
+              ...word,
+              start: Number(word.start.toFixed(3)),
+              end: Number(word.end.toFixed(3))
+            }))
+            .filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end > word.start + 0.01)
+            .sort((left, right) => left.start - right.start || left.end - right.end)
+        : undefined
     }))
     .sort((left, right) => left.start - right.start || left.end - right.end)
   const merged: TranscriptCue[] = []
@@ -9662,6 +10105,19 @@ const mergeTranscriptCueLayers = (layers: TranscriptCue[][]) => {
     const last = merged.length ? merged[merged.length - 1] : null
     if (last && last.text === cue.text && cue.start - last.end <= 0.08) {
       last.end = Number(Math.max(last.end, cue.end).toFixed(3))
+      if (Array.isArray(last.words) || Array.isArray(cue.words)) {
+        const mergedWords = [
+          ...(Array.isArray(last.words) ? last.words : []),
+          ...(Array.isArray(cue.words) ? cue.words : [])
+        ]
+          .filter((word) => Number.isFinite(word.start) && Number.isFinite(word.end) && word.end > word.start + 0.01)
+          .sort((left, right) => left.start - right.start || left.end - right.end)
+        last.words = mergedWords.length ? mergedWords : undefined
+        const textFromWords = formatCueTextFromWords(mergedWords)
+        if (textFromWords) last.text = textFromWords
+      }
+      if (!last.speaker && cue.speaker) last.speaker = cue.speaker
+      if (!last.language && cue.language) last.language = cue.language
       continue
     }
     merged.push(cue)
@@ -19752,6 +20208,9 @@ const processJob = async (
               animationEnabled: verticalCaptionConfig.animationEnabled,
               animationMode: verticalCaptionConfig.animation,
               autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
+              autoEmphasis: verticalCaptionConfig.autoEmphasis,
+              autoEmoji: verticalCaptionConfig.autoEmoji,
+              removeFillers: verticalCaptionConfig.removeFillers,
               editorMode: editorModeForRender,
               styleProfile: verticalStyleProfile,
               nicheProfile: verticalNicheProfile
@@ -19759,7 +20218,11 @@ const processJob = async (
           : []
         verticalClipCaptionOverlays.push(clipCaptionOverlays)
 
-        const clipOverlayCues = overlaysToTranscriptCues(clipCaptionOverlays)
+        const clipOverlayCues = overlaysToTranscriptCues(clipCaptionOverlays, {
+          autoEmphasis: verticalCaptionConfig.autoEmphasis,
+          autoEmoji: verticalCaptionConfig.autoEmoji,
+          removeFillers: verticalCaptionConfig.removeFillers
+        })
         const clipCueLayers: TranscriptCue[][] = []
         if (options.autoCaptions && verticalSourceCues.length && !shouldApplyVerticalCaptionOverlays) {
           const remappedClipCues = remapTranscriptCuesToEditedTimeline(verticalSourceCues, [clipSegment])
@@ -21381,7 +21844,8 @@ const processJob = async (
             const assPath = buildMrBeastAnimatedAss({
               srtPath: subtitlePath,
               workingDir: workDir,
-              style: subtitleStyle
+              style: subtitleStyle,
+              cues: remappedCues
             })
             if (assPath) {
               subtitlePath = assPath
