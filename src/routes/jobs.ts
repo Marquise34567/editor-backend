@@ -5578,16 +5578,26 @@ const resolveHorizontalTargetDimensions = ({
 const getVerticalOutputPathsFromAnalysis = (analysis?: any) => {
   const raw = analysis?.verticalOutputPaths
   if (!Array.isArray(raw)) return [] as string[]
+  const allowedExt = new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv'])
   return raw
     .map((value: any) => String(value || '').trim())
-    .filter((value: string) => value.length > 0)
+    .filter((value: string) => {
+      if (!value) return false
+      const ext = path.extname(value.split('?')[0] || '').toLowerCase()
+      return allowedExt.has(ext)
+    })
 }
 
 const getOutputPathsForJob = (job: any) => {
   const analysis = job?.analysis as any
   const verticalPaths = getVerticalOutputPathsFromAnalysis(analysis)
   if (verticalPaths.length > 0) return verticalPaths
-  if (job?.outputPath) return [job.outputPath]
+  if (job?.outputPath) {
+    const ext = path.extname(String(job.outputPath || '').split('?')[0] || '').toLowerCase()
+    if (new Set(['.mp4', '.m4v', '.mov', '.webm', '.mkv']).has(ext)) {
+      return [job.outputPath]
+    }
+  }
   return [] as string[]
 }
 
