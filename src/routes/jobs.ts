@@ -12617,7 +12617,16 @@ const buildVerticalMetadataSummary = ({
             end: Number(Math.max(0, overlay.end).toFixed(3)),
             text: String(overlay.text || '').trim().slice(0, 140),
             animation: overlay.animation,
-            position: overlay.position
+            position: overlay.position,
+            emphasisWords: Array.isArray(overlay.emphasisWords)
+              ? overlay.emphasisWords
+                  .map((word) => String(word || '').trim())
+                  .filter(Boolean)
+                  .slice(0, 4)
+              : [],
+            emoji: typeof overlay.emoji === 'string' && overlay.emoji.trim().length
+              ? overlay.emoji.trim().slice(0, 2)
+              : null
           }))
           .filter((overlay) => overlay.text.length > 0 && overlay.end - overlay.start > 0.05)
       : []
@@ -14604,27 +14613,155 @@ const escapeAssDialogueText = (text: string) =>
     .replace(/\}/g, '\\}')
     .replace(/\r?\n/g, '\\N')
 
+const toAssKaraokeCentiseconds = (seconds: number, animationSpeed = 1) => {
+  const safeSeconds = Math.max(0.02, Number(seconds) || 0)
+  const speed = clamp(Number(animationSpeed) || 1, 0.5, 2.2)
+  return Math.max(4, Math.round((safeSeconds * 100) / speed))
+}
+
+const resolveCueWordsForAss = ({
+  cue,
+  removeFillers,
+  autoEmphasis,
+  autoEmoji
+}: {
+  cue: TranscriptCue
+  removeFillers: boolean
+  autoEmphasis: boolean
+  autoEmoji: boolean
+}) => {
+  const cueStart = Number.isFinite(cue.start) ? cue.start : 0
+  const cueEnd = Number.isFinite(cue.end) ? cue.end : cueStart + 1
+  const existingWords = Array.isArray(cue.words) ? cue.words : []
+  const baseWords = existingWords.length
+    ? existingWords
+        .map((word) => ({
+          ...word,
+          text: String(word.text || '').replace(/\s+/g, ' ').trim(),
+          start: Number(clamp(Number(word.start), cueStart, cueEnd).toFixed(3)),
+          end: Number(clamp(Number(word.end), cueStart, cueEnd).toFixed(3))
+        }))
+        .filter((word) => word.text.length > 0 && Number.isFinite(word.start) && Number.isFinite(word.end) && word.end > word.start + 0.01)
+        .sort((left, right) => left.start - right.start || left.end - right.end)
+    : buildSyntheticTranscriptWords({
+        text: cue.text,
+        start: cueStart,
+        end: cueEnd,
+        autoEmphasis,
+        autoEmoji,
+        removeFillers,
+        speaker: cue.speaker ?? null
+      })
+  if (!baseWords.length) return [] as TranscriptWord[]
+  const filteredWords = removeFillers
+    ? baseWords.filter((word, index) => {
+        const token = normalizeCaptionToken(word.text)
+        const previousToken = index > 0 ? normalizeCaptionToken(baseWords[index - 1].text) : ''
+        const nextToken = index + 1 < baseWords.length ? normalizeCaptionToken(baseWords[index + 1].text) : ''
+        return !Boolean(word.isFiller || isCaptionFillerToken(token, previousToken, nextToken))
+      })
+    : baseWords
+  const activeWords = filteredWords.length ? filteredWords : baseWords
+  return activeWords.map((word) => {
+    const emphasis = autoEmphasis
+      ? Boolean(word.emphasis || shouldEmphasizeCaptionWord(word.text))
+      : Boolean(word.emphasis)
+    const emoji = autoEmoji
+      ? (word.emoji || inferCaptionEmoji(word.text))
+      : null
+    return {
+      ...word,
+      emphasis,
+      emoji: emoji || null
+    }
+  })
+}
+
+const buildAssCueText = ({
+  cue,
+  words,
+  highlightWords,
+  autoEmoji,
+  uppercase,
+  animationSpeed,
+  primaryColor,
+  emphasisColor
+}: {
+  cue: TranscriptCue
+  words: TranscriptWord[]
+  highlightWords: boolean
+  autoEmoji: boolean
+  uppercase: boolean
+  animationSpeed: number
+  primaryColor: string
+  emphasisColor: string
+}) => {
+  const cueTextFromWords = formatCueTextFromWords(words)
+  const fallbackPhrase = String(cue.text || '').replace(/\s+/g, ' ').trim()
+  const basePhrase = cueTextFromWords || fallbackPhrase
+  if (!basePhrase) return ''
+  const candidateEmoji = autoEmoji
+    ? (
+      words.find((word) => Boolean(word.emoji))?.emoji ||
+      inferCaptionEmoji(basePhrase)
+    )
+    : null
+  if (!highlightWords || words.length < 2) {
+    let plain = uppercase ? basePhrase.toUpperCase() : basePhrase
+    if (candidateEmoji && !CAPTION_EMOJI_PATTERN.test(plain)) {
+      plain = `${plain} ${candidateEmoji}`
+    }
+    return escapeAssDialogueText(plain)
+  }
+  const tokenParts: string[] = []
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index]
+    const tokenTextRaw = uppercase ? String(word.text || '').toUpperCase() : String(word.text || '')
+    const tokenText = escapeAssDialogueText(tokenTextRaw.trim())
+    if (!tokenText) continue
+    const durationSeconds = Math.max(0.03, Number(word.end) - Number(word.start))
+    const durationCs = toAssKaraokeCentiseconds(durationSeconds, animationSpeed)
+    const emphasis = Boolean(word.emphasis)
+    const color = emphasis ? emphasisColor : primaryColor
+    const scale = emphasis ? 112 : 100
+    const wordTag = `{\\k${durationCs}\\1c${color}\\fscx${scale}\\fscy${scale}\\b1}`
+    tokenParts.push(`${wordTag}${tokenText}`)
+  }
+  if (!tokenParts.length) return ''
+  let built = tokenParts.join(' ')
+  if (candidateEmoji) {
+    built += ` ${escapeAssDialogueText(candidateEmoji)}`
+  }
+  return built
+}
+
 const buildMrBeastAnimatedAss = ({
   srtPath,
   workingDir,
-  style
+  style,
+  cues
 }: {
   srtPath: string
   workingDir: string
   style?: string | null
+  cues?: TranscriptCue[] | null
 }) => {
   const config = parseSubtitleStyleConfig(style)
   if (config.preset !== 'mrbeast_animated') return null
-  const cues = parseTranscriptCues(srtPath)
-  if (!cues.length) return null
+  const transcriptCues = Array.isArray(cues) && cues.length ? cues : parseTranscriptCues(srtPath)
+  if (!transcriptCues.length) return null
   const fontName = resolveSubtitleFontName(config.fontId)
   const primaryColor = toAssColorFromHex(config.textColor)
   const secondaryColor = toAssColorFromHex(config.accentColor)
   const outlineColor = toAssColorFromHex(config.outlineColor)
   const outlineWidth = Math.max(1, Math.min(24, Math.round(Number(config.outlineWidth || 20))))
   const fontSize = Math.max(36, Math.min(220, Math.round(Number(config.fontSize || 96))))
+  const animationSpeed = 1.16
+  const scaleInA = Math.max(35, Math.round(130 / animationSpeed))
+  const scaleInB = Math.max(scaleInA + 45, Math.round(240 / animationSpeed))
+  const scaleInC = Math.max(scaleInB + 50, Math.round(320 / animationSpeed))
   const baseTag = config.animation === 'pop'
-    ? `{\\an2\\fscx82\\fscy82\\bord${outlineWidth}\\t(0,130,\\fscx100\\fscy100)\\t(130,240,\\fscx106\\fscy106)\\t(240,320,\\fscx100\\fscy100)}`
+    ? `{\\an2\\fscx82\\fscy82\\bord${outlineWidth}\\t(0,${scaleInA},\\fscx100\\fscy100)\\t(${scaleInA},${scaleInB},\\fscx106\\fscy106)\\t(${scaleInB},${scaleInC},\\fscx100\\fscy100)}`
     : `{\\an2\\bord${outlineWidth}}`
 
   const assLines: string[] = [
@@ -14643,11 +14780,26 @@ const buildMrBeastAnimatedAss = ({
     'Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text'
   ]
 
-  for (const cue of cues) {
+  for (const cue of transcriptCues) {
     const start = Number.isFinite(cue.start) ? cue.start : 0
     const end = Number.isFinite(cue.end) ? cue.end : start + 0.8
     if (end <= start + 0.03) continue
-    const text = escapeAssDialogueText(String(cue.text || '').toUpperCase())
+    const words = resolveCueWordsForAss({
+      cue,
+      removeFillers: false,
+      autoEmphasis: true,
+      autoEmoji: true
+    })
+    const text = buildAssCueText({
+      cue,
+      words,
+      highlightWords: true,
+      autoEmoji: true,
+      uppercase: true,
+      animationSpeed,
+      primaryColor,
+      emphasisColor: secondaryColor
+    })
     if (!text) continue
     assLines.push(
       `Dialogue: 0,${toAssTimestamp(start)},${toAssTimestamp(end)},Beast,,0,0,0,,${baseTag}${text}`
@@ -14844,6 +14996,12 @@ const buildVerticalCaptionAss = ({
   const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
   const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
     (config.animationEnabled ? 'pop' : 'none')
+  const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? 1
+  const highlightWords = Boolean(config.highlightWords)
+  const autoEmphasis = Boolean(config.autoEmphasis)
+  const autoEmoji = Boolean(config.autoEmoji)
+  const removeFillers = Boolean(config.removeFillers)
+  const scaledMs = (value: number) => Math.max(20, Math.round(value / animationSpeed))
   const preserveManualText = !config.autoGenerate && isLikelyManualVerticalCaptionText(config.text)
   const useUppercase = (
     !preserveManualText &&
@@ -14871,28 +15029,49 @@ const buildVerticalCaptionAss = ({
     const start = Number.isFinite(cue.start) ? cue.start : 0
     const end = Number.isFinite(cue.end) ? cue.end : start + 0.8
     if (end <= start + 0.03) continue
-    const phrase = preserveManualText
+    const words = resolveCueWordsForAss({
+      cue,
+      removeFillers,
+      autoEmphasis,
+      autoEmoji
+    })
+    const phraseSource = preserveManualText
       ? normalizeVerticalCaptionCueText(cue.text)
-      : sanitizeCaptionPhrase(String(cue.text || ''))
+      : sanitizeCaptionPhrase(String(formatCueTextFromWords(words) || cue.text || ''))
+    const phrase = String(phraseSource || '').trim()
     if (!phrase) continue
-    const text = escapeAssDialogueText(useUppercase ? phrase.toUpperCase() : phrase)
+    const cueForRender: TranscriptCue = {
+      ...cue,
+      text: phrase
+    }
+    const text = buildAssCueText({
+      cue: cueForRender,
+      words,
+      highlightWords,
+      autoEmoji,
+      uppercase: useUppercase,
+      animationSpeed,
+      primaryColor,
+      emphasisColor: secondaryColor
+    })
+    if (!text) continue
     const animationTag = (() => {
       if (animationMode === 'none') {
         return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
       }
       if (animationMode === 'slide') {
-        return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,180)\\bord${outlineWidth}}`
+        return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,${scaledMs(180)})\\bord${outlineWidth}}`
       }
       if (animationMode === 'fade') {
-        return `{\\an5\\pos(${posX},${posY})\\fad(80,70)\\bord${outlineWidth}}`
+        return `{\\an5\\pos(${posX},${posY})\\fad(${scaledMs(80)},${scaledMs(70)})\\bord${outlineWidth}}`
       }
       if (animationMode === 'bounce') {
-        return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,120,\\fscx110\\fscy110)\\t(120,240,\\fscx100\\fscy100)}`
+        return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx110\\fscy110)\\t(${scaledMs(120)},${scaledMs(240)},\\fscx100\\fscy100)}`
       }
       if (animationMode === 'glitch') {
-        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,80,\\frz-2)\\t(80,160,\\frz1.4)\\t(160,260,\\frz0)}`
+        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,${scaledMs(80)},\\frz-2)\\t(${scaledMs(80)},${scaledMs(160)},\\frz1.4)\\t(${scaledMs(160)},${scaledMs(260)},\\frz0)}`
       }
-      return `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,120,\\fscx100\\fscy100)}`
+      return `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx100\\fscy100)}`
     })()
     assLines.push(
       `Dialogue: 0,${toAssTimestamp(start)},${toAssTimestamp(end)},Viral,,0,0,0,,${animationTag}${text}`
@@ -20086,13 +20265,17 @@ const processJob = async (
             const end = Number(cue?.end)
             const text = typeof cue?.text === 'string' ? cue.text : ''
             if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text.trim()) return null
+            const words = parseTranscriptWordRows(cue?.words, start, end)
             return {
               start: Number(start.toFixed(3)),
               end: Number(end.toFixed(3)),
               text: text.trim(),
               keywordIntensity: clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? 0)),
               curiosityTrigger: clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? 0)),
-              fillerDensity: clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0))
+              fillerDensity: clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0)),
+              words: words.length ? words : undefined,
+              speaker: typeof cue?.speaker === 'string' && cue.speaker.trim().length ? cue.speaker.trim().slice(0, 24) : null,
+              language: typeof cue?.language === 'string' && cue.language.trim().length ? cue.language.trim().slice(0, 16) : null
             } as TranscriptCue
           })
           .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
@@ -21844,8 +22027,7 @@ const processJob = async (
             const assPath = buildMrBeastAnimatedAss({
               srtPath: subtitlePath,
               workingDir: workDir,
-              style: subtitleStyle,
-              cues: remappedCues
+              style: subtitleStyle
             })
             if (assPath) {
               subtitlePath = assPath
