@@ -792,6 +792,12 @@ type Segment = {
   faceFocusY?: number
   transitionStyle?: SegmentTransitionStyle
   soundFxLevel?: number
+  audioLeadInMs?: number
+  audioTailMs?: number
+  reframeMode?: 'none' | 'punch_in' | 'punch_out'
+  brollOverlayHint?: boolean
+  subtitleIntent?: 'neutral' | 'hook' | 'cliffhanger'
+  musicSwell?: boolean
 }
 type WebcamCrop = { x: number; y: number; width: number; height: number }
 type HorizontalFitMode = 'cover' | 'contain'
@@ -1051,6 +1057,7 @@ type RetentionAttemptRecord = {
   boredomRemovalRatio: number
   predictedRetention?: number
   variantScore?: number
+  cutQualityScore?: number
 }
 type HookSelectionDecision = {
   candidate: HookCandidate
@@ -1072,6 +1079,7 @@ type HookSelectionDebugCandidate = {
   instantHold: number
   introClarity: number
   teaserTension: number
+  visualNovelty: number
   openerQuality: number
   selectionScore: number
   text: string
@@ -1104,11 +1112,127 @@ type HookSelectionDebugPayload = {
     instantHold: number
     introClarity: number
     teaserTension: number
+    visualNovelty: number
     openerQuality: number
     selectionScore: number
   }
   why: string
   candidates: HookSelectionDebugCandidate[]
+}
+type VisualShotType = 'close_up' | 'medium' | 'wide' | 'screen_focus' | 'dynamic'
+type VisualShotBoundary = {
+  time: number
+  strength: number
+  reason: string
+}
+type VisualShotTimelineEntry = {
+  start: number
+  end: number
+  shotType: VisualShotType
+  confidence: number
+}
+type VisualObjectTextEvent = {
+  time: number
+  strength: number
+  kind: 'onscreen_text' | 'object_motion' | 'face_spike' | 'speaker_switch'
+  detail: string
+}
+type VisualIntelligenceSummary = {
+  boundaryCount: number
+  shotBoundaries: VisualShotBoundary[]
+  shotTypeTimeline: VisualShotTimelineEntry[]
+  speakerTurns: Array<{ speaker: string; start: number; end: number; duration: number }>
+  visualNoveltyScore: number
+  repetitionScore: number
+  continuityScore: number
+  objectTextEvents: VisualObjectTextEvent[]
+}
+type StoryBeatRole = 'setup' | 'escalation' | 'peak' | 'resolution' | 'sequel_hook'
+type StoryBeatNode = {
+  role: StoryBeatRole
+  start: number
+  end: number
+  strength: number
+  summary: string
+}
+type StoryBeatGraph = {
+  nodes: StoryBeatNode[]
+  peakWindow: TimeRange | null
+  sequelHookWindow: TimeRange | null
+  unresolvedTensionScore: number
+  curiosityScore: number
+}
+type HardQualityGateCheck = {
+  key: 'hook_source_timing' | 'edit_delta' | 'body_novelty' | 'cliffhanger_tension' | 'long_form_chapters' | 'hook_cliff_separation'
+  passed: boolean
+  score: number
+  threshold: number
+  reason: string
+}
+type HardQualityGateAudit = {
+  passed: boolean
+  checks: HardQualityGateCheck[]
+  summary: string
+  generatedAt: string
+}
+type EliteCutAudit = {
+  duplicateDrops: number
+  lowEnergyTailTrims: number
+  lowEnergyHeadTrims: number
+  speedRamps: number
+  jlBoosts: number
+  avgBoundaryJerk: number
+}
+type VariantSelectionAuditEntry = {
+  rank: number
+  strategy: RetentionRetryStrategy
+  policyId: string
+  variantScore: number
+  predictedRetention: number
+  judgeRetentionScore: number
+  cutQualityScore?: number
+  hookStart: number
+  hookDuration: number
+  pacingCurve: 'aggressive' | 'balanced' | 'steady'
+  cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
+}
+type VariantSelectionAudit = {
+  generatedCount: number
+  shortlistedCount: number
+  winnerPolicyId: string
+  winnerReason: string
+  entries: VariantSelectionAuditEntry[]
+}
+type PlayerTelemetryEventName = 'play' | 'pause' | 'seek' | 'ratechange' | 'ended' | 'heartbeat'
+type PlayerTelemetryEvent = {
+  event: PlayerTelemetryEventName
+  job_id: string
+  variant_id: string
+  session_id: string
+  playhead_sec: number
+  video_duration: number
+  timestamp: string
+  rate?: number | null
+}
+type PlayerPlaybackSessionSummary = {
+  sessionId: string
+  variantId: string
+  jobId: string
+  completionRate: number
+  effectiveWatchRatio: number
+  firstDropoffSecond: number | null
+  rewatchHotspots: Array<{ second: number; weight: number }>
+  skipHotspots: Array<{ second: number; weight: number }>
+  avgWatchTime: number
+  eventCount: number
+}
+type EditorTasteFeedbackPayload = {
+  wouldPublishAsIs: boolean
+  hookStrength: number
+  pacingFeel: number
+  bingeContinuity: number
+  notes: string | null
+  submittedAt: string
 }
 type VerticalRetentionPredictorBreakdown = {
   hookStrength: number
@@ -1348,6 +1472,10 @@ type EditPlan = {
   boredomActions?: Array<{ type: 'hard_cut' | 'micro_cut' | 'compress' | 'bridge'; start: number; end: number; score: number; reason: string }>
   pacingGovernorAdjustments?: number
   redundancyPrunedSeconds?: number
+  visualIntelligence?: VisualIntelligenceSummary | null
+  storyBeatGraph?: StoryBeatGraph | null
+  microRehookAnchors?: number[]
+  variantPolicyId?: string | null
   planner?: {
     provider: 'ruthless_retention_prompt' | 'heuristic'
     model: string | null
@@ -1727,6 +1855,24 @@ const LONG_FORM_MIN_EDIT_SECONDS = 20
 const LONG_FORM_MAX_EDIT_SECONDS = 140
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
+const HARD_GATE_MIN_EDIT_DELTA_SHORT = 0.08
+const HARD_GATE_MIN_EDIT_DELTA_LONG_BASE = 0.12
+const HARD_GATE_MIN_EDIT_DELTA_LONG_CAP = 0.15
+const HARD_GATE_BODY_NOVELTY_MIN = 0.52
+const HARD_GATE_CLIFFHANGER_TENSION_SHORT = 0.38
+const HARD_GATE_CLIFFHANGER_TENSION_LONG = 0.46
+const HARD_GATE_MIN_LONG_FORM_CHAPTERS = 3
+const HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_SECONDS = 45
+const HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_RATIO = 0.2
+const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
+const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
+const MANDATORY_VARIANT_MIN = 3
+const MANDATORY_VARIANT_MAX = 5
+const PLAYER_TELEMETRY_MAX_EVENTS_PER_REQUEST = 240
+const BANDIT_POLICY_EXPLORATION_RATE = (() => {
+  const envValue = Number(process.env.BANDIT_POLICY_EXPLORATION_RATE || 0.12)
+  return Number.isFinite(envValue) ? Number(Math.min(0.5, Math.max(0, envValue)).toFixed(4)) : 0.12
+})()
 const FREE_MONTHLY_RENDER_LIMIT = PLAN_CONFIG.free.maxRendersPerMonth || 10
 const FREE_DAILY_RERENDER_LIMIT = PLAN_CONFIG.free.maxRerendersPerDay || 3
 const MIN_WEBCAM_CROP_RATIO = 0.03
@@ -6286,6 +6432,196 @@ const resolveFeedbackSource = (raw: any) => {
   }
 }
 
+const normalizePlayerTelemetryEventName = (raw: any): PlayerTelemetryEventName | null => {
+  const value = String(raw || '').trim().toLowerCase()
+  if (
+    value === 'play' ||
+    value === 'pause' ||
+    value === 'seek' ||
+    value === 'ratechange' ||
+    value === 'ended' ||
+    value === 'heartbeat'
+  ) {
+    return value
+  }
+  return null
+}
+
+const parsePlayerTelemetryEventsPayload = (payload: any, jobId: string): PlayerTelemetryEvent[] => {
+  const rawEvents = Array.isArray(payload?.events) ? payload.events : [payload]
+  const parsed: PlayerTelemetryEvent[] = []
+  for (const entry of rawEvents.slice(0, PLAYER_TELEMETRY_MAX_EVENTS_PER_REQUEST)) {
+    if (!entry || typeof entry !== 'object') continue
+    const event = normalizePlayerTelemetryEventName((entry as any).event)
+    if (!event) continue
+    const parsedJobId = String((entry as any).job_id || jobId).trim()
+    if (!parsedJobId || parsedJobId !== jobId) continue
+    const variantId = String((entry as any).variant_id || 'primary').trim().slice(0, 80) || 'primary'
+    const sessionId = String((entry as any).session_id || '').trim().slice(0, 120)
+    if (!sessionId) continue
+    const playheadSec = Number((entry as any).playhead_sec)
+    const videoDuration = Number((entry as any).video_duration)
+    if (!Number.isFinite(playheadSec) || !Number.isFinite(videoDuration) || videoDuration <= 0) continue
+    const timestampRaw = String((entry as any).timestamp || '').trim()
+    const timestampDate = timestampRaw ? new Date(timestampRaw) : new Date()
+    const timestamp = Number.isFinite(timestampDate.getTime()) ? timestampDate.toISOString() : toIsoNow()
+    const rateRaw = Number((entry as any).rate)
+    const rate = Number.isFinite(rateRaw) ? Number(clamp(rateRaw, 0.25, 4).toFixed(3)) : null
+    parsed.push({
+      event,
+      job_id: jobId,
+      variant_id: variantId,
+      session_id: sessionId,
+      playhead_sec: Number(clamp(playheadSec, 0, Math.max(0, videoDuration)).toFixed(3)),
+      video_duration: Number(clamp(videoDuration, 1, 60 * 60 * 8).toFixed(3)),
+      timestamp,
+      rate
+    })
+  }
+  return parsed
+}
+
+const buildTelemetryHotspots = (map: Map<number, number>, limit = 6) => {
+  return Array.from(map.entries())
+    .map(([second, weight]) => ({
+      second,
+      weight: Number(weight.toFixed(4))
+    }))
+    .sort((a, b) => b.weight - a.weight || a.second - b.second)
+    .slice(0, limit)
+}
+
+const aggregatePlayerTelemetrySessions = (events: PlayerTelemetryEvent[]): PlayerPlaybackSessionSummary[] => {
+  if (!events.length) return []
+  const grouped = new Map<string, PlayerTelemetryEvent[]>()
+  for (const event of events) {
+    const key = `${event.session_id}::${event.variant_id}`
+    const bucket = grouped.get(key) || []
+    bucket.push(event)
+    grouped.set(key, bucket)
+  }
+  const summaries: PlayerPlaybackSessionSummary[] = []
+  for (const [key, rows] of grouped.entries()) {
+    const ordered = rows
+      .slice()
+      .sort((left, right) => (
+        new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime() ||
+        left.playhead_sec - right.playhead_sec
+      ))
+    if (!ordered.length) continue
+    const sessionId = ordered[0].session_id
+    const variantId = ordered[0].variant_id
+    const jobId = ordered[0].job_id
+    const duration = Math.max(1, ordered[0].video_duration)
+    let maxPlayhead = 0
+    let watchSeconds = 0
+    let firstDropoffSecond: number | null = null
+    const rewatchMap = new Map<number, number>()
+    const skipMap = new Map<number, number>()
+    for (let index = 0; index < ordered.length; index += 1) {
+      const current = ordered[index]
+      maxPlayhead = Math.max(maxPlayhead, current.playhead_sec)
+      if (index === 0) continue
+      const prev = ordered[index - 1]
+      const currentTs = new Date(current.timestamp).getTime()
+      const prevTs = new Date(prev.timestamp).getTime()
+      const dtSec = Number.isFinite(currentTs) && Number.isFinite(prevTs)
+        ? clamp((currentTs - prevTs) / 1000, 0, 8)
+        : 0
+      const deltaPlayhead = current.playhead_sec - prev.playhead_sec
+      if (current.event === 'seek') {
+        if (deltaPlayhead <= -3) {
+          const hotspot = Math.max(0, Math.floor(current.playhead_sec))
+          rewatchMap.set(hotspot, (rewatchMap.get(hotspot) || 0) + Math.min(1.5, Math.abs(deltaPlayhead) / 8))
+        } else if (deltaPlayhead >= 6) {
+          const hotspot = Math.max(0, Math.floor(prev.playhead_sec))
+          skipMap.set(hotspot, (skipMap.get(hotspot) || 0) + Math.min(1.5, deltaPlayhead / 10))
+        }
+      }
+      if (deltaPlayhead > 0) {
+        const rate = current.rate && current.rate > 0 ? current.rate : 1
+        watchSeconds += Math.min(deltaPlayhead, dtSec > 0 ? dtSec * rate + 0.8 : deltaPlayhead)
+      }
+      const stalled = dtSec >= 7 && deltaPlayhead <= 0.2 && current.playhead_sec < duration * 0.8
+      const explicitDrop = current.event === 'pause' && current.playhead_sec < duration * 0.8
+      if (firstDropoffSecond === null && (stalled || explicitDrop)) {
+        firstDropoffSecond = Number(current.playhead_sec.toFixed(3))
+      }
+    }
+    const completionRate = clamp01(maxPlayhead / duration)
+    const effectiveWatchRatio = clamp01(watchSeconds / duration)
+    summaries.push({
+      sessionId,
+      variantId,
+      jobId,
+      completionRate: Number(completionRate.toFixed(4)),
+      effectiveWatchRatio: Number(effectiveWatchRatio.toFixed(4)),
+      firstDropoffSecond,
+      rewatchHotspots: buildTelemetryHotspots(rewatchMap),
+      skipHotspots: buildTelemetryHotspots(skipMap),
+      avgWatchTime: Number(clamp(watchSeconds, 0, duration * 3).toFixed(3)),
+      eventCount: ordered.length
+    })
+  }
+  return summaries.sort((a, b) => a.variantId.localeCompare(b.variantId) || a.sessionId.localeCompare(b.sessionId))
+}
+
+const summarizePlayerTelemetry = (sessions: PlayerPlaybackSessionSummary[]) => {
+  if (!sessions.length) {
+    return {
+      session_count: 0,
+      completion_rate: null as number | null,
+      effective_watch_ratio: null as number | null,
+      first_dropoff_second: null as number | null,
+      rewatch_hotspots: [] as Array<{ second: number; weight: number }>,
+      skip_hotspots: [] as Array<{ second: number; weight: number }>,
+      avg_watch_time: null as number | null,
+      variant_breakdown: [] as Array<{ variant_id: string; sessions: number; completion_rate: number; watch_ratio: number }>
+    }
+  }
+  const completionRate = sessions.reduce((sum, session) => sum + session.completionRate, 0) / sessions.length
+  const watchRatio = sessions.reduce((sum, session) => sum + session.effectiveWatchRatio, 0) / sessions.length
+  const avgWatchTime = sessions.reduce((sum, session) => sum + session.avgWatchTime, 0) / sessions.length
+  const firstDrop = sessions
+    .map((session) => session.firstDropoffSecond)
+    .filter((value): value is number => value !== null && Number.isFinite(value))
+    .sort((a, b) => a - b)[0] ?? null
+  const rewatchMap = new Map<number, number>()
+  const skipMap = new Map<number, number>()
+  const byVariant = new Map<string, { sessions: number; completionTotal: number; watchRatioTotal: number }>()
+  for (const session of sessions) {
+    for (const hotspot of session.rewatchHotspots) {
+      rewatchMap.set(hotspot.second, (rewatchMap.get(hotspot.second) || 0) + hotspot.weight)
+    }
+    for (const hotspot of session.skipHotspots) {
+      skipMap.set(hotspot.second, (skipMap.get(hotspot.second) || 0) + hotspot.weight)
+    }
+    const variant = byVariant.get(session.variantId) || { sessions: 0, completionTotal: 0, watchRatioTotal: 0 }
+    variant.sessions += 1
+    variant.completionTotal += session.completionRate
+    variant.watchRatioTotal += session.effectiveWatchRatio
+    byVariant.set(session.variantId, variant)
+  }
+  const variantBreakdown = Array.from(byVariant.entries())
+    .map(([variantId, value]) => ({
+      variant_id: variantId,
+      sessions: value.sessions,
+      completion_rate: Number((value.completionTotal / Math.max(1, value.sessions)).toFixed(4)),
+      watch_ratio: Number((value.watchRatioTotal / Math.max(1, value.sessions)).toFixed(4))
+    }))
+    .sort((a, b) => b.watch_ratio - a.watch_ratio || b.completion_rate - a.completion_rate || a.variant_id.localeCompare(b.variant_id))
+  return {
+    session_count: sessions.length,
+    completion_rate: Number(completionRate.toFixed(4)),
+    effective_watch_ratio: Number(watchRatio.toFixed(4)),
+    first_dropoff_second: firstDrop === null ? null : Number(firstDrop.toFixed(3)),
+    rewatch_hotspots: buildTelemetryHotspots(rewatchMap),
+    skip_hotspots: buildTelemetryHotspots(skipMap),
+    avg_watch_time: Number(avgWatchTime.toFixed(3)),
+    variant_breakdown: variantBreakdown
+  }
+}
+
 const parseRetentionFeedbackPayload = (payload: any): RetentionFeedbackPayload | null => {
   if (!payload || typeof payload !== 'object') return null
   const watchPercent = normalizePercentMetric(
@@ -8639,6 +8975,7 @@ type HookSelectionRankedEntry = {
   instantHold: number
   introClarity: number
   teaserTension: number
+  visualNovelty: number
   openerQuality: number
   selectionScore: number
 }
@@ -8676,13 +9013,27 @@ const scoreRenderableHookCandidateSignals = ({
       0.44 * scoreHookEndingUnresolvedSignal(introText)
     )
     : clamp01(0.9 * candidate.auditScore + 0.06)
-  const openerQuality = clamp01(0.58 * instantHold + 0.24 * introClarity + 0.18 * teaserTension)
-  const selectionScore = clamp01(0.62 * confidence + 0.38 * openerQuality)
+  const visualNovelty = windows.length
+    ? clamp01(averageWindowMetric(windows, candidate.start, candidate.start + candidate.duration, (window) => (
+      0.4 * window.sceneChangeRate +
+      0.34 * window.motionScore +
+      0.18 * window.textDensity +
+      0.08 * (window.actionSpike ?? 0)
+    )))
+    : 0.5
+  const openerQuality = clamp01(
+    0.52 * instantHold +
+    0.21 * introClarity +
+    0.15 * teaserTension +
+    0.12 * visualNovelty
+  )
+  const selectionScore = clamp01(0.58 * confidence + 0.42 * openerQuality)
   return {
     confidence: Number(confidence.toFixed(4)),
     instantHold: Number(instantHold.toFixed(4)),
     introClarity: Number(introClarity.toFixed(4)),
     teaserTension: Number(teaserTension.toFixed(4)),
+    visualNovelty: Number(visualNovelty.toFixed(4)),
     openerQuality: Number(openerQuality.toFixed(4)),
     selectionScore: Number(selectionScore.toFixed(4))
   }
@@ -8736,6 +9087,7 @@ const buildHookSelectionDebugPayload = ({
       instantHold: Number(entry.instantHold.toFixed(4)),
       introClarity: Number(entry.introClarity.toFixed(4)),
       teaserTension: Number(entry.teaserTension.toFixed(4)),
+      visualNovelty: Number(entry.visualNovelty.toFixed(4)),
       openerQuality: Number(entry.openerQuality.toFixed(4)),
       selectionScore: Number(entry.selectionScore.toFixed(4)),
       text: String(entry.candidate.text || ''),
@@ -8768,6 +9120,7 @@ const buildHookSelectionDebugPayload = ({
       instantHold: Number(selected.instantHold.toFixed(4)),
       introClarity: Number(selected.introClarity.toFixed(4)),
       teaserTension: Number(selected.teaserTension.toFixed(4)),
+      visualNovelty: Number(selected.visualNovelty.toFixed(4)),
       openerQuality: Number(selected.openerQuality.toFixed(4)),
       selectionScore: Number(selected.selectionScore.toFixed(4))
     },
@@ -8809,6 +9162,7 @@ const selectLongFormDisplacedHookCandidate = ({
         instantHold: scored.instantHold,
         introClarity: scored.introClarity,
         teaserTension: scored.teaserTension,
+        visualNovelty: scored.visualNovelty,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
@@ -8881,6 +9235,7 @@ const selectRenderableHookCandidate = ({
         instantHold: scored.instantHold,
         introClarity: scored.introClarity,
         teaserTension: scored.teaserTension,
+        visualNovelty: scored.visualNovelty,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
@@ -11299,6 +11654,22 @@ const pickTopHookCandidates = ({
       const longFormStartPenalty = longFormMinHookSourceStart > 0
         ? clamp01((longFormMinHookSourceStart - aligned.start) / Math.max(0.5, longFormMinHookSourceStart))
         : 0
+      const midpoint = aligned.start + (durationSecondsActual / 2)
+      const timelinePosition = clamp01(midpoint / Math.max(1, durationSeconds))
+      const beatRoleScore = timelinePosition < 0.18
+        ? -0.28
+        : timelinePosition < 0.52
+          ? 0.18
+          : timelinePosition < 0.84
+            ? 0.3
+            : -0.12
+      const earlyResolutionPenalty = timelinePosition < 0.34
+        ? clamp01(
+          0.62 * audit.spoilerRisk +
+          0.22 * (1 - unresolvedEndingSignal) +
+          0.16 * (1 - openLoopSignal)
+        )
+        : 0
       const totalScore = clamp01(
         0.14 * baseHookScore +
         0.11 * speechImpact +
@@ -11314,10 +11685,12 @@ const pickTopHookCandidates = ({
         0.1 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
         0.09 * introClarityScore +
         0.04 * durationAlignment +
+        0.06 * clamp01(beatRoleScore + 0.5) +
         0.11 * audit.auditScore * modeHookProfile.auditMultiplier +
         0.06 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
         0.04 * dynamicLift.peakDensity -
         0.1 * longFormStartPenalty -
+        0.07 * earlyResolutionPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier +
         modeHookProfile.baseBias
@@ -11812,6 +12185,41 @@ const injectPatternInterrupts = ({
   }
   const density = Number((count / runtimeSeconds).toFixed(4))
   return { segments: out, count, density }
+}
+
+const applyLongFormMicroRehooks = ({
+  segments,
+  anchors,
+  durationSeconds
+}: {
+  segments: Segment[]
+  anchors: number[]
+  durationSeconds: number
+}) => {
+  if (!segments.length || !anchors.length || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) {
+    return { segments: segments.map((segment) => ({ ...segment })), applied: 0 }
+  }
+  const dedupedAnchors = anchors
+    .map((anchor) => Number(anchor))
+    .filter((anchor) => Number.isFinite(anchor) && anchor > 8 && anchor < durationSeconds - 8)
+    .sort((a, b) => a - b)
+    .filter((anchor, index, list) => index === 0 || Math.abs(anchor - list[index - 1]) >= LONG_FORM_MICRO_REHOOK_MIN_SECONDS * 0.6)
+  if (!dedupedAnchors.length) {
+    return { segments: segments.map((segment) => ({ ...segment })), applied: 0 }
+  }
+  const out = segments.map((segment) => ({ ...segment }))
+  let applied = 0
+  for (const anchor of dedupedAnchors) {
+    const anchorSegment = out.find((segment) => segment.start <= anchor && segment.end >= anchor)
+    if (!anchorSegment) continue
+    const currentZoom = Number(anchorSegment.zoom ?? 0)
+    anchorSegment.zoom = Number(clamp(currentZoom + 0.018, 0, ZOOM_HARD_MAX - 1).toFixed(3))
+    anchorSegment.brightness = Number(clamp(Number(anchorSegment.brightness ?? 0) + 0.02, -0.2, 0.25).toFixed(3))
+    anchorSegment.soundFxLevel = Number(clamp(Number(anchorSegment.soundFxLevel ?? 0) + 0.14, 0, 0.9).toFixed(3))
+    anchorSegment.emphasize = true
+    applied += 1
+  }
+  return { segments: out, applied }
 }
 
 const enforceEndingSpike = ({
@@ -12727,6 +13135,8 @@ const buildRetentionMetadataSummary = ({
   patternInterruptCount,
   patternInterruptDensity,
   boredomRemovedRatio,
+  cutQualityScore,
+  cuttingAudit,
   qualityGateOverride,
   optimizationNotes,
   hookSelectionSource,
@@ -12756,6 +13166,8 @@ const buildRetentionMetadataSummary = ({
   patternInterruptCount?: number
   patternInterruptDensity?: number
   boredomRemovedRatio?: number
+  cutQualityScore?: number | null
+  cuttingAudit?: EliteCutAudit | null
   qualityGateOverride?: { applied: boolean; reason: string } | null
   optimizationNotes?: string[]
   hookSelectionSource?: 'auto' | 'user_selected' | 'fallback'
@@ -12817,6 +13229,29 @@ const buildRetentionMetadataSummary = ({
   }
   if (Number(patternInterruptCount ?? 0) > 0) {
     improvements.push(`Inserted ${Number(patternInterruptCount)} pattern interrupt${Number(patternInterruptCount) === 1 ? '' : 's'} for retention resets.`)
+  }
+  if (Number.isFinite(Number(cutQualityScore))) {
+    improvements.push(`Elite cut refinement quality score: ${(clamp01(Number(cutQualityScore)) * 100).toFixed(0)}%.`)
+  }
+  if (cuttingAudit && (cuttingAudit.lowEnergyHeadTrims > 0 || cuttingAudit.lowEnergyTailTrims > 0)) {
+    const trims = cuttingAudit.lowEnergyHeadTrims + cuttingAudit.lowEnergyTailTrims
+    improvements.push(`Trimmed ${trims} low-signal cut boundaries to sharpen pacing transitions.`)
+  }
+  const jlCutCount = segments.filter((segment) => Number(segment.audioLeadInMs ?? 0) >= 80 || Number(segment.audioTailMs ?? 0) >= 80).length
+  if (jlCutCount > 0) {
+    improvements.push(`Applied ${jlCutCount} J/L-style audio overlaps to smooth hard visual cuts.`)
+  }
+  const reframeCount = segments.filter((segment) => segment.reframeMode === 'punch_in' || segment.reframeMode === 'punch_out').length
+  if (reframeCount > 0) {
+    improvements.push(`Applied ${reframeCount} intentional punch-in/punch-out reframes for emphasis.`)
+  }
+  const brollHintCount = segments.filter((segment) => Boolean(segment.brollOverlayHint)).length
+  if (brollHintCount > 0) {
+    improvements.push(`Flagged ${brollHintCount} contextual B-roll overlay opportunities.`)
+  }
+  const swellCount = segments.filter((segment) => Boolean(segment.musicSwell)).length
+  if (swellCount > 0) {
+    improvements.push(`Applied ${swellCount} tension-aware music/SFX swell cue${swellCount === 1 ? '' : 's'}.`)
   }
   if (autoEscalationCount > 0) {
     improvements.push(`Auto-escalation guarantee fired ${autoEscalationCount} time${autoEscalationCount === 1 ? '' : 's'} to prevent flat pacing.`)
@@ -12944,6 +13379,7 @@ const buildRetentionMetadataSummary = ({
       hookSelectionSource: hookSelectionSource ?? 'auto',
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
+      cutQualityScore: Number(clamp01(Number(cutQualityScore ?? 0)).toFixed(4)),
       styleTimelineFeatures: styleFeatureSnapshot ?? null,
       whyKeepWatching: Array.isArray(judge?.why_keep_watching) ? judge!.why_keep_watching.slice(0, 3) : [],
       genericFlags: Array.isArray(judge?.what_is_generic) ? judge!.what_is_generic.slice(0, 3) : [],
@@ -12991,7 +13427,8 @@ const buildRetentionMetadataSummary = ({
       emotionalPull: attempt.judge.emotional_pull,
       pacingScore: attempt.judge.pacing_score,
       predictedRetention: attempt.predictedRetention ?? null,
-      variantScore: attempt.variantScore ?? null
+      variantScore: attempt.variantScore ?? null,
+      cutQualityScore: attempt.cutQualityScore ?? null
     }))
   }
 }
@@ -13113,6 +13550,797 @@ const computeEditImpactRatio = (segments: Segment[], durationSeconds: number) =>
   const cutImpact = (total - kept) / total
   const paceImpact = Math.max(0, (kept - runtime) / total)
   return Math.max(0, cutImpact + paceImpact)
+}
+
+const classifyShotType = (window: EngagementWindow): { shotType: VisualShotType; confidence: number } => {
+  const faceSignal = Number(window.faceIntensity ?? window.facePresence ?? 0)
+  const motion = Number(window.motionScore ?? 0)
+  const text = Number(window.textDensity ?? 0)
+  const scene = Number(window.sceneChangeRate ?? 0)
+  if (text >= 0.45 && faceSignal <= 0.35) {
+    return { shotType: 'screen_focus', confidence: Number(clamp01(0.58 + 0.42 * text).toFixed(4)) }
+  }
+  if (motion >= 0.64 || scene >= 0.62) {
+    return { shotType: 'dynamic', confidence: Number(clamp01(0.52 + 0.34 * Math.max(motion, scene)).toFixed(4)) }
+  }
+  if (faceSignal >= 0.72) {
+    return { shotType: 'close_up', confidence: Number(clamp01(0.56 + 0.34 * faceSignal).toFixed(4)) }
+  }
+  if (faceSignal <= 0.3 && motion <= 0.38) {
+    return { shotType: 'wide', confidence: Number(clamp01(0.5 + 0.28 * (1 - faceSignal)).toFixed(4)) }
+  }
+  return {
+    shotType: 'medium',
+    confidence: Number(clamp01(
+      0.48 +
+      0.16 * faceSignal +
+      0.12 * motion +
+      0.08 * (1 - Math.abs(scene - 0.34))
+    ).toFixed(4))
+  }
+}
+
+const computeVisualNoveltySeries = (windows: EngagementWindow[]) => {
+  if (!windows.length) return [] as number[]
+  const novelty: number[] = []
+  for (let index = 0; index < windows.length; index += 1) {
+    const current = windows[index]
+    const prev = index > 0 ? windows[index - 1] : null
+    if (!prev) {
+      novelty.push(clamp01(
+        0.28 * current.sceneChangeRate +
+        0.26 * current.motionScore +
+        0.18 * current.textDensity +
+        0.14 * current.emotionIntensity +
+        0.14 * (current.actionSpike ?? 0)
+      ))
+      continue
+    }
+    const delta = clamp01(
+      0.34 * Math.abs(current.sceneChangeRate - prev.sceneChangeRate) +
+      0.3 * Math.abs(current.motionScore - prev.motionScore) +
+      0.16 * Math.abs(current.textDensity - prev.textDensity) +
+      0.12 * Math.abs((current.facePresence ?? 0) - (prev.facePresence ?? 0)) +
+      0.08 * Math.abs((current.emotionIntensity ?? 0) - (prev.emotionIntensity ?? 0))
+    )
+    const sustained = clamp01(
+      0.26 * current.sceneChangeRate +
+      0.24 * current.motionScore +
+      0.18 * (current.actionSpike ?? 0) +
+      0.16 * current.textDensity +
+      0.16 * (current.curiosityTrigger ?? 0)
+    )
+    novelty.push(clamp01(0.62 * delta + 0.38 * sustained))
+  }
+  return novelty.map((value) => Number(value.toFixed(4)))
+}
+
+const buildVisualIntelligenceSummary = ({
+  windows,
+  transcriptCues,
+  durationSeconds
+}: {
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+}): VisualIntelligenceSummary => {
+  if (!windows.length || durationSeconds <= 0) {
+    return {
+      boundaryCount: 0,
+      shotBoundaries: [],
+      shotTypeTimeline: [],
+      speakerTurns: [],
+      visualNoveltyScore: 0,
+      repetitionScore: 1,
+      continuityScore: 0,
+      objectTextEvents: []
+    }
+  }
+  const novelty = computeVisualNoveltySeries(windows)
+  const shotBoundaries: VisualShotBoundary[] = []
+  for (let index = 0; index < windows.length; index += 1) {
+    const current = windows[index]
+    const prev = index > 0 ? windows[index - 1] : null
+    const jump = prev
+      ? Math.abs(current.sceneChangeRate - prev.sceneChangeRate) + Math.abs(current.motionScore - prev.motionScore)
+      : 0
+    const boundaryStrength = clamp01(
+      0.52 * current.sceneChangeRate +
+      0.28 * jump +
+      0.12 * (current.actionSpike ?? 0) +
+      0.08 * novelty[index]
+    )
+    if (boundaryStrength < 0.58) continue
+    shotBoundaries.push({
+      time: Number(current.time.toFixed(3)),
+      strength: Number(boundaryStrength.toFixed(4)),
+      reason: current.sceneChangeRate >= 0.62
+        ? 'scene_cut_detected'
+        : jump >= 0.42
+          ? 'motion_jump_detected'
+          : 'visual_pattern_shift'
+    })
+  }
+  const shotTypeTimeline: VisualShotTimelineEntry[] = []
+  let activeType: VisualShotType | null = null
+  let activeStart = 0
+  let confidenceTotal = 0
+  let confidenceCount = 0
+  const flushType = (end: number) => {
+    if (!activeType) return
+    const confidence = confidenceCount > 0 ? confidenceTotal / confidenceCount : 0.5
+    shotTypeTimeline.push({
+      start: Number(activeStart.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      shotType: activeType,
+      confidence: Number(clamp01(confidence).toFixed(4))
+    })
+  }
+  for (let index = 0; index < windows.length; index += 1) {
+    const current = windows[index]
+    const resolved = classifyShotType(current)
+    if (activeType === null) {
+      activeType = resolved.shotType
+      activeStart = current.time
+      confidenceTotal = resolved.confidence
+      confidenceCount = 1
+      continue
+    }
+    if (resolved.shotType !== activeType) {
+      flushType(current.time)
+      activeType = resolved.shotType
+      activeStart = current.time
+      confidenceTotal = resolved.confidence
+      confidenceCount = 1
+      continue
+    }
+    confidenceTotal += resolved.confidence
+    confidenceCount += 1
+  }
+  flushType(durationSeconds)
+  const speakerTurns: Array<{ speaker: string; start: number; end: number; duration: number }> = []
+  const normalizedCues = transcriptCues
+    .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.02)
+    .map((cue) => ({
+      speaker: String(cue.speaker || '').trim() || 'speaker_1',
+      start: Number(cue.start.toFixed(3)),
+      end: Number(cue.end.toFixed(3))
+    }))
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  for (const cue of normalizedCues) {
+    const last = speakerTurns.length ? speakerTurns[speakerTurns.length - 1] : null
+    if (last && last.speaker === cue.speaker && cue.start <= last.end + 0.22) {
+      last.end = Number(Math.max(last.end, cue.end).toFixed(3))
+      last.duration = Number((last.end - last.start).toFixed(3))
+      continue
+    }
+    speakerTurns.push({
+      speaker: cue.speaker,
+      start: cue.start,
+      end: cue.end,
+      duration: Number((cue.end - cue.start).toFixed(3))
+    })
+  }
+  const objectTextEvents: VisualObjectTextEvent[] = []
+  for (let index = 0; index < windows.length; index += 1) {
+    const window = windows[index]
+    const prev = index > 0 ? windows[index - 1] : null
+    const textEventStrength = clamp01(
+      0.58 * window.textDensity +
+      0.22 * (window.curiosityTrigger ?? 0) +
+      0.2 * novelty[index]
+    )
+    if (textEventStrength >= 0.62) {
+      objectTextEvents.push({
+        time: Number(window.time.toFixed(3)),
+        strength: Number(textEventStrength.toFixed(4)),
+        kind: 'onscreen_text',
+        detail: 'High on-screen text novelty detected.'
+      })
+    }
+    const motionEventStrength = clamp01(
+      0.46 * window.motionScore +
+      0.3 * window.sceneChangeRate +
+      0.24 * (window.actionSpike ?? 0)
+    )
+    if (motionEventStrength >= 0.68) {
+      objectTextEvents.push({
+        time: Number(window.time.toFixed(3)),
+        strength: Number(motionEventStrength.toFixed(4)),
+        kind: 'object_motion',
+        detail: 'High motion/object-change burst detected.'
+      })
+    }
+    const faceJump = prev ? Math.abs((window.facePresence ?? 0) - (prev.facePresence ?? 0)) : 0
+    const faceEventStrength = clamp01(0.7 * faceJump + 0.3 * (window.faceIntensity ?? window.facePresence))
+    if (faceEventStrength >= 0.6) {
+      objectTextEvents.push({
+        time: Number(window.time.toFixed(3)),
+        strength: Number(faceEventStrength.toFixed(4)),
+        kind: 'face_spike',
+        detail: 'Face/speaker visual prominence changed rapidly.'
+      })
+    }
+  }
+  for (let index = 1; index < speakerTurns.length; index += 1) {
+    const previous = speakerTurns[index - 1]
+    const current = speakerTurns[index]
+    const gap = current.start - previous.end
+    if (gap > 1.8) continue
+    objectTextEvents.push({
+      time: Number(current.start.toFixed(3)),
+      strength: Number(clamp01(0.55 + 0.3 * (1 - clamp01(Math.max(0, gap) / 1.8))).toFixed(4)),
+      kind: 'speaker_switch',
+      detail: `Speaker switched from ${previous.speaker} to ${current.speaker}.`
+    })
+  }
+  const noveltyAverage = novelty.length
+    ? novelty.reduce((sum, value) => sum + value, 0) / novelty.length
+    : 0
+  const lowNoveltyRatio = novelty.length
+    ? novelty.filter((value) => value < 0.22).length / novelty.length
+    : 1
+  const repetitionScore = Number(clamp01(lowNoveltyRatio).toFixed(4))
+  const boundaryDensity = shotBoundaries.length / Math.max(1, durationSeconds / 10)
+  const continuityScore = Number(clamp01(
+    0.52 * (1 - repetitionScore) +
+    0.24 * (1 - clamp01(Math.abs(boundaryDensity - 1.15) / 1.15)) +
+    0.24 * (speakerTurns.length ? 1 - clamp01(Math.abs(speakerTurns.length - durationSeconds / 55) / Math.max(1, durationSeconds / 40)) : 0.48)
+  ).toFixed(4))
+  return {
+    boundaryCount: shotBoundaries.length,
+    shotBoundaries: shotBoundaries.slice(0, 220),
+    shotTypeTimeline: shotTypeTimeline.slice(0, 220),
+    speakerTurns: speakerTurns.slice(0, 220),
+    visualNoveltyScore: Number(clamp01(noveltyAverage).toFixed(4)),
+    repetitionScore,
+    continuityScore,
+    objectTextEvents: objectTextEvents
+      .sort((a, b) => b.strength - a.strength || a.time - b.time)
+      .slice(0, 220)
+  }
+}
+
+const computeBodyNoveltyGateScore = ({
+  segments,
+  windows,
+  visualIntelligence
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  visualIntelligence?: VisualIntelligenceSummary | null
+}) => {
+  if (!segments.length || !windows.length) return 0
+  const signatures = segments
+    .map((segment) => {
+      const duration = Math.max(0.001, segment.end - segment.start)
+      const avgMotion = averageWindowMetric(windows, segment.start, segment.end, (window) => window.motionScore)
+      const avgScene = averageWindowMetric(windows, segment.start, segment.end, (window) => window.sceneChangeRate)
+      const avgSpeech = averageWindowMetric(windows, segment.start, segment.end, (window) => window.speechIntensity)
+      const avgEmotion = averageWindowMetric(windows, segment.start, segment.end, (window) => window.emotionIntensity)
+      const avgText = averageWindowMetric(windows, segment.start, segment.end, (window) => window.textDensity)
+      const avgHook = averageWindowMetric(windows, segment.start, segment.end, (window) => (window.hookScore ?? window.score))
+      return {
+        start: segment.start,
+        end: segment.end,
+        duration,
+        vector: [avgMotion, avgScene, avgSpeech, avgEmotion, avgText, avgHook]
+      }
+    })
+    .filter((entry) => entry.duration >= 0.18)
+  if (signatures.length <= 1) return 1
+  let repeatedPairs = 0
+  let comparedPairs = 0
+  for (let leftIndex = 0; leftIndex < signatures.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < signatures.length; rightIndex += 1) {
+      const left = signatures[leftIndex]
+      const right = signatures[rightIndex]
+      const temporalGap = Math.abs(left.start - right.start)
+      if (temporalGap < Math.max(2.2, Math.min(left.duration, right.duration) * 0.65)) continue
+      const similarity = left.vector.reduce((sum, value, idx) => {
+        const delta = Math.abs(value - right.vector[idx])
+        return sum + (1 - clamp01(delta))
+      }, 0) / left.vector.length
+      comparedPairs += 1
+      if (similarity >= 0.86) repeatedPairs += 1
+    }
+  }
+  if (!comparedPairs) return 1
+  const repeatedRatio = repeatedPairs / comparedPairs
+  const noveltyBase = clamp01(1 - repeatedRatio)
+  const visualBoost = visualIntelligence
+    ? clamp01(
+      0.62 * (visualIntelligence.visualNoveltyScore ?? 0) +
+      0.22 * (1 - (visualIntelligence.repetitionScore ?? 0)) +
+      0.16 * (visualIntelligence.continuityScore ?? 0)
+    )
+    : noveltyBase
+  return Number(clamp01(0.74 * noveltyBase + 0.26 * visualBoost).toFixed(4))
+}
+
+const scoreCliffhangerUnresolvedTension = ({
+  segments,
+  windows,
+  transcriptCues,
+  durationSeconds
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+}) => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const endingCoverage = segments.length
+    ? Math.max(0, safeDuration - Math.min(...segments.map((segment) => Math.max(0, segment.end))))
+    : 0
+  const endingSeconds = safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
+    ? clamp(safeDuration * 0.12, 10, 24)
+    : clamp(safeDuration * 0.2, 4, 10)
+  const endingStart = Number(clamp(safeDuration - endingSeconds, 0, safeDuration).toFixed(3))
+  const endingEnd = Number(safeDuration.toFixed(3))
+  const endingText = getTranscriptTextInRange(transcriptCues, endingStart, endingEnd)
+  const unresolvedFromText = scoreHookEndingUnresolvedSignal(endingText)
+  const openLoop = scoreHookOpenLoopSignal(endingText)
+  const spoiler = scoreHookSpoilerRisk(endingText)
+  const curiosity = averageWindowMetric(windows, endingStart, endingEnd, (window) => (window.curiosityTrigger ?? 0))
+  const emotion = averageWindowMetric(windows, endingStart, endingEnd, (window) => window.emotionIntensity)
+  const motion = averageWindowMetric(windows, endingStart, endingEnd, (window) => (
+    0.58 * window.sceneChangeRate + 0.42 * window.motionScore
+  ))
+  const score = clamp01(
+    0.34 * unresolvedFromText +
+    0.18 * openLoop +
+    0.2 * curiosity +
+    0.16 * emotion +
+    0.12 * motion -
+    0.26 * spoiler -
+    0.06 * clamp01(endingCoverage / Math.max(1, endingSeconds))
+  )
+  return {
+    score: Number(score.toFixed(4)),
+    endingWindow: { start: endingStart, end: endingEnd },
+    transcript: endingText,
+    breakdown: {
+      unresolvedFromText: Number(unresolvedFromText.toFixed(4)),
+      openLoop: Number(openLoop.toFixed(4)),
+      curiosity: Number(curiosity.toFixed(4)),
+      emotion: Number(emotion.toFixed(4)),
+      motion: Number(motion.toFixed(4)),
+      spoiler: Number(spoiler.toFixed(4))
+    }
+  }
+}
+
+const buildStoryBeatGraph = ({
+  durationSeconds,
+  windows,
+  transcriptCues,
+  hookCandidates,
+  visualIntelligence
+}: {
+  durationSeconds: number
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  hookCandidates: HookCandidate[]
+  visualIntelligence?: VisualIntelligenceSummary | null
+}): StoryBeatGraph => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const setupEnd = Number(clamp(safeDuration * 0.22, Math.min(6, safeDuration), Math.max(6, safeDuration * 0.36)).toFixed(3))
+  const peakCandidate = hookCandidates
+    .slice()
+    .sort((a, b) => (
+      b.score - a.score ||
+      b.auditScore - a.auditScore ||
+      b.duration - a.duration
+    ))[0] || null
+  const peakWindow = peakCandidate
+    ? {
+        start: Number(clamp(peakCandidate.start, 0, safeDuration).toFixed(3)),
+        end: Number(clamp(peakCandidate.start + peakCandidate.duration, 0, safeDuration).toFixed(3))
+      }
+    : null
+  const escalationStart = Number(clamp(setupEnd * 0.92, 0, safeDuration).toFixed(3))
+  const escalationEnd = Number(clamp(
+    peakWindow ? Math.max(escalationStart + 0.8, peakWindow.start) : safeDuration * 0.62,
+    escalationStart + 0.8,
+    safeDuration
+  ).toFixed(3))
+  const resolutionStart = Number(clamp(
+    peakWindow ? peakWindow.end : safeDuration * 0.62,
+    0,
+    safeDuration
+  ).toFixed(3))
+  const sequelStart = Number(clamp(
+    safeDuration - (safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS ? 18 : 8),
+    0,
+    safeDuration
+  ).toFixed(3))
+  const sequelEnd = Number(safeDuration.toFixed(3))
+  const sequelText = getTranscriptTextInRange(transcriptCues, sequelStart, sequelEnd)
+  const sequelHookWindow = sequelEnd > sequelStart + 0.2
+    ? { start: sequelStart, end: sequelEnd }
+    : null
+  const sequelTension = scoreHookEndingUnresolvedSignal(sequelText)
+  const sequelCuriosity = clamp01(
+    0.58 * averageWindowMetric(windows, sequelStart, sequelEnd, (window) => (window.curiosityTrigger ?? 0)) +
+    0.42 * scoreHookOpenLoopSignal(sequelText)
+  )
+  const nodes: StoryBeatNode[] = ([
+    {
+      role: 'setup',
+      start: 0,
+      end: setupEnd,
+      strength: Number(clamp01(averageWindowMetric(windows, 0, setupEnd, (window) => (
+        0.48 * window.speechIntensity +
+        0.26 * (window.curiosityTrigger ?? 0) +
+        0.26 * window.motionScore
+      ))).toFixed(4)),
+      summary: 'Context setup and premise framing.'
+    },
+    {
+      role: 'escalation',
+      start: escalationStart,
+      end: escalationEnd,
+      strength: Number(clamp01(averageWindowMetric(windows, escalationStart, escalationEnd, (window) => (
+        0.42 * (window.hookScore ?? window.score) +
+        0.28 * window.emotionIntensity +
+        0.16 * (window.curiosityTrigger ?? 0) +
+        0.14 * window.sceneChangeRate
+      ))).toFixed(4)),
+      summary: 'Rising stakes and momentum build.'
+    },
+    {
+      role: 'peak',
+      start: peakWindow?.start ?? Number(clamp(safeDuration * 0.42, 0, safeDuration).toFixed(3)),
+      end: peakWindow?.end ?? Number(clamp(safeDuration * 0.52, 0, safeDuration).toFixed(3)),
+      strength: Number(clamp01(
+        peakCandidate
+          ? 0.6 * peakCandidate.score + 0.4 * peakCandidate.auditScore
+          : averageWindowMetric(windows, safeDuration * 0.42, safeDuration * 0.52, (window) => (window.hookScore ?? window.score))
+      ).toFixed(4)),
+      summary: 'Highest emotional/surprise payoff candidate.'
+    },
+    {
+      role: 'resolution',
+      start: resolutionStart,
+      end: sequelStart,
+      strength: Number(clamp01(averageWindowMetric(windows, resolutionStart, sequelStart, (window) => (
+        0.45 * (window.narrativeProgress ?? 0.4) +
+        0.25 * window.speechIntensity +
+        0.3 * (1 - (window.fillerDensity ?? 0))
+      ))).toFixed(4)),
+      summary: 'Partial resolution while preserving momentum.'
+    },
+    {
+      role: 'sequel_hook',
+      start: sequelStart,
+      end: sequelEnd,
+      strength: Number(clamp01(0.56 * sequelTension + 0.44 * sequelCuriosity).toFixed(4)),
+      summary: 'Open-loop ending to trigger next-view intent.'
+    }
+  ] as StoryBeatNode[]).filter((node) => node.end > node.start + 0.05)
+  const unresolvedTensionScore = clamp01(
+    0.64 * sequelTension +
+    0.22 * sequelCuriosity +
+    0.14 * (visualIntelligence ? 1 - (visualIntelligence.repetitionScore ?? 0) : 0.5)
+  )
+  const curiosityScore = clamp01(
+    0.52 * sequelCuriosity +
+    0.28 * scoreHookOpenLoopSignal(sequelText) +
+    0.2 * averageWindowMetric(windows, sequelStart, sequelEnd, (window) => (window.hookScore ?? window.score))
+  )
+  return {
+    nodes,
+    peakWindow,
+    sequelHookWindow,
+    unresolvedTensionScore: Number(unresolvedTensionScore.toFixed(4)),
+    curiosityScore: Number(curiosityScore.toFixed(4))
+  }
+}
+
+const buildLongFormMicroRehookAnchors = ({
+  durationSeconds,
+  storyBeatGraph
+}: {
+  durationSeconds: number
+  storyBeatGraph: StoryBeatGraph | null
+}) => {
+  if (!storyBeatGraph || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return [] as number[]
+  const anchors: number[] = []
+  const baseInterval = clamp(
+    LONG_FORM_MICRO_REHOOK_MAX_SECONDS -
+    (storyBeatGraph.unresolvedTensionScore * 24),
+    LONG_FORM_MICRO_REHOOK_MIN_SECONDS,
+    LONG_FORM_MICRO_REHOOK_MAX_SECONDS
+  )
+  for (
+    let cursor = baseInterval;
+    cursor < Math.max(baseInterval + 10, durationSeconds - 20) && anchors.length < 24;
+    cursor += baseInterval
+  ) {
+    anchors.push(Number(cursor.toFixed(3)))
+  }
+  const seen = new Set<string>()
+  return anchors.filter((anchor) => {
+    const key = anchor.toFixed(0)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
+const buildVariantPolicyId = (entry: {
+  strategy: RetentionRetryStrategy
+  hookStart: number
+  pacingCurve: 'aggressive' | 'balanced' | 'steady'
+  cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
+}) => {
+  const source = [
+    entry.strategy,
+    entry.hookStart.toFixed(2),
+    entry.pacingCurve,
+    entry.cliffhangerStyle
+  ].join('|')
+  return `vp_${crypto.createHash('sha1').update(source).digest('hex').slice(0, 12)}`
+}
+
+const buildVariantSelectionAudit = ({
+  attempts,
+  winnerStrategy,
+  winnerHookStart
+}: {
+  attempts: Array<{
+    strategy: RetentionRetryStrategy
+    variantScore: number
+    predictedRetention: number
+    judgeRetentionScore: number
+    cutQualityScore?: number
+    hookStart: number
+    hookDuration: number
+    pacingCurve: 'aggressive' | 'balanced' | 'steady'
+    cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
+  }>
+  winnerStrategy: RetentionRetryStrategy | null
+  winnerHookStart: number | null
+}): VariantSelectionAudit | null => {
+  if (!attempts.length) return null
+  const sorted = attempts
+    .slice()
+    .sort((a, b) => (
+      b.variantScore - a.variantScore ||
+      Number(b.cutQualityScore ?? 0) - Number(a.cutQualityScore ?? 0) ||
+      b.predictedRetention - a.predictedRetention ||
+      b.judgeRetentionScore - a.judgeRetentionScore
+    ))
+  const shortlisted = sorted.slice(0, clamp(MANDATORY_VARIANT_MAX, MANDATORY_VARIANT_MIN, sorted.length))
+  const entries = shortlisted.map((entry, index) => {
+    const policyId = buildVariantPolicyId({
+      strategy: entry.strategy,
+      hookStart: entry.hookStart,
+      pacingCurve: entry.pacingCurve,
+      cliffhangerStyle: entry.cliffhangerStyle
+    })
+    return {
+      rank: index + 1,
+      strategy: entry.strategy,
+      policyId,
+      variantScore: Number(entry.variantScore.toFixed(2)),
+      predictedRetention: Number(entry.predictedRetention.toFixed(2)),
+      judgeRetentionScore: Number(entry.judgeRetentionScore.toFixed(2)),
+      cutQualityScore: Number(clamp01(Number(entry.cutQualityScore ?? 0)).toFixed(4)),
+      hookStart: Number(entry.hookStart.toFixed(3)),
+      hookDuration: Number(entry.hookDuration.toFixed(3)),
+      pacingCurve: entry.pacingCurve,
+      cliffhangerStyle: entry.cliffhangerStyle
+    }
+  })
+  const winnerEntry = entries.find((entry) => (
+    winnerStrategy !== null &&
+    winnerHookStart !== null &&
+    entry.strategy === winnerStrategy &&
+    Math.abs(entry.hookStart - winnerHookStart) < 0.05
+  )) || entries[0]
+  return {
+    generatedCount: attempts.length,
+    shortlistedCount: entries.length,
+    winnerPolicyId: winnerEntry?.policyId || '',
+    winnerReason: winnerEntry
+      ? `Winner selected by structural retention score: ${winnerEntry.strategy} (${winnerEntry.variantScore.toFixed(2)}, cut ${(clamp01(Number(winnerEntry.cutQualityScore ?? 0)) * 100).toFixed(0)}%).`
+      : 'Winner unavailable.',
+    entries
+  }
+}
+
+const resolveHardGateMinimumEditDelta = (durationSeconds: number) => {
+  if (durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return HARD_GATE_MIN_EDIT_DELTA_SHORT
+  const longFormLift = durationSeconds >= 45 * 60
+    ? 0.03
+    : durationSeconds >= 25 * 60
+      ? 0.02
+      : durationSeconds >= 12 * 60
+        ? 0.015
+        : durationSeconds >= 6 * 60
+          ? 0.01
+          : 0
+  return Number(clamp(
+    HARD_GATE_MIN_EDIT_DELTA_LONG_BASE + longFormLift,
+    HARD_GATE_MIN_EDIT_DELTA_LONG_BASE,
+    HARD_GATE_MIN_EDIT_DELTA_LONG_CAP
+  ).toFixed(4))
+}
+
+const computeLongFormChapterCount = ({
+  durationSeconds,
+  beatAnchors,
+  segments
+}: {
+  durationSeconds: number
+  beatAnchors: number[]
+  segments: Segment[]
+}) => {
+  if (durationSeconds <= 0) return 0
+  const meaningfulAnchors = beatAnchors
+    .filter((anchor) => Number.isFinite(anchor))
+    .filter((anchor) => anchor > 8 && anchor < durationSeconds - 8)
+  const coverageAnchors = segments
+    .map((segment) => Number(((segment.start + segment.end) / 2).toFixed(3)))
+    .filter((value) => value > 8 && value < durationSeconds - 8)
+  const merged = [...meaningfulAnchors, ...coverageAnchors]
+    .sort((a, b) => a - b)
+    .filter((value, index, list) => (
+      index === 0 || Math.abs(value - list[index - 1]) >= 24
+    ))
+  return merged.length + 1
+}
+
+const evaluateHardQualityBar = ({
+  durationSeconds,
+  contentFormat,
+  hookSourceStart,
+  segments,
+  removedRanges,
+  compressedRanges,
+  storyReorderMap,
+  windows,
+  transcriptCues,
+  visualIntelligence,
+  storyBeatGraph,
+  beatAnchors
+}: {
+  durationSeconds: number
+  contentFormat: RetentionContentFormat
+  hookSourceStart: number
+  segments: Segment[]
+  removedRanges: TimeRange[]
+  compressedRanges: TimeRange[]
+  storyReorderMap: Array<{ sourceStart: number; sourceEnd: number; orderedIndex: number }>
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  visualIntelligence: VisualIntelligenceSummary | null
+  storyBeatGraph: StoryBeatGraph | null
+  beatAnchors: number[]
+}): HardQualityGateAudit => {
+  const isLongForm = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS && contentFormat !== 'tiktok_short'
+  const minHookSourceStart = Number(Math.max(8, durationSeconds * 0.08).toFixed(3))
+  const hookTimingScore = isLongForm
+    ? clamp01(hookSourceStart / Math.max(0.1, minHookSourceStart))
+    : 1
+  const hookTimingPass = !isLongForm || hookSourceStart >= minHookSourceStart
+  const baseEditDelta = computeEditImpactRatio(segments, durationSeconds)
+  const compressedRatio = durationSeconds > 0
+    ? clamp01(getRangesDurationSeconds(compressedRanges) / durationSeconds)
+    : 0
+  let reorderSeconds = 0
+  for (let index = 1; index < storyReorderMap.length; index += 1) {
+    const prev = storyReorderMap[index - 1]
+    const current = storyReorderMap[index]
+    if (current.sourceStart + 0.08 >= prev.sourceStart) continue
+    reorderSeconds += Math.max(0, prev.sourceStart - current.sourceStart)
+  }
+  const reorderRatio = durationSeconds > 0
+    ? clamp01(reorderSeconds / durationSeconds)
+    : 0
+  const editDeltaScore = clamp01(baseEditDelta + 0.38 * reorderRatio + 0.22 * compressedRatio)
+  const minEditDelta = resolveHardGateMinimumEditDelta(durationSeconds)
+  const editDeltaPass = editDeltaScore >= minEditDelta
+  const bodyNoveltyScore = computeBodyNoveltyGateScore({
+    segments,
+    windows,
+    visualIntelligence
+  })
+  const bodyNoveltyThreshold = isLongForm ? HARD_GATE_BODY_NOVELTY_MIN : Math.max(0.46, HARD_GATE_BODY_NOVELTY_MIN - 0.06)
+  const bodyNoveltyPass = bodyNoveltyScore >= bodyNoveltyThreshold
+  const cliffhanger = scoreCliffhangerUnresolvedTension({
+    segments,
+    windows,
+    transcriptCues,
+    durationSeconds
+  })
+  const cliffhangerThreshold = isLongForm ? HARD_GATE_CLIFFHANGER_TENSION_LONG : HARD_GATE_CLIFFHANGER_TENSION_SHORT
+  const cliffhangerPass = cliffhanger.score >= cliffhangerThreshold
+  const chapterCount = computeLongFormChapterCount({
+    durationSeconds,
+    beatAnchors,
+    segments
+  })
+  const chapterPass = !isLongForm || chapterCount >= HARD_GATE_MIN_LONG_FORM_CHAPTERS
+  const chapterScore = isLongForm
+    ? clamp01(chapterCount / Math.max(1, HARD_GATE_MIN_LONG_FORM_CHAPTERS))
+    : 1
+  const cliffStart = cliffhanger.endingWindow.start
+  const requiredSeparation = isLongForm
+    ? Math.max(HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_SECONDS, durationSeconds * HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_RATIO)
+    : 8
+  const hookCliffSeparation = Math.max(0, cliffStart - hookSourceStart)
+  const hookCliffSeparationScore = clamp01(hookCliffSeparation / Math.max(0.1, requiredSeparation))
+  const hookCliffSeparationPass = hookCliffSeparation >= requiredSeparation
+  const checks: HardQualityGateCheck[] = [
+    {
+      key: 'hook_source_timing',
+      passed: hookTimingPass,
+      score: Number(hookTimingScore.toFixed(4)),
+      threshold: Number((isLongForm ? 1 : 0).toFixed(4)),
+      reason: hookTimingPass
+        ? `Hook source timing passed (${hookSourceStart.toFixed(1)}s).`
+        : `Hook source starts too early (${hookSourceStart.toFixed(1)}s < ${minHookSourceStart.toFixed(1)}s).`
+    },
+    {
+      key: 'edit_delta',
+      passed: editDeltaPass,
+      score: Number(editDeltaScore.toFixed(4)),
+      threshold: Number(minEditDelta.toFixed(4)),
+      reason: editDeltaPass
+        ? `Edit delta passed (${(editDeltaScore * 100).toFixed(1)}%).`
+        : `Edit delta too low (${(editDeltaScore * 100).toFixed(1)}% < ${(minEditDelta * 100).toFixed(1)}%).`
+    },
+    {
+      key: 'body_novelty',
+      passed: bodyNoveltyPass,
+      score: Number(bodyNoveltyScore.toFixed(4)),
+      threshold: Number(bodyNoveltyThreshold.toFixed(4)),
+      reason: bodyNoveltyPass
+        ? `Body novelty passed (${bodyNoveltyScore.toFixed(3)}).`
+        : `Body repeats near-identical windows too often (${bodyNoveltyScore.toFixed(3)} < ${bodyNoveltyThreshold.toFixed(3)}).`
+    },
+    {
+      key: 'cliffhanger_tension',
+      passed: cliffhangerPass,
+      score: Number(cliffhanger.score.toFixed(4)),
+      threshold: Number(cliffhangerThreshold.toFixed(4)),
+      reason: cliffhangerPass
+        ? `Cliffhanger tension passed (${cliffhanger.score.toFixed(3)}).`
+        : `Cliffhanger unresolved tension too weak (${cliffhanger.score.toFixed(3)} < ${cliffhangerThreshold.toFixed(3)}).`
+    },
+    {
+      key: 'long_form_chapters',
+      passed: chapterPass,
+      score: Number(chapterScore.toFixed(4)),
+      threshold: Number((isLongForm ? 1 : 0).toFixed(4)),
+      reason: chapterPass
+        ? `Chapter continuity passed (${chapterCount} chapters).`
+        : `Long-form chapter continuity failed (${chapterCount} < ${HARD_GATE_MIN_LONG_FORM_CHAPTERS}).`
+    },
+    {
+      key: 'hook_cliff_separation',
+      passed: hookCliffSeparationPass,
+      score: Number(hookCliffSeparationScore.toFixed(4)),
+      threshold: 1,
+      reason: hookCliffSeparationPass
+        ? `Hook/cliffhanger separation passed (${hookCliffSeparation.toFixed(1)}s).`
+        : `Hook/cliffhanger separation too tight (${hookCliffSeparation.toFixed(1)}s < ${requiredSeparation.toFixed(1)}s).`
+    }
+  ]
+  const hardFailures = checks.filter((check) => !check.passed)
+  const passed = hardFailures.length === 0
+  const summary = passed
+    ? 'Hard quality bar passed.'
+    : `Hard quality bar failed: ${hardFailures.map((check) => check.key).join(', ')}.`
+  return {
+    passed,
+    checks,
+    summary,
+    generatedAt: toIsoNow()
+  }
 }
 
 const buildGuaranteedFallbackSegments = (durationSeconds: number, options: EditOptions) => {
@@ -13788,6 +15016,11 @@ const buildEditPlan = async (
     silences,
     transcriptCues
   })
+  const visualIntelligence = buildVisualIntelligenceSummary({
+    windows,
+    transcriptCues,
+    durationSeconds
+  })
   const styleProfileAuto = inferContentStyleProfile({
     windows,
     transcriptCues,
@@ -14192,6 +15425,17 @@ const buildEditPlan = async (
   } catch (error) {
     console.warn('retention planner integration failed, continuing with base timeline', error)
   }
+  const storyBeatGraph = buildStoryBeatGraph({
+    durationSeconds,
+    windows,
+    transcriptCues,
+    hookCandidates: hookVariants,
+    visualIntelligence
+  })
+  const microRehookAnchors = buildLongFormMicroRehookAnchors({
+    durationSeconds,
+    storyBeatGraph
+  })
   const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
   const totalPatternInterruptDensity = Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
@@ -14259,6 +15503,9 @@ const buildEditPlan = async (
     autoEscalationEvents: autoEscalationResult.events,
     editDecisionTimeline: decisionTimeline,
     styleFeatureSnapshot,
+    visualIntelligence,
+    storyBeatGraph,
+    microRehookAnchors,
     planner: plannerSummary
   }
 }
@@ -14360,6 +15607,13 @@ const applySegmentEffects = (
   const energyBaseline = segmentScores.length
     ? segmentScores.reduce((sum, entry) => sum + entry.energyScore, 0) / segmentScores.length
     : 0.45
+  const timelineEnd = segments.length
+    ? segments.reduce((max, segment) => Math.max(max, Number(segment.end || 0)), 0)
+    : 0
+  const cliffhangerTailStart = Math.max(
+    0,
+    timelineEnd - (timelineEnd >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS ? 18 : 8)
+  )
 
   const zoomCandidates = segmentScores
     .filter((entry) => {
@@ -14429,6 +15683,41 @@ const applySegmentEffects = (
       Boolean(score?.isHook && options.aggressiveMode)
     )
     const transitionStyle: SegmentTransitionStyle = options.jumpCuts && jumpTrigger ? 'jump' : 'smooth'
+    const isCliffhangerTail = seg.end >= cliffhangerTailStart
+    const reframeMode: 'none' | 'punch_in' | 'punch_out' = score?.isHook
+      ? 'punch_in'
+      : isCliffhangerTail
+        ? 'punch_out'
+        : (energeticMoment || motionEmphasis ? 'punch_in' : 'none')
+    const subtitleIntent: 'neutral' | 'hook' | 'cliffhanger' = score?.isHook
+      ? 'hook'
+      : (isCliffhangerTail ? 'cliffhanger' : 'neutral')
+    const audioLeadInMs = Number(clamp(
+      score?.isHook
+        ? 140
+        : motionEmphasis
+          ? 110
+          : jumpTrigger
+            ? 90
+            : 50,
+      20,
+      280
+    ).toFixed(0))
+    const audioTailMs = Number(clamp(
+      isCliffhangerTail
+        ? 170
+        : speechPeak
+          ? 95
+          : 60,
+      20,
+      320
+    ).toFixed(0))
+    const brollOverlayHint = Boolean(
+      !score?.isHook &&
+      (energeticMoment || motionEmphasis) &&
+      (score?.speechIntensity ?? 0) < 0.46
+    )
+    const musicSwell = Boolean(score?.isHook || isCliffhangerTail || speechPeak)
     const soundFxLevel = Number(clamp(
       options.soundFx
         ? (
@@ -14454,6 +15743,12 @@ const applySegmentEffects = (
       faceFocusY,
       transitionStyle,
       soundFxLevel,
+      audioLeadInMs,
+      audioTailMs,
+      reframeMode,
+      brollOverlayHint,
+      subtitleIntent,
+      musicSwell,
       emphasize: Boolean(hasSpike || speechPeak || motionEmphasis || score?.isHook)
     }
   })
@@ -14729,6 +16024,329 @@ const applyPacingGovernor = ({
   return {
     segments: governed.filter((segment) => segment.end - segment.start > 0.12),
     adjustments
+  }
+}
+
+type SegmentSignalProfileForCut = {
+  score: number
+  speech: number
+  emotion: number
+  motion: number
+  scene: number
+  curiosity: number
+  action: number
+  energy: number
+  novelty: number
+  tension: number
+}
+
+const buildSegmentSignalProfileForCut = ({
+  segment,
+  windows,
+  cache
+}: {
+  segment: Segment
+  windows: EngagementWindow[]
+  cache: Map<string, SegmentSignalProfileForCut>
+}): SegmentSignalProfileForCut => {
+  const key = `${segment.start.toFixed(3)}:${segment.end.toFixed(3)}`
+  const cached = cache.get(key)
+  if (cached) return cached
+  const score = averageWindowMetric(windows, segment.start, segment.end, (window) => window.score)
+  const speech = averageWindowMetric(windows, segment.start, segment.end, (window) => window.speechIntensity)
+  const emotion = averageWindowMetric(windows, segment.start, segment.end, (window) => window.emotionIntensity)
+  const motion = averageWindowMetric(windows, segment.start, segment.end, (window) => window.motionScore)
+  const scene = averageWindowMetric(windows, segment.start, segment.end, (window) => window.sceneChangeRate)
+  const curiosity = averageWindowMetric(windows, segment.start, segment.end, (window) => (window.curiosityTrigger ?? 0))
+  const action = averageWindowMetric(windows, segment.start, segment.end, (window) => (window.actionSpike ?? 0))
+  const energy = averageWindowMetric(windows, segment.start, segment.end, (window) => window.audioEnergy)
+  const novelty = clamp01(0.42 * scene + 0.34 * curiosity + 0.24 * action)
+  const tension = clamp01(0.46 * emotion + 0.32 * curiosity + 0.22 * action)
+  const profile: SegmentSignalProfileForCut = {
+    score: Number(clamp01(score).toFixed(4)),
+    speech: Number(clamp01(speech).toFixed(4)),
+    emotion: Number(clamp01(emotion).toFixed(4)),
+    motion: Number(clamp01(motion).toFixed(4)),
+    scene: Number(clamp01(scene).toFixed(4)),
+    curiosity: Number(clamp01(curiosity).toFixed(4)),
+    action: Number(clamp01(action).toFixed(4)),
+    energy: Number(clamp01(energy).toFixed(4)),
+    novelty: Number(clamp01(novelty).toFixed(4)),
+    tension: Number(clamp01(tension).toFixed(4))
+  }
+  cache.set(key, profile)
+  return profile
+}
+
+const scoreSegmentSimilarityForCut = (left: SegmentSignalProfileForCut, right: SegmentSignalProfileForCut) => {
+  const distance = (
+    0.26 * Math.abs(left.score - right.score) +
+    0.2 * Math.abs(left.speech - right.speech) +
+    0.16 * Math.abs(left.emotion - right.emotion) +
+    0.16 * Math.abs(left.motion - right.motion) +
+    0.1 * Math.abs(left.novelty - right.novelty) +
+    0.12 * Math.abs(left.energy - right.energy)
+  )
+  return Number(clamp01(1 - distance).toFixed(4))
+}
+
+const scoreEliteCutAudit = (audit: EliteCutAudit, segmentCount: number) => {
+  const safeCount = Math.max(1, segmentCount)
+  const duplicatePenalty = clamp01(audit.duplicateDrops / Math.max(1, safeCount * 0.22))
+  const trimLift = clamp01((audit.lowEnergyTailTrims + audit.lowEnergyHeadTrims) / Math.max(1, safeCount * 0.5))
+  const speedLift = clamp01(audit.speedRamps / Math.max(1, safeCount * 0.42))
+  const jlLift = clamp01(audit.jlBoosts / Math.max(1, safeCount * 0.35))
+  const jerkLift = clamp01(audit.avgBoundaryJerk / 0.34)
+  return Number(clamp01(
+    0.31 * (1 - duplicatePenalty) +
+    0.2 * trimLift +
+    0.18 * speedLift +
+    0.17 * jlLift +
+    0.14 * jerkLift
+  ).toFixed(4))
+}
+
+const applyEliteCutRefinement = ({
+  segments,
+  windows,
+  durationSeconds,
+  styleProfile,
+  aggressionLevel,
+  contentFormat,
+  hookRange,
+  allowSpeedChanges
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  styleProfile?: ContentStyleProfile | null
+  aggressionLevel: RetentionAggressionLevel
+  contentFormat: RetentionContentFormat
+  hookRange?: TimeRange | null
+  allowSpeedChanges: boolean
+}) => {
+  const audit: EliteCutAudit = {
+    duplicateDrops: 0,
+    lowEnergyTailTrims: 0,
+    lowEnergyHeadTrims: 0,
+    speedRamps: 0,
+    jlBoosts: 0,
+    avgBoundaryJerk: 0
+  }
+  if (!segments.length) {
+    return {
+      segments: [] as Segment[],
+      audit,
+      cutQualityScore: 0
+    }
+  }
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const minSegmentDuration = contentFormat === 'tiktok_short'
+    ? 0.24
+    : styleProfile?.style === 'tutorial'
+      ? 0.36
+      : styleProfile?.style === 'vlog'
+        ? 0.32
+        : 0.28
+  const duplicateSimilarityThreshold = styleProfile?.style === 'tutorial'
+    ? 0.91
+    : styleProfile?.style === 'vlog'
+      ? 0.89
+      : 0.86
+  const trimStep = contentFormat === 'tiktok_short'
+    ? 0.08
+    : styleProfile?.style === 'tutorial'
+      ? 0.1
+      : 0.12
+  const lowSignalBoundaryThreshold = aggressionLevel === 'viral' || aggressionLevel === 'high'
+    ? 0.44
+    : 0.47
+  const speedCap = styleProfile?.style === 'tutorial'
+    ? 1.2
+    : aggressionLevel === 'viral'
+      ? 1.34
+      : aggressionLevel === 'high'
+        ? 1.3
+        : 1.24
+
+  const normalized = segments
+    .map((segment) => {
+      const start = Number(clamp(Number(segment.start || 0), 0, Math.max(0, safeDuration - 0.05)).toFixed(3))
+      const end = Number(clamp(Number(segment.end || 0), start + 0.05, safeDuration).toFixed(3))
+      const speed = Number(segment.speed && segment.speed > 0 ? segment.speed : 1)
+      return {
+        ...segment,
+        start,
+        end,
+        speed: Number(clamp(speed, 1, speedCap).toFixed(3))
+      }
+    })
+    .filter((segment) => segment.end - segment.start > 0.16)
+  if (!normalized.length) {
+    return {
+      segments: segments.map((segment) => ({ ...segment })),
+      audit,
+      cutQualityScore: 0.32
+    }
+  }
+
+  const overlapsHookRange = (segment: Segment) => {
+    if (!hookRange) return false
+    return segment.start < hookRange.end && segment.end > hookRange.start
+  }
+
+  const cache = new Map<string, SegmentSignalProfileForCut>()
+  const deduped: Segment[] = []
+  for (const segment of normalized) {
+    const duration = segment.end - segment.start
+    if (duration < minSegmentDuration * 0.52) continue
+    const prev = deduped[deduped.length - 1]
+    if (!prev) {
+      deduped.push({ ...segment })
+      continue
+    }
+    const prevProfile = buildSegmentSignalProfileForCut({ segment: prev, windows, cache })
+    const currentProfile = buildSegmentSignalProfileForCut({ segment, windows, cache })
+    const similarity = scoreSegmentSimilarityForCut(prevProfile, currentProfile)
+    const prevQuality = 0.48 * prevProfile.score + 0.3 * prevProfile.novelty + 0.22 * prevProfile.tension
+    const currentQuality = 0.48 * currentProfile.score + 0.3 * currentProfile.novelty + 0.22 * currentProfile.tension
+    const protectedIntent = (
+      prev.subtitleIntent === 'hook' ||
+      prev.subtitleIntent === 'cliffhanger' ||
+      segment.subtitleIntent === 'hook' ||
+      segment.subtitleIntent === 'cliffhanger'
+    )
+    const repeatedLowNovelty = prevProfile.novelty < 0.3 && currentProfile.novelty < 0.3
+    if (
+      similarity >= duplicateSimilarityThreshold &&
+      repeatedLowNovelty &&
+      !protectedIntent &&
+      !overlapsHookRange(prev) &&
+      !overlapsHookRange(segment)
+    ) {
+      audit.duplicateDrops += 1
+      if (currentQuality > prevQuality + 0.04) {
+        deduped[deduped.length - 1] = { ...segment }
+      }
+      continue
+    }
+    deduped.push({ ...segment })
+  }
+
+  const out = deduped.length ? deduped : normalized.map((segment) => ({ ...segment }))
+  const boundaryJerks: number[] = []
+  for (let index = 0; index < out.length - 1; index += 1) {
+    const current = out[index]
+    const next = out[index + 1]
+    const currentDuration = current.end - current.start
+    const nextDuration = next.end - next.start
+    const tailSignal = averageWindowMetric(
+      windows,
+      Math.max(current.start, current.end - 0.45),
+      current.end,
+      (window) => (
+        0.58 * window.score +
+        0.24 * (window.curiosityTrigger ?? 0) +
+        0.18 * window.sceneChangeRate
+      )
+    )
+    const headSignal = averageWindowMetric(
+      windows,
+      next.start,
+      Math.min(next.end, next.start + 0.45),
+      (window) => (
+        0.58 * window.score +
+        0.24 * (window.curiosityTrigger ?? 0) +
+        0.18 * window.sceneChangeRate
+      )
+    )
+    if (
+      currentDuration > minSegmentDuration + trimStep + 0.08 &&
+      tailSignal < lowSignalBoundaryThreshold &&
+      !overlapsHookRange(current)
+    ) {
+      current.end = Number((current.end - trimStep).toFixed(3))
+      audit.lowEnergyTailTrims += 1
+    }
+    if (
+      nextDuration > minSegmentDuration + trimStep + 0.08 &&
+      headSignal < lowSignalBoundaryThreshold &&
+      !overlapsHookRange(next)
+    ) {
+      next.start = Number((next.start + trimStep).toFixed(3))
+      audit.lowEnergyHeadTrims += 1
+    }
+    if (current.end - current.start <= minSegmentDuration * 0.48) continue
+    if (next.end - next.start <= minSegmentDuration * 0.48) continue
+    const leftProfile = buildSegmentSignalProfileForCut({ segment: current, windows, cache })
+    const rightProfile = buildSegmentSignalProfileForCut({ segment: next, windows, cache })
+    const jerk = clamp01(
+      0.45 * Math.abs(leftProfile.energy - rightProfile.energy) +
+      0.23 * Math.abs(leftProfile.motion - rightProfile.motion) +
+      0.2 * Math.abs(leftProfile.speech - rightProfile.speech) +
+      0.12 * Math.abs(leftProfile.novelty - rightProfile.novelty)
+    )
+    boundaryJerks.push(jerk)
+    const jumpThreshold = styleProfile?.style === 'tutorial' ? 0.27 : 0.2
+    if (jerk >= jumpThreshold) {
+      current.transitionStyle = 'jump'
+      next.transitionStyle = 'jump'
+      const tailBoost = Number(clamp(105 + jerk * 180, 20, 320).toFixed(0))
+      const leadBoost = Number(clamp(95 + jerk * 170, 20, 280).toFixed(0))
+      current.audioTailMs = Number(clamp(Math.max(Number(current.audioTailMs ?? 0), tailBoost), 20, 320).toFixed(0))
+      next.audioLeadInMs = Number(clamp(Math.max(Number(next.audioLeadInMs ?? 0), leadBoost), 20, 280).toFixed(0))
+      audit.jlBoosts += 1
+    } else {
+      if (!current.transitionStyle) current.transitionStyle = 'smooth'
+      if (!next.transitionStyle) next.transitionStyle = 'smooth'
+      current.audioTailMs = Number(clamp(Math.max(Number(current.audioTailMs ?? 0), 70), 20, 320).toFixed(0))
+      next.audioLeadInMs = Number(clamp(Math.max(Number(next.audioLeadInMs ?? 0), 70), 20, 280).toFixed(0))
+    }
+  }
+
+  if (allowSpeedChanges) {
+    for (const segment of out) {
+      if (overlapsHookRange(segment)) continue
+      const baseSpeed = Number(segment.speed && segment.speed > 0 ? segment.speed : 1)
+      const runtime = Math.max(0.001, (segment.end - segment.start) / baseSpeed)
+      if (runtime < 2.25) continue
+      const profile = buildSegmentSignalProfileForCut({ segment, windows, cache })
+      const lowEnergy = (
+        profile.score < 0.47 &&
+        profile.energy < 0.48 &&
+        profile.speech < 0.56 &&
+        profile.novelty < 0.38
+      )
+      if (!lowEnergy) continue
+      const boost = aggressionLevel === 'viral'
+        ? 0.14
+        : aggressionLevel === 'high'
+          ? 0.12
+          : 0.09
+      const resolvedSpeed = clamp(baseSpeed + boost, 1, speedCap)
+      if (resolvedSpeed > baseSpeed + 0.02) {
+        segment.speed = Number(resolvedSpeed.toFixed(3))
+        audit.speedRamps += 1
+      }
+    }
+  }
+
+  const finalSegments = out
+    .map((segment) => {
+      const start = Number(clamp(segment.start, 0, Math.max(0, safeDuration - 0.05)).toFixed(3))
+      const end = Number(clamp(segment.end, start + 0.05, safeDuration).toFixed(3))
+      return { ...segment, start, end }
+    })
+    .filter((segment) => segment.end - segment.start > minSegmentDuration * 0.48)
+  const avgBoundaryJerk = boundaryJerks.length
+    ? boundaryJerks.reduce((sum, value) => sum + value, 0) / boundaryJerks.length
+    : 0
+  audit.avgBoundaryJerk = Number(avgBoundaryJerk.toFixed(4))
+  const cutQualityScore = scoreEliteCutAudit(audit, finalSegments.length)
+  return {
+    segments: finalSegments.length ? finalSegments : normalized.map((segment) => ({ ...segment })),
+    audit,
+    cutQualityScore
   }
 }
 
@@ -20320,12 +21938,16 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         behavior_style_profile: editPlan?.behaviorStyleProfile ?? null,
         edit_decision_timeline: editPlan?.editDecisionTimeline ?? null,
         style_timeline_features: editPlan?.styleFeatureSnapshot ?? null,
+        visual_intelligence: editPlan?.visualIntelligence ?? null,
+        story_beat_graph: editPlan?.storyBeatGraph ?? null,
+        micro_rehook_anchors: editPlan?.microRehookAnchors ?? [],
         auto_escalation_events: editPlan?.autoEscalationEvents ?? [],
         auto_escalation_count: Number(editPlan?.autoEscalationEvents?.length ?? 0),
         transcript_signals: editPlan?.transcriptSignals ?? {
           cueCount: transcriptCues.length,
           hasTranscript: transcriptCues.length > 0
         },
+        transcript_cues: transcriptCues.slice(0, 1200),
         extracted_frame_count: extractedFrameCount,
         pattern_interrupt_count: editPlan?.patternInterruptCount ?? 0,
         pattern_interrupt_density: editPlan?.patternInterruptDensity ?? 0,
@@ -21276,6 +22898,22 @@ const processJob = async (
       : []
     let editDecisionTimelineForAnalysis: EditDecisionTimeline | null = ((job.analysis as any)?.edit_decision_timeline as EditDecisionTimeline) || null
     let styleFeatureSnapshotForAnalysis: TimelineFeatureSnapshot | null = ((job.analysis as any)?.style_timeline_features as TimelineFeatureSnapshot) || null
+    let visualIntelligenceForAnalysis: VisualIntelligenceSummary | null =
+      ((job.analysis as any)?.visual_intelligence as VisualIntelligenceSummary) || null
+    let storyBeatGraphForAnalysis: StoryBeatGraph | null =
+      ((job.analysis as any)?.story_beat_graph as StoryBeatGraph) || null
+    let microRehookAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.micro_rehook_anchors)
+      ? (((job.analysis as any)?.micro_rehook_anchors as number[]) || [])
+      : []
+    let variantSelectionAuditForAnalysis: VariantSelectionAudit | null =
+      ((job.analysis as any)?.variant_selection_audit as VariantSelectionAudit) || null
+    let hardQualityGateForAnalysis: HardQualityGateAudit | null =
+      ((job.analysis as any)?.hard_quality_gate as HardQualityGateAudit) || null
+    let selectedEliteCutAudit: EliteCutAudit | null =
+      ((job.analysis as any)?.cutting_audit as EliteCutAudit) || null
+    let selectedCutQualityScore = Number.isFinite(Number((job.analysis as any)?.cut_quality_score))
+      ? Number((job.analysis as any).cut_quality_score)
+      : 0
     let selectedContentFormat: RetentionContentFormat = inferRetentionContentFormat({
       runtimeSeconds: durationSeconds,
       windows: [],
@@ -21283,6 +22921,26 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       targetPlatform: retentionTargetPlatform
     })
+    const processTranscriptCues: TranscriptCue[] = (
+      Array.isArray((job.analysis as any)?.transcript_cues)
+        ? ((job.analysis as any).transcript_cues as any[])
+        : Array.isArray((job.analysis as any)?.transcriptCues)
+          ? ((job.analysis as any).transcriptCues as any[])
+          : []
+    )
+      .map((cue) => ({
+        start: Number(cue?.start),
+        end: Number(cue?.end),
+        text: String(cue?.text || ''),
+        keywordIntensity: Number(clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? 0))),
+        curiosityTrigger: Number(clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? 0))),
+        fillerDensity: Number(clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0))),
+        words: Array.isArray(cue?.words) ? cue.words : undefined,
+        speaker: typeof cue?.speaker === 'string' ? cue.speaker : null,
+        language: typeof cue?.language === 'string' ? cue.language : null
+      }))
+      .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.01)
+      .slice(0, 1200)
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
@@ -21324,6 +22982,7 @@ const processJob = async (
             editorMode: editorModeForRender,
             aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
           }, undefined, {
+            transcriptCues: processTranscriptCues,
             aggressionLevel,
             hookCalibration,
             renderMode: renderConfig.mode
@@ -21385,6 +23044,9 @@ const processJob = async (
       if (Array.isArray(editPlan?.autoEscalationEvents)) autoEscalationEventsForAnalysis = editPlan.autoEscalationEvents
       if (editPlan?.editDecisionTimeline) editDecisionTimelineForAnalysis = editPlan.editDecisionTimeline
       if (editPlan?.styleFeatureSnapshot) styleFeatureSnapshotForAnalysis = editPlan.styleFeatureSnapshot
+      if (editPlan?.visualIntelligence) visualIntelligenceForAnalysis = editPlan.visualIntelligence
+      if (editPlan?.storyBeatGraph) storyBeatGraphForAnalysis = editPlan.storyBeatGraph
+      if (Array.isArray(editPlan?.microRehookAnchors)) microRehookAnchorsForAnalysis = editPlan.microRehookAnchors
       const energySamplesForEscalation = buildEnergySamplesFromWindows(editPlan?.engagementWindows ?? [])
 
       await updateJob(jobId, { status: 'story', progress: 55 })
@@ -21522,6 +23184,7 @@ const processJob = async (
               instantHold: scored.instantHold,
               introClarity: scored.introClarity,
               teaserTension: scored.teaserTension,
+              visualNovelty: scored.visualNovelty,
               openerQuality: scored.openerQuality,
               selectionScore: scored.selectionScore
             }
@@ -21660,6 +23323,7 @@ const processJob = async (
             instantHold: Number(initialHookSignals.instantHold.toFixed(4)),
             introClarity: Number(initialHookSignals.introClarity.toFixed(4)),
             teaserTension: Number(initialHookSignals.teaserTension.toFixed(4)),
+            visualNovelty: Number(initialHookSignals.visualNovelty.toFixed(4)),
             openerQuality: Number(initialHookSignals.openerQuality.toFixed(4)),
             selectionScore: Number(initialHookSignals.selectionScore.toFixed(4))
           },
@@ -21941,15 +23605,30 @@ const processJob = async (
         const pacingGovernedAttempt = applyPacingGovernor({
           segments: runtimeBandAdjustedSegments,
           windows: editPlan?.engagementWindows ?? [],
-          transcriptCues: [],
+          transcriptCues: processTranscriptCues,
           durationSeconds,
           maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
           maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds,
           clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
           enabled: longFormRuntimeTuning.isLongForm
         })
-        const governedAttemptSegments = pacingGovernedAttempt.segments
-        const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
+        const microRehookResult = applyLongFormMicroRehooks({
+          segments: pacingGovernedAttempt.segments,
+          anchors: microRehookAnchorsForAnalysis,
+          durationSeconds
+        })
+        const eliteCutRefined = applyEliteCutRefinement({
+          segments: microRehookResult.segments,
+          windows: editPlan?.engagementWindows ?? [],
+          durationSeconds,
+          styleProfile: styleProfileForAnalysis,
+          aggressionLevel,
+          contentFormat: selectedContentFormat,
+          hookRange,
+          allowSpeedChanges: !options.onlyCuts
+        })
+        const governedAttemptSegments = eliteCutRefined.segments
+        const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count + microRehookResult.applied
         const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(governedAttemptSegments))
         return {
           hook: effectiveHookCandidate,
@@ -21957,12 +23636,33 @@ const processJob = async (
           segments: governedAttemptSegments,
           autoEscalationEvents: autoEscalationResult.events,
           patternInterruptCount: totalPatternInterruptCount,
-          patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
+          patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4)),
+          eliteCutAudit: eliteCutRefined.audit,
+          cutQualityScore: eliteCutRefined.cutQualityScore
         }
       }
 
       let finalSegments: Segment[] = []
       const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, MAX_QUALITY_GATE_RETRIES + 1))
+      const mandatoryVariantTarget = Math.round(clamp(
+        MANDATORY_VARIANT_MIN +
+        (durationSeconds >= 45 * 60 ? 2 : durationSeconds >= 18 * 60 ? 1 : 0),
+        MANDATORY_VARIANT_MIN,
+        MANDATORY_VARIANT_MAX
+      ))
+      const variantPlans: Array<{
+        strategy: RetentionRetryStrategy
+        hookCandidateIndex: number
+      }> = attemptStrategies.map((strategy, index) => ({
+        strategy,
+        hookCandidateIndex: index
+      }))
+      while (variantPlans.length < mandatoryVariantTarget) {
+        variantPlans.push({
+          strategy: 'BASELINE',
+          hookCandidateIndex: variantPlans.length
+        })
+      }
       const attemptEvaluations: Array<{
         strategy: RetentionRetryStrategy
         hookCandidate: HookCandidate
@@ -21974,9 +23674,15 @@ const processJob = async (
         patternInterruptCount: number
         patternInterruptDensity: number
         autoEscalationEvents: AutoEscalationEvent[]
+        eliteCutAudit: EliteCutAudit
+        cutQualityScore: number
+        pacingCurve: 'aggressive' | 'balanced' | 'steady'
+        cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
+        policyId: string
       }> = []
-      for (let attemptIndex = 0; attemptIndex < attemptStrategies.length; attemptIndex += 1) {
-        const strategy = attemptStrategies[attemptIndex]
+      for (let attemptIndex = 0; attemptIndex < variantPlans.length; attemptIndex += 1) {
+        const plan = variantPlans[attemptIndex]
+        const strategy = plan.strategy
         const hookCandidate = (
           preferredHookCandidate
             ? preferredHookCandidate
@@ -21986,7 +23692,7 @@ const processJob = async (
                 ? (orderedHookCandidates[2] || orderedHookCandidates[0] || initialHook)
                 : strategy === 'PACING_FIRST'
                   ? (orderedHookCandidates[3] || orderedHookCandidates[0] || initialHook)
-                  : initialHook
+                  : (orderedHookCandidates[plan.hookCandidateIndex] || orderedHookCandidates[0] || initialHook)
         )
         const attempt = buildAttemptSegments(strategy, hookCandidate)
         const effectiveHookCandidate = attempt.hook
@@ -22032,9 +23738,32 @@ const processJob = async (
           hookCalibration: hookCalibrationForAnalysis,
           styleProfile: styleProfileForAnalysis
         })
+        const pacingCurve: 'aggressive' | 'balanced' | 'steady' =
+          strategy === 'PACING_FIRST' || strategy === 'RESCUE_MODE'
+            ? 'aggressive'
+            : strategy === 'EMOTION_FIRST'
+              ? 'balanced'
+              : 'steady'
+        const cliffhangerOpenLoop = scoreHookOpenLoopSignal(effectiveHookCandidate.text || '')
+        const cliffhangerTension = scoreHookEndingUnresolvedSignal(effectiveHookCandidate.text || '')
+        const cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question' =
+          cliffhangerTension >= 0.62
+            ? 'mystery_question'
+            : cliffhangerOpenLoop >= 0.55
+              ? 'open_loop'
+              : 'reveal_tease'
+        const policyId = buildVariantPolicyId({
+          strategy,
+          hookStart: effectiveHookCandidate.start,
+          pacingCurve,
+          cliffhangerStyle
+        })
         const variantScore = Number((
-          0.8 * predictedRetention +
+          0.75 * predictedRetention +
           0.2 * judge.retention_score +
+          2.2 * (attempt.cutQualityScore ?? 0) +
+          4.5 * cliffhangerTension +
+          (storyBeatGraphForAnalysis?.unresolvedTensionScore ? storyBeatGraphForAnalysis.unresolvedTensionScore * 2 : 0) +
           (judge.passed ? 3.5 : 0)
         ).toFixed(2))
         retentionAttempts.push({
@@ -22046,7 +23775,8 @@ const processJob = async (
           patternInterruptDensity: attempt.patternInterruptDensity,
           boredomRemovalRatio: retention.details.boredomRemovalRatio,
           predictedRetention,
-          variantScore
+          variantScore,
+          cutQualityScore: attempt.cutQualityScore
         })
         attemptEvaluations.push({
           strategy,
@@ -22058,19 +23788,55 @@ const processJob = async (
           variantScore,
           patternInterruptCount: attempt.patternInterruptCount,
           patternInterruptDensity: attempt.patternInterruptDensity,
-          autoEscalationEvents: attempt.autoEscalationEvents
+          autoEscalationEvents: attempt.autoEscalationEvents,
+          eliteCutAudit: attempt.eliteCutAudit,
+          cutQualityScore: attempt.cutQualityScore,
+          pacingCurve,
+          cliffhangerStyle,
+          policyId
         })
       }
       if (attemptEvaluations.length) {
         const passedAttempts = attemptEvaluations.filter((attempt) => attempt.judge.passed)
         const candidatePool = passedAttempts.length ? passedAttempts : attemptEvaluations
-        const winner = candidatePool
+        const ranked = candidatePool
           .slice()
           .sort((a, b) => (
             b.variantScore - a.variantScore ||
+            b.cutQualityScore - a.cutQualityScore ||
             b.predictedRetention - a.predictedRetention ||
             b.judge.retention_score - a.judge.retention_score
-          ))[0]
+          ))
+        const exploreSeedRaw = crypto
+          .createHash('sha1')
+          .update(`${jobId}:${durationSeconds}:${selectedContentFormat}:${candidatePool.length}`)
+          .digest('hex')
+          .slice(0, 8)
+        const exploreSeed = Number.parseInt(exploreSeedRaw, 16) / 0xffffffff
+        const shouldExplorePolicy = ranked.length > 1 && exploreSeed < BANDIT_POLICY_EXPLORATION_RATE
+        const winner = shouldExplorePolicy
+          ? ranked[Math.min(1, ranked.length - 1)]
+          : ranked[0]
+        variantSelectionAuditForAnalysis = buildVariantSelectionAudit({
+          attempts: ranked.map((attempt) => ({
+            strategy: attempt.strategy,
+            variantScore: attempt.variantScore,
+            predictedRetention: attempt.predictedRetention,
+            judgeRetentionScore: attempt.judge.retention_score,
+            cutQualityScore: attempt.cutQualityScore,
+            hookStart: attempt.hookCandidate.start,
+            hookDuration: attempt.hookCandidate.duration,
+            pacingCurve: attempt.pacingCurve,
+            cliffhangerStyle: attempt.cliffhangerStyle
+          })),
+          winnerStrategy: winner?.strategy || null,
+          winnerHookStart: winner?.hookCandidate?.start ?? null
+        })
+        if (shouldExplorePolicy && winner) {
+          optimizationNotes.push(
+            `Contextual bandit exploration selected policy ${winner.policyId} (seed ${(exploreSeed * 100).toFixed(1)}).`
+          )
+        }
         if (winner) {
           finalSegments = winner.segments
           selectedHook = winner.hookCandidate
@@ -22081,6 +23847,8 @@ const processJob = async (
           selectedBoredomRemovalRatio = winner.retention.details.boredomRemovalRatio
           selectedAutoEscalationEvents = winner.autoEscalationEvents
           selectedStrategy = winner.strategy
+          selectedEliteCutAudit = winner.eliteCutAudit
+          selectedCutQualityScore = winner.cutQualityScore
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -22089,6 +23857,8 @@ const processJob = async (
           optimizationNotes = [
             ...optimizationNotes,
             ...winner.retention.notes,
+            `Variant winner policy: ${winner.policyId} (${winner.strategy}).`,
+            `Elite cut quality score: ${(winner.cutQualityScore * 100).toFixed(0)}%.`,
             ...winner.judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
           ]
         }
@@ -22239,7 +24009,8 @@ const processJob = async (
             hook: rescueHookCandidate,
             patternInterruptCount: rescueAttempt.patternInterruptCount,
             patternInterruptDensity: rescueAttempt.patternInterruptDensity,
-            boredomRemovalRatio: rescueRetention.details.boredomRemovalRatio
+            boredomRemovalRatio: rescueRetention.details.boredomRemovalRatio,
+            cutQualityScore: rescueAttempt.cutQualityScore
           })
           finalSegments = rescueAttempt.segments
           selectedHook = rescueHookCandidate
@@ -22250,6 +24021,8 @@ const processJob = async (
           selectedBoredomRemovalRatio = rescueRetention.details.boredomRemovalRatio
           selectedAutoEscalationEvents = rescueAttempt.autoEscalationEvents
           selectedStrategy = 'RESCUE_MODE'
+          selectedEliteCutAudit = rescueAttempt.eliteCutAudit
+          selectedCutQualityScore = rescueAttempt.cutQualityScore
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -22591,6 +24364,97 @@ const processJob = async (
           )
         }
       }
+      const resolvedHookForHardGate = selectedHook || initialHook
+      if (!visualIntelligenceForAnalysis) {
+        visualIntelligenceForAnalysis = buildVisualIntelligenceSummary({
+          windows: engagementWindowsForAnalysis,
+          transcriptCues: processTranscriptCues,
+          durationSeconds
+        })
+      }
+      if (!storyBeatGraphForAnalysis) {
+        storyBeatGraphForAnalysis = buildStoryBeatGraph({
+          durationSeconds,
+          windows: engagementWindowsForAnalysis,
+          transcriptCues: processTranscriptCues,
+          hookCandidates: hookVariantsForAnalysis.length
+            ? hookVariantsForAnalysis
+            : [resolvedHookForHardGate],
+          visualIntelligence: visualIntelligenceForAnalysis
+        })
+      }
+      if (!microRehookAnchorsForAnalysis.length && storyBeatGraphForAnalysis) {
+        microRehookAnchorsForAnalysis = buildLongFormMicroRehookAnchors({
+          durationSeconds,
+          storyBeatGraph: storyBeatGraphForAnalysis
+        })
+      }
+      const hardQualityAudit = evaluateHardQualityBar({
+        durationSeconds,
+        contentFormat: selectedContentFormat,
+        hookSourceStart: Number(resolvedHookForHardGate.start || 0),
+        segments: finalSegments,
+        removedRanges: editPlan?.removedSegments ?? [],
+        compressedRanges: editPlan?.compressedSegments ?? [],
+        storyReorderMap: selectedStoryReorderMap.length
+          ? selectedStoryReorderMap
+          : finalSegments.map((segment, orderedIndex) => ({
+              sourceStart: Number(segment.start.toFixed(3)),
+              sourceEnd: Number(segment.end.toFixed(3)),
+              orderedIndex
+            })),
+        windows: engagementWindowsForAnalysis,
+        transcriptCues: processTranscriptCues,
+        visualIntelligence: visualIntelligenceForAnalysis,
+        storyBeatGraph: storyBeatGraphForAnalysis,
+        beatAnchors: beatAnchorsForAnalysis
+      })
+      hardQualityGateForAnalysis = hardQualityAudit
+      if (!hardQualityAudit.passed) {
+        const failureReason = `Hard quality bar failed: ${hardQualityAudit.checks.filter((check) => !check.passed).map((check) => check.key).join(', ')}`
+        await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+          status: 'failed',
+          completedAt: toIsoNow(),
+          lastError: failureReason,
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hardQualityGate: hardQualityAudit,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile
+          }
+        })
+        await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+          status: 'failed',
+          completedAt: toIsoNow(),
+          lastError: failureReason,
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hardQualityGate: hardQualityAudit,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile
+          }
+        })
+        await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${failureReason}` })
+        throw new QualityGateError(failureReason, {
+          attempts: retentionAttempts,
+          thresholds: qualityGateThresholds,
+          hardQualityGate: hardQualityAudit,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          strategyProfile
+        })
+      }
+      optimizationNotes.push(hardQualityAudit.summary)
       if (!finalSegments.length) {
         await updateJob(jobId, { status: 'failed', error: 'no_renderable_segments' })
         throw new Error('no_renderable_segments')
@@ -23233,6 +25097,8 @@ const processJob = async (
       patternInterruptCount: selectedPatternInterruptCount,
       patternInterruptDensity: selectedPatternInterruptDensity,
       boredomRemovedRatio: selectedBoredomRemovalRatio,
+      cutQualityScore: selectedCutQualityScore,
+      cuttingAudit: selectedEliteCutAudit,
       qualityGateOverride,
       optimizationNotes,
       hookSelectionSource: selectedHookSelectionSource,
@@ -23273,6 +25139,7 @@ const processJob = async (
           instantHold: Number(finalHookSignals.instantHold.toFixed(4)),
           introClarity: Number(finalHookSignals.introClarity.toFixed(4)),
           teaserTension: Number(finalHookSignals.teaserTension.toFixed(4)),
+          visualNovelty: Number(finalHookSignals.visualNovelty.toFixed(4)),
           openerQuality: Number(finalHookSignals.openerQuality.toFixed(4)),
           selectionScore: Number(finalHookSignals.selectionScore.toFixed(4))
         },
@@ -23329,6 +25196,8 @@ const processJob = async (
         pattern_interrupt_count: selectedPatternInterruptCount || (job.analysis as any)?.pattern_interrupt_count || 0,
         pattern_interrupt_density: selectedPatternInterruptDensity || (job.analysis as any)?.pattern_interrupt_density || 0,
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
+        cut_quality_score: Number(clamp01(selectedCutQualityScore || 0).toFixed(4)),
+        cutting_audit: selectedEliteCutAudit,
         story_reorder_map: selectedStoryReorderMap,
         style_profile: styleProfileForAnalysis,
         niche_profile: nicheProfileForAnalysis,
@@ -23336,6 +25205,9 @@ const processJob = async (
         behavior_style_profile: behaviorStyleProfileForAnalysis,
         edit_decision_timeline: editDecisionTimelineForAnalysis,
         style_timeline_features: styleFeatureSnapshotForAnalysis,
+        visual_intelligence: visualIntelligenceForAnalysis,
+        story_beat_graph: storyBeatGraphForAnalysis,
+        micro_rehook_anchors: microRehookAnchorsForAnalysis,
         auto_escalation_events: autoEscalationEventsForAnalysis,
         auto_escalation_count: Number(autoEscalationEventsForAnalysis.length || 0),
         beat_anchors: beatAnchorsForAnalysis,
@@ -23343,6 +25215,8 @@ const processJob = async (
         emotional_beat_cut_count: emotionalBeatCutCountForAnalysis,
         emotional_lead_trimmed_seconds: emotionalLeadTrimmedSecondsForAnalysis,
         emotional_tuning_profile: emotionalTuningForAnalysis,
+        variant_selection_audit: variantSelectionAuditForAnalysis,
+        hard_quality_gate: hardQualityGateForAnalysis,
         hook_variants: hookVariantsForAnalysis,
         hook_calibration: hookCalibrationForAnalysis,
         audio_profile: audioProfileForAnalysis
@@ -24440,6 +26314,12 @@ router.get('/:id', async (req: any, res) => {
     const jobAnalysis = (job.analysis as any) || {}
     jobPayload.hookDebug = jobAnalysis?.hook_debug ?? null
     jobPayload.hookWhy = jobAnalysis?.hook_debug?.why ?? null
+    jobPayload.hardQualityGate = jobAnalysis?.hard_quality_gate ?? null
+    jobPayload.variantSelectionAudit = jobAnalysis?.variant_selection_audit ?? null
+    jobPayload.cutQualityScore = jobAnalysis?.cut_quality_score ?? null
+    jobPayload.cuttingAudit = jobAnalysis?.cutting_audit ?? null
+    jobPayload.storyBeatGraph = jobAnalysis?.story_beat_graph ?? null
+    jobPayload.visualIntelligence = jobAnalysis?.visual_intelligence ?? null
     const outputPaths = getOutputPathsForJob(job)
     if (job.status === 'completed' && outputPaths.length > 0) {
       const resolvedUrls: string[] = []
@@ -26034,6 +27914,200 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
   }
 })
 
+router.post('/:id/player-events', async (req: any, res) => {
+  try {
+    const id = String(req.params.id || '').trim()
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+
+    const events = parsePlayerTelemetryEventsPayload(req.body || {}, id)
+    if (!events.length) {
+      return res.status(400).json({ error: 'invalid_player_events' })
+    }
+    for (const event of events) {
+      try {
+        await prisma.siteAnalyticsEvent.create({
+          data: {
+            userId: req.user.id,
+            sessionId: event.session_id,
+            eventName: `player_${event.event}`,
+            category: 'feedback',
+            pagePath: '/editor/player',
+            retentionProfile: String((job.renderSettings as any)?.retentionStrategyProfile || ''),
+            targetPlatform: String((job.renderSettings as any)?.retentionTargetPlatform || ''),
+            captionStyle: String((job.renderSettings as any)?.subtitleStyle || ''),
+            jobId: id,
+            metadata: event
+          }
+        })
+      } catch (error) {
+        console.warn('player telemetry analytics write failed', error)
+      }
+    }
+    const analysis = (job.analysis as any) || {}
+    const existingEvents = Array.isArray(analysis.player_telemetry_events)
+      ? analysis.player_telemetry_events
+      : []
+    const mergedEvents = [
+      ...existingEvents.slice(-2800),
+      ...events
+    ]
+    const sessions = aggregatePlayerTelemetrySessions(mergedEvents as PlayerTelemetryEvent[])
+    const summary = summarizePlayerTelemetry(sessions)
+    const hookHoldRate = sessions.length
+      ? sessions.filter((session) => session.firstDropoffSecond === null || session.firstDropoffSecond >= 8).length / sessions.length
+      : null
+    const rewatchRate = sessions.length
+      ? sessions.filter((session) => session.rewatchHotspots.length > 0).length / sessions.length
+      : null
+    const derivedFeedback = parseRetentionFeedbackPayload({
+      watchPercent: summary.effective_watch_ratio,
+      completionPercent: summary.completion_rate,
+      hookHoldPercent: hookHoldRate,
+      rewatchRate,
+      avgViewDurationSec: summary.avg_watch_time,
+      source: 'player_telemetry',
+      sourceType: 'internal',
+      notes: 'Derived from player telemetry events.'
+    })
+    if (derivedFeedback) {
+      await persistRetentionFeedbackForJob({
+        job,
+        feedback: derivedFeedback,
+        analysisPatch: {
+          player_telemetry_events: mergedEvents.slice(-3000),
+          player_playback_sessions: sessions.slice(-300),
+          player_watch_labels: summary,
+          player_telemetry_updated_at: toIsoNow()
+        }
+      })
+      try {
+        await runFeedbackLoop({
+          trigger: 'feedback_submission',
+          actorUserId: req.user?.id || null
+        })
+      } catch (error) {
+        console.warn('feedback loop run failed after player telemetry', error)
+      }
+      return res.json({
+        ok: true,
+        ingested: events.length,
+        summary,
+        feedback: derivedFeedback
+      })
+    }
+    await updateJob(job.id, {
+      analysis: {
+        ...analysis,
+        player_telemetry_events: mergedEvents.slice(-3000),
+        player_playback_sessions: sessions.slice(-300),
+        player_watch_labels: summary,
+        player_telemetry_updated_at: toIsoNow()
+      }
+    })
+    return res.json({
+      ok: true,
+      ingested: events.length,
+      summary
+    })
+  } catch (err) {
+    console.error('player telemetry ingest failed', err)
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/editor-taste-feedback', async (req: any, res) => {
+  try {
+    const id = String(req.params.id || '').trim()
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+    const wouldPublishAsIs = Boolean(req.body?.wouldPublishAsIs ?? req.body?.would_publish_as_is)
+    const hookStrength = Number(clamp(Number(req.body?.hookStrength ?? req.body?.hook_strength), 1, 10))
+    const pacingFeel = Number(clamp(Number(req.body?.pacingFeel ?? req.body?.pacing_feel), 1, 10))
+    const bingeContinuity = Number(clamp(Number(req.body?.bingeContinuity ?? req.body?.binge_continuity), 1, 10))
+    if (!Number.isFinite(hookStrength) || !Number.isFinite(pacingFeel) || !Number.isFinite(bingeContinuity)) {
+      return res.status(400).json({ error: 'invalid_editor_taste_feedback' })
+    }
+    const notes = typeof req.body?.notes === 'string' && req.body.notes.trim()
+      ? req.body.notes.trim().slice(0, 400)
+      : null
+    const payload: EditorTasteFeedbackPayload = {
+      wouldPublishAsIs,
+      hookStrength: Number(hookStrength.toFixed(2)),
+      pacingFeel: Number(pacingFeel.toFixed(2)),
+      bingeContinuity: Number(bingeContinuity.toFixed(2)),
+      notes,
+      submittedAt: toIsoNow()
+    }
+    const analysis = (job.analysis as any) || {}
+    const history = Array.isArray(analysis.editor_taste_feedback_history)
+      ? analysis.editor_taste_feedback_history.slice(-59)
+      : []
+    const manualScore = Number(clamp(
+      0.38 * payload.hookStrength * 10 +
+      0.3 * payload.pacingFeel * 10 +
+      0.32 * payload.bingeContinuity * 10 +
+      (payload.wouldPublishAsIs ? 6 : -6),
+      0,
+      100
+    ).toFixed(2))
+    const mappedFeedback = parseRetentionFeedbackPayload({
+      manualScore,
+      hookHoldPercent: payload.hookStrength / 10,
+      watchPercent: payload.bingeContinuity / 10,
+      completionPercent: payload.pacingFeel / 10,
+      source: 'editor_taste_review',
+      sourceType: 'internal',
+      notes: payload.notes
+    })
+    if (!mappedFeedback) return res.status(400).json({ error: 'invalid_editor_taste_feedback' })
+    await persistRetentionFeedbackForJob({
+      job,
+      feedback: mappedFeedback,
+      analysisPatch: {
+        editor_taste_feedback: payload,
+        editor_taste_feedback_history: [...history, payload],
+        editor_taste_feedback_updated_at: toIsoNow()
+      }
+    })
+    try {
+      await prisma.siteAnalyticsEvent.create({
+        data: {
+          userId: req.user.id,
+          sessionId: null,
+          eventName: 'editor_taste_feedback',
+          category: 'feedback',
+          pagePath: '/editor',
+          retentionProfile: String((job.renderSettings as any)?.retentionStrategyProfile || ''),
+          targetPlatform: String((job.renderSettings as any)?.retentionTargetPlatform || ''),
+          captionStyle: String((job.renderSettings as any)?.subtitleStyle || ''),
+          jobId: id,
+          metadata: payload
+        }
+      })
+    } catch (error) {
+      console.warn('editor taste analytics write failed', error)
+    }
+    try {
+      await runFeedbackLoop({
+        trigger: 'creator_feedback_submission',
+        actorUserId: req.user?.id || null
+      })
+    } catch (error) {
+      console.warn('feedback loop run failed after editor taste feedback', error)
+    }
+    return res.json({
+      ok: true,
+      feedback: payload,
+      mappedRetentionFeedback: mappedFeedback
+    })
+  } catch (err) {
+    console.error('editor taste feedback failed', err)
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
 router.get('/:id/output-url', async (req: any, res) => {
   try {
     const id = req.params.id
@@ -26395,6 +28469,11 @@ export const __retentionTestUtils = {
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
   buildPersistedRenderAnalysis,
+  buildVisualIntelligenceSummary,
+  buildStoryBeatGraph,
+  evaluateHardQualityBar,
+  aggregatePlayerTelemetrySessions,
+  summarizePlayerTelemetry,
   buildUniquenessSignatureForTest,
   buildEditPlanForTest
 }
