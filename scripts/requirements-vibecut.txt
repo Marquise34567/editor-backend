@@ -5,3 +5,4 @@ opencv-python>=4.9.0
 pillow>=10.0.0
 pydub>=0.25.1
 faster-whisper>=1.1.0
+transformers>=4.45.0
