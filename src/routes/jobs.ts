@@ -1058,6 +1058,57 @@ type HookSelectionDecision = {
   threshold: number
   usedFallback: boolean
   reason: string | null
+  debug?: HookSelectionDebugPayload | null
+}
+type HookSelectionDebugCandidate = {
+  rank: number
+  start: number
+  end: number
+  duration: number
+  score: number
+  auditScore: number
+  auditPassed: boolean
+  confidence: number
+  instantHold: number
+  introClarity: number
+  teaserTension: number
+  openerQuality: number
+  selectionScore: number
+  text: string
+  reason: string
+  gates: {
+    strictAudit: boolean
+    strictConfidence: boolean
+    strictInstantHold: boolean
+    strictTeaserTension: boolean
+    relaxedAuditOrLowSignal: boolean
+    relaxedConfidence: boolean
+    relaxedInstantHold: boolean
+    relaxedTeaserTension: boolean
+  }
+}
+type HookSelectionDebugPayload = {
+  threshold: number
+  relaxedThreshold: number
+  relaxedInstantHoldFloor: number
+  relaxedTeaserFloor: number
+  selectionMode: 'strict' | 'relaxed' | 'fallback'
+  selected: {
+    start: number
+    end: number
+    duration: number
+    score: number
+    auditScore: number
+    auditPassed: boolean
+    confidence: number
+    instantHold: number
+    introClarity: number
+    teaserTension: number
+    openerQuality: number
+    selectionScore: number
+  }
+  why: string
+  candidates: HookSelectionDebugCandidate[]
 }
 type VerticalRetentionPredictorBreakdown = {
   hookStrength: number
@@ -1416,6 +1467,7 @@ const AUTO_HOOK_DURATION_MIN_SECONDS = 5
 const AUTO_HOOK_DURATION_MAX_SECONDS = 8
 const HOOK_OPENER_FIRST_SECONDS = 3
 const HOOK_STANDARD_INSTANT_HOLD_MIN = 0.56
+const HOOK_STANDARD_TEASER_TENSION_MIN = 0.44
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -2092,6 +2144,42 @@ const CURIOSITY_PHRASES = [
   'this changed everything',
   'what happens next',
   'wait for it'
+]
+const HOOK_UNRESOLVED_PHRASES = [
+  'but then',
+  'and then',
+  'until',
+  'before i',
+  'before we',
+  'next part',
+  'part 2',
+  'to be continued',
+  'tomorrow',
+  'coming up',
+  'wait for',
+  'what happens next',
+  'you are not ready',
+  'this is where it gets',
+  'right before'
+]
+const HOOK_RESOLUTION_PHRASES = [
+  'the answer is',
+  'here is the answer',
+  "here's the answer",
+  'in the end',
+  'turns out',
+  'the result is',
+  'the results are',
+  'exactly what happened',
+  'this is why',
+  "that's why",
+  'this is how',
+  "that's how",
+  'problem solved',
+  'we solved it',
+  'full breakdown',
+  'complete guide',
+  'step by step'
 ]
 const FILLER_WORDS = [
   'um',
@@ -8541,6 +8629,151 @@ const shouldForceRescueRender = (
   )
 }
 
+type HookSelectionRankedEntry = {
+  candidate: HookCandidate
+  confidence: number
+  instantHold: number
+  introClarity: number
+  teaserTension: number
+  openerQuality: number
+  selectionScore: number
+}
+
+const scoreRenderableHookCandidateSignals = ({
+  candidate,
+  windows
+}: {
+  candidate: HookCandidate
+  windows: EngagementWindow[]
+}) => {
+  const confidence = getHookCandidateConfidence(candidate)
+  const instantHold = windows.length
+    ? computeHookInstantHoldScore({
+      start: candidate.start,
+      end: candidate.start + candidate.duration,
+      windows
+    })
+    : clamp01(0.64 * candidate.score + 0.36 * candidate.auditScore)
+  const introText = String(candidate.text || '').trim()
+  const introSignals = introText
+    ? scoreTranscriptSignals(introText.toLowerCase())
+    : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0 }
+  const introClarity = introText
+    ? clamp01(
+      0.4 * scoreHookOpenLoopSignal(introText) +
+      0.24 * introSignals.keywordIntensity +
+      0.22 * introSignals.curiosityTrigger +
+      0.14 * (1 - introSignals.fillerDensity)
+    )
+    : clamp01(0.86 * candidate.auditScore + 0.08)
+  const teaserTension = introText
+    ? clamp01(
+      0.56 * scoreHookOpenLoopSignal(introText) +
+      0.44 * scoreHookEndingUnresolvedSignal(introText)
+    )
+    : clamp01(0.9 * candidate.auditScore + 0.06)
+  const openerQuality = clamp01(0.58 * instantHold + 0.24 * introClarity + 0.18 * teaserTension)
+  const selectionScore = clamp01(0.62 * confidence + 0.38 * openerQuality)
+  return {
+    confidence: Number(confidence.toFixed(4)),
+    instantHold: Number(instantHold.toFixed(4)),
+    introClarity: Number(introClarity.toFixed(4)),
+    teaserTension: Number(teaserTension.toFixed(4)),
+    openerQuality: Number(openerQuality.toFixed(4)),
+    selectionScore: Number(selectionScore.toFixed(4))
+  }
+}
+
+const buildHookSelectionDebugPayload = ({
+  ranked,
+  selected,
+  threshold,
+  relaxedThreshold,
+  relaxedInstantHoldFloor,
+  relaxedTeaserFloor,
+  selectionMode,
+  hasTranscript,
+  signalStrength,
+  reason,
+  usedFallback
+}: {
+  ranked: HookSelectionRankedEntry[]
+  selected: HookSelectionRankedEntry
+  threshold: number
+  relaxedThreshold: number
+  relaxedInstantHoldFloor: number
+  relaxedTeaserFloor: number
+  selectionMode: 'strict' | 'relaxed' | 'fallback'
+  hasTranscript: boolean
+  signalStrength: number
+  reason: string | null
+  usedFallback: boolean
+}): HookSelectionDebugPayload => {
+  const why = reason
+    ? String(reason)
+    : (
+      selectionMode === 'strict'
+        ? `Hook won strict gates with confidence ${selected.confidence.toFixed(3)} >= ${threshold.toFixed(3)}, instantHold ${selected.instantHold.toFixed(3)}, and teaserTension ${selected.teaserTension.toFixed(3)}.`
+        : selectionMode === 'relaxed'
+          ? `Hook won relaxed gates after strict miss; confidence ${selected.confidence.toFixed(3)} vs relaxed ${relaxedThreshold.toFixed(3)}, teaserTension ${selected.teaserTension.toFixed(3)}.`
+          : 'Hook fallback selected because no candidate cleared strict/relaxed gates.'
+    )
+  const candidates = ranked
+    .slice(0, Math.max(8, HOOK_SELECTION_MAX_CANDIDATES))
+    .map((entry, index) => ({
+      rank: index + 1,
+      start: Number(entry.candidate.start.toFixed(3)),
+      end: Number((entry.candidate.start + entry.candidate.duration).toFixed(3)),
+      duration: Number(entry.candidate.duration.toFixed(3)),
+      score: Number(entry.candidate.score.toFixed(4)),
+      auditScore: Number(entry.candidate.auditScore.toFixed(4)),
+      auditPassed: Boolean(entry.candidate.auditPassed),
+      confidence: Number(entry.confidence.toFixed(4)),
+      instantHold: Number(entry.instantHold.toFixed(4)),
+      introClarity: Number(entry.introClarity.toFixed(4)),
+      teaserTension: Number(entry.teaserTension.toFixed(4)),
+      openerQuality: Number(entry.openerQuality.toFixed(4)),
+      selectionScore: Number(entry.selectionScore.toFixed(4)),
+      text: String(entry.candidate.text || ''),
+      reason: String(entry.candidate.reason || ''),
+      gates: {
+        strictAudit: Boolean(entry.candidate.auditPassed),
+        strictConfidence: entry.confidence >= threshold,
+        strictInstantHold: entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN,
+        strictTeaserTension: entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN,
+        relaxedAuditOrLowSignal: Boolean(entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48),
+        relaxedConfidence: entry.confidence >= relaxedThreshold,
+        relaxedInstantHold: entry.openerQuality >= relaxedInstantHoldFloor,
+        relaxedTeaserTension: entry.teaserTension >= relaxedTeaserFloor
+      }
+    }))
+  return {
+    threshold: Number(threshold.toFixed(4)),
+    relaxedThreshold: Number(relaxedThreshold.toFixed(4)),
+    relaxedInstantHoldFloor: Number(relaxedInstantHoldFloor.toFixed(4)),
+    relaxedTeaserFloor: Number(relaxedTeaserFloor.toFixed(4)),
+    selectionMode,
+    selected: {
+      start: Number(selected.candidate.start.toFixed(3)),
+      end: Number((selected.candidate.start + selected.candidate.duration).toFixed(3)),
+      duration: Number(selected.candidate.duration.toFixed(3)),
+      score: Number(selected.candidate.score.toFixed(4)),
+      auditScore: Number(selected.candidate.auditScore.toFixed(4)),
+      auditPassed: Boolean(selected.candidate.auditPassed),
+      confidence: Number(selected.confidence.toFixed(4)),
+      instantHold: Number(selected.instantHold.toFixed(4)),
+      introClarity: Number(selected.introClarity.toFixed(4)),
+      teaserTension: Number(selected.teaserTension.toFixed(4)),
+      openerQuality: Number(selected.openerQuality.toFixed(4)),
+      selectionScore: Number(selected.selectionScore.toFixed(4))
+    },
+    why: usedFallback && !reason
+      ? `${why} Fallback mode enabled.`
+      : why,
+    candidates
+  }
+}
+
 const selectRenderableHookCandidate = ({
   candidates,
   aggressionLevel,
@@ -8568,31 +8801,18 @@ const selectRenderableHookCandidate = ({
     )) === index
   ))
   if (!deduped.length) return null
-  const ranked = deduped
+  const ranked: HookSelectionRankedEntry[] = deduped
     .map((candidate) => {
-      const confidence = getHookCandidateConfidence(candidate)
-      const instantHold = windows.length
-        ? computeHookInstantHoldScore({
-          start: candidate.start,
-          end: candidate.start + candidate.duration,
-          windows
-        })
-        : clamp01(0.64 * candidate.score + 0.36 * candidate.auditScore)
-      const introText = String(candidate.text || '').trim()
-      const introSignals = introText
-        ? scoreTranscriptSignals(introText.toLowerCase())
-        : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0 }
-      const introClarity = introText
-        ? clamp01(
-          0.4 * scoreHookOpenLoopSignal(introText) +
-          0.24 * introSignals.keywordIntensity +
-          0.22 * introSignals.curiosityTrigger +
-          0.14 * (1 - introSignals.fillerDensity)
-        )
-        : clamp01(0.86 * candidate.auditScore + 0.08)
-      const openerQuality = clamp01(0.72 * instantHold + 0.28 * introClarity)
-      const selectionScore = clamp01(0.68 * confidence + 0.32 * openerQuality)
-      return { candidate, confidence, openerQuality, selectionScore }
+      const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
+      return {
+        candidate,
+        confidence: scored.confidence,
+        instantHold: scored.instantHold,
+        introClarity: scored.introClarity,
+        teaserTension: scored.teaserTension,
+        openerQuality: scored.openerQuality,
+        selectionScore: scored.selectionScore
+      }
     })
     .sort((a, b) => (
       b.selectionScore - a.selectionScore ||
@@ -8606,24 +8826,6 @@ const selectRenderableHookCandidate = ({
     signalStrength,
     thresholdOffset
   })
-  const strictWithInstantHold = ranked.find((entry) => (
-    entry.candidate.auditPassed &&
-    entry.confidence >= threshold &&
-    entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN
-  ))
-  const strict = strictWithInstantHold || ranked.find((entry) => (
-    entry.candidate.auditPassed &&
-    entry.confidence >= threshold
-  ))
-  if (strict) {
-    return {
-      candidate: strict.candidate,
-      confidence: strict.confidence,
-      threshold,
-      usedFallback: false,
-      reason: null
-    }
-  }
   const relaxedThreshold = clamp(
     threshold - (hasTranscript ? 0.08 : 0.16) - (signalStrength < 0.5 ? 0.04 : 0),
     0.4,
@@ -8634,23 +8836,78 @@ const selectRenderableHookCandidate = ({
     0.34,
     HOOK_STANDARD_INSTANT_HOLD_MIN
   )
+  const relaxedTeaserFloor = clamp(
+    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.26,
+    HOOK_STANDARD_TEASER_TENSION_MIN
+  )
+  const strictWithInstantHold = ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    entry.confidence >= threshold &&
+    entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
+    entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN
+  ))
+  const strict = strictWithInstantHold || ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    entry.confidence >= threshold
+  ))
+  if (strict) {
+    const debug = buildHookSelectionDebugPayload({
+      ranked,
+      selected: strict,
+      threshold,
+      relaxedThreshold,
+      relaxedInstantHoldFloor,
+      relaxedTeaserFloor,
+      selectionMode: 'strict',
+      hasTranscript,
+      signalStrength,
+      reason: null,
+      usedFallback: false
+    })
+    return {
+      candidate: strict.candidate,
+      confidence: strict.confidence,
+      threshold,
+      usedFallback: false,
+      reason: null,
+      debug
+    }
+  }
   const relaxed = ranked.find((entry) => (
     entry.confidence >= relaxedThreshold &&
     entry.openerQuality >= relaxedInstantHoldFloor &&
+    entry.teaserTension >= relaxedTeaserFloor &&
     (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
   )) || ranked.find((entry) => (
     entry.confidence >= relaxedThreshold &&
+    entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.06, 0.24) &&
     (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
   ))
   if (relaxed) {
+    const fallbackReason = hasTranscript
+      ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment with better first-3-second hold (no fixed timestamp).'
+      : 'Hook fallback selected from this video\'s strongest non-verbal peak with higher first-3-second hold due missing transcript context (no fixed timestamp).'
+    const debug = buildHookSelectionDebugPayload({
+      ranked,
+      selected: relaxed,
+      threshold,
+      relaxedThreshold,
+      relaxedInstantHoldFloor,
+      relaxedTeaserFloor,
+      selectionMode: 'relaxed',
+      hasTranscript,
+      signalStrength,
+      reason: fallbackReason,
+      usedFallback: true
+    })
     return {
       candidate: relaxed.candidate,
       confidence: relaxed.confidence,
       threshold,
       usedFallback: true,
-      reason: hasTranscript
-        ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment with better first-3-second hold (no fixed timestamp).'
-        : 'Hook fallback selected from this video\'s strongest non-verbal peak with higher first-3-second hold due missing transcript context (no fixed timestamp).'
+      reason: fallbackReason,
+      debug
     }
   }
   return null
@@ -10426,14 +10683,39 @@ const extractHookText = (start: number, end: number, transcriptCues: TranscriptC
 const scoreHookSpoilerRisk = (text: string) => {
   const normalized = String(text || '').trim().toLowerCase()
   if (!normalized) return 0
+  const tokens = normalized.split(/\s+/).filter(Boolean)
+  const tail = tokens.slice(Math.max(0, tokens.length - 14)).join(' ')
   let score = 0
   if (/\b(the answer is|here(?:'s| is) what happened|in the end|turns out|the result is|results are|exactly what happened)\b/.test(normalized)) score += 0.44
   if (/\b(i|we)\s+(won|lost|proved|showed|revealed)\b/.test(normalized)) score += 0.24
   if (/\b(finally|step by step|full breakdown|complete guide)\b/.test(normalized)) score += 0.2
+  if (/\b(this is why|that's why|this is how|that's how|so the answer|therefore)\b/.test(normalized)) score += 0.26
+  if (HOOK_RESOLUTION_PHRASES.some((phrase) => normalized.includes(phrase))) score += 0.18
+  if (HOOK_RESOLUTION_PHRASES.some((phrase) => tail.includes(phrase))) score += 0.15
   if (normalized.split(/\s+/).length >= 20) score += 0.12
   if (!/[?]/.test(normalized) && !/\b(wait|watch|before|until|next|later|soon|why|how|what happens)\b/.test(normalized)) {
     score += 0.1
   }
+  return clamp01(score)
+}
+
+const scoreHookEndingUnresolvedSignal = (text: string) => {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) return 0
+  const tokens = normalized.split(/\s+/).filter(Boolean)
+  if (!tokens.length) return 0
+  const tailTokens = tokens.slice(Math.max(0, tokens.length - 16))
+  const tail = tailTokens.join(' ')
+  let score = 0
+  if (/\?/.test(tail)) score += 0.22
+  if (/\b(wait|watch|before|until|next|later|soon|what happens|part 2|coming up)\b/.test(tail)) score += 0.12
+  if (HOOK_UNRESOLVED_PHRASES.some((phrase) => tail.includes(phrase))) score += 0.24
+  if (/\b(but|then|unless|except)\b/.test(tail)) score += 0.1
+  if (/(\.\.\.|…)$/.test(normalized)) score += 0.1
+  if (/(but|and|so|then|because)$/i.test(tailTokens[tailTokens.length - 1] || '')) score += 0.06
+  if (/\b(the answer is|this is why|that's why|this is how|that's how|we solved it|problem solved|in the end)\b/.test(tail)) score -= 0.26
+  if (/\b(finally|therefore|so basically)\b/.test(tail)) score -= 0.12
+  if (/^\s*(watch this|wait for it|coming up)\s*[.!?]?\s*$/.test(normalized)) score -= 0.2
   return clamp01(score)
 }
 
@@ -10447,8 +10729,9 @@ const scoreHookOpenLoopSignal = (text: string) => {
   if (/\b(result|truth|proof|finally)\b/.test(normalized)) score += 0.04
   if (/\b(but|then|and then|so)\b/.test(normalized)) score += 0.08
   if (/\b(i|you|we)\b/.test(normalized)) score += 0.05
+  score += 0.16 * scoreHookEndingUnresolvedSignal(normalized)
   const spoilerRisk = scoreHookSpoilerRisk(normalized)
-  return clamp01(score - 0.32 * spoilerRisk)
+  return clamp01(score - 0.42 * spoilerRisk)
 }
 
 const computeHookInstantHoldScore = ({
@@ -10582,45 +10865,52 @@ const runHookAudit = ({
     /\b(changed|reveal|result|mistake|warning|proof|won|lost)\b/.test(text) ||
     (!hasTranscriptSupport && nonVerbalClarity >= 0.64)
   )
+  const endingUnresolved = scoreHookEndingUnresolvedSignal(text)
   const spoilerRisk = scoreHookSpoilerRisk(text)
   const teaserStrength = clamp01(
-    0.44 * scoreHookOpenLoopSignal(text) +
-    0.3 * curiositySignal +
-    0.18 * transcriptSignals.curiosityTrigger +
-    0.08 * (1 - transcriptSignals.fillerDensity) -
-    0.34 * spoilerRisk
+    0.36 * scoreHookOpenLoopSignal(text) +
+    0.26 * curiositySignal +
+    0.2 * transcriptSignals.curiosityTrigger +
+    0.12 * endingUnresolved +
+    0.06 * (1 - transcriptSignals.fillerDensity) -
+    0.38 * spoilerRisk
   )
-  const teaserThreshold = hasTranscriptSupport ? 0.26 : 0.22
+  const teaserThreshold = hasTranscriptSupport ? 0.29 : 0.24
   const teaserPass = teaserStrength >= teaserThreshold
-  const spoilerLimit = hasTranscriptSupport ? 0.58 : 0.66
+  const highIntensityTeaserBySignal = emotionalSignal >= 0.76 && curiositySignal >= 0.58
+  const endingTensionPass = endingUnresolved >= (hasTranscriptSupport ? 0.24 : 0.18) || highIntensityTeaserBySignal
+  const spoilerLimit = hasTranscriptSupport ? 0.52 : 0.62
   const noOverReveal = spoilerRisk <= spoilerLimit
   const auditScore = hasTranscriptSupport
     ? clamp01(
-        0.28 * (understandable ? 1 : 0) +
-        0.22 * (curiosity ? 1 : 0) +
-        0.18 * (payoff ? 1 : 0) +
-        0.18 * teaserStrength +
-        0.1 * (1 - contextPenalty) +
-        0.08 * (1 - spoilerRisk)
+        0.24 * (understandable ? 1 : 0) +
+        0.2 * (curiosity ? 1 : 0) +
+        0.16 * (payoff ? 1 : 0) +
+        0.2 * teaserStrength +
+        0.1 * endingUnresolved +
+        0.06 * (1 - contextPenalty) +
+        0.04 * (1 - spoilerRisk)
       )
     : clamp01(
-        0.28 * (understandable ? 1 : 0) +
+        0.24 * (understandable ? 1 : 0) +
         0.2 * (curiosity ? 1 : 0) +
         0.18 * (payoff ? 1 : 0) +
         0.2 * teaserStrength +
-        0.08 * (1 - contextPenalty) +
-        0.06 * (1 - spoilerRisk)
+        0.1 * endingUnresolved +
+        0.05 * (1 - contextPenalty) +
+        0.03 * (1 - spoilerRisk)
       )
-  const passThreshold = hasTranscriptSupport ? 0.68 : 0.55
+  const passThreshold = hasTranscriptSupport ? 0.7 : 0.58
   const reasons: string[] = []
   if (!understandable) reasons.push(hasTranscriptSupport ? 'Not understandable in isolation' : 'Non-verbal hook beat is too context-dependent')
   if (!curiosity) reasons.push(hasTranscriptSupport ? 'Does not trigger curiosity strongly enough' : 'Visual/audio peak does not trigger enough curiosity')
   if (!payoff) reasons.push(hasTranscriptSupport ? 'Payoff signal is weak' : 'Peak moment does not imply a clear payoff')
   if (!teaserPass) reasons.push('Hook reveals too much or has weak teaser pressure')
+  if (!endingTensionPass) reasons.push('Ending resolves too cleanly; opener should end with stronger unresolved tension')
   if (!noOverReveal) reasons.push('Reveals too much too early; keep the opener as a curiosity teaser')
   if (contextPenalty > (hasTranscriptSupport ? 0.34 : 0.55)) reasons.push('Requires too much prior context')
   return {
-    passed: understandable && curiosity && payoff && teaserPass && noOverReveal && auditScore >= passThreshold,
+    passed: understandable && curiosity && payoff && teaserPass && endingTensionPass && noOverReveal && auditScore >= passThreshold,
     auditScore: Number(auditScore.toFixed(4)),
     understandable,
     curiosity,
@@ -10782,6 +11072,7 @@ const scoreHookFaceoffCandidate = ({
     0.6 * (window.curiosityTrigger ?? 0) +
     0.4 * (window.keywordIntensity ?? 0)
   ))
+  const teaserTension = scoreHookEndingUnresolvedSignal(candidate.text || '')
   const emotionalPull = computeEmotionalHookPull(start, end)
   const emotionalSpike = averageWindowMetric(windows, start, end, (window) => (
     0.48 * window.emotionIntensity +
@@ -10807,6 +11098,7 @@ const scoreHookFaceoffCandidate = ({
     weights.auditScore * candidate.auditScore * modeHookProfile.faceoffAuditMultiplier +
     weights.energy * energy +
     weights.curiosity * curiosity * modeHookProfile.faceoffCuriosityMultiplier +
+    0.03 * teaserTension +
     weights.emotionalSpike * emotionalSpike +
     0.08 * emotionalPull +
     0.08 * instantHold * modeHookProfile.faceoffInstantHoldMultiplier +
@@ -10906,6 +11198,7 @@ const pickTopHookCandidates = ({
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
       const hookText = extractHookText(aligned.start, aligned.end, transcriptCues)
       const openLoopSignal = clamp01(scoreHookOpenLoopSignal(hookText) * emotionalTuning.openLoopBoost)
+      const unresolvedEndingSignal = scoreHookEndingUnresolvedSignal(hookText)
       const curiosityAcceleration = clamp01(
         averageWindowMetric(windows, aligned.start, aligned.start + durationSecondsActual * 0.45, (window) => (window.curiosityTrigger ?? 0)) * 0.55 +
         averageWindowMetric(windows, aligned.start + durationSecondsActual * 0.55, aligned.end, (window) => (window.hookScore ?? window.score)) * 0.45
@@ -10938,6 +11231,7 @@ const pickTopHookCandidates = ({
         0.09 * emotionalHookPull +
         0.08 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier +
         0.05 * openLoopSignal +
+        0.03 * unresolvedEndingSignal +
         0.05 * teaserReserve * modeHookProfile.teaserReserveMultiplier +
         0.03 * audit.teaserStrength +
         0.1 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
@@ -20883,6 +21177,8 @@ const processJob = async (
     let selectedJudge: RetentionJudgeReport | null = null
     let selectedHook: HookCandidate | null = null
     let selectedHookSelectionSource: 'auto' | 'user_selected' | 'fallback' = 'auto'
+    let hookDebugForAnalysis: Record<string, any> | null =
+      ((job.analysis as any)?.hook_debug as Record<string, any>) || null
     let selectedPatternInterruptCount = 0
     let selectedPatternInterruptDensity = 0
     let selectedBoredomRemovalRatio = 0
@@ -21087,6 +21383,27 @@ const processJob = async (
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
       if (!resolvedHookDecision) {
+        const fallbackThreshold = resolveHookScoreThreshold({
+          aggressionLevel,
+          hasTranscript: hasTranscriptSignals,
+          signalStrength: contentSignalStrength,
+          thresholdOffset: hookThresholdOffset
+        })
+        const fallbackRelaxedThreshold = clamp(
+          fallbackThreshold - (hasTranscriptSignals ? 0.08 : 0.16) - (contentSignalStrength < 0.5 ? 0.04 : 0),
+          0.4,
+          fallbackThreshold
+        )
+        const fallbackRelaxedInstantHoldFloor = clamp(
+          HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscriptSignals ? 0.08 : 0.14) - (contentSignalStrength < 0.5 ? 0.05 : 0),
+          0.34,
+          HOOK_STANDARD_INSTANT_HOLD_MIN
+        )
+        const fallbackRelaxedTeaserFloor = clamp(
+          HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (contentSignalStrength < 0.5 ? 0.04 : 0),
+          0.26,
+          HOOK_STANDARD_TEASER_TENSION_MIN
+        )
         const fallbackHook = buildFallbackHookCandidateFromStorySegments({
           segments: storySegments,
           windows: editPlan?.engagementWindows ?? [],
@@ -21108,17 +21425,61 @@ const processJob = async (
           reason: 'Fallback hook generated from this video\'s strongest high-energy moment with best available first-3-second hold due weak candidate pool (no fixed timestamp).',
           synthetic: true
         }
+        const fallbackCandidatesForDebug = [
+          fallbackHook,
+          ...hookCandidates.filter((candidate) => (
+            Math.abs(candidate.start - fallbackHook.start) > 0.01 ||
+            Math.abs(candidate.duration - fallbackHook.duration) > 0.01
+          ))
+        ]
+        const fallbackRanked: HookSelectionRankedEntry[] = fallbackCandidatesForDebug
+          .map((candidate) => {
+            const scored = scoreRenderableHookCandidateSignals({
+              candidate,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            return {
+              candidate,
+              confidence: scored.confidence,
+              instantHold: scored.instantHold,
+              introClarity: scored.introClarity,
+              teaserTension: scored.teaserTension,
+              openerQuality: scored.openerQuality,
+              selectionScore: scored.selectionScore
+            }
+          })
+          .sort((a, b) => (
+            b.selectionScore - a.selectionScore ||
+            b.confidence - a.confidence ||
+            b.candidate.score - a.candidate.score ||
+            a.candidate.start - b.candidate.start
+          ))
+        const fallbackSelectedEntry = fallbackRanked.find((entry) => (
+          Math.abs(entry.candidate.start - fallbackHook.start) < 0.01 &&
+          Math.abs(entry.candidate.duration - fallbackHook.duration) < 0.01
+        )) || fallbackRanked[0]
+        const fallbackDebug = fallbackSelectedEntry
+          ? buildHookSelectionDebugPayload({
+            ranked: fallbackRanked,
+            selected: fallbackSelectedEntry,
+            threshold: fallbackThreshold,
+            relaxedThreshold: fallbackRelaxedThreshold,
+            relaxedInstantHoldFloor: fallbackRelaxedInstantHoldFloor,
+            relaxedTeaserFloor: fallbackRelaxedTeaserFloor,
+            selectionMode: 'fallback',
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength,
+            reason: fallbackHook.reason,
+            usedFallback: true
+          })
+          : null
         resolvedHookDecision = {
           candidate: fallbackHook,
           confidence: getHookCandidateConfidence(fallbackHook),
-          threshold: resolveHookScoreThreshold({
-            aggressionLevel,
-            hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength,
-            thresholdOffset: hookThresholdOffset
-          }),
+          threshold: fallbackThreshold,
           usedFallback: true,
-          reason: fallbackHook.reason
+          reason: fallbackHook.reason,
+          debug: fallbackDebug
         }
         optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected this video\'s highest-impact timeline peak.')
       }
@@ -21180,6 +21541,34 @@ const processJob = async (
         : resolvedHookDecision.usedFallback
           ? 'fallback'
           : 'auto'
+      const initialHookSignals = scoreRenderableHookCandidateSignals({
+        candidate: initialHook,
+        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+      })
+      const resolvedHookDebug = resolvedHookDecision.debug
+        ? {
+          ...resolvedHookDecision.debug,
+          selected: {
+            ...resolvedHookDecision.debug.selected,
+            start: Number(initialHook.start.toFixed(3)),
+            end: Number((initialHook.start + initialHook.duration).toFixed(3)),
+            duration: Number(initialHook.duration.toFixed(3)),
+            score: Number(initialHook.score.toFixed(4)),
+            auditScore: Number(initialHook.auditScore.toFixed(4)),
+            auditPassed: Boolean(initialHook.auditPassed),
+            confidence: Number(initialHookSignals.confidence.toFixed(4)),
+            instantHold: Number(initialHookSignals.instantHold.toFixed(4)),
+            introClarity: Number(initialHookSignals.introClarity.toFixed(4)),
+            teaserTension: Number(initialHookSignals.teaserTension.toFixed(4)),
+            openerQuality: Number(initialHookSignals.openerQuality.toFixed(4)),
+            selectionScore: Number(initialHookSignals.selectionScore.toFixed(4))
+          },
+          hookSelectionMode: hookSelectionModeForRender,
+          hookSelectionSource: selectedHookSelectionSource,
+          generatedAt: toIsoNow()
+        }
+        : null
+      if (resolvedHookDebug) hookDebugForAnalysis = resolvedHookDebug
       if (
         Math.abs(initialHook.duration - autoHookSource.duration) > 0.001 ||
         Math.abs(initialHook.start - autoHookSource.start) > 0.001
@@ -21216,12 +21605,13 @@ const processJob = async (
         completedAt: toIsoNow(),
         meta: {
           selectedHook: initialHook,
-          confidence: Number(resolvedHookDecision.confidence.toFixed(4)),
+          confidence: Number(initialHookSignals.confidence.toFixed(4)),
           threshold: resolvedHookDecision.threshold,
           usedFallback: resolvedHookDecision.usedFallback,
           reason: resolvedHookDecision.reason,
           hookSelectionMode: hookSelectionModeForRender,
           hookSelectionSource: selectedHookSelectionSource,
+          hookDebug: resolvedHookDebug,
           hasTranscriptSignals,
           contentSignalStrength: Number(contentSignalStrength.toFixed(4))
         }
@@ -22749,6 +23139,42 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       editorMode: editorModeForRender
     })
+    if (selectedHook) {
+      const finalHookSignals = scoreRenderableHookCandidateSignals({
+        candidate: selectedHook,
+        windows: engagementWindowsForAnalysis
+      })
+      const existingHookDebug = hookDebugForAnalysis && typeof hookDebugForAnalysis === 'object'
+        ? hookDebugForAnalysis
+        : {}
+      hookDebugForAnalysis = {
+        ...existingHookDebug,
+        selected: {
+          ...(existingHookDebug as any)?.selected,
+          start: Number(selectedHook.start.toFixed(3)),
+          end: Number((selectedHook.start + selectedHook.duration).toFixed(3)),
+          duration: Number(selectedHook.duration.toFixed(3)),
+          score: Number(selectedHook.score.toFixed(4)),
+          auditScore: Number(selectedHook.auditScore.toFixed(4)),
+          auditPassed: Boolean(selectedHook.auditPassed),
+          confidence: Number(finalHookSignals.confidence.toFixed(4)),
+          instantHold: Number(finalHookSignals.instantHold.toFixed(4)),
+          introClarity: Number(finalHookSignals.introClarity.toFixed(4)),
+          teaserTension: Number(finalHookSignals.teaserTension.toFixed(4)),
+          openerQuality: Number(finalHookSignals.openerQuality.toFixed(4)),
+          selectionScore: Number(finalHookSignals.selectionScore.toFixed(4))
+        },
+        why: String(
+          (existingHookDebug as any)?.why ||
+          selectedHook.reason ||
+          'Hook selected by retention scorer.'
+        ),
+        hookSelectionMode: hookSelectionModeForRender,
+        hookSelectionSource: selectedHookSelectionSource,
+        finalStrategy: selectedStrategy,
+        finalUpdatedAt: toIsoNow()
+      }
+    }
 
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
@@ -22780,6 +23206,7 @@ const processJob = async (
         hookSelectionMode: hookSelectionModeForRender,
         hook_selection_mode: hookSelectionModeForRender,
         hook_selection_source: selectedHookSelectionSource,
+        hook_debug: hookDebugForAnalysis,
         selected_strategy: selectedStrategy,
         retention_attempts: retentionAttempts,
         retention_judge: selectedJudge,
@@ -23898,6 +24325,9 @@ router.get('/:id', async (req: any, res) => {
         { key: 'ready', label: 'Ready' }
       ]
     }
+    const jobAnalysis = (job.analysis as any) || {}
+    jobPayload.hookDebug = jobAnalysis?.hook_debug ?? null
+    jobPayload.hookWhy = jobAnalysis?.hook_debug?.why ?? null
     const outputPaths = getOutputPathsForJob(job)
     if (job.status === 'completed' && outputPaths.length > 0) {
       const resolvedUrls: string[] = []
