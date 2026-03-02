@@ -2349,6 +2349,10 @@ const resolveHookCandidateTarget = (durationSeconds: number) => {
   if (minutes >= 10) return 24
   return 20
 }
+const resolveLongFormMinHookSourceStart = (durationSeconds: number) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 8
+  return Number(clamp(durationSeconds * 0.08, 8, 24).toFixed(3))
+}
 const resolveClipCandidateTarget = ({
   durationSeconds,
   editorMode,
@@ -8774,6 +8778,73 @@ const buildHookSelectionDebugPayload = ({
   }
 }
 
+const selectLongFormDisplacedHookCandidate = ({
+  primary,
+  candidates,
+  windows,
+  durationSeconds
+}: {
+  primary: HookCandidate
+  candidates: HookCandidate[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+}) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return null
+  const minSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
+  if (primary.start >= minSourceStart) return null
+  const unique: HookCandidate[] = []
+  for (const candidate of [primary, ...candidates]) {
+    const duplicate = unique.some((entry) => (
+      Math.abs(entry.start - candidate.start) < 0.01 &&
+      Math.abs(entry.duration - candidate.duration) < 0.01
+    ))
+    if (!duplicate) unique.push(candidate)
+  }
+  const ranked: HookSelectionRankedEntry[] = unique
+    .map((candidate) => {
+      const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
+      return {
+        candidate,
+        confidence: scored.confidence,
+        instantHold: scored.instantHold,
+        introClarity: scored.introClarity,
+        teaserTension: scored.teaserTension,
+        openerQuality: scored.openerQuality,
+        selectionScore: scored.selectionScore
+      }
+    })
+    .sort((a, b) => (
+      b.selectionScore - a.selectionScore ||
+      b.confidence - a.confidence ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
+    ))
+  const primaryEntry = ranked.find((entry) => (
+    Math.abs(entry.candidate.start - primary.start) < 0.01 &&
+    Math.abs(entry.candidate.duration - primary.duration) < 0.01
+  )) || ranked[0]
+  if (!primaryEntry) return null
+  const minSelectionFloor = Math.max(0.42, primaryEntry.selectionScore - 0.08)
+  const displaced = ranked.find((entry) => (
+    entry.candidate.start >= minSourceStart &&
+    entry.selectionScore >= minSelectionFloor &&
+    (entry.candidate.auditPassed || !primary.auditPassed)
+  )) || ranked.find((entry) => (
+    entry.candidate.start >= minSourceStart &&
+    entry.selectionScore >= Math.max(0.38, primaryEntry.selectionScore - 0.12)
+  ))
+  if (!displaced) return null
+  const displacementSeconds = displaced.candidate.start - primary.start
+  if (displacementSeconds < 4) return null
+  return {
+    hook: displaced.candidate,
+    minSourceStart: Number(minSourceStart.toFixed(3)),
+    fromStart: Number(primary.start.toFixed(3)),
+    toStart: Number(displaced.candidate.start.toFixed(3)),
+    reason: `Long-form hook relocation applied: moved source hook from ${primary.start.toFixed(1)}s to ${displaced.candidate.start.toFixed(1)}s to avoid generic intro and increase opener novelty.`
+  }
+}
+
 const selectRenderableHookCandidate = ({
   candidates,
   aggressionLevel,
@@ -11141,6 +11212,9 @@ const pickTopHookCandidates = ({
   })
   const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
   const hookCandidateTarget = resolveHookCandidateTarget(durationSeconds)
+  const longFormMinHookSourceStart = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
+    ? resolveLongFormMinHookSourceStart(durationSeconds)
+    : 0
   const dynamicBaseline = computeHookDynamicBaseline(windows)
   const starts = new Set<number>()
   segments.forEach((segment) => starts.add(Number(segment.start.toFixed(2))))
@@ -11222,6 +11296,9 @@ const pickTopHookCandidates = ({
         windows
       })
       const teaserReserve = clamp01(1 - audit.spoilerRisk)
+      const longFormStartPenalty = longFormMinHookSourceStart > 0
+        ? clamp01((longFormMinHookSourceStart - aligned.start) / Math.max(0.5, longFormMinHookSourceStart))
+        : 0
       const totalScore = clamp01(
         0.14 * baseHookScore +
         0.11 * speechImpact +
@@ -11240,6 +11317,7 @@ const pickTopHookCandidates = ({
         0.11 * audit.auditScore * modeHookProfile.auditMultiplier +
         0.06 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
         0.04 * dynamicLift.peakDensity -
+        0.1 * longFormStartPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier +
         modeHookProfile.baseBias
@@ -21532,7 +21610,7 @@ const processJob = async (
         optimizationNotes.push('Auto hook mode enabled: editor-selected hook used for opening.')
       }
       const autoHookSource = preferredHookCandidate || resolvedHookDecision.candidate
-      const initialHook = enforceAutoHookDurationRange({
+      let initialHook = enforceAutoHookDurationRange({
         candidate: autoHookSource,
         durationSeconds
       })
@@ -21541,11 +21619,33 @@ const processJob = async (
         : resolvedHookDecision.usedFallback
           ? 'fallback'
           : 'auto'
-      const initialHookSignals = scoreRenderableHookCandidateSignals({
+      const relocationCandidates = [
+        initialHook,
+        ...hookCandidates.filter((candidate) => (
+          Math.abs(candidate.start - initialHook.start) > 0.01 ||
+          Math.abs(candidate.duration - initialHook.duration) > 0.01
+        ))
+      ]
+      const longFormRelocation = selectedHookSelectionSource === 'user_selected'
+        ? null
+        : selectLongFormDisplacedHookCandidate({
+          primary: initialHook,
+          candidates: relocationCandidates,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+          durationSeconds
+        })
+      if (longFormRelocation) {
+        initialHook = enforceAutoHookDurationRange({
+          candidate: longFormRelocation.hook,
+          durationSeconds
+        })
+        optimizationNotes.push(longFormRelocation.reason)
+      }
+      let initialHookSignals = scoreRenderableHookCandidateSignals({
         candidate: initialHook,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
-      const resolvedHookDebug = resolvedHookDecision.debug
+      let resolvedHookDebug = resolvedHookDecision.debug
         ? {
           ...resolvedHookDecision.debug,
           selected: {
@@ -21568,6 +21668,15 @@ const processJob = async (
           generatedAt: toIsoNow()
         }
         : null
+      if (resolvedHookDebug && longFormRelocation) {
+        ;(resolvedHookDebug as any).longFormRelocation = {
+          applied: true,
+          minSourceStart: longFormRelocation.minSourceStart,
+          fromStart: longFormRelocation.fromStart,
+          toStart: longFormRelocation.toStart,
+          reason: longFormRelocation.reason
+        }
+      }
       if (resolvedHookDebug) hookDebugForAnalysis = resolvedHookDebug
       if (
         Math.abs(initialHook.duration - autoHookSource.duration) > 0.001 ||
@@ -21582,9 +21691,12 @@ const processJob = async (
       }
       // User-selected hooks must always be stitched to the opening so the
       // chosen intro is guaranteed to lead the final edit.
+      const forceLongFormHookMove =
+        durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
+        selectedHookSelectionSource !== 'user_selected'
       const shouldMoveHookForRender =
         !options.onlyCuts &&
-        (options.autoHookMove || selectedHookSelectionSource === 'user_selected')
+        (options.autoHookMove || selectedHookSelectionSource === 'user_selected' || forceLongFormHookMove)
       if (preferredHookCandidate) {
         optimizationNotes.push(
           `User-selected hook pinned to opening (${formatHookRange(
@@ -21595,7 +21707,7 @@ const processJob = async (
       }
       const orderedHookCandidates = [
         initialHook,
-        ...hookCandidates.filter((candidate) => (
+        ...relocationCandidates.filter((candidate) => (
           Math.abs(candidate.start - initialHook.start) > 0.01 ||
           Math.abs(candidate.duration - initialHook.duration) > 0.01
         ))
