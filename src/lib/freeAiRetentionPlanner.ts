@@ -80,11 +80,29 @@ export type RetentionTitleSuggestion = {
 }
 
 export type PredictionConfidenceLevel = 'low' | 'medium' | 'high'
+export type PeakMomentTrait = 'surprise' | 'intrigue' | 'funny' | 'crazy'
+export type HookOutputFormat = 'short-form' | 'long-form'
+
+export type SelectedPeakMoment = {
+  description: string
+  rating: number
+  trait: PeakMomentTrait
+  reason: string
+}
+
+export type HookBlueprint = {
+  format: HookOutputFormat
+  timeline: string[]
+  suggestedEnhancements: string[]
+  retentionReason: string
+}
 
 export type FreeAiHookPlan = {
   provider: 'ruthless_retention_prompt' | 'heuristic'
   model: string | null
   selectedHook: HookCandidate | null
+  selectedPeakMoment: SelectedPeakMoment | null
+  hookBlueprint: HookBlueprint | null
   rankedHooks: HookCandidate[]
   pacingAdjustments: PacingAdjustment[]
   hookComparison: HookComparison[]
@@ -110,6 +128,8 @@ type PlannerInput = {
   frameScan: PlannerFrameScan
   transcriptSegments: PlannerTranscriptSegment[]
   transcriptExcerpt: string
+  editorMode?: string | null
+  modePlaybookPrompt?: string | null
 }
 
 const HYPE_WORDS = [
@@ -209,6 +229,27 @@ Required output fields for every full-video analysis:
 - final_summary (one sentence: "This edit prioritizes 80%+ average retention over length - viewers are far more likely to finish this than the original.")
 
 Output machine-parseable JSON only.`
+
+const UNIVERSAL_HOOK_FRAMEWORK = `You are an expert video editor specializing in high-retention hooks for both short-form (15-60 seconds: TikTok, Instagram Reels, YouTube Shorts) and long-form (8-60+ minutes: YouTube main videos).
+Mission: create a cliffhanger/teaser opening around the single most surprising, intriguing, funniest, or craziest moment without fully revealing the payoff.
+
+Core Rules for Every Hook:
+1) Identify the #1 peak moment in the full video and rate it 1-10 for surprise/intrigue/funny/crazy with a short reason.
+2) Tease at least 8 seconds from or immediately leading into that moment with amplified tension (quick cuts, slow-motion, zoom-ins, dramatic angles, or sound design).
+3) Build suspense and end the hook at maximum curiosity (freeze-frame, cut to black, music sting, or "Wait for it..." language).
+4) Use subtle enhancements: on-screen text overlays, voiceover hints, elevated audio/SFX, and color grading for dramatic contrast.
+5) Optimize for retention: short-form should maximize completion/loop rate; long-form should protect first 30-60s survival and reduce early drop-off.
+
+Format-Specific Adaptation:
+- Short-form: hook must fire in 1-3s, run 3-8s opener structure, use aggressive visual pattern interrupts, then end with a re-hook/CTA.
+- Long-form: hook should run 10-20s (ideal 10-15s), open with 3-5s attention spike, then 8+ second peak-moment tease, and end with a "stick around" story promise.
+
+Required final hook format:
+- Selected peak moment: [brief description] - Rated [X/10] for [surprise|intrigue|funny|crazy]. Why chosen: [reason].
+- Format: Short-form OR Long-form.
+- Hook description & timeline: [second-by-second plan].
+- Suggested enhancements: [music, text overlays, transitions, voiceover lines].
+- Why this hook will boost retention: [platform psychology reason].`
 
 const normalizeText = (value: string) =>
   String(value || '')
@@ -1688,16 +1729,108 @@ const toAIDurationHook = (candidate: HookCandidate, duration: number, targetSeco
   return resolved
 }
 
+const resolveHookOutputFormat = ({
+  mode,
+  duration
+}: {
+  mode: PlannerMode
+  duration: number
+}): HookOutputFormat => {
+  if (duration >= 8 * 60) return 'long-form'
+  if (duration <= 60) return 'short-form'
+  return mode === 'vertical' ? 'short-form' : 'long-form'
+}
+
+const resolvePeakMomentTrait = (candidate: HookCandidate): PeakMomentTrait => {
+  const transcript = normalizeText(candidate.transcript || '')
+  if (/\b(lol|funny|laugh|hilarious|joke|comedy)\b/.test(transcript)) return 'funny'
+  if (candidate.scores.motion >= 0.82 || /\b(crazy|wild|insane|wtf|no way)\b/.test(transcript)) return 'crazy'
+  if (candidate.scores.audio >= 0.72 || /\b(shock|shocking|unexpected|unbelievable)\b/.test(transcript)) return 'surprise'
+  return 'intrigue'
+}
+
+const buildSelectedPeakMoment = (candidate: HookCandidate | null): SelectedPeakMoment | null => {
+  if (!candidate) return null
+  const trait = resolvePeakMomentTrait(candidate)
+  const rating = Math.round(clamp(candidate.scores.combined * 10, 1, 10))
+  const description = clipText(
+    candidate.transcript ||
+      `High-intensity moment around ${candidate.start.toFixed(1)}s-${candidate.end.toFixed(1)}s.`,
+    220
+  )
+  const reason = clipText(
+    `Chosen because it scored highest on early hook pressure: motion ${Math.round(candidate.scores.motion * 100)}%, audio ${Math.round(candidate.scores.audio * 100)}%, curiosity ${Math.round(candidate.scores.sentiment * 100)}%.`,
+    220
+  )
+  return { description, rating, trait, reason }
+}
+
+const buildHookBlueprint = ({
+  format,
+  selectedHook,
+  selectedPeakMoment
+}: {
+  format: HookOutputFormat
+  selectedHook: HookCandidate | null
+  selectedPeakMoment: SelectedPeakMoment | null
+}): HookBlueprint | null => {
+  if (!selectedHook || !selectedPeakMoment) return null
+  const hookStart = Number(selectedHook.start || 0).toFixed(1)
+  const hookEnd = Number(selectedHook.end || selectedHook.start + 8).toFixed(1)
+
+  if (format === 'short-form') {
+    return {
+      format,
+      timeline: [
+        `0.0-1.2s: Start mid-action from ${hookStart}s-${hookEnd}s with a bold text punch tied to the peak moment.`,
+        '1.2-4.6s: Aggressive quick-cut build with zoom-ins, pacing hits, and rising tension audio.',
+        '4.6-8.2s: Extend tease into the highest-intensity beat, then freeze right before payoff and cut to story with re-hook copy.'
+      ],
+      suggestedEnhancements: [
+        'Music: high-energy riser with a hard stop at the cliffhanger frame.',
+        'Text overlays: "This changed everything..." then "Wait for it..."',
+        'Transitions: speed ramps + punch-in zooms at every new beat.',
+        'Voiceover line: "This gets way crazier in the next seconds."'
+      ],
+      retentionReason:
+        'This structure front-loads pattern interrupts in the first second to stop scroll, then withholds resolution to drive completion and rewatch loops.'
+    }
+  }
+
+  return {
+    format,
+    timeline: [
+      '0.0-4.0s: Open with strongest visual/audio claim from the peak moment and immediate stakes.',
+      `4.0-14.0s: Tease 8+ seconds around ${hookStart}s-${hookEnd}s with selective fast cuts and tension-focused framing.`,
+      '14.0-18.0s: Hold on a cliffhanger beat and promise full payoff later in the video before moving into main intro.'
+    ],
+    suggestedEnhancements: [
+      'Music: cinematic tension bed with a sting at the cliffhanger cut.',
+      'Text overlays: one bold promise line, then one curiosity gap line.',
+      'Transitions: controlled zooms, cut-ins, and one freeze-frame before reveal.',
+      'Voiceover line: "Stay to see how this actually ends."'
+    ],
+    retentionReason:
+      'This validates value in the first 3-5 seconds, creates an open loop in the first 15-20 seconds, and increases first-minute survival by delaying payoff.'
+  }
+}
+
 const buildPrompts = ({
   mode,
   duration,
+  format,
   transcriptExcerpt,
+  editorMode,
+  modePlaybookPrompt,
   candidates,
   windows
 }: {
   mode: PlannerMode
   duration: number
+  format: HookOutputFormat
   transcriptExcerpt: string
+  editorMode?: string | null
+  modePlaybookPrompt?: string | null
   candidates: HookCandidate[]
   windows: TimelineWindow[]
 }) => {
@@ -1716,25 +1849,33 @@ const buildPrompts = ({
       filler_density: window.fillerDensity
     }))
   )
-  const context = `Context: mode=${mode}, duration_seconds=${duration.toFixed(2)}, transcript_excerpt="${clipText(transcriptExcerpt, 320)}".
+  const modePromptContext = modePlaybookPrompt ? `\nModePlaybookPrompt=${JSON.stringify(modePlaybookPrompt)}` : ''
+  const context = `Context: mode=${mode}, format=${format}, editor_mode=${String(editorMode || 'auto')}, duration_seconds=${duration.toFixed(2)}, transcript_excerpt="${clipText(transcriptExcerpt, 320)}".
 HookCandidates=${candidateContext}
-TimelineWindows=${timelineContext}`
+TimelineWindows=${timelineContext}${modePromptContext}`
 
   const eligibilityPrompt = `${STRICT_RETENTION_PREFIX}
 ${RUTHLESS_RETENTION_PLAYBOOK}
+${UNIVERSAL_HOOK_FRAMEWORK}
 Identify which candidate IDs are viable dopamine-trap openers (first 3-15s in final timeline). Return JSON only:
 {"eligible_ids":["id1","id2"],"notes":["short reason"]}.
 ${context}`
 
   const rankingPrompt = `${STRICT_RETENTION_PREFIX}
 ${RUTHLESS_RETENTION_PLAYBOOK}
+${UNIVERSAL_HOOK_FRAMEWORK}
 Rank these hook candidates by predicted retention as opener. Select exactly one 8-second opener and compare it against 2-3 runner-ups.
-Explain why the selected opener beats alternatives in retention terms.
+Explain why the selected opener beats alternatives in retention terms and output the hook in the required final format.
 Return JSON only:
 {
   "ranked_ids":["id1","id2","id3"],
   "selected_id":"id1",
   "hook_cut":{"start":0.0,"end":8.0},
+  "selected_peak_moment":{"description":"...", "rating_1_to_10":9, "trait":"surprise", "why_chosen":"..."},
+  "format":"short-form",
+  "hook_description_timeline":["0-2s ...","2-10s ...","..."],
+  "suggested_enhancements":["music ...","text ...","transition ...","voiceover ..."],
+  "why_this_hook_boosts_retention":"...",
   "selected_reason":"Selected this 8-second opener over alternatives because [highest early retention prediction / strongest surprise element / continuation pressure].",
   "runner_ups":[
     {"id":"id2","reason":"why weaker than winner","predicted_retention_lift_percent":84},
@@ -1745,6 +1886,7 @@ ${context}`
 
   const pacingPrompt = `${STRICT_RETENTION_PREFIX}
 ${RUTHLESS_RETENTION_PLAYBOOK}
+${UNIVERSAL_HOOK_FRAMEWORK}
 Run full-video ruthless retention analysis and output cut/pacing/insight/title plan.
 If any segment predicts >15-20% drop-off, cut or compress it.
 Prefer shorter final runtime when it increases average retention.
@@ -1802,6 +1944,7 @@ const estimateFallbackRetention = ({
 export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise<FreeAiHookPlan> => {
   const mode = input.mode
   const duration = Math.max(1, Number(input.metadata.duration || 0))
+  const format = resolveHookOutputFormat({ mode, duration })
   const safeFps = clamp(
     Number.isFinite(Number(input.metadata.fps)) ? Number(input.metadata.fps) : FRAME_ALIGNMENT_FALLBACK_FPS,
     12,
@@ -1832,12 +1975,17 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   const prompts = buildPrompts({
     mode,
     duration,
+    format,
     transcriptExcerpt: input.transcriptExcerpt,
+    editorMode: input.editorMode,
+    modePlaybookPrompt: input.modePlaybookPrompt,
     candidates,
     windows
   })
 
   const notes: string[] = ['ruthless_retention_prompt:deterministic_local_planner']
+  notes.push(`hook_format:${format}`)
+  if (input.editorMode) notes.push(`editor_mode:${String(input.editorMode).toLowerCase()}`)
   const provider: FreeAiHookPlan['provider'] = 'ruthless_retention_prompt'
   const model: string | null = null
 
@@ -1874,6 +2022,12 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       ? strongestEarlyCandidate
       : strongest
   const selected = selectedCandidate ? toAIDurationHook(selectedCandidate, duration, 8) : null
+  const selectedPeakMoment = buildSelectedPeakMoment(selected)
+  const hookBlueprint = buildHookBlueprint({
+    format,
+    selectedHook: selected,
+    selectedPeakMoment
+  })
   const pacingAdjustments = buildHeuristicPacingAdjustments({
     duration,
     transcriptSignals,
@@ -1910,6 +2064,8 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   return {
     provider,
     model,
+    selectedPeakMoment,
+    hookBlueprint,
     selectedHook: selected
       ? {
           ...selected,
@@ -1918,7 +2074,7 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
               ? `Selected this 8-second opener over alternatives because it anchors at timeline start while preserving comparable retention strength (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
               : selectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
               ? `Selected this 8-second opener over alternatives because its early-timeline placement preserves first-3s hold while matching top retention score (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.`
+              : `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),

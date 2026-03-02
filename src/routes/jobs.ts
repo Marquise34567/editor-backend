@@ -1306,6 +1306,16 @@ type EditPlan = {
     pacingAdjustmentCount: number
     retentionProtectionChanges: string[]
     notes: string[]
+    format?: 'short-form' | 'long-form' | null
+    selectedPeakMoment?: {
+      description: string
+      rating: number
+      trait: 'surprise' | 'intrigue' | 'funny' | 'crazy'
+      reason: string
+    } | null
+    hookDescriptionTimeline?: string[]
+    suggestedEnhancements?: string[]
+    retentionRationale?: string | null
   }
 }
 type EditOptions = {
@@ -1758,12 +1768,39 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
   ultra: { target: 79, floor: 68 },
   'retention-king': { target: 82, floor: 70 }
 }
+const UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT = `You are an expert video editor specializing in high-retention hooks for short-form (15-60 seconds) and long-form (8-60+ minutes).
+Mission: create a cliffhanger/teaser opener built around the single most surprising, intriguing, funniest, or craziest moment without fully revealing the payoff.
+
+Core hook rules:
+1) Select the #1 peak moment and rate it 1-10 for surprise/intrigue/funny/crazy with a short reason.
+2) Tease at least 8 seconds from or immediately leading into that moment.
+3) End on maximum curiosity using freeze-frame/cut-to-black/music sting/"Wait for it..." style.
+4) Add subtle enhancements: text overlays, voiceover hints, elevated audio/SFX, and contrast-driven grading.
+5) Optimize retention psychology: short-form for completion/loops; long-form for first 30-60s survival.
+
+Format adaptation:
+- Short-form: 3-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
+- Long-form: 10-20s opener (ideal 10-15s), 3-5s attention spike, then 8+ second teaser, then story promise.
+
+Required output framing:
+- Selected peak moment [description + score + why]
+- Format [Short-form or Long-form]
+- Hook timeline [second-by-second]
+- Suggested enhancements [music/text/transitions/voiceover]
+- Why this boosts retention [platform psychology]`
+const STANDARD_MODE_PLAYBOOK_PROMPT = `${UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT}
+
+Standard mode profile:
+- Balanced pacing and clarity, but never weak intros.
+- Hook must still behave as a teaser-first cliffhanger and preserve payoff sequencing.`
 const ULTRA_MODE_PLAYBOOK_PROMPT = `Dynamic Binge Editor Prompt
+${UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT}
 Step 1: Analyze content type quickly, detect weak spots, then adapt edits dynamically.
 Step 2: Ruthless cuts, no dead air, lock an 8-second opener window at 0:00 (target 6-8 seconds), make the first 3 seconds impossible to scroll past, keep the opener teaser-first without revealing the full payoff, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
 Step 3: Apply type-specific adaptation (challenge, story, tutorial, reaction, list, gaming, ASMR, humor, documentary, hybrid) with pacing and visual pattern interrupts tuned to that type.
 Universal boosters: bold timed subtitles, constant visual/audio changes, re-hooks, and test for any >20% drop-off risk windows.`
 const RETENTION_KING_PLAYBOOK_PROMPT = `Retention Engineer Prompt
+${UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT}
 Objective: maximize watch time, completion rate, and emotional momentum while eliminating drop-off.
 Rules: opener hook must run 6-8 seconds at the beginning, with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay, while still withholding the full payoff as a teaser; remove filler/dead air/repetition; compress aggressively without losing clarity.
 Every 5-12 seconds introduce a pacing shift, visual change, pattern interrupt, or tension spike.
@@ -1805,8 +1842,10 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
   return {
     id: 'standard',
     label: 'Standard',
-    prompt: '',
-    notes: []
+    prompt: STANDARD_MODE_PLAYBOOK_PROMPT,
+    notes: [
+      'Standard mode playbook active: universal high-retention hook framework enabled.'
+    ]
   }
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
@@ -13673,6 +13712,7 @@ const buildEditPlan = async (
       videoWidth: resolvedWidth,
       videoHeight: resolvedHeight
     })
+    const plannerModePlaybook = resolveEditorModePlaybook(options.editorMode ?? null)
 
     const freeAiPlan = await planRetentionEditsWithFreeAi({
       mode: inferredRenderMode,
@@ -13684,7 +13724,9 @@ const buildEditPlan = async (
       },
       frameScan: plannerFrameScan,
       transcriptSegments: plannerTranscriptSegments,
-      transcriptExcerpt: plannerTranscriptExcerpt
+      transcriptExcerpt: plannerTranscriptExcerpt,
+      editorMode: options.editorMode ?? null,
+      modePlaybookPrompt: plannerModePlaybook.prompt || null
     })
 
     const plannerAdjustments = freeAiPlan.pacingAdjustments.map((adjustment) => ({
@@ -13752,7 +13794,28 @@ const buildEditPlan = async (
       predictionConfidenceLevel: freeAiPlan.predictionConfidenceLevel,
       pacingAdjustmentCount: plannerAdjustments.length,
       retentionProtectionChanges: (freeAiPlan.retentionProtectionChanges || []).slice(0, 6),
-      notes: (freeAiPlan.notes || []).slice(0, 6)
+      notes: (freeAiPlan.notes || []).slice(0, 6),
+      format: freeAiPlan.hookBlueprint?.format || null,
+      selectedPeakMoment: freeAiPlan.selectedPeakMoment
+        ? {
+            description: String(freeAiPlan.selectedPeakMoment.description || '').slice(0, 220),
+            rating: Number(clamp(Number(freeAiPlan.selectedPeakMoment.rating || 0), 1, 10)),
+            trait: (
+              freeAiPlan.selectedPeakMoment.trait === 'surprise' ||
+              freeAiPlan.selectedPeakMoment.trait === 'intrigue' ||
+              freeAiPlan.selectedPeakMoment.trait === 'funny' ||
+              freeAiPlan.selectedPeakMoment.trait === 'crazy'
+            )
+              ? freeAiPlan.selectedPeakMoment.trait
+              : 'intrigue',
+            reason: String(freeAiPlan.selectedPeakMoment.reason || '').slice(0, 260)
+          }
+        : null,
+      hookDescriptionTimeline: (freeAiPlan.hookBlueprint?.timeline || []).map((row) => String(row || '').slice(0, 220)).filter(Boolean).slice(0, 6),
+      suggestedEnhancements: (freeAiPlan.hookBlueprint?.suggestedEnhancements || []).map((row) => String(row || '').slice(0, 220)).filter(Boolean).slice(0, 8),
+      retentionRationale: freeAiPlan.hookBlueprint?.retentionReason
+        ? String(freeAiPlan.hookBlueprint.retentionReason).slice(0, 320)
+        : null
     }
   } catch (error) {
     console.warn('retention planner integration failed, continuing with base timeline', error)
@@ -17683,6 +17746,8 @@ const renderVerticalClip = async ({
   applyStabilization,
   averageLuma,
   autoZoomMax,
+  watermarkEnabled,
+  watermarkImagePath,
   subtitlePath,
   subtitleIsAss,
   subtitleStyle
@@ -17706,6 +17771,8 @@ const renderVerticalClip = async ({
   applyStabilization: boolean
   averageLuma?: number | null
   autoZoomMax: number
+  watermarkEnabled?: boolean
+  watermarkImagePath?: string | null
   subtitlePath?: string | null
   subtitleIsAss?: boolean
   subtitleStyle?: string | null
@@ -17786,6 +17853,20 @@ const renderVerticalClip = async ({
     graphParts.push(`[${videoLabel}]${videoFx.join(',')}[vfx]`)
     videoLabel = 'vfx'
   }
+  const shouldApplyWatermark = Boolean(watermarkEnabled)
+  const shouldOverlayWatermarkImage = shouldApplyWatermark && Boolean(watermarkImagePath)
+  if (shouldOverlayWatermarkImage) {
+    graphParts.push('[1:v]scale=32:-1[wmraw]')
+    graphParts.push(`[${videoLabel}][wmraw]overlay=x=main_w-overlay_w-10:y=main_h-overlay_h-10:format=auto[vwm]`)
+    videoLabel = 'vwm'
+  } else if (shouldApplyWatermark) {
+    const watermarkFont = getSystemFontFile()
+    const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
+    graphParts.push(
+      `[${videoLabel}]drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72[vwm]`
+    )
+    videoLabel = 'vwm'
+  }
   const shouldPolishAudio = withAudio && audioFilters.length > 0
   let audioLabel = 'outa'
   if (withAudio) {
@@ -17822,7 +17903,12 @@ const renderVerticalClip = async ({
     '-filter_threads',
     String(RENDER_FILTER_THREADS),
     '-i',
-    inputPath,
+    inputPath
+  ]
+  if (shouldOverlayWatermarkImage && watermarkImagePath) {
+    args.push('-i', watermarkImagePath)
+  }
+  args.push(
     '-movflags',
     '+faststart',
     '-c:v',
@@ -17839,7 +17925,7 @@ const renderVerticalClip = async ({
     filterComplex,
     '-map',
     `[${videoLabel}]`
-  ]
+  )
   if (withAudio) {
     args.push(
       '-map',
@@ -20300,8 +20386,24 @@ const processJob = async (
         outlineWidth: verticalCaptionConfig.outlineWidth,
         fallbackStyle: subtitleStyle
       })
-      await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: false })
-      await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: false })
+      const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
+      const watermarkImageCandidates = [
+        configuredWatermarkImage,
+        path.join(process.cwd(), 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
+      ].filter(Boolean)
+      const watermarkImagePath = watermarkEnabled
+        ? (watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || '')
+        : ''
+      await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: watermarkEnabled })
+      await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: watermarkEnabled })
       const shouldGenerateVerticalTranscript = (
         options.autoCaptions ||
         (shouldApplyVerticalCaptionOverlays && verticalCaptionConfig.autoGenerate)
@@ -20312,7 +20414,7 @@ const processJob = async (
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
         }
       }
-      await updateJob(jobId, { status: 'audio', progress: 68, watermarkApplied: false })
+      await updateJob(jobId, { status: 'audio', progress: 68, watermarkApplied: watermarkEnabled })
       const verticalPreScan = buildLongFormPreScanSummary({
         durationSeconds,
         windows: verticalWindows,
@@ -20321,7 +20423,7 @@ const processJob = async (
         nicheProfile: verticalNicheProfile,
         editorMode: editorModeForRender
       })
-      await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: false })
+      await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: watermarkEnabled })
       const verticalSelection = buildVerticalRetentionCandidates({
         durationSeconds: durationSeconds || 0,
         requestedCount: renderConfig.verticalClipCount,
@@ -20365,7 +20467,7 @@ const processJob = async (
         startedAt: toIsoNow(),
         lastError: null
       })
-      await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: false })
+      await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: watermarkEnabled })
 
       const verticalClipCaptionOverlays: VerticalClipCaptionOverlay[][] = []
       for (let idx = 0; idx < clipRanges.length; idx += 1) {
@@ -20488,6 +20590,8 @@ const processJob = async (
           applyStabilization: applyClipStabilization,
           averageLuma: clipAverageLuma,
           autoZoomMax: options.autoZoomMax,
+          watermarkEnabled,
+          watermarkImagePath,
           subtitlePath: clipSubtitlePath,
           subtitleIsAss: clipSubtitleIsAss,
           subtitleStyle: clipSubtitleStyle
@@ -20710,7 +20814,7 @@ const processJob = async (
         progress: 100,
         outputPath: outputPaths[0],
         finalQuality,
-        watermarkApplied: false,
+        watermarkApplied: watermarkEnabled,
         retentionScore: verticalPredictedRetention,
         optimizationNotes: [
           `Vertical candidate pool: ${verticalSelection.accepted.length} accepted, ${verticalSelection.rejectedCount} rejected below ${MIN_PREDICTED_COMPLETION_PERCENT}%.`,
@@ -20882,6 +20986,11 @@ const processJob = async (
         optimizationNotes.push(
           `Retention planner (${editPlan.planner.provider}) predicted ${Number(editPlan.planner.predictedAverageRetention).toFixed(1)}% average retention (${editPlan.planner.predictionConfidenceLevel} confidence) and proposed ${editPlan.planner.pacingAdjustmentCount} pacing adjustment${editPlan.planner.pacingAdjustmentCount === 1 ? '' : 's'}.`
         )
+        if (editPlan.planner.selectedPeakMoment) {
+          optimizationNotes.push(
+            `Hook peak moment selected: ${editPlan.planner.selectedPeakMoment.rating}/10 ${editPlan.planner.selectedPeakMoment.trait}.`
+          )
+        }
       }
       engagementWindowsForAnalysis = editPlan?.engagementWindows ?? []
       if (Array.isArray(editPlan?.beatAnchors)) beatAnchorsForAnalysis = editPlan.beatAnchors
@@ -22104,7 +22213,7 @@ const processJob = async (
       const watermarkFilter = watermarkImageExists
         ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
         : watermarkEnabled
-        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-12:y=h-th-12:fontsize=18:fontcolor=white@0.45:box=1:boxcolor=black@0.25:boxborderw=6`
+        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
         : ''
       const subtitleFilter = subtitlePath
         ? (
