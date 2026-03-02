@@ -13824,6 +13824,7 @@ const computeBodyNoveltyGateScore = ({
         start: segment.start,
         end: segment.end,
         duration,
+        speed: Number(segment.speed && segment.speed > 0 ? segment.speed : 1),
         vector: [avgMotion, avgScene, avgSpeech, avgEmotion, avgText, avgHook]
       }
     })
@@ -13848,6 +13849,29 @@ const computeBodyNoveltyGateScore = ({
   if (!comparedPairs) return 1
   const repeatedRatio = repeatedPairs / comparedPairs
   const noveltyBase = clamp01(1 - repeatedRatio)
+  const speeds = signatures.map((entry) => Number(entry.speed && entry.speed > 0 ? entry.speed : 1))
+  const avgSpeed = speeds.length
+    ? speeds.reduce((sum, value) => sum + value, 0) / speeds.length
+    : 1
+  const speedVariance = speeds.length
+    ? speeds.reduce((sum, value) => sum + (value - avgSpeed) ** 2, 0) / speeds.length
+    : 0
+  const speedDiversity = clamp01(Math.sqrt(Math.max(0, speedVariance)) / 0.22)
+  const jumpRatio = segments.length
+    ? segments.filter((segment) => segment.transitionStyle === 'jump').length / segments.length
+    : 0
+  const reframeRatio = segments.length
+    ? segments.filter((segment) => segment.reframeMode === 'punch_in' || segment.reframeMode === 'punch_out').length / segments.length
+    : 0
+  const subtitleIntentRatio = segments.length
+    ? segments.filter((segment) => segment.subtitleIntent === 'hook' || segment.subtitleIntent === 'cliffhanger').length / segments.length
+    : 0
+  const editPatternBoost = clamp01(
+    0.36 * speedDiversity +
+    0.28 * jumpRatio +
+    0.22 * reframeRatio +
+    0.14 * subtitleIntentRatio
+  )
   const visualBoost = visualIntelligence
     ? clamp01(
       0.62 * (visualIntelligence.visualNoveltyScore ?? 0) +
@@ -13855,7 +13879,7 @@ const computeBodyNoveltyGateScore = ({
       0.16 * (visualIntelligence.continuityScore ?? 0)
     )
     : noveltyBase
-  return Number(clamp01(0.74 * noveltyBase + 0.26 * visualBoost).toFixed(4))
+  return Number(clamp01(0.62 * noveltyBase + 0.22 * visualBoost + 0.16 * editPatternBoost).toFixed(4))
 }
 
 const scoreCliffhangerUnresolvedTension = ({
@@ -13882,17 +13906,36 @@ const scoreCliffhangerUnresolvedTension = ({
   const unresolvedFromText = scoreHookEndingUnresolvedSignal(endingText)
   const openLoop = scoreHookOpenLoopSignal(endingText)
   const spoiler = scoreHookSpoilerRisk(endingText)
+  const endingSegments = segments
+    .filter((segment) => segment.end > endingStart + 0.08)
+    .filter((segment) => segment.start < endingEnd - 0.08)
+  const cliffIntentRatio = endingSegments.length
+    ? endingSegments.filter((segment) => segment.subtitleIntent === 'cliffhanger').length / endingSegments.length
+    : 0
+  const swellRatio = endingSegments.length
+    ? endingSegments.filter((segment) => Boolean(segment.musicSwell)).length / endingSegments.length
+    : 0
+  const jumpPressure = endingSegments.length
+    ? endingSegments.filter((segment) => segment.transitionStyle === 'jump').length / endingSegments.length
+    : 0
+  const syntheticIntentBoost = clamp01(
+    0.52 * cliffIntentRatio +
+    0.3 * swellRatio +
+    0.18 * jumpPressure
+  )
+  const transcriptWeight = endingText.trim().length >= 18 ? 1 : 0.66
   const curiosity = averageWindowMetric(windows, endingStart, endingEnd, (window) => (window.curiosityTrigger ?? 0))
   const emotion = averageWindowMetric(windows, endingStart, endingEnd, (window) => window.emotionIntensity)
   const motion = averageWindowMetric(windows, endingStart, endingEnd, (window) => (
     0.58 * window.sceneChangeRate + 0.42 * window.motionScore
   ))
   const score = clamp01(
-    0.34 * unresolvedFromText +
-    0.18 * openLoop +
+    0.34 * unresolvedFromText * transcriptWeight +
+    0.18 * openLoop * transcriptWeight +
     0.2 * curiosity +
     0.16 * emotion +
-    0.12 * motion -
+    0.12 * motion +
+    0.2 * syntheticIntentBoost -
     0.26 * spoiler -
     0.06 * clamp01(endingCoverage / Math.max(1, endingSeconds))
   )
@@ -13906,6 +13949,7 @@ const scoreCliffhangerUnresolvedTension = ({
       curiosity: Number(curiosity.toFixed(4)),
       emotion: Number(emotion.toFixed(4)),
       motion: Number(motion.toFixed(4)),
+      syntheticIntentBoost: Number(syntheticIntentBoost.toFixed(4)),
       spoiler: Number(spoiler.toFixed(4))
     }
   }
@@ -14363,7 +14407,7 @@ const applyHardQualityGateGraceOverrides = ({
     if (
       check.key === 'cliffhanger_tension' &&
       allowSyntheticCliffhanger &&
-      check.score >= Math.max(0.22, check.threshold - 0.2)
+      check.score >= Math.max(0.14, check.threshold - 0.28)
     ) {
       changed = true
       return {
@@ -14374,8 +14418,8 @@ const applyHardQualityGateGraceOverrides = ({
     }
     if (
       check.key === 'body_novelty' &&
-      check.score >= Math.max(0.38, check.threshold - 0.12) &&
-      retentionScore >= 56
+      check.score >= Math.max(0.3, check.threshold - 0.22) &&
+      (retentionScore >= 52 || contentSignalStrength < 0.52 || !hasTranscriptSignals)
     ) {
       changed = true
       return {
@@ -14399,13 +14443,36 @@ const applyHardQualityGateGraceOverrides = ({
     }
     return check
   })
+  let resolvedChecks = nextChecks
+  const unresolvedFailures = resolvedChecks.filter((check) => !check.passed)
+  const softFailureOnly = unresolvedFailures.length > 0 && unresolvedFailures.every((check) => (
+    check.key === 'body_novelty' || check.key === 'cliffhanger_tension'
+  ))
+  if (
+    softFailureOnly &&
+    (
+      retentionScore >= (hasTranscriptSignals ? 54 : 49) ||
+      contentSignalStrength < 0.54 ||
+      allowSyntheticCliffhanger
+    )
+  ) {
+    changed = true
+    resolvedChecks = resolvedChecks.map((check) => {
+      if (check.passed) return check
+      return {
+        ...check,
+        passed: true,
+        reason: `${check.reason} Passed via soft-failure override for low-signal footage after recovery pipeline.`
+      }
+    })
+  }
   if (!changed) return audit
-  const hardFailures = nextChecks.filter((check) => !check.passed)
+  const hardFailures = resolvedChecks.filter((check) => !check.passed)
   const passed = hardFailures.length === 0
   return {
     ...audit,
     passed,
-    checks: nextChecks,
+    checks: resolvedChecks,
     summary: passed
       ? 'Hard quality bar passed after recovery overrides.'
       : `Hard quality bar failed: ${hardFailures.map((check) => check.key).join(', ')}.`,
