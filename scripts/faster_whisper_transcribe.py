@@ -2,8 +2,157 @@
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
+
+FILLER_WORDS = {
+    "um",
+    "uh",
+    "like",
+    "basically",
+    "literally",
+    "actually",
+    "honestly",
+    "seriously",
+}
+EMPHASIS_WORDS = {
+    "crazy",
+    "insane",
+    "wild",
+    "shocking",
+    "secret",
+    "proof",
+    "never",
+    "always",
+    "must",
+    "now",
+    "stop",
+    "wait",
+    "watch",
+    "listen",
+    "important",
+    "viral",
+    "breaking",
+    "unbelievable",
+    "cannot",
+    "can't",
+    "cant",
+    "no",
+    "way",
+    "how",
+    "why",
+    "what",
+}
+EMOJI_RULES = [
+    (re.compile(r"(crazy|insane|wild|shocking|wtf|no\s*way)", re.IGNORECASE), "🤯"),
+    (re.compile(r"(fire|hot|viral|legend|win|clutch|craziest|hype)", re.IGNORECASE), "🔥"),
+    (re.compile(r"(laugh|funny|lol|lmao|joke)", re.IGNORECASE), "😂"),
+    (re.compile(r"(money|cash|million|deal|profit|sales)", re.IGNORECASE), "💸"),
+    (re.compile(r"(love|heart|cute)", re.IGNORECASE), "❤️"),
+    (re.compile(r"(watch|look|wait|listen|secret|proof)", re.IGNORECASE), "👀"),
+]
+
+
+def _clean_surface(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _normalize_token(text: str) -> str:
+    # Keep apostrophes so contractions still map (can't, don't, etc.).
+    compact = _clean_surface(text).lower()
+    return re.sub(r"(^[^a-z0-9']+|[^a-z0-9']+$)", "", compact)
+
+
+def _is_filler_token(token: str, prev_token: str, next_token: str) -> bool:
+    if token in FILLER_WORDS:
+        return True
+    if token in {"you", "know"} and (prev_token == "you" or next_token == "know"):
+        return True
+    if token in {"kind", "sort"} and next_token == "of":
+        return True
+    if token == "of" and prev_token in {"kind", "sort"}:
+        return True
+    if token in {"i", "mean"} and (prev_token == "i" or next_token == "mean"):
+        return True
+    return False
+
+
+def _is_emphasis_token(token: str, surface: str) -> bool:
+    if not token:
+        return False
+    if token in EMPHASIS_WORDS:
+        return True
+    if any(ch.isdigit() for ch in token):
+        return True
+    if surface.isupper() and len(token) >= 3:
+        return True
+    if len(token) >= 8 and token.endswith(("est", "ever", "ing")):
+        return True
+    return False
+
+
+def _infer_emoji(surface: str, token: str) -> str:
+    sample = f"{surface} {token}".strip()
+    for pattern, emoji in EMOJI_RULES:
+        if pattern.search(sample):
+            return emoji
+    return ""
+
+
+def _normalize_word_rows(segment_words, segment_start: float, segment_end: float):
+    rows = []
+    if not segment_words:
+        return rows
+    for raw_word in segment_words:
+        surface = _clean_surface(getattr(raw_word, "word", "") or getattr(raw_word, "text", ""))
+        if not surface:
+            continue
+        start = float(getattr(raw_word, "start", segment_start) or segment_start)
+        end = float(getattr(raw_word, "end", segment_start) or segment_start)
+        if end <= start + 0.005:
+            end = start + 0.05
+        start = max(segment_start, start)
+        end = min(segment_end, end)
+        if end <= start + 0.005:
+            continue
+        probability = getattr(raw_word, "probability", None)
+        rows.append(
+            {
+                "surface": surface,
+                "token": _normalize_token(surface),
+                "start": round(start, 3),
+                "end": round(end, 3),
+                "confidence": round(float(probability), 4) if probability is not None else None,
+            }
+        )
+    return rows
+
+
+def _annotate_words(rows):
+    if not rows:
+        return []
+    annotated = []
+    for idx, row in enumerate(rows):
+        token = row["token"]
+        prev_token = rows[idx - 1]["token"] if idx > 0 else ""
+        next_token = rows[idx + 1]["token"] if idx + 1 < len(rows) else ""
+        is_filler = _is_filler_token(token, prev_token, next_token)
+        emphasis = _is_emphasis_token(token, row["surface"])
+        emoji = _infer_emoji(row["surface"], token) if emphasis else ""
+        annotated.append(
+            {
+                "text": row["surface"],
+                "start": row["start"],
+                "end": row["end"],
+                "confidence": row["confidence"],
+                "emphasis": bool(emphasis),
+                "isFiller": bool(is_filler),
+                "emoji": emoji or None,
+                "speaker": None,
+            }
+        )
+    return annotated
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -111,12 +260,16 @@ def main() -> int:
             continue
         if end <= start + 0.01:
             continue
+        raw_words = _normalize_word_rows(getattr(segment, "words", None), start, end)
+        words = _annotate_words(raw_words)
         cues.append(
             {
                 "text": text,
                 "start": round(start, 3),
                 "end": round(end, 3),
                 "confidence": round(float(avg_logprob), 4) if avg_logprob is not None else None,
+                "words": words,
+                "speaker": None,
             }
         )
 
@@ -128,6 +281,10 @@ def main() -> int:
             {
                 "language": getattr(info, "language", None),
                 "duration": getattr(info, "duration", None),
+                "model": args.model,
+                "device": device,
+                "computeType": compute_type,
+                "wordLevelTimestamps": True,
                 "segments": cues,
             },
             ensure_ascii=False,

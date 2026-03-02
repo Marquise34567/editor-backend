@@ -9395,6 +9395,7 @@ const parseTranscriptWordRows = (value: any, cueStart: number, cueEnd: number): 
       const confidenceRaw = Number(entry?.confidence)
       const confidence = Number.isFinite(confidenceRaw) ? Number(clamp(confidenceRaw, -1, 1).toFixed(4)) : null
       const emphasis = parseBooleanFlag(entry?.emphasis) ?? shouldEmphasizeCaptionWord(rawText)
+      const fillerFlag = parseBooleanFlag(entry?.isFiller ?? entry?.is_filler) ?? isCaptionFillerToken(token)
       const emoji = (
         typeof entry?.emoji === 'string' && entry.emoji.trim().length
           ? entry.emoji.trim().slice(0, 2)
@@ -9406,7 +9407,7 @@ const parseTranscriptWordRows = (value: any, cueStart: number, cueEnd: number): 
         end: boundedEnd,
         confidence,
         emphasis,
-        isFiller: isCaptionFillerToken(token),
+        isFiller: fillerFlag,
         emoji: emoji || null,
         speaker: typeof entry?.speaker === 'string' && entry.speaker.trim().length ? entry.speaker.trim().slice(0, 24) : null
       } as TranscriptWord
@@ -14706,6 +14707,7 @@ const buildAssCueText = ({
       inferCaptionEmoji(basePhrase)
     )
     : null
+  const hasEmojiInBasePhrase = CAPTION_EMOJI_PATTERN.test(basePhrase)
   if (!highlightWords || words.length < 2) {
     let plain = uppercase ? basePhrase.toUpperCase() : basePhrase
     if (candidateEmoji && !CAPTION_EMOJI_PATTERN.test(plain)) {
@@ -14729,7 +14731,7 @@ const buildAssCueText = ({
   }
   if (!tokenParts.length) return ''
   let built = tokenParts.join(' ')
-  if (candidateEmoji) {
+  if (candidateEmoji && !hasEmojiInBasePhrase) {
     built += ` ${escapeAssDialogueText(candidateEmoji)}`
   }
   return built
