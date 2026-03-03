@@ -403,6 +403,16 @@ const normalizeSegments = (segments: SegmentLike[], durationSeconds: number) => 
   return out
 }
 
+const normalizeEngagementWindows = (windows: EngagementWindowLike[] | undefined, safeDuration: number) =>
+  (windows || [])
+    .map((window) => ({
+      start: clamp(toFiniteNumber(window.start, 0), 0, safeDuration),
+      end: clamp(toFiniteNumber(window.end, 0), 0, safeDuration),
+      score: clamp01(toFiniteNumber(window.score, 0.55)),
+      speechIntensity: clamp01(toFiniteNumber(window.speechIntensity, window.score ?? 0.5))
+    }))
+    .filter((window) => window.end > window.start)
+
 const scoreAtTime = (windows: EngagementWindowLike[], time: number) => {
   if (!windows.length) return 0.55
   for (const window of windows) {
@@ -423,6 +433,85 @@ const scoreAtTime = (windows: EngagementWindowLike[], time: number) => {
   return nearestScore
 }
 
+const speechAtTime = (windows: EngagementWindowLike[], time: number) => {
+  if (!windows.length) return 0.5
+  for (const window of windows) {
+    if (time >= window.start && time <= window.end) {
+      return clamp01(toFiniteNumber((window as any).speechIntensity, window.score ?? 0.5))
+    }
+  }
+  let nearestDistance = Number.POSITIVE_INFINITY
+  let nearestSpeech = 0.5
+  for (const window of windows) {
+    const midpoint = (toFiniteNumber(window.start, 0) + toFiniteNumber(window.end, 0)) / 2
+    const distance = Math.abs(midpoint - time)
+    if (distance < nearestDistance) {
+      nearestDistance = distance
+      nearestSpeech = clamp01(toFiniteNumber((window as any).speechIntensity, window.score ?? 0.5))
+    }
+  }
+  return nearestSpeech
+}
+
+const sampleSignalStats = ({
+  windows,
+  durationSeconds,
+  start,
+  end,
+  step = 0.04
+}: {
+  windows: EngagementWindowLike[]
+  durationSeconds: number
+  start: number
+  end: number
+  step?: number
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const safeStart = clamp(start, 0, safeDuration)
+  const safeEnd = clamp(end, safeStart, safeDuration)
+  if (safeEnd <= safeStart) {
+    const midpoint = Number(((safeStart + safeEnd) / 2).toFixed(3))
+    return {
+      peakScore: scoreAtTime(windows, midpoint),
+      peakTime: midpoint,
+      valleyScore: scoreAtTime(windows, midpoint),
+      valleyTime: midpoint,
+      avgSpeech: speechAtTime(windows, midpoint)
+    }
+  }
+
+  let peakScore = -1
+  let peakTime = safeStart
+  let valleyScore = 2
+  let valleyTime = safeStart
+  let speechSum = 0
+  let count = 0
+
+  for (let cursor = safeStart; cursor <= safeEnd + 1e-6; cursor += Math.max(0.01, step)) {
+    const t = Number(cursor.toFixed(3))
+    const score = scoreAtTime(windows, t)
+    const speech = speechAtTime(windows, t)
+    if (score > peakScore) {
+      peakScore = score
+      peakTime = t
+    }
+    if (score < valleyScore) {
+      valleyScore = score
+      valleyTime = t
+    }
+    speechSum += speech
+    count += 1
+  }
+
+  return {
+    peakScore: clamp01(peakScore < 0 ? 0.55 : peakScore),
+    peakTime: Number(peakTime.toFixed(3)),
+    valleyScore: clamp01(valleyScore > 1 ? 0.55 : valleyScore),
+    valleyTime: Number(valleyTime.toFixed(3)),
+    avgSpeech: Number(clamp01(count ? speechSum / count : 0.5).toFixed(4))
+  }
+}
+
 const buildBoundaryFeatures = ({
   segments,
   durationSeconds,
@@ -434,14 +523,7 @@ const buildBoundaryFeatures = ({
 }): BoundaryFeature[] => {
   const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
   const ordered = normalizeSegments(segments, safeDuration)
-  const engagementWindows = (windows || [])
-    .map((window) => ({
-      start: clamp(toFiniteNumber(window.start, 0), 0, safeDuration),
-      end: clamp(toFiniteNumber(window.end, 0), 0, safeDuration),
-      score: clamp01(toFiniteNumber(window.score, 0.55)),
-      speechIntensity: clamp01(toFiniteNumber(window.speechIntensity, 0.5))
-    }))
-    .filter((window) => window.end > window.start)
+  const engagementWindows = normalizeEngagementWindows(windows, safeDuration)
 
   const boundaries: BoundaryFeature[] = []
   for (let index = 0; index < ordered.length - 1; index += 1) {
@@ -454,13 +536,13 @@ const buildBoundaryFeatures = ({
     const gap = Math.max(0, right.start - left.end)
     const overlap = Math.max(0, left.end - right.start)
     const durationDelta = Math.abs(leftDuration - rightDuration)
-    const continuity = clamp01(
+    const baseContinuity = clamp01(
       1 -
       gap / 0.35 -
       overlap / 0.25 -
       durationDelta / Math.max(1.2, (leftDuration + rightDuration) / 1.8)
     )
-    const context = clamp01(Math.min(leftDuration, rightDuration) / 2.4)
+    const baseContext = clamp01(Math.min(leftDuration, rightDuration) / 2.4)
     const leftSpeed = clamp(toFiniteNumber(left.speed, 1), 0.8, 1.8)
     const rightSpeed = clamp(toFiniteNumber(right.speed, 1), 0.8, 1.8)
     const speedDelta = Math.abs(leftSpeed - rightSpeed)
@@ -469,14 +551,24 @@ const buildBoundaryFeatures = ({
     const tailOut = clamp(toFiniteNumber(left.audioTailMs, 0), 0, 320)
     const transitionStyle = String(left.transitionStyle || right.transitionStyle || '').trim().toLowerCase()
     const transitionBonus = transitionStyle === 'smooth' ? 0.1 : transitionStyle === 'jump' ? -0.04 : 0
-    const audio = clamp01(0.62 * motion + 0.2 * clamp01((leadIn + tailOut) / 240) + 0.18 + transitionBonus)
+    const baseAudio = clamp01(0.62 * motion + 0.2 * clamp01((leadIn + tailOut) / 240) + 0.18 + transitionBonus)
+
+    const speechNow = speechAtTime(engagementWindows, boundaryTime)
+    const speechBefore = speechAtTime(engagementWindows, Math.max(0, boundaryTime - 0.16))
+    const speechAfter = speechAtTime(engagementWindows, Math.min(safeDuration, boundaryTime + 0.16))
+    const phraseContinuationRisk = clamp01(speechNow * 0.78 + Math.abs(speechAfter - speechBefore) * 0.35 - 0.08)
+    const pauseSignal = clamp01(1 - speechNow * 1.06)
+
+    const continuity = clamp01(baseContinuity - phraseContinuationRisk * 0.2 + pauseSignal * 0.08)
+    const context = clamp01(baseContext - phraseContinuationRisk * 0.16 + pauseSignal * 0.1)
+    const audio = clamp01(baseAudio - phraseContinuationRisk * 0.28 + pauseSignal * 0.14)
 
     const local = scoreAtTime(engagementWindows, boundaryTime)
     const before = scoreAtTime(engagementWindows, Math.max(0, boundaryTime - 0.9))
     const after = scoreAtTime(engagementWindows, Math.min(safeDuration, boundaryTime + 0.9))
     const valleySignal = clamp01(((before + after) / 2) - local + 0.22)
     const turnSignal = clamp01(Math.abs(after - before) + 0.18)
-    const narrative = clamp01(0.36 + valleySignal * 0.42 + turnSignal * 0.22)
+    const narrative = clamp01(0.32 + valleySignal * 0.36 + turnSignal * 0.2 + pauseSignal * 0.12 + (1 - phraseContinuationRisk) * 0.1)
 
     boundaries.push({
       boundaryIndex: index,
@@ -519,6 +611,337 @@ const computeBoundaryScores = ({
   } satisfies BoundaryCriticBoundaryScore
 })
 
+type BoundaryRetimeResult = {
+  segments: SegmentLike[]
+  applied: boolean
+  previousCutTime: number
+  cutTime: number
+  previousScore: number
+  bestScore: number
+}
+
+const evaluateBoundaryCutCandidate = ({
+  left,
+  right,
+  cutTime,
+  durationSeconds,
+  windows,
+  model,
+  profile
+}: {
+  left: SegmentLike
+  right: SegmentLike
+  cutTime: number
+  durationSeconds: number
+  windows: EngagementWindowLike[]
+  model: BoundaryCriticModel
+  profile: CreatorStyleProfile | null
+}) => {
+  const candidateLeft: SegmentLike = {
+    ...left,
+    end: Number(cutTime.toFixed(3))
+  }
+  const candidateRight: SegmentLike = {
+    ...right,
+    start: Number(cutTime.toFixed(3))
+  }
+  const feature = buildBoundaryFeatures({
+    segments: [candidateLeft, candidateRight],
+    durationSeconds,
+    windows
+  })[0]
+  if (!feature) return { objective: -1, boundaryScore: 0 }
+
+  const boundaryScore = scoreBoundaryFeature(feature, model)
+  const speechNow = speechAtTime(windows, cutTime)
+  const localScore = scoreAtTime(windows, cutTime)
+  const beforeScore = scoreAtTime(windows, Math.max(0, cutTime - 0.35))
+  const afterScore = scoreAtTime(windows, Math.min(durationSeconds, cutTime + 0.35))
+  const valleySignal = clamp01(((beforeScore + afterScore) / 2) - localScore + 0.28)
+  const pauseSignal = clamp01(1 - speechNow * 1.08)
+  const localStats = sampleSignalStats({
+    windows,
+    durationSeconds,
+    start: cutTime - 0.52,
+    end: cutTime + 0.08,
+    step: 0.05
+  })
+  const holdTarget = clamp(
+    0.12 + clamp01(profile?.hookAggression ?? 0.5) * 0.22 + Math.max(0, profile?.qualityBias ?? 0) * 0.08,
+    0.12,
+    0.38
+  )
+  const holdGap = cutTime - localStats.peakTime
+  const holdFit = localStats.peakScore >= 0.72 ? clamp01(holdGap / holdTarget) : 1
+  const leftDuration = Math.max(0.05, cutTime - candidateLeft.start)
+  const rightDuration = Math.max(0.05, candidateRight.end - cutTime)
+  const durationBalance = clamp01(
+    1 - Math.abs(leftDuration - rightDuration) / Math.max(1.15, (leftDuration + rightDuration) / 1.7)
+  )
+  const hardSpeechPenalty = clamp01((speechNow - 0.76) / 0.22)
+  return {
+    objective:
+      boundaryScore * 0.64 +
+      pauseSignal * 0.14 +
+      valleySignal * 0.1 +
+      holdFit * 0.07 +
+      durationBalance * 0.05 -
+      hardSpeechPenalty * 0.17,
+    boundaryScore
+  }
+}
+
+const retimeBoundaryBySearch = ({
+  segments,
+  boundaryIndex,
+  durationSeconds,
+  windows,
+  model,
+  profile,
+  searchSeconds = 0.34,
+  stepSeconds = 0.04
+}: {
+  segments: SegmentLike[]
+  boundaryIndex: number
+  durationSeconds: number
+  windows: EngagementWindowLike[]
+  model: BoundaryCriticModel
+  profile: CreatorStyleProfile | null
+  searchSeconds?: number
+  stepSeconds?: number
+}): BoundaryRetimeResult => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const ordered = normalizeSegments(cloneSegments(segments), safeDuration)
+  const left = ordered[boundaryIndex]
+  const right = ordered[boundaryIndex + 1]
+  if (!left || !right) {
+    return {
+      segments: ordered,
+      applied: false,
+      previousCutTime: 0,
+      cutTime: 0,
+      previousScore: 0,
+      bestScore: 0
+    }
+  }
+
+  const minLeftDuration = clamp(
+    0.12 + Math.max(0, profile?.qualityBias ?? 0) * 0.08 - Math.max(0, profile?.cutAggression ?? 0) * 0.04,
+    0.1,
+    0.32
+  )
+  const minRightDuration = clamp(
+    0.12 + Math.max(0, profile?.hookAggression ?? 0.5) * 0.08 - Math.max(0, profile?.cutAggression ?? 0) * 0.04,
+    0.1,
+    0.32
+  )
+  const minCut = left.start + minLeftDuration
+  const maxCut = right.end - minRightDuration
+  if (!Number.isFinite(minCut) || !Number.isFinite(maxCut) || maxCut - minCut < 0.04) {
+    const currentCut = Number(((left.end + right.start) / 2).toFixed(3))
+    const currentEval = evaluateBoundaryCutCandidate({
+      left,
+      right,
+      cutTime: currentCut,
+      durationSeconds: safeDuration,
+      windows,
+      model,
+      profile
+    })
+    return {
+      segments: ordered,
+      applied: false,
+      previousCutTime: currentCut,
+      cutTime: currentCut,
+      previousScore: currentEval.boundaryScore,
+      bestScore: currentEval.boundaryScore
+    }
+  }
+
+  const currentCut = clamp((left.end + right.start) / 2, minCut, maxCut)
+  const currentEval = evaluateBoundaryCutCandidate({
+    left,
+    right,
+    cutTime: currentCut,
+    durationSeconds: safeDuration,
+    windows,
+    model,
+    profile
+  })
+  let bestCut = currentCut
+  let bestEval = currentEval
+  const localStats = sampleSignalStats({
+    windows,
+    durationSeconds: safeDuration,
+    start: currentCut - searchSeconds,
+    end: currentCut + searchSeconds,
+    step: stepSeconds
+  })
+  const valleyCandidate = clamp(localStats.valleyTime, minCut, maxCut)
+
+  const searchStart = clamp(currentCut - searchSeconds, minCut, maxCut)
+  const searchEnd = clamp(currentCut + searchSeconds, minCut, maxCut)
+  for (let cursor = searchStart; cursor <= searchEnd + 1e-6; cursor += Math.max(0.01, stepSeconds)) {
+    const candidateCut = Number(clamp(cursor, minCut, maxCut).toFixed(3))
+    const candidateEval = evaluateBoundaryCutCandidate({
+      left,
+      right,
+      cutTime: candidateCut,
+      durationSeconds: safeDuration,
+      windows,
+      model,
+      profile
+    })
+    if (candidateEval.objective > bestEval.objective) {
+      bestEval = candidateEval
+      bestCut = candidateCut
+    }
+  }
+  const valleyEval = evaluateBoundaryCutCandidate({
+    left,
+    right,
+    cutTime: valleyCandidate,
+    durationSeconds: safeDuration,
+    windows,
+    model,
+    profile
+  })
+  if (valleyEval.objective > bestEval.objective) {
+    bestEval = valleyEval
+    bestCut = Number(valleyCandidate.toFixed(3))
+  }
+
+  const improvement = bestEval.objective - currentEval.objective
+  const moved = Math.abs(bestCut - currentCut)
+  if (improvement < 0.016 || moved < 0.015) {
+    return {
+      segments: ordered,
+      applied: false,
+      previousCutTime: Number(currentCut.toFixed(3)),
+      cutTime: Number(currentCut.toFixed(3)),
+      previousScore: Number(currentEval.boundaryScore.toFixed(4)),
+      bestScore: Number(currentEval.boundaryScore.toFixed(4))
+    }
+  }
+
+  const updated = cloneSegments(ordered)
+  updated[boundaryIndex] = {
+    ...updated[boundaryIndex],
+    end: Number(bestCut.toFixed(3))
+  }
+  updated[boundaryIndex + 1] = {
+    ...updated[boundaryIndex + 1],
+    start: Number(bestCut.toFixed(3))
+  }
+  return {
+    segments: normalizeSegments(updated, safeDuration),
+    applied: true,
+    previousCutTime: Number(currentCut.toFixed(3)),
+    cutTime: Number(bestCut.toFixed(3)),
+    previousScore: Number(currentEval.boundaryScore.toFixed(4)),
+    bestScore: Number(bestEval.boundaryScore.toFixed(4))
+  }
+}
+
+const runBoundaryMicroSearchPass = ({
+  segments,
+  durationSeconds,
+  windows,
+  model,
+  profile,
+  passes = 2,
+  searchSeconds = 0.34
+}: {
+  segments: SegmentLike[]
+  durationSeconds: number
+  windows: EngagementWindowLike[]
+  model: BoundaryCriticModel
+  profile: CreatorStyleProfile | null
+  passes?: number
+  searchSeconds?: number
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  let working = normalizeSegments(cloneSegments(segments), safeDuration)
+  let retimedCount = 0
+  for (let pass = 0; pass < Math.max(1, passes); pass += 1) {
+    let changed = false
+    for (let boundaryIndex = 0; boundaryIndex < working.length - 1; boundaryIndex += 1) {
+      const retime = retimeBoundaryBySearch({
+        segments: working,
+        boundaryIndex,
+        durationSeconds: safeDuration,
+        windows,
+        model,
+        profile,
+        searchSeconds,
+        stepSeconds: 0.04
+      })
+      if (!retime.applied) continue
+      working = retime.segments
+      retimedCount += 1
+      changed = true
+    }
+    if (!changed) break
+  }
+  return {
+    segments: normalizeSegments(working, safeDuration),
+    retimedCount
+  }
+}
+
+const applyBoundarySofteningAtIndex = ({
+  segments,
+  boundaryIndex,
+  durationSeconds,
+  windows,
+  model,
+  profile
+}: {
+  segments: SegmentLike[]
+  boundaryIndex: number
+  durationSeconds: number
+  windows: EngagementWindowLike[]
+  model: BoundaryCriticModel
+  profile: CreatorStyleProfile | null
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const ordered = normalizeSegments(cloneSegments(segments), safeDuration)
+  const left = ordered[boundaryIndex]
+  const right = ordered[boundaryIndex + 1]
+  if (!left || !right) return null
+  const boundaryFeature = buildBoundaryFeatures({
+    segments: [left, right],
+    durationSeconds: safeDuration,
+    windows
+  })[0]
+  if (!boundaryFeature) return null
+  const boundaryScore = scoreBoundaryFeature(boundaryFeature, model)
+  const boundaryTime = Number(((left.end + right.start) / 2).toFixed(3))
+  const speech = speechAtTime(windows, boundaryTime)
+  const risk = clamp01(1 - boundaryScore)
+  const softenMs = clamp(72 + risk * 118 + speech * 44, 64, 220)
+  const softened = cloneSegments(ordered)
+  softened[boundaryIndex] = {
+    ...softened[boundaryIndex],
+    transitionStyle: risk > 0.18 || speech > 0.68 || profile?.preferredTransitionStyle !== 'jump'
+      ? 'smooth'
+      : 'jump',
+    audioTailMs: Number(clamp(Math.max(toFiniteNumber(softened[boundaryIndex].audioTailMs, 0), softenMs), 50, 320).toFixed(0))
+  }
+  softened[boundaryIndex + 1] = {
+    ...softened[boundaryIndex + 1],
+    audioLeadInMs: Number(clamp(Math.max(toFiniteNumber(softened[boundaryIndex + 1].audioLeadInMs, 0), softenMs * 0.88), 50, 320).toFixed(0))
+  }
+  const leftSpeed = toFiniteNumber(softened[boundaryIndex].speed, 1)
+  const rightSpeed = toFiniteNumber(softened[boundaryIndex + 1].speed, 1)
+  if (Math.abs(leftSpeed - rightSpeed) > 0.15) {
+    const blended = Number(clamp((leftSpeed + rightSpeed) / 2, 0.88, 1.3).toFixed(3))
+    softened[boundaryIndex].speed = blended
+    softened[boundaryIndex + 1].speed = blended
+  }
+  return normalizeSegments(softened, safeDuration)
+}
+
 const summarizeBoundaryScores = ({
   scores,
   model,
@@ -558,21 +981,25 @@ export const applyBoundaryCriticHardGateWithModel = ({
   durationSeconds,
   windows,
   model,
+  creatorProfile,
   maxFixes = 4
 }: {
   segments: SegmentLike[]
   durationSeconds: number
   windows?: EngagementWindowLike[]
   model?: BoundaryCriticModel | null
+  creatorProfile?: CreatorStyleProfile | null
   maxFixes?: number
 }): BoundaryCriticGateResult => {
   const activeModel = model || activeModelCache || DEFAULT_BOUNDARY_MODEL
-  let working = normalizeSegments(cloneSegments(segments || []), durationSeconds)
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const engagementWindows = normalizeEngagementWindows(windows, safeDuration)
+  let working = normalizeSegments(cloneSegments(segments || []), safeDuration)
   let fixesApplied = 0
   const reasons: string[] = []
   if (working.length <= 1) {
     const scores = computeBoundaryScores({
-      boundaries: buildBoundaryFeatures({ segments: working, durationSeconds, windows }),
+      boundaries: buildBoundaryFeatures({ segments: working, durationSeconds: safeDuration, windows: engagementWindows }),
       model: activeModel
     })
     return {
@@ -587,11 +1014,26 @@ export const applyBoundaryCriticHardGateWithModel = ({
     }
   }
 
+  const initialMicroSearch = runBoundaryMicroSearchPass({
+    segments: working,
+    durationSeconds: safeDuration,
+    windows: engagementWindows,
+    model: activeModel,
+    profile: creatorProfile || null,
+    passes: 2,
+    searchSeconds: 0.32
+  })
+  if (initialMicroSearch.retimedCount > 0) {
+    working = initialMicroSearch.segments
+    fixesApplied += initialMicroSearch.retimedCount
+    reasons.push(`Retimed ${initialMicroSearch.retimedCount} boundaries with local continuity + speech-aware micro-search.`)
+  }
+
   for (let attempt = 0; attempt < Math.max(0, maxFixes); attempt += 1) {
     const boundaryFeatures = buildBoundaryFeatures({
       segments: working,
-      durationSeconds,
-      windows
+      durationSeconds: safeDuration,
+      windows: engagementWindows
     })
     const scores = computeBoundaryScores({
       boundaries: boundaryFeatures,
@@ -603,6 +1045,43 @@ export const applyBoundaryCriticHardGateWithModel = ({
     if (!worst || worst.score >= activeModel.threshold) {
       break
     }
+
+    const retimeAttempt = retimeBoundaryBySearch({
+      segments: working,
+      boundaryIndex: worst.boundaryIndex,
+      durationSeconds: safeDuration,
+      windows: engagementWindows,
+      model: activeModel,
+      profile: creatorProfile || null,
+      searchSeconds: 0.42,
+      stepSeconds: 0.02
+    })
+    if (retimeAttempt.applied && retimeAttempt.bestScore >= retimeAttempt.previousScore + 0.02) {
+      working = retimeAttempt.segments
+      fixesApplied += 1
+      reasons.push(
+        `Retimed boundary ${worst.boundaryIndex} ${retimeAttempt.previousCutTime.toFixed(2)}s -> ${retimeAttempt.cutTime.toFixed(2)}s (${retimeAttempt.previousScore.toFixed(2)} -> ${retimeAttempt.bestScore.toFixed(2)}).`
+      )
+      continue
+    }
+
+    if (worst.score >= activeModel.threshold - 0.08) {
+      const softened = applyBoundarySofteningAtIndex({
+        segments: working,
+        boundaryIndex: worst.boundaryIndex,
+        durationSeconds: safeDuration,
+        windows: engagementWindows,
+        model: activeModel,
+        profile: creatorProfile || null
+      })
+      if (softened) {
+        working = softened
+        fixesApplied += 1
+        reasons.push(`Softened near-threshold boundary ${worst.boundaryIndex} with adaptive J/L overlap and speed smoothing.`)
+        continue
+      }
+    }
+
     const left = working[worst.boundaryIndex]
     const right = working[worst.boundaryIndex + 1]
     if (!left || !right) break
@@ -623,12 +1102,12 @@ export const applyBoundaryCriticHardGateWithModel = ({
     if (working.length <= 1) break
   }
 
-  const finalSegments = normalizeSegments(working, durationSeconds)
+  const finalSegments = normalizeSegments(working, safeDuration)
   const finalScores = computeBoundaryScores({
     boundaries: buildBoundaryFeatures({
       segments: finalSegments,
-      durationSeconds,
-      windows
+      durationSeconds: safeDuration,
+      windows: engagementWindows
     }),
     model: activeModel
   })
@@ -669,31 +1148,212 @@ const mergeTinyStorySegments = (segments: SegmentLike[], minDuration = 0.45) => 
   return out
 }
 
-const applyPacingNormalization = ({
+const applyReactionHoldBuffers = ({
   segments,
+  durationSeconds,
+  windows,
   profile
 }: {
   segments: SegmentLike[]
+  durationSeconds: number
+  windows?: EngagementWindowLike[]
   profile: CreatorStyleProfile | null
 }) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const engagementWindows = normalizeEngagementWindows(windows, safeDuration)
+  if (engagementWindows.length === 0) {
+    return {
+      segments: normalizeSegments(segments, safeDuration),
+      adjustments: 0
+    }
+  }
+  const out = normalizeSegments(cloneSegments(segments), safeDuration)
+  let adjustments = 0
+  for (let index = 0; index < out.length - 1; index += 1) {
+    const left = out[index]
+    const right = out[index + 1]
+    if (!left || !right) continue
+    const currentCut = clamp((left.end + right.start) / 2, left.start + 0.1, right.end - 0.1)
+    const localStats = sampleSignalStats({
+      windows: engagementWindows,
+      durationSeconds: safeDuration,
+      start: currentCut - 0.5,
+      end: currentCut + 0.05,
+      step: 0.05
+    })
+    if (localStats.peakScore < 0.74) continue
+    const holdTarget = clamp(
+      0.14 + clamp01(profile?.hookAggression ?? 0.5) * 0.2 + Math.max(0, profile?.qualityBias ?? 0) * 0.08,
+      0.14,
+      0.36
+    )
+    const nextCut = clamp(localStats.peakTime + holdTarget, left.start + 0.1, right.end - 0.1)
+    if (nextCut <= currentCut + 0.015) continue
+    left.end = Number(nextCut.toFixed(3))
+    right.start = Number(nextCut.toFixed(3))
+    adjustments += 1
+  }
+  return {
+    segments: normalizeSegments(out, safeDuration),
+    adjustments
+  }
+}
+
+const applyMinimumBreathingRoom = ({
+  segments,
+  durationSeconds,
+  profile
+}: {
+  segments: SegmentLike[]
+  durationSeconds: number
+  profile: CreatorStyleProfile | null
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const out = normalizeSegments(cloneSegments(segments), safeDuration)
+  if (out.length <= 2) return { segments: out, adjustments: 0 }
+  const targetMin = clamp(
+    0.22 + Math.max(0, profile?.qualityBias ?? 0) * 0.12 - Math.max(0, profile?.cutAggression ?? 0) * 0.08,
+    0.18,
+    0.42
+  )
+  let adjustments = 0
+  for (let index = 1; index < out.length - 1; index += 1) {
+    const previous = out[index - 1]
+    const current = out[index]
+    const next = out[index + 1]
+    if (!previous || !current || !next) continue
+    const currentDuration = current.end - current.start
+    if (currentDuration >= targetMin) continue
+    let deficit = targetMin - currentDuration
+    const previousSpare = Math.max(0, (previous.end - previous.start) - targetMin * 0.82)
+    const nextSpare = Math.max(0, (next.end - next.start) - targetMin * 0.82)
+    if (previousSpare > 0) {
+      const shift = Math.min(previousSpare, deficit / 2)
+      const boundary = clamp(current.start - shift, previous.start + 0.08, current.end - 0.08)
+      previous.end = Number(boundary.toFixed(3))
+      current.start = Number(boundary.toFixed(3))
+      deficit -= shift
+      if (shift > 0.005) adjustments += 1
+    }
+    if (deficit > 0 && nextSpare > 0) {
+      const shift = Math.min(nextSpare, deficit)
+      const boundary = clamp(current.end + shift, current.start + 0.08, next.end - 0.08)
+      current.end = Number(boundary.toFixed(3))
+      next.start = Number(boundary.toFixed(3))
+      if (shift > 0.005) adjustments += 1
+    }
+  }
+  return {
+    segments: normalizeSegments(out, safeDuration),
+    adjustments
+  }
+}
+
+const applyAdaptiveEdgePolish = ({
+  segments,
+  durationSeconds,
+  windows,
+  model,
+  profile
+}: {
+  segments: SegmentLike[]
+  durationSeconds: number
+  windows?: EngagementWindowLike[]
+  model: BoundaryCriticModel
+  profile: CreatorStyleProfile | null
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const engagementWindows = normalizeEngagementWindows(windows, safeDuration)
+  const ordered = normalizeSegments(cloneSegments(segments), safeDuration)
+  if (ordered.length <= 1) return ordered
+  const out = cloneSegments(ordered)
+  const boundaryScores = computeBoundaryScores({
+    boundaries: buildBoundaryFeatures({
+      segments: out,
+      durationSeconds: safeDuration,
+      windows: engagementWindows
+    }),
+    model
+  })
+  for (const boundary of boundaryScores) {
+    const left = out[boundary.boundaryIndex]
+    const right = out[boundary.boundaryIndex + 1]
+    if (!left || !right) continue
+    const risk = clamp01(1 - boundary.score)
+    const speech = speechAtTime(engagementWindows, boundary.time)
+    const beforeScore = scoreAtTime(engagementWindows, Math.max(0, boundary.time - 0.28))
+    const afterScore = scoreAtTime(engagementWindows, Math.min(safeDuration, boundary.time + 0.28))
+    const valley = clamp01(((beforeScore + afterScore) / 2) - scoreAtTime(engagementWindows, boundary.time) + 0.24)
+    const overlapMs = clamp(46 + risk * 112 + speech * 36 + (1 - valley) * 18, 38, 170)
+    const preferJump = profile?.preferredTransitionStyle === 'jump' && risk < 0.16 && speech < 0.62
+    left.transitionStyle = preferJump ? 'jump' : 'smooth'
+    left.audioTailMs = Number(clamp(Math.max(toFiniteNumber(left.audioTailMs, 0), overlapMs), 40, 320).toFixed(0))
+    right.audioLeadInMs = Number(clamp(Math.max(toFiniteNumber(right.audioLeadInMs, 0), overlapMs * 0.9), 40, 320).toFixed(0))
+  }
+  return out
+}
+
+const applyPacingNormalization = ({
+  segments,
+  profile,
+  durationSeconds,
+  windows,
+  model
+}: {
+  segments: SegmentLike[]
+  profile: CreatorStyleProfile | null
+  durationSeconds: number
+  windows?: EngagementWindowLike[]
+  model?: BoundaryCriticModel | null
+}) => {
+  const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const ordered = normalizeSegments(cloneSegments(segments), safeDuration)
   const pacePreference = profile?.pacePreference ?? 0
   const aggression = profile?.cutAggression ?? 0
-  const speedBase = clamp(1 + pacePreference * 0.08 + aggression * 0.06, 0.94, 1.2)
-  return segments.map((segment, index) => {
+  const hookAggression = profile?.hookAggression ?? 0.5
+  const speedBase = clamp(1 + pacePreference * 0.08 + aggression * 0.06 + hookAggression * 0.04, 0.92, 1.24)
+  const preferredTransition = profile?.preferredTransitionStyle === 'jump' ? 'jump' : 'smooth'
+
+  const tempoWaveShaped = ordered.map((segment, index) => {
     const duration = Math.max(0.05, segment.end - segment.start)
-    const durationBias = duration < 0.9 ? 0.04 : duration > 3.5 ? -0.04 : 0
-    const speed = clamp(toFiniteNumber(segment.speed, 1) + durationBias, 0.88, 1.28)
-    const adjustedSpeed = Number(clamp((speed + speedBase) / 2, 0.9, 1.28).toFixed(3))
-    const isCutBoundary = index < segments.length - 1
+    const midpoint = clamp((segment.start + segment.end) / 2, 0, safeDuration)
+    const progress = safeDuration > 0 ? midpoint / safeDuration : 0
+    const wave = Math.sin(progress * Math.PI * 2.6) * 0.028 + Math.sin(progress * Math.PI * 5.2 + 0.6) * 0.014
+    const durationBias = duration < 0.85 ? 0.05 : duration > 3.4 ? -0.05 : 0
+    const existingSpeed = clamp(toFiniteNumber(segment.speed, 1), 0.82, 1.45)
+    const weighted = existingSpeed * 0.55 + speedBase * 0.45
+    const speed = clamp(weighted + wave + durationBias, 0.88, 1.32)
+    const isCutBoundary = index < ordered.length - 1
     return {
       ...segment,
-      speed: adjustedSpeed,
-      transitionStyle: isCutBoundary
-        ? (profile?.preferredTransitionStyle === 'jump' ? 'jump' : 'smooth')
-        : segment.transitionStyle,
-      audioLeadInMs: Number(clamp(Math.max(toFiniteNumber(segment.audioLeadInMs, 0), 90), 50, 260).toFixed(0)),
-      audioTailMs: Number(clamp(Math.max(toFiniteNumber(segment.audioTailMs, 0), 90), 50, 260).toFixed(0))
+      speed: Number(speed.toFixed(3)),
+      transitionStyle: isCutBoundary ? preferredTransition : segment.transitionStyle,
+      audioLeadInMs: Number(clamp(Math.max(toFiniteNumber(segment.audioLeadInMs, 0), 78), 45, 280).toFixed(0)),
+      audioTailMs: Number(clamp(Math.max(toFiniteNumber(segment.audioTailMs, 0), 78), 45, 280).toFixed(0))
     }
+  })
+
+  const speedSmoothed = tempoWaveShaped.map((segment, index) => {
+    const prev = tempoWaveShaped[index - 1]
+    const next = tempoWaveShaped[index + 1]
+    const neighborhood = (
+      toFiniteNumber(prev?.speed, segment.speed || 1) +
+      toFiniteNumber(segment.speed, 1) +
+      toFiniteNumber(next?.speed, segment.speed || 1)
+    ) / 3
+    const smoothedSpeed = clamp(toFiniteNumber(segment.speed, 1) * 0.68 + neighborhood * 0.32, 0.88, 1.32)
+    return {
+      ...segment,
+      speed: Number(smoothedSpeed.toFixed(3))
+    }
+  })
+
+  return applyAdaptiveEdgePolish({
+    segments: speedSmoothed,
+    durationSeconds: safeDuration,
+    windows,
+    model: model || activeModelCache || DEFAULT_BOUNDARY_MODEL,
+    profile
   })
 }
 
@@ -711,23 +1371,60 @@ export const runMultiPassRefinementWithModel = ({
   creatorProfile?: CreatorStyleProfile | null
 }): MultiPassRefinementResult => {
   const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
+  const activeProfile = creatorProfile || null
   const pass1Input = normalizeSegments(cloneSegments(segments || []), safeDuration)
-  const pass1Merged = mergeTinyStorySegments(pass1Input, 0.5)
+  const pass1MinDuration = clamp(
+    0.42 + Math.max(0, activeProfile?.qualityBias ?? 0) * 0.14 - Math.max(0, activeProfile?.cutAggression ?? 0) * 0.08,
+    0.36,
+    0.62
+  )
+  const pass1Merged = mergeTinyStorySegments(pass1Input, pass1MinDuration)
   const pass1 = normalizeSegments(pass1Merged, safeDuration)
 
   const gate = applyBoundaryCriticHardGateWithModel({
     segments: pass1,
     durationSeconds: safeDuration,
     windows,
-    model
+    model,
+    creatorProfile: activeProfile
   })
   const pass2 = normalizeSegments(gate.segments, safeDuration)
 
-  const polished = applyPacingNormalization({
+  const holdBuffered = applyReactionHoldBuffers({
     segments: pass2,
-    profile: creatorProfile || null
+    durationSeconds: safeDuration,
+    windows,
+    profile: activeProfile
+  })
+  const breathingRoomAdjusted = applyMinimumBreathingRoom({
+    segments: holdBuffered.segments,
+    durationSeconds: safeDuration,
+    profile: activeProfile
+  })
+  const polished = applyPacingNormalization({
+    segments: breathingRoomAdjusted.segments,
+    profile: activeProfile,
+    durationSeconds: safeDuration,
+    windows,
+    model
   })
   const pass3 = normalizeSegments(polished, safeDuration)
+
+  const pass2Notes = [
+    'Applied boundary critic hard gate with speech-aware boundary micro-search and adaptive fallback repairs.'
+  ]
+  if (gate.summary.fixesApplied > 0) {
+    pass2Notes.push(`Auto-repaired ${gate.summary.fixesApplied} high-risk boundary decision${gate.summary.fixesApplied === 1 ? '' : 's'}.`)
+  }
+  const pass3Notes = [
+    'Applied tempo-wave pacing normalization with adaptive J/L cut overlaps and micro-fade edge polish.'
+  ]
+  if (holdBuffered.adjustments > 0) {
+    pass3Notes.push(`Inserted ${holdBuffered.adjustments} reaction hold buffer${holdBuffered.adjustments === 1 ? '' : 's'} near high-signal moments.`)
+  }
+  if (breathingRoomAdjusted.adjustments > 0) {
+    pass3Notes.push(`Expanded ${breathingRoomAdjusted.adjustments} tight clips to keep sentence-level continuity and timing readability.`)
+  }
 
   return {
     segments: pass3,
@@ -737,25 +1434,21 @@ export const runMultiPassRefinementWithModel = ({
         segmentCountIn: pass1Input.length,
         segmentCountOut: pass1.length,
         notes: [
-          'Merged micro-segments to preserve narrative context before policy scoring.'
+          'Merged micro-segments with dynamic context floor to preserve narrative continuity before policy scoring.'
         ]
       },
       pass2: {
         name: 'cut_policy_selection',
         segmentCountIn: pass1.length,
         segmentCountOut: pass2.length,
-        notes: [
-          'Applied boundary critic hard gate and merged pathological boundaries.'
-        ],
+        notes: pass2Notes,
         boundaryGate: gate.summary
       },
       pass3: {
         name: 'polish',
         segmentCountIn: pass2.length,
         segmentCountOut: pass3.length,
-        notes: [
-          'Applied pacing normalization and edge smoothing (J/L-friendly micro fades).'
-        ]
+        notes: pass3Notes
       }
     }
   }
