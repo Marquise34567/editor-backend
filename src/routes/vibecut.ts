@@ -166,6 +166,16 @@ type RetentionHeatCell = {
   intensity: number
 }
 
+type VibeBoundaryPathologySummary = {
+  worst: number
+  avg: number
+  highCount: number
+  boundaryCount: number
+  highPathologyBoundariesPerMinute: number
+  fixesApplied: number
+  worstTimes: number[]
+}
+
 type ThumbnailOption = {
   id: string
   url: string
@@ -191,6 +201,7 @@ type RenderJobRecord = {
     points: RetentionPoint[]
     heatmap: RetentionHeatCell[]
     summary: string
+    boundaryPathologySummary?: VibeBoundaryPathologySummary | null
     insights?: RenderInsightsPayload
   }
   errorMessage: string | null
@@ -269,6 +280,7 @@ type UploadRuthlessSignal = {
 } | null
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+const clamp01 = (value: number) => clamp(Number(value || 0), 0, 1)
 
 const DEFAULT_CAPTION_FONT = 'Inter'
 const CAPTION_FONT_OPTIONS = [
@@ -309,6 +321,11 @@ const HORIZONTAL_LONGFORM_KEEP_RATIO = 0.68
 const HORIZONTAL_BASE_KEEP_RATIO = 0.58
 const AUTO_HOOK_MIN_SECONDS = 5
 const AUTO_HOOK_MAX_SECONDS = 8
+const VIBECUT_BOUNDARY_PATHOLOGY_HIGH_THRESHOLD = 0.68
+const VIBECUT_BOUNDARY_PATHOLOGY_REANCHOR_THRESHOLD = 0.54
+const VIBECUT_BOUNDARY_PATHOLOGY_REANCHOR_MIN_IMPROVEMENT = 0.05
+const VIBECUT_BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.72
+const VIBECUT_BOUNDARY_REANCHOR_CANDIDATES = [0, 0.08, 0.16, 0.24, 0.32] as const
 const frameScanRatioRaw = Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1)
 const FRAME_SCAN_SAMPLE_RATIO = Number.isFinite(frameScanRatioRaw) ? clamp(frameScanRatioRaw, 0.05, 1) : 1
 const UPLOAD_RUTHLESS_TIMEOUT_MS = clamp(Number(process.env.VIBECUT_UPLOAD_RUTHLESS_TIMEOUT_MS || 3500), 1500, 10_000)
@@ -720,6 +737,9 @@ const toRenderJobRecord = (row: any): RenderJobRecord => {
       points: Array.isArray(retention?.points) ? retention.points : [],
       heatmap: Array.isArray(retention?.heatmap) ? retention.heatmap : [],
       summary: String(retention?.summary || ''),
+      boundaryPathologySummary: retention?.boundaryPathologySummary && typeof retention.boundaryPathologySummary === 'object'
+        ? (retention.boundaryPathologySummary as VibeBoundaryPathologySummary)
+        : null,
       insights: retention?.insights && typeof retention.insights === 'object'
         ? (retention.insights as RenderInsightsPayload)
         : undefined
@@ -1605,7 +1625,8 @@ const handleAnalyzeUpload = (req: any, res: any, next: any) => {
 const createEmptyRetentionPayload = () => ({
   points: [] as RetentionPoint[],
   heatmap: [] as RetentionHeatCell[],
-  summary: 'AI retention model pending.'
+  summary: 'AI retention model pending.',
+  boundaryPathologySummary: null as VibeBoundaryPathologySummary | null
 })
 
 const buildJobSummary = (job: RenderJobRecord) => ({
@@ -2336,6 +2357,265 @@ const normalizeSegments = (segments: TimelineSegment[], duration: number): Array
     .filter((segment) => segment.end - segment.start >= 0.4)
 }
 
+const buildEmptyVibeBoundaryPathologySummary = (fixesApplied = 0): VibeBoundaryPathologySummary => ({
+  worst: 0,
+  avg: 0,
+  highCount: 0,
+  boundaryCount: 0,
+  highPathologyBoundariesPerMinute: 0,
+  fixesApplied: Number(Math.max(0, fixesApplied)),
+  worstTimes: []
+})
+
+const buildRetentionSignalInterpolator = (points: RetentionPoint[], duration: number) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const normalized = points
+    .map((point) => ({
+      time: clamp(Number(point.timestamp || 0), 0, safeDuration),
+      value: clamp01(Number(point.watchedPct || 0) / 100)
+    }))
+    .filter((point) => Number.isFinite(point.time) && Number.isFinite(point.value))
+    .sort((left, right) => left.time - right.time)
+  if (!normalized.length) return (_timestamp: number) => 0.52
+  const deduped: Array<{ time: number; value: number }> = []
+  for (const point of normalized) {
+    const prev = deduped[deduped.length - 1]
+    if (!prev || Math.abs(prev.time - point.time) > 0.02) {
+      deduped.push(point)
+      continue
+    }
+    prev.value = Number(((prev.value + point.value) / 2).toFixed(4))
+  }
+  if (deduped.length === 1) {
+    const constant = deduped[0].value
+    return (_timestamp: number) => constant
+  }
+  return (timestamp: number) => {
+    const t = clamp(Number(timestamp || 0), 0, safeDuration)
+    if (t <= deduped[0].time) return deduped[0].value
+    const last = deduped[deduped.length - 1]
+    if (t >= last.time) return last.value
+    for (let index = 1; index < deduped.length; index += 1) {
+      const right = deduped[index]
+      if (t > right.time) continue
+      const left = deduped[index - 1]
+      const span = Math.max(1e-6, right.time - left.time)
+      const mix = clamp01((t - left.time) / span)
+      return Number((left.value + (right.value - left.value) * mix).toFixed(4))
+    }
+    return last.value
+  }
+}
+
+const averageSignalRange = (
+  signalAt: (timestamp: number) => number,
+  start: number,
+  end: number,
+  samples = 3
+) => {
+  const safeSamples = Math.max(1, Math.round(samples))
+  const span = Math.max(0.001, end - start)
+  let total = 0
+  for (let index = 0; index < safeSamples; index += 1) {
+    const ratio = (index + 0.5) / safeSamples
+    const timestamp = start + span * ratio
+    total += signalAt(timestamp)
+  }
+  return Number((total / safeSamples).toFixed(4))
+}
+
+const computeVibeBoundaryPathologyMetrics = ({
+  left,
+  right,
+  signalAt
+}: {
+  left: { start: number; end: number }
+  right: { start: number; end: number }
+  signalAt: (timestamp: number) => number
+}) => {
+  const leftTailStart = Math.max(left.start, left.end - 0.45)
+  const rightHeadEnd = Math.min(right.end, right.start + 0.45)
+  const leftTailSignal = averageSignalRange(signalAt, leftTailStart, left.end, 3)
+  const rightHeadSignal = averageSignalRange(signalAt, right.start, rightHeadEnd, 3)
+  const leftBodySignal = averageSignalRange(signalAt, left.start, left.end, 4)
+  const rightBodySignal = averageSignalRange(signalAt, right.start, right.end, 4)
+  const jerk = clamp01(
+    1.7 * Math.abs(leftTailSignal - rightHeadSignal) +
+    0.35 * Math.abs(leftBodySignal - rightBodySignal)
+  )
+  const deadRiskTail = clamp01(1 - leftTailSignal)
+  const deadRiskHead = clamp01(1 - rightHeadSignal)
+  const deadRisk = clamp01((deadRiskTail + deadRiskHead) / 2)
+  const pathology = clamp01(
+    0.5 * jerk +
+    0.25 * deadRiskTail +
+    0.25 * deadRiskHead
+  )
+  return {
+    jerk: Number(jerk.toFixed(4)),
+    deadRiskTail: Number(deadRiskTail.toFixed(4)),
+    deadRiskHead: Number(deadRiskHead.toFixed(4)),
+    deadRisk: Number(deadRisk.toFixed(4)),
+    pathology: Number(pathology.toFixed(4))
+  }
+}
+
+const summarizeVibeBoundaryPathology = ({
+  segments,
+  duration,
+  points,
+  fixesApplied = 0
+}: {
+  segments: TimelineSegment[]
+  duration: number
+  points: RetentionPoint[]
+  fixesApplied?: number
+}): VibeBoundaryPathologySummary => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const normalized = normalizeSegments(segments, safeDuration).sort((left, right) => left.start - right.start)
+  if (normalized.length < 2) return buildEmptyVibeBoundaryPathologySummary(fixesApplied)
+  const signalAt = buildRetentionSignalInterpolator(points, safeDuration)
+  const boundaries: Array<{ time: number; pathology: number }> = []
+  for (let index = 0; index < normalized.length - 1; index += 1) {
+    const left = normalized[index]
+    const right = normalized[index + 1]
+    if (!left || !right) continue
+    if (left.end - left.start < 0.35 || right.end - right.start < 0.35) continue
+    const metrics = computeVibeBoundaryPathologyMetrics({ left, right, signalAt })
+    boundaries.push({
+      time: Number((((left.end + right.start) / 2)).toFixed(3)),
+      pathology: metrics.pathology
+    })
+  }
+  if (!boundaries.length) return buildEmptyVibeBoundaryPathologySummary(fixesApplied)
+  const worst = boundaries.reduce((maxValue, boundary) => Math.max(maxValue, boundary.pathology), 0)
+  const avg = boundaries.reduce((sum, boundary) => sum + boundary.pathology, 0) / boundaries.length
+  const highCount = boundaries.filter((boundary) => boundary.pathology >= VIBECUT_BOUNDARY_PATHOLOGY_HIGH_THRESHOLD).length
+  const highPerMinute = highCount / Math.max(1e-6, safeDuration / 60)
+  const worstTimes = boundaries
+    .slice()
+    .sort((left, right) => right.pathology - left.pathology || left.time - right.time)
+    .slice(0, 3)
+    .map((boundary) => Number(boundary.time.toFixed(3)))
+  return {
+    worst: Number(worst.toFixed(4)),
+    avg: Number(avg.toFixed(4)),
+    highCount,
+    boundaryCount: boundaries.length,
+    highPathologyBoundariesPerMinute: Number(highPerMinute.toFixed(4)),
+    fixesApplied: Number(Math.max(0, fixesApplied)),
+    worstTimes
+  }
+}
+
+const refineBoundaryPathologySegments = ({
+  segments,
+  duration,
+  points
+}: {
+  segments: TimelineSegment[]
+  duration: number
+  points: RetentionPoint[]
+}) => {
+  const safeDuration = Math.max(0.4, Number(duration || 0))
+  const next = normalizeSegments(segments, safeDuration).sort((left, right) => left.start - right.start)
+  if (next.length < 2) {
+    return {
+      segments: next,
+      summary: buildEmptyVibeBoundaryPathologySummary(0)
+    }
+  }
+  const minSegmentDuration = 0.4
+  const minRenderableDuration = minSegmentDuration * 0.92
+  const signalAt = buildRetentionSignalInterpolator(points, safeDuration)
+  let fixesApplied = 0
+  const durationPenalty = (leftDuration: number, rightDuration: number) => {
+    const leftMargin = clamp01((leftDuration - minRenderableDuration) / 1.2)
+    const rightMargin = clamp01((rightDuration - minRenderableDuration) / 1.2)
+    return clamp01(1 - Math.min(leftMargin, rightMargin))
+  }
+
+  for (let index = 0; index < next.length - 1; index += 1) {
+    const left = next[index]
+    const right = next[index + 1]
+    if (!left || !right) continue
+    if (left.end - left.start < minRenderableDuration || right.end - right.start < minRenderableDuration) continue
+
+    let metrics = computeVibeBoundaryPathologyMetrics({ left, right, signalAt })
+    const baseObjective = (
+      0.6 * metrics.jerk +
+      0.25 * metrics.deadRisk +
+      0.15 * durationPenalty(left.end - left.start, right.end - right.start)
+    )
+
+    if (metrics.pathology >= VIBECUT_BOUNDARY_PATHOLOGY_REANCHOR_THRESHOLD) {
+      let bestCandidate: { leftEnd: number; rightStart: number; objective: number } | null = null
+      for (const leftTrim of VIBECUT_BOUNDARY_REANCHOR_CANDIDATES) {
+        for (const rightTrim of VIBECUT_BOUNDARY_REANCHOR_CANDIDATES) {
+          if (leftTrim <= 0 && rightTrim <= 0) continue
+          const candidateLeftEnd = Number((left.end - leftTrim).toFixed(3))
+          const candidateRightStart = Number((right.start + rightTrim).toFixed(3))
+          const leftDuration = candidateLeftEnd - left.start
+          const rightDuration = right.end - candidateRightStart
+          if (leftDuration < minRenderableDuration || rightDuration < minRenderableDuration) continue
+          const candidateMetrics = computeVibeBoundaryPathologyMetrics({
+            left: { ...left, end: candidateLeftEnd },
+            right: { ...right, start: candidateRightStart },
+            signalAt
+          })
+          const objective = (
+            0.6 * candidateMetrics.jerk +
+            0.25 * candidateMetrics.deadRisk +
+            0.15 * durationPenalty(leftDuration, rightDuration)
+          )
+          if (!bestCandidate || objective < bestCandidate.objective) {
+            bestCandidate = {
+              leftEnd: candidateLeftEnd,
+              rightStart: candidateRightStart,
+              objective: objective
+            }
+          }
+        }
+      }
+      if (
+        bestCandidate &&
+        baseObjective - bestCandidate.objective >= VIBECUT_BOUNDARY_PATHOLOGY_REANCHOR_MIN_IMPROVEMENT
+      ) {
+        left.end = bestCandidate.leftEnd
+        right.start = bestCandidate.rightStart
+        fixesApplied += 1
+      }
+    }
+
+    metrics = computeVibeBoundaryPathologyMetrics({ left, right, signalAt })
+    if (metrics.pathology >= VIBECUT_BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD) {
+      const adaptiveTrim = clamp((metrics.pathology - VIBECUT_BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD) * 0.5, 0.04, 0.16)
+      const halfTrim = adaptiveTrim / 2
+      const leftCandidateEnd = Number((left.end - halfTrim).toFixed(3))
+      const rightCandidateStart = Number((right.start + halfTrim).toFixed(3))
+      if (
+        leftCandidateEnd - left.start >= minRenderableDuration &&
+        right.end - rightCandidateStart >= minRenderableDuration
+      ) {
+        left.end = leftCandidateEnd
+        right.start = rightCandidateStart
+        fixesApplied += 1
+      }
+    }
+  }
+
+  const resolvedSegments = normalizeSegments(next, safeDuration).sort((left, right) => left.start - right.start)
+  return {
+    segments: resolvedSegments,
+    summary: summarizeVibeBoundaryPathology({
+      segments: resolvedSegments,
+      duration: safeDuration,
+      points,
+      fixesApplied
+    })
+  }
+}
+
 const mergeSegmentsWithGap = (
   segments: TimelineSegment[],
   duration: number,
@@ -2801,11 +3081,20 @@ const runHorizontalPipeline = async ({
 
     segments.forEach((segment, index) => {
       const speed = clamp(Number(segment.speed || 1), 1, 1.8)
+      const sourceDuration = Math.max(0.01, Number(segment.end || 0) - Number(segment.start || 0))
+      const runtimeDuration = Math.max(0.01, sourceDuration / speed)
+      const fadeDuration = Number(clamp(Math.min(0.12, runtimeDuration * 0.18), 0.04, 0.12).toFixed(3))
+      const fadeOutStart = Number(Math.max(0, runtimeDuration - fadeDuration).toFixed(3))
       const videoFilters = ['setpts=PTS-STARTPTS']
       if (speed > 1.01) videoFilters.push(`setpts=PTS/${speed.toFixed(4)}`)
       filterParts.push(`[0:v]trim=start=${segment.start}:end=${segment.end},${videoFilters.join(',')}[v${index}]`)
       if (audioEnabled) {
-        const audioFilters = ['asetpts=PTS-STARTPTS', ...buildAtempoChain(speed)]
+        const audioFilters = [
+          'asetpts=PTS-STARTPTS',
+          ...buildAtempoChain(speed),
+          `afade=t=in:st=0:d=${fadeDuration.toFixed(3)}`,
+          `afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDuration.toFixed(3)}`
+        ]
         filterParts.push(`[0:a]atrim=start=${segment.start}:end=${segment.end},${audioFilters.join(',')}[a${index}]`)
         concatInputs.push(`[v${index}][a${index}]`)
       } else {
@@ -2962,6 +3251,10 @@ const runVerticalPipeline = async ({
     for (let index = 0; index < segments.length; index += 1) {
       const segment = segments[index]
       const speed = clamp(Number(segment.speed || 1), 1, 1.8)
+      const sourceDuration = Math.max(0.01, Number(segment.end || 0) - Number(segment.start || 0))
+      const runtimeDuration = Math.max(0.01, sourceDuration / speed)
+      const fadeDuration = Number(clamp(Math.min(0.12, runtimeDuration * 0.18), 0.04, 0.12).toFixed(3))
+      const fadeOutStart = Number(Math.max(0, runtimeDuration - fadeDuration).toFixed(3))
       const clipPath = path.join(clipDir, `clip_${String(index + 1).padStart(2, '0')}.mp4`)
       const videoFilter = speed > 1.01
         ? `setpts=PTS/${speed.toFixed(4)},${verticalFilter}`
@@ -2985,9 +3278,12 @@ const runVerticalPipeline = async ({
       ]
       if (audioEnabled) {
         const atempoFilters = buildAtempoChain(speed)
-        if (atempoFilters.length > 0) {
-          clipArgs.push('-af', atempoFilters.join(','))
-        }
+        const audioFilters = [
+          ...atempoFilters,
+          `afade=t=in:st=0:d=${fadeDuration.toFixed(3)}`,
+          `afade=t=out:st=${fadeOutStart.toFixed(3)}:d=${fadeDuration.toFixed(3)}`
+        ]
+        clipArgs.push('-af', audioFilters.join(','))
         clipArgs.push('-c:a', 'aac', '-b:a', '128k')
       } else {
         clipArgs.push('-an')
@@ -3367,6 +3663,25 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         points: retention.points
       })
     }
+    const boundaryRefinement = manualSegments.length === 0
+      ? refineBoundaryPathologySegments({
+          segments,
+          duration: source.metadata.duration,
+          points: retention.points
+        })
+      : {
+          segments: normalizeSegments(segments, source.metadata.duration),
+          summary: summarizeVibeBoundaryPathology({
+            segments,
+            duration: source.metadata.duration,
+            points: retention.points,
+            fixesApplied: 0
+          })
+        }
+    if (boundaryRefinement.segments.length > 0) {
+      segments = boundaryRefinement.segments
+    }
+    const boundaryPathologySummary = boundaryRefinement.summary
 
     let clipPathsAbs: string[] = []
 
@@ -3494,6 +3809,7 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         ...postEditRetention,
         points: optimizedPoints,
         heatmap: optimizedHeatmap,
+        boundaryPathologySummary,
         insights: generatedInsights,
         summary: [
           `Adaptive profile: ${resolvedProfile.vibeChip} vibe, ${resolvedProfile.stylePreset} style, ${resolvedProfile.pacingPreset} pacing.`,
@@ -3516,6 +3832,9 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
                   : '(auto-selected + pacing trims with long-form coverage guard)'
                 : '(auto-selected + pacing optimized)'
           }.`,
+          boundaryPathologySummary.boundaryCount > 0
+            ? `Boundary pathology audit: worst ${boundaryPathologySummary.worst.toFixed(2)}, high-risk cuts ${boundaryPathologySummary.highCount}, fixes ${boundaryPathologySummary.fixesApplied}.`
+            : 'Boundary pathology audit: no cut boundaries detected.',
           generatedInsights.ruthlessAudit.cutsAndSpeed.length > 0
             ? `Applied cut/speed actions: ${generatedInsights.ruthlessAudit.cutsAndSpeed.slice(0, 6).map((item) => `${item.action} ${item.start.toFixed(1)}-${item.end.toFixed(1)}s${item.speedMultiplier ? ` @${item.speedMultiplier.toFixed(2)}x` : ''}`).join(' | ')}.`
             : 'Applied cut/speed actions: none.',
