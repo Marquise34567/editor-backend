@@ -1576,6 +1576,10 @@ type EditOptions = {
   longFormAggression: number
   longFormClarityVsSpeed: number
   tangentKiller: boolean
+  coldStartAutopilot: boolean
+  continuityFirstMode: boolean
+  exploreX3Mode: boolean
+  creatorStyleLock: number
   manualTimestampConfig?: ManualTimestampConfig | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
@@ -1661,6 +1665,9 @@ const LONG_FORM_AGGRESSION_MIN = 0
 const LONG_FORM_AGGRESSION_MAX = 100
 const LONG_FORM_CLARITY_MIN = 0
 const LONG_FORM_CLARITY_MAX = 100
+const CREATOR_STYLE_LOCK_PERCENT_MIN = 0
+const CREATOR_STYLE_LOCK_PERCENT_MAX = 100
+const DEFAULT_CREATOR_STYLE_LOCK_PERCENT = 65
 const EFFECT_PREVIEW_TYPES: EffectPreviewType[] = ['transitions', 'swoosh', 'zooms', 'all', 'auto']
 const VIRAL_PREVIEW_MODES: ViralPreviewMode[] = ['none', 'youtube', 'tiktok']
 const VERTICAL_SELECTION_MODE_VALUES: VerticalSelectionMode[] = ['best_moments', 'story_arc', 'hook_storm', 'loop_builder']
@@ -3306,7 +3313,11 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   longFormPreset: 'auto',
   longFormAggression: 72,
   longFormClarityVsSpeed: 46,
-  tangentKiller: true
+  tangentKiller: true,
+  coldStartAutopilot: false,
+  continuityFirstMode: false,
+  exploreX3Mode: false,
+  creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4))
 }
 
 const applyRetentionStyleReferencePreset = ({
@@ -4445,6 +4456,62 @@ const getTangentKillerFromPayload = (payload?: any): boolean | null => {
     parseBooleanFlag((payload as any).tangentKiller) ??
     parseBooleanFlag((payload as any).tangent_killer) ??
     parseBooleanFlag((payload as any).removeTangents) ??
+    null
+  )
+}
+
+const parseCreatorStyleLockPercent = (value: any): number | null => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Number(clamp(parsed, CREATOR_STYLE_LOCK_PERCENT_MIN, CREATOR_STYLE_LOCK_PERCENT_MAX).toFixed(2))
+}
+
+const toCreatorStyleLockStrength = (value: number | null | undefined) =>
+  Number(clamp((Number(value) || 0) / 100, 0, 1).toFixed(4))
+
+const toCreatorStyleLockPercent = (value: number | null | undefined) =>
+  Number(clamp((Number(value) || 0) * 100, CREATOR_STYLE_LOCK_PERCENT_MIN, CREATOR_STYLE_LOCK_PERCENT_MAX).toFixed(2))
+
+const getColdStartAutopilotFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).coldStartAutopilot) ??
+    parseBooleanFlag((payload as any).cold_start_autopilot) ??
+    parseBooleanFlag((payload as any).coldStartMode) ??
+    parseBooleanFlag((payload as any).cold_start_mode) ??
+    null
+  )
+}
+
+const getContinuityFirstModeFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).continuityFirstMode) ??
+    parseBooleanFlag((payload as any).continuity_first_mode) ??
+    parseBooleanFlag((payload as any).continuityFirst) ??
+    parseBooleanFlag((payload as any).continuity_first) ??
+    null
+  )
+}
+
+const getExploreX3ModeFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).exploreX3Mode) ??
+    parseBooleanFlag((payload as any).explore_x3_mode) ??
+    parseBooleanFlag((payload as any).exploreX3) ??
+    parseBooleanFlag((payload as any).explore_x3) ??
+    null
+  )
+}
+
+const getCreatorStyleLockPercentFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseCreatorStyleLockPercent((payload as any).creatorStyleLock) ??
+    parseCreatorStyleLockPercent((payload as any).creator_style_lock) ??
+    parseCreatorStyleLockPercent((payload as any).styleLock) ??
+    parseCreatorStyleLockPercent((payload as any).style_lock) ??
     null
   )
 }
@@ -5767,6 +5834,54 @@ const getFastModeFromJob = (job?: any): boolean => {
   )
 }
 
+const getColdStartAutopilotFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.coldStartAutopilot) ??
+    parseBooleanFlag(settings?.cold_start_autopilot) ??
+    parseBooleanFlag(analysis?.coldStartAutopilot) ??
+    parseBooleanFlag(analysis?.cold_start_autopilot) ??
+    false
+  )
+}
+
+const getContinuityFirstModeFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.continuityFirstMode) ??
+    parseBooleanFlag(settings?.continuity_first_mode) ??
+    parseBooleanFlag(analysis?.continuityFirstMode) ??
+    parseBooleanFlag(analysis?.continuity_first_mode) ??
+    false
+  )
+}
+
+const getExploreX3ModeFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.exploreX3Mode) ??
+    parseBooleanFlag(settings?.explore_x3_mode) ??
+    parseBooleanFlag(analysis?.exploreX3Mode) ??
+    parseBooleanFlag(analysis?.explore_x3_mode) ??
+    false
+  )
+}
+
+const getCreatorStyleLockPercentFromJob = (job?: any): number => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const parsed = (
+    parseCreatorStyleLockPercent(settings?.creatorStyleLock) ??
+    parseCreatorStyleLockPercent(settings?.creator_style_lock) ??
+    parseCreatorStyleLockPercent(analysis?.creatorStyleLock) ??
+    parseCreatorStyleLockPercent(analysis?.creator_style_lock)
+  )
+  return parsed ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
+}
+
 const getMaxCutsFromJob = (job?: any): number | null => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -6040,6 +6155,10 @@ const buildPersistedRenderSettings = (
     longFormClarityVsSpeed?: number | null
     tangentKiller?: boolean | null
     fastMode?: boolean | null
+    coldStartAutopilot?: boolean | null
+    continuityFirstMode?: boolean | null
+    exploreX3Mode?: boolean | null
+    creatorStyleLockPercent?: number | null
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
   }
@@ -6064,6 +6183,10 @@ const buildPersistedRenderSettings = (
   const longFormPreset = parseLongFormPreset(opts?.longFormPreset || resolveLongFormPresetByAggression(longFormAggression))
   const tangentKiller = typeof opts?.tangentKiller === 'boolean' ? opts.tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
   const fastMode = typeof opts?.fastMode === 'boolean' ? opts.fastMode : null
+  const coldStartAutopilot = typeof opts?.coldStartAutopilot === 'boolean' ? opts.coldStartAutopilot : false
+  const continuityFirstMode = typeof opts?.continuityFirstMode === 'boolean' ? opts.continuityFirstMode : false
+  const exploreX3Mode = typeof opts?.exploreX3Mode === 'boolean' ? opts.exploreX3Mode : false
+  const creatorStyleLockPercent = parseCreatorStyleLockPercent(opts?.creatorStyleLockPercent) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
     ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
@@ -6107,6 +6230,14 @@ const buildPersistedRenderSettings = (
     long_form_clarity_vs_speed: longFormClarityVsSpeed,
     tangentKiller,
     tangent_killer: tangentKiller,
+    coldStartAutopilot,
+    cold_start_autopilot: coldStartAutopilot,
+    continuityFirstMode,
+    continuity_first_mode: continuityFirstMode,
+    exploreX3Mode,
+    explore_x3_mode: exploreX3Mode,
+    creatorStyleLock: creatorStyleLockPercent,
+    creator_style_lock: creatorStyleLockPercent,
     ...(fastMode === null ? {} : { fastMode, fast_mode: fastMode }),
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
     ...(smartZoom === null ? {} : { smartZoom }),
@@ -6135,6 +6266,10 @@ const buildPersistedRenderAnalysis = ({
   longFormClarityVsSpeed,
   tangentKiller,
   fastMode,
+  coldStartAutopilot,
+  continuityFirstMode,
+  exploreX3Mode,
+  creatorStyleLockPercent,
   manualTimestampConfig,
   verticalCaptionConfig,
   retentionTargetPlatform,
@@ -6155,6 +6290,10 @@ const buildPersistedRenderAnalysis = ({
   longFormClarityVsSpeed?: number | null
   tangentKiller?: boolean | null
   fastMode?: boolean | null
+  coldStartAutopilot?: boolean | null
+  continuityFirstMode?: boolean | null
+  exploreX3Mode?: boolean | null
+  creatorStyleLockPercent?: number | null
   manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
@@ -6247,6 +6386,35 @@ const buildPersistedRenderAnalysis = ({
       parseBooleanFlag((existing as any)?.fast_mode) ??
       null
     )
+  const resolvedColdStartAutopilot = (
+    typeof coldStartAutopilot === 'boolean'
+      ? coldStartAutopilot
+      : (
+        parseBooleanFlag((existing as any)?.coldStartAutopilot) ??
+        parseBooleanFlag((existing as any)?.cold_start_autopilot)
+      )
+  ) ?? false
+  const resolvedContinuityFirstMode = (
+    typeof continuityFirstMode === 'boolean'
+      ? continuityFirstMode
+      : (
+        parseBooleanFlag((existing as any)?.continuityFirstMode) ??
+        parseBooleanFlag((existing as any)?.continuity_first_mode)
+      )
+  ) ?? false
+  const resolvedExploreX3Mode = (
+    typeof exploreX3Mode === 'boolean'
+      ? exploreX3Mode
+      : (
+        parseBooleanFlag((existing as any)?.exploreX3Mode) ??
+        parseBooleanFlag((existing as any)?.explore_x3_mode)
+      )
+  ) ?? false
+  const resolvedCreatorStyleLockPercent = parseCreatorStyleLockPercent(
+    creatorStyleLockPercent ??
+    (existing as any)?.creatorStyleLock ??
+    (existing as any)?.creator_style_lock
+  ) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const resolvedManualTimestampConfig = (
     parseManualTimestampConfig(manualTimestampConfig) ??
     parseManualTimestampConfig((existing as any)?.manualTimestamp ?? (existing as any)?.manual_timestamp) ??
@@ -6366,6 +6534,14 @@ const buildPersistedRenderAnalysis = ({
   payload.long_form_clarity_vs_speed = resolvedLongFormClarityVsSpeed
   payload.tangentKiller = resolvedTangentKiller
   payload.tangent_killer = resolvedTangentKiller
+  payload.coldStartAutopilot = resolvedColdStartAutopilot
+  payload.cold_start_autopilot = resolvedColdStartAutopilot
+  payload.continuityFirstMode = resolvedContinuityFirstMode
+  payload.continuity_first_mode = resolvedContinuityFirstMode
+  payload.exploreX3Mode = resolvedExploreX3Mode
+  payload.explore_x3_mode = resolvedExploreX3Mode
+  payload.creatorStyleLock = resolvedCreatorStyleLockPercent
+  payload.creator_style_lock = resolvedCreatorStyleLockPercent
   if (resolvedFastMode !== null) {
     payload.fastMode = resolvedFastMode
     payload.fast_mode = resolvedFastMode
@@ -22377,6 +22553,10 @@ const getEditOptionsForUser = async (
     tangentKiller?: boolean | null
     manualTimestampConfig?: ManualTimestampConfig | null
     fastMode?: boolean | null
+    coldStartAutopilot?: boolean | null
+    continuityFirstMode?: boolean | null
+    exploreX3Mode?: boolean | null
+    creatorStyleLockPercent?: number | null
   },
   userEmail?: string | null
 ) => {
@@ -22396,6 +22576,27 @@ const getEditOptionsForUser = async (
   const transitionsOverride = typeof overrides?.transitions === 'boolean' ? overrides.transitions : null
   const soundFxOverride = typeof overrides?.soundFx === 'boolean' ? overrides.soundFx : null
   const fastModeOverride = typeof overrides?.fastMode === 'boolean' ? overrides.fastMode : null
+  const coldStartAutopilot = (
+    typeof overrides?.coldStartAutopilot === 'boolean'
+      ? overrides.coldStartAutopilot
+      : parseBooleanFlag((settings as any)?.coldStartAutopilot)
+  ) ?? false
+  const continuityFirstMode = (
+    typeof overrides?.continuityFirstMode === 'boolean'
+      ? overrides.continuityFirstMode
+      : parseBooleanFlag((settings as any)?.continuityFirstMode)
+  ) ?? false
+  const exploreX3Mode = (
+    typeof overrides?.exploreX3Mode === 'boolean'
+      ? overrides.exploreX3Mode
+      : parseBooleanFlag((settings as any)?.exploreX3Mode)
+  ) ?? false
+  const creatorStyleLockPercent = parseCreatorStyleLockPercent(
+    overrides?.creatorStyleLockPercent ??
+    (settings as any)?.creatorStyleLock ??
+    (settings as any)?.creator_style_lock
+  ) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
+  const creatorStyleLock = toCreatorStyleLockStrength(creatorStyleLockPercent)
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
     : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
@@ -22473,6 +22674,24 @@ const getEditOptionsForUser = async (
     overrides?.retentionAggressionLevel ?? STRATEGY_TO_AGGRESSION[requestedStrategy]
   )
   let resolvedFastMode = fastModeOverride ?? false
+  if (coldStartAutopilot) {
+    if (requestedStrategy === 'viral') requestedStrategy = 'balanced'
+    if (requestedAggression === 'viral' || requestedAggression === 'high') requestedAggression = 'medium'
+    longFormPreset = longFormPreset === 'ultra' ? 'balanced' : longFormPreset
+    longFormAggression = Math.min(longFormAggression, 60)
+    longFormClarityVsSpeed = Math.max(longFormClarityVsSpeed, 72)
+    tangentKiller = true
+    resolvedFastMode = false
+  }
+  if (continuityFirstMode) {
+    if (requestedStrategy === 'viral') requestedStrategy = 'safe'
+    if (requestedAggression === 'viral' || requestedAggression === 'high') requestedAggression = 'low'
+    longFormPreset = longFormPreset === 'ultra' || longFormPreset === 'aggressive' ? 'balanced' : longFormPreset
+    longFormAggression = Math.min(longFormAggression, 52)
+    longFormClarityVsSpeed = Math.max(longFormClarityVsSpeed, 82)
+    tangentKiller = true
+    resolvedFastMode = false
+  }
   if (ultraModeRequested) {
     requestedStrategy = 'viral'
     requestedAggression = 'viral'
@@ -22528,6 +22747,10 @@ const getEditOptionsForUser = async (
     longFormAggression,
     longFormClarityVsSpeed,
     tangentKiller,
+    coldStartAutopilot,
+    continuityFirstMode,
+    exploreX3Mode,
+    creatorStyleLock,
     manualTimestampConfig,
     fastMode: resolvedFastMode
   }
@@ -22541,6 +22764,27 @@ const getEditOptionsForUser = async (
     plan: effectivePlan,
     tier: effectiveTier
   }
+}
+
+const applyCreatorStyleLockToProfile = <T extends Record<string, any>>(profile: T | null, styleLockStrength: number): T | null => {
+  if (!profile) return null
+  const lock = clamp(Number(styleLockStrength || 0), 0, 1)
+  const blendUnit = (value: unknown, neutral = 0.5) => {
+    const numeric = Number(value)
+    const safe = Number.isFinite(numeric) ? numeric : neutral
+    return Number(clamp(neutral + (safe - neutral) * lock, 0, 1).toFixed(4))
+  }
+  const preferredTransitionStyle = lock < 0.34
+    ? 'mixed'
+    : (profile.preferredTransitionStyle === 'jump' ? 'jump' : profile.preferredTransitionStyle === 'smooth' ? 'smooth' : 'mixed')
+  return {
+    ...profile,
+    pacePreference: blendUnit(profile.pacePreference),
+    cutAggression: blendUnit(profile.cutAggression),
+    hookAggression: blendUnit(profile.hookAggression),
+    qualityBias: blendUnit(profile.qualityBias),
+    preferredTransitionStyle
+  } as T
 }
 
 const analyzeJob = async (jobId: string, options: EditOptions, requestId?: string) => {
@@ -22986,6 +23230,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
       fastMode: options.fastMode,
+      coldStartAutopilot: options.coldStartAutopilot,
+      continuityFirstMode: options.continuityFirstMode,
+      exploreX3Mode: options.exploreX3Mode,
+      creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
@@ -23012,6 +23260,10 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
         fastMode: options.fastMode,
+        coldStartAutopilot: options.coldStartAutopilot,
+        continuityFirstMode: options.continuityFirstMode,
+        exploreX3Mode: options.exploreX3Mode,
+        creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
       analysis: analysis
@@ -23795,6 +24047,10 @@ const processJob = async (
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
         fastMode: options.fastMode,
+        coldStartAutopilot: options.coldStartAutopilot,
+        continuityFirstMode: options.continuityFirstMode,
+        exploreX3Mode: options.exploreX3Mode,
+        creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         verticalCaptionConfig,
         outputPaths
       })
@@ -23858,6 +24114,10 @@ const processJob = async (
           longFormClarityVsSpeed: options.longFormClarityVsSpeed,
           tangentKiller: options.tangentKiller,
           fastMode: options.fastMode,
+          coldStartAutopilot: options.coldStartAutopilot,
+          continuityFirstMode: options.continuityFirstMode,
+          exploreX3Mode: options.exploreX3Mode,
+          creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
           manualTimestampConfig: requestedManualTimestampConfig,
           verticalCaptionConfig
         }),
@@ -24474,8 +24734,30 @@ const processJob = async (
           return segment
         })
       }
-      const boundaryCriticModelForRender = await getActiveBoundaryCriticModel().catch(() => null)
-      const creatorStyleProfileForRender = await getCreatorStyleProfile(job.userId).catch(() => null)
+      const boundaryCriticModelForRenderRaw = await getActiveBoundaryCriticModel().catch(() => null)
+      const continuityBoundaryThresholdDelta = options.continuityFirstMode ? 0.06 : 0
+      const boundaryCriticModelForRender = boundaryCriticModelForRenderRaw
+        ? {
+            ...boundaryCriticModelForRenderRaw,
+            threshold: Number(clamp(
+              Number(boundaryCriticModelForRenderRaw.threshold || 0.48) + continuityBoundaryThresholdDelta,
+              0.2,
+              0.86
+            ).toFixed(4))
+          }
+        : null
+      const creatorStyleProfileRaw = await getCreatorStyleProfile(job.userId).catch(() => null)
+      const creatorStyleProfileForRender = applyCreatorStyleLockToProfile(
+        creatorStyleProfileRaw as Awaited<ReturnType<typeof getCreatorStyleProfile>> | null,
+        options.creatorStyleLock
+      )
+      if (options.coldStartAutopilot) {
+        optimizationNotes.push('Cold-start autopilot active: conservative defaults prioritized while outcome history is sparse.')
+      }
+      if (options.continuityFirstMode) {
+        optimizationNotes.push('Continuity-first mode active: stricter boundary threshold and slower pacing profile applied.')
+      }
+      optimizationNotes.push(`Creator style lock applied at ${Math.round(clamp(options.creatorStyleLock, 0, 1) * 100)}%.`)
 
       const buildAttemptSegments = (strategy: RetentionRetryStrategy, hookCandidate: HookCandidate) => {
         const baseHookRange: TimeRange = {
@@ -24716,12 +24998,15 @@ const processJob = async (
 
       let finalSegments: Segment[] = []
       const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, MAX_QUALITY_GATE_RETRIES + 1))
-      const mandatoryVariantTarget = Math.round(clamp(
+      const baseMandatoryVariantTarget = Math.round(clamp(
         MANDATORY_VARIANT_MIN +
         (durationSeconds >= 45 * 60 ? 2 : durationSeconds >= 18 * 60 ? 1 : 0),
         MANDATORY_VARIANT_MIN,
         MANDATORY_VARIANT_MAX
       ))
+      const mandatoryVariantTarget = options.exploreX3Mode
+        ? Math.max(baseMandatoryVariantTarget, 3)
+        : baseMandatoryVariantTarget
       const variantPlans: Array<{
         strategy: RetentionRetryStrategy
         hookCandidateIndex: number
@@ -24887,7 +25172,10 @@ const processJob = async (
           .digest('hex')
           .slice(0, 8)
         const exploreSeed = Number.parseInt(exploreSeedRaw, 16) / 0xffffffff
-        const shouldExplorePolicy = ranked.length > 1 && exploreSeed < BANDIT_POLICY_EXPLORATION_RATE
+        const effectiveExplorationRate = options.exploreX3Mode
+          ? Math.max(BANDIT_POLICY_EXPLORATION_RATE, 0.5)
+          : BANDIT_POLICY_EXPLORATION_RATE
+        const shouldExplorePolicy = ranked.length > 1 && exploreSeed < effectiveExplorationRate
         let winner = shouldExplorePolicy
           ? ranked[Math.min(1, ranked.length - 1)]
           : ranked[0]
@@ -24899,7 +25187,7 @@ const processJob = async (
               variantScore: attempt.variantScore,
               predictedRetention: attempt.predictedRetention
             })),
-            explorationRate: BANDIT_POLICY_EXPLORATION_RATE
+            explorationRate: effectiveExplorationRate
           })
           if (learnedSelection?.selectedPolicyId) {
             const learnedWinner = ranked.find((attempt) => attempt.policyId === learnedSelection.selectedPolicyId)
@@ -24940,6 +25228,9 @@ const processJob = async (
           optimizationNotes.push(
             `Contextual bandit exploration selected policy ${winner.policyId} (seed ${(exploreSeed * 100).toFixed(1)}).`
           )
+        }
+        if (options.exploreX3Mode) {
+          optimizationNotes.push('Explore x3 mode enabled: evaluated multiple policy variants and promoted the winner using live outcome learning priors.')
         }
         if (winner) {
           finalSegments = winner.segments
@@ -26633,6 +26924,10 @@ const processJob = async (
       longFormClarityVsSpeed: options.longFormClarityVsSpeed,
       tangentKiller: options.tangentKiller,
       fastMode: options.fastMode,
+      coldStartAutopilot: options.coldStartAutopilot,
+      continuityFirstMode: options.continuityFirstMode,
+      exploreX3Mode: options.exploreX3Mode,
+      creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
       outputPaths
@@ -26666,6 +26961,10 @@ const processJob = async (
         longFormClarityVsSpeed: options.longFormClarityVsSpeed,
         tangentKiller: options.tangentKiller,
         fastMode: options.fastMode,
+        coldStartAutopilot: options.coldStartAutopilot,
+        continuityFirstMode: options.continuityFirstMode,
+        exploreX3Mode: options.exploreX3Mode,
+        creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: persistedVerticalCaptionConfig
       }),
@@ -26731,6 +27030,10 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         tangentKiller: getTangentKillerFromJob(existing),
         manualTimestampConfig: getManualTimestampConfigFromJob(existing),
         fastMode: getFastModeFromJob(existing),
+        coldStartAutopilot: getColdStartAutopilotFromJob(existing),
+        continuityFirstMode: getContinuityFirstModeFromJob(existing),
+        exploreX3Mode: getExploreX3ModeFromJob(existing),
+        creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       }, user.email)
@@ -26757,6 +27060,10 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         tangentKiller: getTangentKillerFromJob(latestBeforeProcess),
         manualTimestampConfig: getManualTimestampConfigFromJob(latestBeforeProcess),
         fastMode: getFastModeFromJob(latestBeforeProcess),
+        coldStartAutopilot: getColdStartAutopilotFromJob(latestBeforeProcess),
+        continuityFirstMode: getContinuityFirstModeFromJob(latestBeforeProcess),
+        exploreX3Mode: getExploreX3ModeFromJob(latestBeforeProcess),
+        creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(latestBeforeProcess),
         autoCaptions: getAutoCaptionsFromPayload((latestBeforeProcess.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((latestBeforeProcess.analysis as any) || {})
       }, user.email)
@@ -27111,6 +27418,10 @@ const handleCreateJob = async (req: any, res: any) => {
     let tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     let requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const coldStartAutopilotOverride = getColdStartAutopilotFromPayload(req.body)
+    const continuityFirstModeOverride = getContinuityFirstModeFromPayload(req.body)
+    const exploreX3ModeOverride = getExploreX3ModeFromPayload(req.body)
+    const creatorStyleLockPercentOverride = getCreatorStyleLockPercentFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: DEFAULT_EDIT_OPTIONS.retentionAggressionLevel,
@@ -27158,6 +27469,36 @@ const handleCreateJob = async (req: any, res: any) => {
       if (autoCaptionsOverride === null) autoCaptionsOverride = defaults.autoCaptions
       if (!subtitleStyleOverride) subtitleStyleOverride = defaults.subtitleStyle
     }
+    const coldStartAutopilot = coldStartAutopilotOverride ?? false
+    const continuityFirstMode = continuityFirstModeOverride ?? false
+    const exploreX3Mode = exploreX3ModeOverride ?? false
+    const creatorStyleLockPercent = creatorStyleLockPercentOverride ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
+    if (coldStartAutopilot) {
+      if (!retentionTuning.hasStrategyOverride) retentionStrategyProfile = 'safe'
+      if (!retentionTuning.hasAggressionOverride) retentionAggressionLevel = 'low'
+      if (!retentionPlatformTuning.hasOverride) retentionTargetPlatform = 'youtube'
+      if (maxCutsOverride === null) maxCutsOverride = 6
+      if (editorModeOverride === null) editorModeOverride = 'auto'
+      if (longFormPresetOverride === null || longFormPresetOverride === 'ultra') longFormPresetOverride = 'balanced'
+      if (longFormAggressionOverride === null) longFormAggressionOverride = 58
+      if (longFormClarityVsSpeedOverride === null) longFormClarityVsSpeedOverride = 78
+      if (tangentKillerOverride === null) tangentKillerOverride = true
+      requestedFastMode = false
+    }
+    if (continuityFirstMode) {
+      if (!retentionTuning.hasStrategyOverride || retentionStrategyProfile === 'viral') retentionStrategyProfile = 'safe'
+      if (!retentionTuning.hasAggressionOverride || retentionAggressionLevel === 'viral' || retentionAggressionLevel === 'high') {
+        retentionAggressionLevel = 'low'
+      }
+      if (maxCutsOverride !== null) maxCutsOverride = Math.min(maxCutsOverride, 8)
+      if (longFormPresetOverride === null || longFormPresetOverride === 'aggressive' || longFormPresetOverride === 'ultra') {
+        longFormPresetOverride = 'balanced'
+      }
+      if (longFormAggressionOverride === null) longFormAggressionOverride = 48
+      if (longFormClarityVsSpeedOverride === null) longFormClarityVsSpeedOverride = 86
+      if (tangentKillerOverride === null) tangentKillerOverride = true
+      requestedFastMode = false
+    }
     const fullAutoYoutubeProfile = fullAutoYoutubePreset
       ? {
           ...fullAutoYoutubePreset.profile,
@@ -27179,6 +27520,10 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
             tangentKiller: tangentKillerOverride,
             fastMode: requestedFastMode,
+            coldStartAutopilot,
+            continuityFirstMode,
+            exploreX3Mode,
+            creatorStyleLock: creatorStyleLockPercent,
             autoCaptions: autoCaptionsOverride,
             subtitleStyle: subtitleStyleOverride
           }
@@ -27290,6 +27635,10 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
             tangentKiller: tangentKillerOverride,
             fastMode: effectiveFastMode,
+            coldStartAutopilot,
+            continuityFirstMode,
+            exploreX3Mode,
+            creatorStyleLockPercent,
             manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride
           }),
@@ -27319,6 +27668,14 @@ const handleCreateJob = async (req: any, res: any) => {
             pipeline_mode_prompt: createModePlaybook.prompt || null,
             pipelinePowerMode: createModePlaybook.id,
             pipeline_power_mode: createModePlaybook.id,
+            coldStartAutopilot,
+            cold_start_autopilot: coldStartAutopilot,
+            continuityFirstMode,
+            continuity_first_mode: continuityFirstMode,
+            exploreX3Mode,
+            explore_x3_mode: exploreX3Mode,
+            creatorStyleLock: creatorStyleLockPercent,
+            creator_style_lock: creatorStyleLockPercent,
             ...(fullAutoYoutubeProfile
               ? { fullAutoYoutube: fullAutoYoutubeProfile, full_auto_youtube: fullAutoYoutubeProfile }
               : {}),
@@ -27357,6 +27714,10 @@ const handleCreateJob = async (req: any, res: any) => {
           longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
           tangentKiller: tangentKillerOverride,
           fastMode: effectiveFastMode,
+          coldStartAutopilot,
+          continuityFirstMode,
+          exploreX3Mode,
+          creatorStyleLockPercent,
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
           outputPaths: null
@@ -28155,6 +28516,10 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
+    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra' ? true : analyzeRequestedFastMode
     const nextRenderSettings = {
@@ -28184,6 +28549,14 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
@@ -28221,6 +28594,14 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -28240,6 +28621,10 @@ router.post('/:id/analyze', async (req: any, res) => {
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       fastMode: effectiveAnalyzeFastMode,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -28323,6 +28708,10 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
+    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveProcessFastMode = requestedEditorMode === 'ultra' ? true : processRequestedFastMode
     const nextRenderSettings = {
@@ -28352,6 +28741,14 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
@@ -28389,6 +28786,14 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -28408,6 +28813,10 @@ router.post('/:id/process', async (req: any, res) => {
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       fastMode: effectiveProcessFastMode,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
@@ -28579,6 +28988,10 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
+    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedHookSelectionModeRaw = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedHookSelectionMode = requestedManualTimestampConfig?.enabled ? 'manual' : requestedHookSelectionModeRaw
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
@@ -28602,6 +29015,10 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         longFormAggression: requestedLongFormAggression,
         longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
         tangentKiller: requestedTangentKiller,
+        coldStartAutopilot: requestedColdStartAutopilot,
+        continuityFirstMode: requestedContinuityFirstMode,
+        exploreX3Mode: requestedExploreX3Mode,
+        creatorStyleLockPercent: requestedCreatorStyleLockPercent,
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: verticalCaptionConfigOverride
       }),
@@ -28625,6 +29042,14 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         platform: requestedTargetPlatform,
         platformProfile: requestedPlatformProfile,
         platform_profile: requestedPlatformProfile,
+        coldStartAutopilot: requestedColdStartAutopilot,
+        cold_start_autopilot: requestedColdStartAutopilot,
+        continuityFirstMode: requestedContinuityFirstMode,
+        continuity_first_mode: requestedContinuityFirstMode,
+        exploreX3Mode: requestedExploreX3Mode,
+        explore_x3_mode: requestedExploreX3Mode,
+        creatorStyleLock: requestedCreatorStyleLockPercent,
+        creator_style_lock: requestedCreatorStyleLockPercent,
         style_archetype_blend_override: styleBlendOverride
       },
       renderConfig: effectiveRenderConfig,
@@ -28641,6 +29066,10 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       longFormAggression: requestedLongFormAggression,
       longFormClarityVsSpeed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: verticalCaptionConfigOverride
     }) as Record<string, any>
@@ -28908,6 +29337,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
     const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
     const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
+    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const reprocessRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveReprocessFastMode = requestedEditorMode === 'ultra' ? true : reprocessRequestedFastMode
 
@@ -28977,6 +29410,14 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -29031,6 +29472,14 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      coldStartAutopilot: requestedColdStartAutopilot,
+      cold_start_autopilot: requestedColdStartAutopilot,
+      continuityFirstMode: requestedContinuityFirstMode,
+      continuity_first_mode: requestedContinuityFirstMode,
+      exploreX3Mode: requestedExploreX3Mode,
+      explore_x3_mode: requestedExploreX3Mode,
+      creatorStyleLock: requestedCreatorStyleLockPercent,
+      creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: preferredHookCandidate ?? null,
