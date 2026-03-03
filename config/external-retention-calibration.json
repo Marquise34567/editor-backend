@@ -1,0 +1,171 @@
+{
+  "version": "1.0",
+  "generatedAt": "2026-03-03T03:54:48.949716+00:00",
+  "source": "youtube_audience_retention_export",
+  "channel": "Quise Live",
+  "appliesToUserIds": [],
+  "retentionTiers": {
+    "high": {
+      "rule": "ret10 >= 55 and drop0to1 <= 22",
+      "avgRetentionPercent": 55.58
+    },
+    "average": {
+      "rule": "ret10 >= 30 and drop0to1 <= 35 (and not high)",
+      "avgRetentionPercent": 20.48
+    },
+    "low": {
+      "rule": "otherwise",
+      "avgRetentionPercent": 14.55
+    }
+  },
+  "summary": {
+    "videoCount": 4,
+    "tierCounts": {
+      "high": 1,
+      "average": 1,
+      "low": 2
+    },
+    "avgRetentionPercent": 26.29,
+    "avgRet10Percent": 36.73,
+    "avgDrop0to1": 31.46,
+    "avgDrop0to10": 61.31,
+    "avgVsOtherPercent": -11.63
+  },
+  "contentTypeSummary": {
+    "days": 28,
+    "avgSeconds": 149.04,
+    "minSeconds": 73,
+    "maxSeconds": 230
+  },
+  "videos": [
+    {
+      "title": "Audience retention 2025-10-23_2026-03-02 Karen Takes Argument With Her Neighbor TOO FAR\u2026",
+      "zipPath": "C:\\Users\\Quise\\Downloads\\Audience retention 2025-10-23_2026-03-02 Karen Takes Argument With Her Neighbor TOO FAR\u2026.zip",
+      "tier": "high",
+      "avgRetentionPercent": 55.58,
+      "retentionAt": {
+        "0": 98.16,
+        "1": 82.94,
+        "3": 76.12,
+        "5": 70.6,
+        "10": 63.78,
+        "20": 58.01,
+        "30": 56.69,
+        "50": 53.54,
+        "75": 50.13,
+        "100": 46.98
+      },
+      "drops": {
+        "0_to_1": 15.22,
+        "0_to_3": 22.04,
+        "0_to_10": 34.38
+      },
+      "avgVsOtherPercent": 5.62,
+      "outcomeScore": 0.571
+    },
+    {
+      "title": "Audience retention 2025-11-14_2026-03-02 Fine Shyt Failed The Gold Digger Test In Seconds\u2026",
+      "zipPath": "C:\\Users\\Quise\\Downloads\\Audience retention 2025-11-14_2026-03-02 Fine Shyt Failed The Gold Digger Test In Seconds\u2026.zip",
+      "tier": "average",
+      "avgRetentionPercent": 20.48,
+      "retentionAt": {
+        "0": 95.52,
+        "1": 70.75,
+        "3": 62.99,
+        "5": 50.33,
+        "10": 34.82,
+        "20": 24.38,
+        "30": 25.02,
+        "50": 18.0,
+        "75": 8.41,
+        "100": 8.65
+      },
+      "drops": {
+        "0_to_1": 24.77,
+        "0_to_3": 32.53,
+        "0_to_10": 60.7
+      },
+      "avgVsOtherPercent": -10.69,
+      "outcomeScore": 0.2485
+    },
+    {
+      "title": "Audience retention 2025-11-28_2026-03-02 Fine Shyt Made Him Fail the Loyalty Test in Minutes\u2026",
+      "zipPath": "C:\\Users\\Quise\\Downloads\\Audience retention 2025-11-28_2026-03-02 Fine Shyt Made Him Fail the Loyalty Test in Minutes\u2026.zip",
+      "tier": "low",
+      "avgRetentionPercent": 15.68,
+      "retentionAt": {
+        "0": 101.17,
+        "1": 48.4,
+        "3": 28.28,
+        "5": 23.32,
+        "10": 20.99,
+        "20": 14.58,
+        "30": 12.83,
+        "50": 11.95,
+        "75": 13.99,
+        "100": 8.16
+      },
+      "drops": {
+        "0_to_1": 52.77,
+        "0_to_3": 72.89,
+        "0_to_10": 80.18
+      },
+      "avgVsOtherPercent": -13.95,
+      "outcomeScore": 0.1493
+    },
+    {
+      "title": "Audience retention 2025-10-05_2026-03-02 Fine Shyt Actually PASSED The Gold Digger Test\u2026",
+      "zipPath": "C:\\Users\\Quise\\Downloads\\Audience retention 2025-10-05_2026-03-02 Fine Shyt Actually PASSED The Gold Digger Test\u2026.zip",
+      "tier": "low",
+      "avgRetentionPercent": 13.42,
+      "retentionAt": {
+        "0": 97.29,
+        "1": 64.2,
+        "3": 35.99,
+        "5": 27.49,
+        "10": 27.31,
+        "20": 18.44,
+        "30": 14.65,
+        "50": 8.32,
+        "75": 6.33,
+        "100": 4.34
+      },
+      "drops": {
+        "0_to_1": 33.09,
+        "0_to_3": 61.3,
+        "0_to_10": 69.98
+      },
+      "avgVsOtherPercent": -27.5,
+      "outcomeScore": 0.1714
+    }
+  ],
+  "hookCalibration": {
+    "enabled": true,
+    "sampleSize": 4,
+    "averageOutcome": 0.285,
+    "earlyDropRate": 0.5,
+    "platformFeedbackShare": 1.0,
+    "dominantStyle": "reaction",
+    "weights": {
+      "candidateScore": 0.3462,
+      "auditScore": 0.2692,
+      "energy": 0.1538,
+      "curiosity": 0.125,
+      "emotionalSpike": 0.1058
+    },
+    "strategyBias": {
+      "BASELINE": -1.0,
+      "HOOK_FIRST": 2.0,
+      "EMOTION_FIRST": 2.5,
+      "PACING_FIRST": 1.0
+    },
+    "reasons": [
+      "Severe first-second drop appears in multiple videos; enforcing safer hook selection.",
+      "Weak tail retention trend found; favoring unresolved open-loop hook candidates.",
+      "At least one high-retention outlier suggests keeping energetic/emotional signals active.",
+      "Overall normalized outcome is low; adding conservative quality bias.",
+      "Bootstrap profile derived from 4 YouTube audience retention exports for channel Quise Live."
+    ],
+    "updatedAt": "2026-03-03T03:54:48.949716+00:00"
+  }
+}

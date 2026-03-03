@@ -1383,6 +1383,25 @@ type HookCalibrationProfile = {
   reasons: string[]
   updatedAt: string
 }
+type ExternalRetentionCalibrationDoc = {
+  version?: string
+  generatedAt?: string
+  source?: string
+  channel?: string
+  appliesToUserIds?: string[]
+  hookCalibration?: {
+    enabled?: boolean
+    sampleSize?: number
+    averageOutcome?: number
+    earlyDropRate?: number
+    platformFeedbackShare?: number
+    dominantStyle?: ContentStyle | null
+    weights?: Partial<HookCalibrationWeights>
+    strategyBias?: Partial<Record<RetentionRetryStrategy, number>>
+    reasons?: string[]
+    updatedAt?: string
+  }
+}
 type OutcomeMenuProfile = {
   enabled: boolean
   source: 'real_distribution_analytics'
@@ -1899,6 +1918,20 @@ const DEFAULT_HOOK_FACEOFF_WEIGHTS: HookCalibrationWeights = {
   emotionalSpike: 0.1
 }
 const RETENTION_VARIANT_STRATEGIES: RetentionRetryStrategy[] = ['BASELINE', 'HOOK_FIRST', 'EMOTION_FIRST', 'PACING_FIRST']
+const EXTERNAL_RETENTION_CALIBRATION_ENV = String(process.env.EXTERNAL_RETENTION_CALIBRATION_PATH || '').trim()
+const EXTERNAL_RETENTION_CALIBRATION_CANDIDATES = [
+  EXTERNAL_RETENTION_CALIBRATION_ENV,
+  path.resolve(process.cwd(), 'config', 'external-retention-calibration.json'),
+  path.resolve(process.cwd(), 'backend', 'config', 'external-retention-calibration.json'),
+  path.resolve(__dirname, '../../config/external-retention-calibration.json'),
+  path.resolve(__dirname, '../../../backend/config/external-retention-calibration.json')
+].filter((value): value is string => Boolean(value))
+const EXTERNAL_RETENTION_CALIBRATION_MAX_BYTES = 512_000
+let externalRetentionCalibrationCache: {
+  path: string
+  mtimeMs: number
+  doc: ExternalRetentionCalibrationDoc | null
+} | null = null
 const CREATOR_FEEDBACK_CATEGORIES: CreatorFeedbackCategory[] = ['bad_hook', 'too_fast', 'too_generic', 'great_edit']
 const CREATOR_FEEDBACK_SIGNAL_MAP: Record<CreatorFeedbackCategory, {
   manualScore: number
@@ -6824,6 +6857,116 @@ const buildDefaultHookCalibrationProfile = (reason: string, sampleSize = 0): Hoo
   updatedAt: toIsoNow()
 })
 
+const asContentStyle = (value: unknown): ContentStyle | null => {
+  const normalized = String(value || '').trim().toLowerCase()
+  return (normalized === 'reaction' || normalized === 'vlog' || normalized === 'tutorial' || normalized === 'gaming' || normalized === 'story')
+    ? (normalized as ContentStyle)
+    : null
+}
+
+const resolveExternalRetentionCalibrationPath = (): string | null => {
+  for (const candidate of EXTERNAL_RETENTION_CALIBRATION_CANDIDATES) {
+    if (!candidate) continue
+    try {
+      if (!fs.existsSync(candidate)) continue
+      const stat = fs.statSync(candidate)
+      if (stat.isFile()) return candidate
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+const readExternalRetentionCalibrationDoc = (): { path: string; doc: ExternalRetentionCalibrationDoc } | null => {
+  const resolvedPath = resolveExternalRetentionCalibrationPath()
+  if (!resolvedPath) return null
+  try {
+    const stat = fs.statSync(resolvedPath)
+    if (!stat.isFile()) return null
+    if (externalRetentionCalibrationCache &&
+        externalRetentionCalibrationCache.path === resolvedPath &&
+        externalRetentionCalibrationCache.mtimeMs === stat.mtimeMs) {
+      if (!externalRetentionCalibrationCache.doc) return null
+      return { path: resolvedPath, doc: externalRetentionCalibrationCache.doc }
+    }
+    if (stat.size > EXTERNAL_RETENTION_CALIBRATION_MAX_BYTES) {
+      console.warn(`external retention calibration file too large: ${resolvedPath}`)
+      externalRetentionCalibrationCache = { path: resolvedPath, mtimeMs: stat.mtimeMs, doc: null }
+      return null
+    }
+    const rawText = fs.readFileSync(resolvedPath, 'utf8')
+    const raw = JSON.parse(rawText)
+    if (!raw || typeof raw !== 'object') {
+      externalRetentionCalibrationCache = { path: resolvedPath, mtimeMs: stat.mtimeMs, doc: null }
+      return null
+    }
+    const doc = raw as ExternalRetentionCalibrationDoc
+    externalRetentionCalibrationCache = { path: resolvedPath, mtimeMs: stat.mtimeMs, doc }
+    return { path: resolvedPath, doc }
+  } catch (error) {
+    console.warn('external retention calibration read failed', error)
+    return null
+  }
+}
+
+const loadExternalHookCalibrationProfile = (userId: string): HookCalibrationProfile | null => {
+  const loaded = readExternalRetentionCalibrationDoc()
+  if (!loaded) return null
+  const { path: calibrationPath, doc } = loaded
+  const appliesTo = Array.isArray(doc.appliesToUserIds)
+    ? doc.appliesToUserIds.map((value) => String(value || '').trim()).filter(Boolean)
+    : []
+  if (appliesTo.length > 0 && !appliesTo.includes(userId)) return null
+  const raw = doc.hookCalibration
+  if (!raw || typeof raw !== 'object') return null
+
+  const rawWeights = (raw.weights && typeof raw.weights === 'object')
+    ? raw.weights
+    : {}
+  const weights = normalizeHookCalibrationWeights({
+    candidateScore: Number((rawWeights as HookCalibrationWeights).candidateScore ?? DEFAULT_HOOK_FACEOFF_WEIGHTS.candidateScore),
+    auditScore: Number((rawWeights as HookCalibrationWeights).auditScore ?? DEFAULT_HOOK_FACEOFF_WEIGHTS.auditScore),
+    energy: Number((rawWeights as HookCalibrationWeights).energy ?? DEFAULT_HOOK_FACEOFF_WEIGHTS.energy),
+    curiosity: Number((rawWeights as HookCalibrationWeights).curiosity ?? DEFAULT_HOOK_FACEOFF_WEIGHTS.curiosity),
+    emotionalSpike: Number((rawWeights as HookCalibrationWeights).emotionalSpike ?? DEFAULT_HOOK_FACEOFF_WEIGHTS.emotionalSpike)
+  })
+
+  const rawStrategyBias = (raw.strategyBias && typeof raw.strategyBias === 'object')
+    ? raw.strategyBias
+    : {}
+  const strategyBias: Partial<Record<RetentionRetryStrategy, number>> = {}
+  for (const strategy of RETENTION_VARIANT_STRATEGIES) {
+    const value = Number((rawStrategyBias as Record<string, unknown>)[strategy])
+    if (!Number.isFinite(value)) continue
+    strategyBias[strategy] = Number(clamp(value, -12, 12).toFixed(2))
+  }
+
+  const sampleSizeRaw = Number(raw.sampleSize)
+  const sampleSize = Number.isFinite(sampleSizeRaw) ? Math.max(0, Math.round(sampleSizeRaw)) : 0
+  const reasons = [
+    ...(Array.isArray(raw.reasons)
+      ? raw.reasons.map((value) => String(value || '').trim()).filter(Boolean)
+      : []),
+    `Loaded external retention calibration from ${calibrationPath}.`
+  ]
+
+  return {
+    enabled: Boolean(raw.enabled ?? true),
+    sampleSize,
+    averageOutcome: Number(clamp01(Number(raw.averageOutcome ?? 0)).toFixed(4)),
+    earlyDropRate: Number(clamp01(Number(raw.earlyDropRate ?? 0)).toFixed(4)),
+    platformFeedbackShare: Number(clamp01(Number(raw.platformFeedbackShare ?? 0)).toFixed(4)),
+    dominantStyle: asContentStyle(raw.dominantStyle) || null,
+    weights,
+    strategyBias,
+    reasons: reasons.length ? reasons : ['Loaded external retention calibration profile.'],
+    updatedAt: typeof raw.updatedAt === 'string' && raw.updatedAt.trim().length
+      ? raw.updatedAt
+      : toIsoNow()
+  }
+}
+
 const computeFeedbackOutcomeSignal = (entry: {
   analysis?: any
   retentionScore?: number | null
@@ -7382,6 +7525,7 @@ const computeHookCalibrationProfileFromHistory = (
 
 const loadHookCalibrationProfile = async (userId: string) => {
   if (!userId) return buildDefaultHookCalibrationProfile('Missing user context for calibration.', 0)
+  const externalProfile = loadExternalHookCalibrationProfile(userId)
   try {
     const jobs = await prisma.job.findMany({
       where: { userId, status: 'completed' },
@@ -7392,14 +7536,17 @@ const loadHookCalibrationProfile = async (userId: string) => {
         retentionScore: true
       }
     })
-    return computeHookCalibrationProfileFromHistory(
+    const computed = computeHookCalibrationProfileFromHistory(
       jobs.map((job) => ({
         analysis: job.analysis,
         retentionScore: job.retentionScore
       }))
     )
+    if (!computed.enabled && externalProfile) return externalProfile
+    return computed
   } catch (error) {
     console.warn('hook calibration load failed', error)
+    if (externalProfile) return externalProfile
     return buildDefaultHookCalibrationProfile('Failed to load calibration data; using baseline weights.', 0)
   }
 }
