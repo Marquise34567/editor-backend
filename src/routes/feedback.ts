@@ -906,6 +906,38 @@ type YouTubeSignalState = {
   recommendation: string
 }
 
+type YouTubeReferenceTargetPlatform = 'tiktok' | 'instagram_reels' | 'youtube'
+type YouTubeReferenceRetentionProfile = 'safe' | 'balanced' | 'viral'
+type YouTubeReferenceSubtitleStyle =
+  | 'basic_clean'
+  | 'bold_pop'
+  | 'outline_heavy'
+  | 'caption_box'
+  | 'mrbeast_animated'
+  | 'neon_glow'
+  | 'karaoke_highlight'
+
+type YouTubeReferenceStyleProfile = {
+  retentionStrategyProfile: YouTubeReferenceRetentionProfile
+  retentionTargetPlatform: YouTubeReferenceTargetPlatform
+  maxCuts: number
+  subtitleStyle: YouTubeReferenceSubtitleStyle
+  autoCaptions: boolean
+  confidence: number
+  source: 'public_metrics' | 'public_metrics_plus_analytics'
+}
+
+type YouTubeReferenceStyleMetrics = {
+  durationSeconds: number | null
+  viewCount: number
+  likeCount: number
+  commentCount: number
+  engagementRate: number
+  averageViewPercentage: number | null
+  hookHoldPercent: number | null
+  first30Retention: number | null
+}
+
 type YouTubePlatformFeedback = {
   watchPercent: number | null
   hookHoldPercent: number | null
@@ -1364,6 +1396,155 @@ const fetchYouTubeAnalyticsReport = async ({
   return {
     summary,
     retentionCurve: parseYouTubeRetentionCurve(retentionResponse.payload)
+  }
+}
+
+const resolveYouTubeReferenceAnalyticsDateRange = (publishedAt: string | null) => {
+  const fallback = resolveYouTubeAnalyticsDateRange({})
+  if (!publishedAt) return fallback
+  const published = new Date(String(publishedAt))
+  if (!Number.isFinite(published.getTime())) return fallback
+  const publishedYmd = toYmd(published)
+  const startDate = publishedYmd > fallback.startDate ? publishedYmd : fallback.startDate
+  return {
+    startDate: startDate > fallback.endDate ? fallback.endDate : startDate,
+    endDate: fallback.endDate
+  }
+}
+
+const deriveYouTubeReferenceStyleProfile = ({
+  metrics,
+  analyticsSummary,
+  retentionCurve
+}: {
+  metrics: YouTubeVideoMetrics
+  analyticsSummary?: YouTubeAnalyticsSummary | null
+  retentionCurve?: YouTubeRetentionPoint[] | null
+}) => {
+  const durationSeconds = Number.isFinite(Number(metrics.durationSeconds)) && Number(metrics.durationSeconds) > 0
+    ? Number(metrics.durationSeconds)
+    : null
+  const engagementRate = Number(clamp01(Number(metrics.engagementRate || 0)).toFixed(4))
+  const engagementPercent = Number((engagementRate * 100).toFixed(2))
+  const watchPercent = analyticsSummary?.averageViewPercentage !== null && analyticsSummary?.averageViewPercentage !== undefined
+    ? Number(clamp(analyticsSummary.averageViewPercentage, 0, 100).toFixed(3))
+    : null
+  const safeRetentionCurve = Array.isArray(retentionCurve) ? retentionCurve : []
+  const hookHoldPercent = averagePercentForRange(safeRetentionCurve, 0.08)
+  const first30Retention = averagePercentForRange(safeRetentionCurve, 0.3)
+  const reasoning: string[] = []
+
+  let retentionTargetPlatform: YouTubeReferenceTargetPlatform = 'youtube'
+  if (durationSeconds !== null && durationSeconds <= 75) {
+    retentionTargetPlatform = 'tiktok'
+    reasoning.push('Runtime is short-form; optimize pacing for TikTok-style delivery.')
+  } else if (durationSeconds !== null && durationSeconds <= 180) {
+    retentionTargetPlatform = 'instagram_reels'
+    reasoning.push('Runtime fits quick-scroll format; use Reels pacing defaults.')
+  } else {
+    reasoning.push('Runtime is long-form; keep context-first YouTube pacing defaults.')
+  }
+
+  let aggressionScore = 0.5
+  if (retentionTargetPlatform !== 'youtube') aggressionScore += 0.08
+  if (engagementPercent >= 6.5) {
+    aggressionScore += 0.18
+    reasoning.push(`High engagement (${engagementPercent.toFixed(1)}%) supports a more aggressive cut profile.`)
+  } else if (engagementPercent >= 4) {
+    aggressionScore += 0.08
+    reasoning.push(`Good engagement (${engagementPercent.toFixed(1)}%) supports balanced cut pressure.`)
+  } else if (engagementPercent < 2.5) {
+    aggressionScore -= 0.14
+    reasoning.push(`Low engagement (${engagementPercent.toFixed(1)}%) suggests safer pacing and stronger context.`)
+  }
+
+  if (watchPercent !== null) {
+    if (watchPercent >= 58) {
+      aggressionScore += 0.12
+      reasoning.push(`Average view percentage ${watchPercent.toFixed(1)}% indicates viewers tolerate faster pacing.`)
+    } else if (watchPercent < 42) {
+      aggressionScore -= 0.12
+      reasoning.push(`Average view percentage ${watchPercent.toFixed(1)}% indicates drop risk; use safer pacing.`)
+    }
+  }
+
+  if (hookHoldPercent !== null) {
+    if (hookHoldPercent >= 75) {
+      aggressionScore += 0.1
+      reasoning.push(`Hook hold ${hookHoldPercent.toFixed(1)}% supports stronger interruption density.`)
+    } else if (hookHoldPercent < 55) {
+      aggressionScore -= 0.1
+      reasoning.push(`Hook hold ${hookHoldPercent.toFixed(1)}% suggests reducing early cut turbulence.`)
+    }
+  }
+
+  if (durationSeconds !== null && durationSeconds >= 600) aggressionScore -= 0.1
+  if (durationSeconds !== null && durationSeconds <= 40) aggressionScore += 0.07
+  aggressionScore = clamp01(aggressionScore)
+
+  const retentionStrategyProfile: YouTubeReferenceRetentionProfile =
+    aggressionScore >= 0.68
+      ? 'viral'
+      : aggressionScore < 0.42
+        ? 'safe'
+        : 'balanced'
+
+  let maxCuts = retentionStrategyProfile === 'viral' ? 12 : retentionStrategyProfile === 'safe' ? 7 : 9
+  if (durationSeconds !== null) {
+    if (durationSeconds < 45) maxCuts += 2
+    else if (durationSeconds > 600) maxCuts -= 3
+    else if (durationSeconds > 300) maxCuts -= 2
+    else if (durationSeconds > 180) maxCuts -= 1
+  }
+  if (retentionTargetPlatform === 'youtube') maxCuts -= 1
+  if (retentionStrategyProfile === 'viral' && retentionTargetPlatform !== 'youtube') maxCuts += 1
+  maxCuts = Math.round(clamp(maxCuts, 4, 15))
+
+  let subtitleStyle: YouTubeReferenceSubtitleStyle = 'basic_clean'
+  if (retentionStrategyProfile === 'viral') subtitleStyle = 'mrbeast_animated'
+  else if (retentionTargetPlatform === 'youtube') subtitleStyle = 'outline_heavy'
+  else if (retentionTargetPlatform === 'instagram_reels') subtitleStyle = 'caption_box'
+  else subtitleStyle = 'bold_pop'
+  if (watchPercent !== null && watchPercent < 40 && retentionStrategyProfile === 'safe') subtitleStyle = 'basic_clean'
+
+  let confidence = 0.42
+  if (durationSeconds !== null) confidence += 0.08
+  if (metrics.viewCount >= 10_000) confidence += 0.12
+  else if (metrics.viewCount >= 1_000) confidence += 0.06
+  if (analyticsSummary) confidence += 0.22
+  if (watchPercent !== null) confidence += 0.08
+  if (hookHoldPercent !== null) confidence += 0.05
+  confidence = clamp01(confidence)
+
+  if (!reasoning.length) {
+    reasoning.push('Applied balanced defaults from video runtime and engagement signals.')
+  }
+
+  const profile: YouTubeReferenceStyleProfile = {
+    retentionStrategyProfile,
+    retentionTargetPlatform,
+    maxCuts,
+    subtitleStyle,
+    autoCaptions: true,
+    confidence: Number(confidence.toFixed(3)),
+    source: analyticsSummary ? 'public_metrics_plus_analytics' : 'public_metrics'
+  }
+
+  const referenceMetrics: YouTubeReferenceStyleMetrics = {
+    durationSeconds,
+    viewCount: Math.max(0, Number(metrics.viewCount || 0)),
+    likeCount: Math.max(0, Number(metrics.likeCount || 0)),
+    commentCount: Math.max(0, Number(metrics.commentCount || 0)),
+    engagementRate,
+    averageViewPercentage: watchPercent,
+    hookHoldPercent,
+    first30Retention
+  }
+
+  return {
+    profile,
+    metrics: referenceMetrics,
+    reasoning: Array.from(new Set(reasoning)).slice(0, 6)
   }
 }
 
@@ -1930,6 +2111,107 @@ router.post('/youtube/video-metrics', async (req: any, res) => {
     return res.status(500).json({
       error: 'youtube_api_server_error',
       message: 'Could not fetch YouTube metrics.'
+    })
+  }
+})
+
+router.post('/youtube/reference-style', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const apiKey = String(process.env.YOUTUBE_API_KEY || '').trim()
+    const rawVideoInput =
+      req.body?.videoId ??
+      req.body?.video_id ??
+      req.body?.videoUrl ??
+      req.body?.video_url ??
+      req.body?.video ??
+      req.body?.id
+    const videoId = parseYouTubeVideoId(rawVideoInput)
+    if (!videoId) {
+      return res.status(400).json({
+        error: 'invalid_youtube_video',
+        message: 'Provide a valid YouTube video ID or URL.'
+      })
+    }
+
+    const metrics = await fetchYouTubeVideoMetrics({
+      userId,
+      videoId,
+      apiKey
+    })
+
+    const analyticsDateRange = resolveYouTubeReferenceAnalyticsDateRange(metrics.publishedAt)
+    let analyticsSummary: YouTubeAnalyticsSummary | null = null
+    let analyticsCurve: YouTubeRetentionPoint[] | null = null
+    let analyticsStatus: 'available' | 'unavailable' = 'unavailable'
+    try {
+      const report = await fetchYouTubeAnalyticsReport({
+        userId,
+        videoId,
+        startDate: analyticsDateRange.startDate,
+        endDate: analyticsDateRange.endDate
+      })
+      analyticsSummary = report.summary
+      analyticsCurve = report.retentionCurve
+      analyticsStatus = 'available'
+    } catch {
+      analyticsSummary = null
+      analyticsCurve = null
+      analyticsStatus = 'unavailable'
+    }
+
+    const recommendation = deriveYouTubeReferenceStyleProfile({
+      metrics,
+      analyticsSummary,
+      retentionCurve: analyticsCurve
+    })
+
+    return res.json({
+      ok: true,
+      videoId: metrics.videoId,
+      title: metrics.title,
+      channelId: metrics.channelId,
+      channelTitle: metrics.channelTitle,
+      dataSource: metrics.dataSource,
+      analyticsStatus,
+      analyticsWindow: analyticsDateRange,
+      profile: recommendation.profile,
+      metrics: recommendation.metrics,
+      reasoning: recommendation.reasoning
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '')
+    const message = String(error?.message || '')
+    if (code === 'youtube_auth_missing') {
+      return res.status(503).json({
+        error: code,
+        message: 'Connect YouTube OAuth or configure YOUTUBE_API_KEY.'
+      })
+    }
+    if (code === 'youtube_video_not_found') {
+      return res.status(404).json({
+        error: code,
+        message: 'No public YouTube video found for that ID.'
+      })
+    }
+    if (code === 'youtube_data_api_failed') {
+      return res.status(502).json({
+        error: code,
+        message: 'YouTube Data API request failed.',
+        reason: message || null,
+        status: Number(error?.status || 0) || null
+      })
+    }
+    if (message.toLowerCase().includes('aborted')) {
+      return res.status(504).json({
+        error: 'youtube_api_timeout',
+        message: 'YouTube Data API request timed out.'
+      })
+    }
+    return res.status(500).json({
+      error: 'youtube_reference_style_failed',
+      message: 'Could not build reference style from YouTube video.'
     })
   }
 })
