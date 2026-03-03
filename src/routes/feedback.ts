@@ -115,6 +115,47 @@ const parseSourceType = (value: any): 'classic' | 'vibecut' | null => {
   return null
 }
 
+const parseYouTubeVideoId = (value: any): string | null => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+  if (/^[a-zA-Z0-9_-]{11}$/.test(raw)) return raw
+  try {
+    const asUrl = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+    const parsed = new URL(asUrl)
+    const hostname = parsed.hostname.replace(/^www\./i, '').toLowerCase()
+    if (hostname === 'youtu.be') {
+      const id = parsed.pathname.split('/').filter(Boolean)[0] || ''
+      return /^[a-zA-Z0-9_-]{11}$/.test(id) ? id : null
+    }
+    if (!hostname.endsWith('youtube.com')) return null
+    const watchId = parsed.searchParams.get('v') || ''
+    if (/^[a-zA-Z0-9_-]{11}$/.test(watchId)) return watchId
+    const pathTokens = parsed.pathname.split('/').filter(Boolean)
+    const pathId = pathTokens.length >= 2 && (
+      pathTokens[0] === 'shorts' ||
+      pathTokens[0] === 'embed' ||
+      pathTokens[0] === 'live' ||
+      pathTokens[0] === 'v'
+    )
+      ? pathTokens[1]
+      : ''
+    return /^[a-zA-Z0-9_-]{11}$/.test(pathId) ? pathId : null
+  } catch {
+    return null
+  }
+}
+
+const parseIso8601DurationSeconds = (value: any): number | null => {
+  const text = String(value || '').trim().toUpperCase()
+  const match = text.match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/)
+  if (!match) return null
+  const hours = Number(match[1] || 0)
+  const minutes = Number(match[2] || 0)
+  const seconds = Number(match[3] || 0)
+  const total = hours * 3600 + minutes * 60 + seconds
+  return Number.isFinite(total) ? total : null
+}
+
 const extractNoiseReductionLevel = (filters: string[]) => {
   for (const filter of filters) {
     const match = filter.match(/afftdn[^\s,]*nf=([-+]?\d+(?:\.\d+)?)/i)
@@ -972,6 +1013,104 @@ router.get('/realtime-predictions', async (req: any, res) => {
     })
   } catch {
     return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/youtube/video-metrics', async (req: any, res) => {
+  try {
+    const apiKey = String(process.env.YOUTUBE_API_KEY || '').trim()
+    if (!apiKey) {
+      return res.status(503).json({
+        error: 'youtube_api_key_missing',
+        message: 'YOUTUBE_API_KEY is not configured on the backend.'
+      })
+    }
+
+    const rawVideoInput =
+      req.body?.videoId ??
+      req.body?.video_id ??
+      req.body?.videoUrl ??
+      req.body?.video_url ??
+      req.body?.video ??
+      req.body?.id
+    const videoId = parseYouTubeVideoId(rawVideoInput)
+    if (!videoId) {
+      return res.status(400).json({
+        error: 'invalid_youtube_video',
+        message: 'Provide a valid YouTube video ID or URL.'
+      })
+    }
+
+    const endpoint = new URL('https://www.googleapis.com/youtube/v3/videos')
+    endpoint.searchParams.set('part', 'snippet,statistics,contentDetails')
+    endpoint.searchParams.set('id', videoId)
+    endpoint.searchParams.set('key', apiKey)
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 12000)
+    let response: Response
+    try {
+      response = await fetch(endpoint.toString(), {
+        method: 'GET',
+        signal: controller.signal
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+
+    const payload = await response.json().catch(() => ({} as any))
+    if (!response.ok) {
+      return res.status(502).json({
+        error: 'youtube_api_request_failed',
+        message: 'YouTube Data API request failed.',
+        status: response.status,
+        reason: payload?.error?.message || null
+      })
+    }
+
+    const item = Array.isArray(payload?.items) ? payload.items[0] : null
+    if (!item) {
+      return res.status(404).json({
+        error: 'youtube_video_not_found',
+        message: 'No public YouTube video found for that ID.'
+      })
+    }
+
+    const viewCount = Math.max(0, Number(item?.statistics?.viewCount || 0))
+    const likeCount = Math.max(0, Number(item?.statistics?.likeCount || 0))
+    const commentCount = Math.max(0, Number(item?.statistics?.commentCount || 0))
+    const engagementRate = viewCount > 0
+      ? clamp01((likeCount + commentCount) / viewCount)
+      : 0
+    const durationSeconds = parseIso8601DurationSeconds(item?.contentDetails?.duration)
+
+    return res.json({
+      ok: true,
+      videoId,
+      title: String(item?.snippet?.title || ''),
+      channelId: String(item?.snippet?.channelId || ''),
+      channelTitle: String(item?.snippet?.channelTitle || ''),
+      publishedAt: item?.snippet?.publishedAt || null,
+      durationSeconds,
+      stats: {
+        viewCount,
+        likeCount,
+        commentCount,
+        engagementRate: Number(engagementRate.toFixed(4))
+      }
+    })
+  } catch (error: any) {
+    const message = String(error?.message || error || '')
+    if (message.toLowerCase().includes('aborted')) {
+      return res.status(504).json({
+        error: 'youtube_api_timeout',
+        message: 'YouTube Data API request timed out.'
+      })
+    }
+    return res.status(500).json({
+      error: 'youtube_api_server_error',
+      message: 'Could not fetch YouTube metrics.'
+    })
   }
 })
 
