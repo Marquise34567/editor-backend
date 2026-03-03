@@ -19,6 +19,9 @@ type YouTubeOAuthCredentials = {
   tokenUri: string
 }
 
+const GOOGLE_OAUTH_AUTH_URI = 'https://accounts.google.com/o/oauth2/v2/auth'
+const GOOGLE_OAUTH_AUTH_URI_LEGACY = 'https://accounts.google.com/o/oauth2/auth'
+
 type StoredConnection = {
   userId: string
   channelId: string | null
@@ -77,6 +80,13 @@ const toScopeList = (scope: string | null | undefined) =>
     .map((entry) => entry.trim())
     .filter(Boolean)
 
+const normalizeGoogleAuthUri = (value: unknown) => {
+  const normalized = String(value || '').trim()
+  if (!normalized) return GOOGLE_OAUTH_AUTH_URI
+  if (normalized === GOOGLE_OAUTH_AUTH_URI_LEGACY) return GOOGLE_OAUTH_AUTH_URI
+  return normalized
+}
+
 const parseOAuthConfigObject = (raw: any): YouTubeOAuthCredentials | null => {
   const source = raw?.web && typeof raw.web === 'object' ? raw.web : raw
   if (!source || typeof source !== 'object') return null
@@ -88,7 +98,7 @@ const parseOAuthConfigObject = (raw: any): YouTubeOAuthCredentials | null => {
     source.redirectUri ||
     (Array.isArray(source.redirect_uris) ? source.redirect_uris[0] : null)
   const redirectUri = String(redirectUriRaw || '').trim()
-  const authUri = String(source.auth_uri || source.authUri || 'https://accounts.google.com/o/oauth2/auth').trim()
+  const authUri = normalizeGoogleAuthUri(source.auth_uri || source.authUri)
   const tokenUri = String(source.token_uri || source.tokenUri || 'https://oauth2.googleapis.com/token').trim()
 
   if (!clientId || !clientSecret || !redirectUri) return null
@@ -96,7 +106,7 @@ const parseOAuthConfigObject = (raw: any): YouTubeOAuthCredentials | null => {
     clientId,
     clientSecret,
     redirectUri,
-    authUri: authUri || 'https://accounts.google.com/o/oauth2/auth',
+    authUri: authUri || GOOGLE_OAUTH_AUTH_URI,
     tokenUri: tokenUri || 'https://oauth2.googleapis.com/token'
   }
 }
