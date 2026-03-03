@@ -18,6 +18,7 @@ import adminRoutes from './routes/admin'
 import debugRoutes from './routes/debug'
 import analyticsRoutes from './routes/analytics'
 import feedbackRoutes from './routes/feedback'
+import intelligenceRoutes from './routes/intelligence'
 import liveStatsRoutes from './routes/liveStats'
 import vibeCutRoutes from './routes/vibecut'
 import algorithmDevRoutes from './dev/algorithm/routes/algorithm'
@@ -247,6 +248,7 @@ app.use('/api/vibecut', requireAuth, vibeCutRoutes)
 app.use('/api/settings', requireAuth, settingsRoutes)
 app.use('/api/analytics', requireAuth, analyticsRoutes)
 app.use('/api/feedback', requireAuth, feedbackRoutes)
+app.use('/api/intelligence', requireAuth, intelligenceRoutes)
 app.use('/api/dev/algorithm', algorithmDevRoutes)
 app.use('/api/admin', adminRoutes)
 

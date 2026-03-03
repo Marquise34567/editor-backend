@@ -66,6 +66,17 @@ import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
 import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
 import { buildFullAutoYoutubePreset, parseFullAutoYoutubeRequest } from '../services/fullAutoYoutube'
+import {
+  derivePerSecondRewardSignal,
+  getActiveBoundaryCriticModel,
+  getCreatorStyleProfile,
+  ingestPlatformRewardSignal,
+  registerPolicyAssignment,
+  registerPolicyOutcomeForJob,
+  runMultiPassRefinementWithModel,
+  selectPolicyWinnerWithLearning,
+  upsertCreatorStyleProfileFromFeedback
+} from '../services/editorIntelligence'
 
 const router = express.Router()
 
@@ -24462,6 +24473,8 @@ const processJob = async (
           return segment
         })
       }
+      const boundaryCriticModelForRender = await getActiveBoundaryCriticModel().catch(() => null)
+      const creatorStyleProfileForRender = await getCreatorStyleProfile(job.userId).catch(() => null)
 
       const buildAttemptSegments = (strategy: RetentionRetryStrategy, hookCandidate: HookCandidate) => {
         const baseHookRange: TimeRange = {
@@ -24663,7 +24676,25 @@ const processJob = async (
           protectedRanges: attemptProtectedRanges,
           allowSpeedChanges: !options.onlyCuts
         })
-        const governedAttemptSegments = eliteCutRefined.segments
+        const boundaryWindows = (editPlan?.engagementWindows ?? []).map((window) => ({
+          start: Math.max(0, Number(window.time || 0) - 0.45),
+          end: Math.min(durationSeconds, Number(window.time || 0) + 0.45),
+          score: Number(window.score || 0),
+          speechIntensity: Number(window.speechIntensity || 0)
+        }))
+        const multiPassRefined = runMultiPassRefinementWithModel({
+          segments: eliteCutRefined.segments,
+          durationSeconds,
+          windows: boundaryWindows,
+          model: boundaryCriticModelForRender,
+          creatorProfile: creatorStyleProfileForRender
+        })
+        const governedAttemptSegments: Segment[] = multiPassRefined.segments.map((segment) => ({
+          ...segment,
+          transitionStyle: segment.transitionStyle === 'smooth' || segment.transitionStyle === 'jump'
+            ? segment.transitionStyle
+            : undefined
+        }))
         const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count + microRehookResult.applied
         const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(governedAttemptSegments))
         return {
@@ -24674,7 +24705,10 @@ const processJob = async (
           patternInterruptCount: totalPatternInterruptCount,
           patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4)),
           eliteCutAudit: eliteCutRefined.audit,
-          cutQualityScore: eliteCutRefined.cutQualityScore,
+          cutQualityScore: Math.max(
+            eliteCutRefined.cutQualityScore,
+            Number((multiPassRefined.report.pass2.boundaryGate.averageScore || 0).toFixed(4))
+          ),
           boundaryPathologySummary: eliteCutRefined.boundaryPathologySummary
         }
       }
@@ -24853,9 +24887,39 @@ const processJob = async (
           .slice(0, 8)
         const exploreSeed = Number.parseInt(exploreSeedRaw, 16) / 0xffffffff
         const shouldExplorePolicy = ranked.length > 1 && exploreSeed < BANDIT_POLICY_EXPLORATION_RATE
-        const winner = shouldExplorePolicy
+        let winner = shouldExplorePolicy
           ? ranked[Math.min(1, ranked.length - 1)]
           : ranked[0]
+        try {
+          const learnedSelection = await selectPolicyWinnerWithLearning({
+            userId: job.userId,
+            candidates: ranked.map((attempt) => ({
+              policyId: attempt.policyId,
+              variantScore: attempt.variantScore,
+              predictedRetention: attempt.predictedRetention
+            })),
+            explorationRate: BANDIT_POLICY_EXPLORATION_RATE
+          })
+          if (learnedSelection?.selectedPolicyId) {
+            const learnedWinner = ranked.find((attempt) => attempt.policyId === learnedSelection.selectedPolicyId)
+            if (learnedWinner) {
+              winner = learnedWinner
+              optimizationNotes.push(learnedSelection.reason)
+            }
+          }
+        } catch (error) {
+          console.warn('policy learner selection failed, using local winner', error)
+        }
+        if (winner?.policyId) {
+          await registerPolicyAssignment({
+            userId: job.userId,
+            jobId,
+            policyId: winner.policyId,
+            variantId: winner.strategy
+          }).catch((error) => {
+            console.warn('policy assignment registration failed', error)
+          })
+        }
         variantSelectionAuditForAnalysis = buildVariantSelectionAudit({
           attempts: ranked.map((attempt) => ({
             strategy: attempt.strategy,
@@ -29033,6 +29097,24 @@ router.post('/:id/retention-feedback', async (req: any, res) => {
     }
 
     await persistRetentionFeedbackForJob({ job, feedback })
+    await upsertCreatorStyleProfileFromFeedback({
+      userId: job.userId,
+      feedback
+    }).catch((error) => {
+      console.warn('creator style profile update failed after retention feedback', error)
+    })
+    await registerPolicyOutcomeForJob({
+      userId: job.userId,
+      jobId: id,
+      feedback,
+      source: 'retention_feedback',
+      isPlatform: false,
+      metadata: {
+        route: 'jobs/:id/retention-feedback'
+      }
+    }).catch((error) => {
+      console.warn('policy outcome registration failed after retention feedback', error)
+    })
 
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
     let feedbackLoop: {
@@ -29083,6 +29165,62 @@ router.post('/:id/platform-feedback', async (req: any, res) => {
     }
 
     await persistRetentionFeedbackForJob({ job, feedback })
+    await upsertCreatorStyleProfileFromFeedback({
+      userId: job.userId,
+      feedback
+    }).catch((error) => {
+      console.warn('creator style profile update failed after platform feedback', error)
+    })
+    await registerPolicyOutcomeForJob({
+      userId: job.userId,
+      jobId: id,
+      feedback,
+      source: 'platform_feedback',
+      isPlatform: true,
+      metadata: {
+        route: 'jobs/:id/platform-feedback'
+      }
+    }).catch((error) => {
+      console.warn('policy outcome registration failed after platform feedback', error)
+    })
+    const durationForReward = Number(job.inputDurationSeconds || 0)
+    if (Number.isFinite(durationForReward) && durationForReward > 0.1) {
+      const normalizedWatch = Number(
+        clamp(
+          Number(
+            feedback.watchPercent ??
+            feedback.completionPercent ??
+            feedback.hookHoldPercent ??
+            45
+          ),
+          0,
+          100
+        ).toFixed(3)
+      )
+      const normalizedHook = Number(clamp(Number(feedback.hookHoldPercent ?? normalizedWatch), 0, 100).toFixed(3))
+      const normalizedCompletion = Number(clamp(Number(feedback.completionPercent ?? normalizedWatch), 0, 100).toFixed(3))
+      const rewardSignal = derivePerSecondRewardSignal({
+        durationSeconds: durationForReward,
+        retentionPoints: [
+          { timestamp: 0, watchedPct: normalizedHook },
+          { timestamp: durationForReward * 0.3, watchedPct: normalizedWatch },
+          { timestamp: durationForReward * 0.98, watchedPct: normalizedCompletion }
+        ]
+      })
+      await ingestPlatformRewardSignal({
+        userId: job.userId,
+        jobId: id,
+        source: 'platform_feedback_submission',
+        videoId: null,
+        perSecondRewards: rewardSignal.perSecondRewards,
+        summary: {
+          ...rewardSignal.summary,
+          sourceRoute: 'jobs/:id/platform-feedback'
+        }
+      }).catch((error) => {
+        console.warn('platform reward ingest failed after platform feedback', error)
+      })
+    }
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
     let feedbackLoop: {
       applied: boolean
@@ -29153,6 +29291,29 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
         creator_feedback_history: creatorHistory,
         creator_feedback_updated_at: toIsoNow()
       }
+    })
+    await upsertCreatorStyleProfileFromFeedback({
+      userId: job.userId,
+      feedback: {
+        ...feedback,
+        category: creatorFeedback.category,
+        source: creatorFeedback.source
+      }
+    }).catch((error) => {
+      console.warn('creator style profile update failed after creator feedback', error)
+    })
+    await registerPolicyOutcomeForJob({
+      userId: job.userId,
+      jobId: id,
+      feedback,
+      source: 'creator_feedback',
+      isPlatform: false,
+      metadata: {
+        route: 'jobs/:id/creator-feedback',
+        category: creatorFeedback.category
+      }
+    }).catch((error) => {
+      console.warn('policy outcome registration failed after creator feedback', error)
     })
 
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
@@ -29255,6 +29416,25 @@ router.post('/:id/player-events', async (req: any, res) => {
           player_telemetry_updated_at: toIsoNow()
         }
       })
+      await upsertCreatorStyleProfileFromFeedback({
+        userId: job.userId,
+        feedback: derivedFeedback
+      }).catch((error) => {
+        console.warn('creator style profile update failed after player telemetry', error)
+      })
+      await registerPolicyOutcomeForJob({
+        userId: job.userId,
+        jobId: id,
+        feedback: derivedFeedback,
+        source: 'player_telemetry',
+        isPlatform: false,
+        metadata: {
+          route: 'jobs/:id/player-events',
+          sessionCount: sessions.length
+        }
+      }).catch((error) => {
+        console.warn('policy outcome registration failed after player telemetry', error)
+      })
       try {
         await runFeedbackLoop({
           trigger: 'feedback_submission',
@@ -29344,6 +29524,28 @@ router.post('/:id/editor-taste-feedback', async (req: any, res) => {
         editor_taste_feedback_history: [...history, payload],
         editor_taste_feedback_updated_at: toIsoNow()
       }
+    })
+    await upsertCreatorStyleProfileFromFeedback({
+      userId: job.userId,
+      feedback: {
+        ...mappedFeedback,
+        source: 'editor_taste_review'
+      }
+    }).catch((error) => {
+      console.warn('creator style profile update failed after editor taste feedback', error)
+    })
+    await registerPolicyOutcomeForJob({
+      userId: job.userId,
+      jobId: id,
+      feedback: mappedFeedback,
+      source: 'editor_taste_feedback',
+      isPlatform: false,
+      metadata: {
+        route: 'jobs/:id/editor-taste-feedback',
+        wouldPublishAsIs: payload.wouldPublishAsIs
+      }
+    }).catch((error) => {
+      console.warn('policy outcome registration failed after editor taste feedback', error)
     })
     try {
       await prisma.siteAnalyticsEvent.create({

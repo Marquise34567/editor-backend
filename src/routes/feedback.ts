@@ -14,6 +14,12 @@ import {
   getYouTubeOAuthConfigStatus,
   getYouTubeOAuthConnectionForUser
 } from '../services/youtubeOAuth'
+import {
+  derivePerSecondRewardSignal,
+  ingestPlatformRewardSignal,
+  registerPolicyOutcomeForJob,
+  upsertCreatorStyleProfileFromFeedback
+} from '../services/editorIntelligence'
 
 const router = express.Router()
 
@@ -1277,6 +1283,48 @@ const persistPlatformFeedbackForJob = async ({
       analysis: nextAnalysis
     }
   })
+  await upsertCreatorStyleProfileFromFeedback({
+    userId,
+    feedback
+  }).catch((error) => {
+    console.warn('creator style profile update failed after youtube sync', error)
+  })
+  await registerPolicyOutcomeForJob({
+    userId,
+    jobId,
+    feedback,
+    source: 'youtube_analytics_sync',
+    isPlatform: true,
+    metadata: {
+      route: 'feedback/youtube/analytics/sync-job-feedback'
+    }
+  }).catch((error) => {
+    console.warn('policy outcome registration failed after youtube sync', error)
+  })
+  const durationForReward = Number(job.inputDurationSeconds || 0)
+  if (Number.isFinite(durationForReward) && durationForReward > 0.1) {
+    const reward = derivePerSecondRewardSignal({
+      durationSeconds: durationForReward,
+      retentionPoints: [
+        { timestamp: 0, watchedPct: Number(feedback.hookHoldPercent ?? feedback.watchPercent ?? 0) },
+        { timestamp: durationForReward * 0.3, watchedPct: Number(feedback.first30Retention ?? feedback.watchPercent ?? 0) },
+        { timestamp: durationForReward * 0.98, watchedPct: Number(feedback.completionPercent ?? feedback.watchPercent ?? 0) }
+      ]
+    })
+    await ingestPlatformRewardSignal({
+      userId,
+      jobId,
+      source: 'youtube_analytics_oauth',
+      videoId: null,
+      perSecondRewards: reward.perSecondRewards,
+      summary: {
+        ...reward.summary,
+        from: 'youtube_sync'
+      }
+    }).catch((error) => {
+      console.warn('platform reward ingest failed after youtube sync', error)
+    })
+  }
 
   let feedbackLoop: {
     applied: boolean

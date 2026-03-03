@@ -15,6 +15,11 @@ import {
   type VideoInsightStat
 } from '../lib/uniqueScoreGenerators'
 import { prisma } from '../db/prisma'
+import {
+  getActiveBoundaryCriticModel,
+  getCreatorStyleProfile,
+  runMultiPassRefinementWithModel
+} from '../services/editorIntelligence'
 
 const router = express.Router()
 
@@ -3663,6 +3668,8 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         points: retention.points
       })
     }
+    const boundaryCriticModel = await getActiveBoundaryCriticModel().catch(() => null)
+    const creatorStyleProfile = await getCreatorStyleProfile(job.userId).catch(() => null)
     const boundaryRefinement = manualSegments.length === 0
       ? refineBoundaryPathologySegments({
           segments,
@@ -3681,7 +3688,30 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
     if (boundaryRefinement.segments.length > 0) {
       segments = boundaryRefinement.segments
     }
-    const boundaryPathologySummary = boundaryRefinement.summary
+    const multiPassRefined = runMultiPassRefinementWithModel({
+      segments,
+      durationSeconds: source.metadata.duration,
+      windows: retention.points.map((point) => {
+        const start = Math.max(0, Number(point.timestamp || 0) - 0.45)
+        const end = Math.min(source.metadata.duration, Number(point.timestamp || 0) + 0.45)
+        return {
+          start,
+          end,
+          score: clamp(Number(point.watchedPct || 0) / 100, 0, 1)
+        }
+      }),
+      model: boundaryCriticModel,
+      creatorProfile: creatorStyleProfile
+    })
+    segments = multiPassRefined.segments.length ? multiPassRefined.segments : segments
+    const boundaryPathologySummary = {
+      ...boundaryRefinement.summary,
+      worst: Number(Math.min(
+        boundaryRefinement.summary.worst,
+        1 - (multiPassRefined.report.pass2.boundaryGate.worstScore || 0)
+      ).toFixed(4)),
+      avg: Number(Math.max(0, Math.min(1, boundaryRefinement.summary.avg)).toFixed(4))
+    }
 
     let clipPathsAbs: string[] = []
 
