@@ -1250,6 +1250,8 @@ type VerticalRetentionCandidate = {
   reason: string
 }
 type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'bounce' | 'glitch' | 'none'
+type VerticalCaptionDynamicMode = 'classic' | 'karaoke_word' | 'kinetic_word'
+type VerticalVoicePreset = 'none' | 'deep' | 'helium' | 'radio' | 'robot'
 type VerticalCaptionPreset =
   | 'basic_clean'
   | 'mrbeast_animated'
@@ -1267,6 +1269,8 @@ type VerticalCaptionConfig = {
   animationEnabled: boolean
   animation: VerticalClipCaptionAnimation
   animationSpeed: number
+  dynamicMode: VerticalCaptionDynamicMode
+  voicePreset: VerticalVoicePreset
   highlightWords: boolean
   autoEmphasis: boolean
   autoEmoji: boolean
@@ -3219,6 +3223,31 @@ const resolveLongFormRuntimeTuning = ({
     ).toFixed(3))
   }
 }
+const resolveAdaptiveSilenceDbThreshold = ({
+  options,
+  longFormRuntimeTuning,
+  durationSeconds
+}: {
+  options: EditOptions
+  longFormRuntimeTuning: LongFormRuntimeTuning
+  durationSeconds: number
+}) => {
+  const aggressionNormalized = clamp01(
+    (longFormRuntimeTuning.aggression - LONG_FORM_AGGRESSION_MIN) /
+    Math.max(1, LONG_FORM_AGGRESSION_MAX - LONG_FORM_AGGRESSION_MIN)
+  )
+  const speedBias = clamp01(1 - longFormRuntimeTuning.clarityVsSpeed / 100)
+  const shortFormBias = durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS ? 0.12 : 0
+  const aggressiveModeBias = options.aggressiveMode ? 0.15 : 0
+  const onlyCutsBias = options.onlyCuts ? 0.22 : 0
+  const sensitivityLift =
+    7.5 * aggressionNormalized +
+    3.2 * speedBias +
+    2.4 * shortFormBias +
+    2.8 * aggressiveModeBias +
+    3.4 * onlyCutsBias
+  return Number(clamp(SILENCE_DB + sensitivityLift, -30, -18).toFixed(1))
+}
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -3239,9 +3268,9 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   editorMode: null,
   hookSelectionMode: 'auto',
   longFormPreset: 'auto',
-  longFormAggression: 55,
-  longFormClarityVsSpeed: 60,
-  tangentKiller: false
+  longFormAggression: 72,
+  longFormClarityVsSpeed: 46,
+  tangentKiller: true
 }
 
 const applyRetentionStyleReferencePreset = ({
@@ -3258,7 +3287,7 @@ const applyRetentionStyleReferencePreset = ({
     return {
       ...options,
       retentionStrategyProfile: strategy,
-      aggressiveMode: options.onlyCuts ? false : options.aggressiveMode
+      aggressiveMode: options.aggressiveMode
     }
   }
   return {
@@ -4577,6 +4606,26 @@ const parseVerticalCaptionAnimationSpeed = (value: any): number | null => {
   return Number(clamp(parsed, 0.5, 2.2).toFixed(2))
 }
 
+const parseVerticalCaptionDynamicMode = (value: any): VerticalCaptionDynamicMode | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['classic', 'standard', 'default', 'line'].includes(normalized)) return 'classic'
+  if (['karaoke_word', 'karaoke', 'word_highlight', 'word-highlight', 'word'].includes(normalized)) return 'karaoke_word'
+  if (['kinetic_word', 'kinetic', 'dynamic', 'rapid', 'tiktok'].includes(normalized)) return 'kinetic_word'
+  return null
+}
+
+const parseVerticalVoicePreset = (value: any): VerticalVoicePreset | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['none', 'off', 'disable', 'disabled', 'normal', 'clean'].includes(normalized)) return 'none'
+  if (['deep', 'low', 'bass', 'baritone'].includes(normalized)) return 'deep'
+  if (['helium', 'high', 'chipmunk'].includes(normalized)) return 'helium'
+  if (['radio', 'walkie', 'walkie-talkie', 'broadcast'].includes(normalized)) return 'radio'
+  if (['robot', 'ai', 'synth', 'synthetic'].includes(normalized)) return 'robot'
+  return null
+}
+
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).verticalCaptions
@@ -4730,6 +4779,32 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.animationSpeed,
     nested?.animation_speed
   )
+  const dynamicModeCandidate = pickFirstDefinedValue(
+    (payload as any).dynamicMode,
+    (payload as any).dynamic_mode,
+    (payload as any).captionDynamicMode,
+    (payload as any).caption_dynamic_mode,
+    (payload as any).verticalCaptionDynamicMode,
+    (payload as any).vertical_caption_dynamic_mode,
+    nested?.dynamicMode,
+    nested?.dynamic_mode,
+    nested?.captionDynamicMode,
+    nested?.caption_dynamic_mode
+  )
+  const voicePresetCandidate = pickFirstDefinedValue(
+    (payload as any).voicePreset,
+    (payload as any).voice_preset,
+    (payload as any).voiceEffect,
+    (payload as any).voice_effect,
+    (payload as any).verticalVoicePreset,
+    (payload as any).vertical_voice_preset,
+    (payload as any).verticalCaptionVoicePreset,
+    (payload as any).vertical_caption_voice_preset,
+    nested?.voicePreset,
+    nested?.voice_preset,
+    nested?.voiceEffect,
+    nested?.voice_effect
+  )
   const positionXCandidate = pickFirstDefinedValue(
     (payload as any).positionX,
     (payload as any).position_x,
@@ -4852,6 +4927,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     boxColorCandidate === undefined &&
     animationCandidate === undefined &&
     animationSpeedCandidate === undefined &&
+    dynamicModeCandidate === undefined &&
+    voicePresetCandidate === undefined &&
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
     autoGenerateCandidate === null &&
@@ -4878,6 +4955,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedAnimation = parseVerticalCaptionAnimationMode(animationCandidate)
   const parsedAnimationEnabled = parseVerticalCaptionAnimationEnabled(animationCandidate)
   const parsedAnimationSpeed = parseVerticalCaptionAnimationSpeed(animationSpeedCandidate)
+  const parsedDynamicMode = parseVerticalCaptionDynamicMode(dynamicModeCandidate)
+  const parsedVoicePreset = parseVerticalVoicePreset(voicePresetCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   return {
@@ -4897,6 +4976,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedAnimation ? { animation: parsedAnimation } : {}),
     ...(parsedAnimationEnabled === null ? {} : { animationEnabled: parsedAnimationEnabled }),
     ...(parsedAnimationSpeed === null ? {} : { animationSpeed: parsedAnimationSpeed }),
+    ...(parsedDynamicMode ? { dynamicMode: parsedDynamicMode } : {}),
+    ...(parsedVoicePreset ? { voicePreset: parsedVoicePreset } : {}),
     ...(highlightWordsCandidate === null ? {} : { highlightWords: highlightWordsCandidate }),
     ...(autoEmphasisCandidate === null ? {} : { autoEmphasis: autoEmphasisCandidate }),
     ...(autoEmojiCandidate === null ? {} : { autoEmoji: autoEmojiCandidate }),
@@ -4929,6 +5010,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: false,
         animation: 'none' as VerticalClipCaptionAnimation,
         animationSpeed: 1,
+        dynamicMode: 'classic' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: false,
@@ -4950,6 +5033,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: true,
         animation: 'slide' as VerticalClipCaptionAnimation,
         animationSpeed: 1.08,
+        dynamicMode: 'kinetic_word' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: true,
@@ -4971,6 +5056,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: false,
         animation: 'none' as VerticalClipCaptionAnimation,
         animationSpeed: 0.96,
+        dynamicMode: 'classic' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: false,
@@ -4992,6 +5079,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: true,
         animation: 'bounce' as VerticalClipCaptionAnimation,
         animationSpeed: 1.2,
+        dynamicMode: 'kinetic_word' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: true,
@@ -5013,6 +5102,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: true,
         animation: 'pop' as VerticalClipCaptionAnimation,
         animationSpeed: 1.08,
+        dynamicMode: 'karaoke_word' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: true,
@@ -5034,6 +5125,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: true,
         animation: 'slide' as VerticalClipCaptionAnimation,
         animationSpeed: 1.06,
+        dynamicMode: 'kinetic_word' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: true,
@@ -5055,6 +5148,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: true,
         animation: 'glitch' as VerticalClipCaptionAnimation,
         animationSpeed: 1.14,
+        dynamicMode: 'kinetic_word' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: true,
@@ -5076,6 +5171,8 @@ const resolveVerticalCaptionConfig = (
         animationEnabled: false,
         animation: 'none' as VerticalClipCaptionAnimation,
         animationSpeed: 0.92,
+        dynamicMode: 'classic' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
         autoEmoji: false,
@@ -5096,6 +5193,8 @@ const resolveVerticalCaptionConfig = (
       animationEnabled: true,
       animation: 'pop' as VerticalClipCaptionAnimation,
       animationSpeed: 1.1,
+      dynamicMode: 'karaoke_word' as VerticalCaptionDynamicMode,
+      voicePreset: 'none' as VerticalVoicePreset,
       highlightWords: true,
       autoEmphasis: true,
       autoEmoji: true,
@@ -5146,6 +5245,28 @@ const resolveVerticalCaptionConfig = (
     animation: resolvedFallbackAnimation,
     animationEnabled: resolvedFallbackAnimation !== 'none',
     animationSpeed: parseVerticalCaptionAnimationSpeed(defaults?.animationSpeed) ?? fallbackPresetStyle.animationSpeed,
+    dynamicMode: parseVerticalCaptionDynamicMode(
+      pickFirstDefinedValue(
+        (defaults as any)?.dynamicMode,
+        (defaults as any)?.dynamic_mode,
+        (defaults as any)?.captionDynamicMode,
+        (defaults as any)?.caption_dynamic_mode,
+        (defaults as any)?.verticalCaptionDynamicMode,
+        (defaults as any)?.vertical_caption_dynamic_mode
+      )
+    ) || fallbackPresetStyle.dynamicMode,
+    voicePreset: parseVerticalVoicePreset(
+      pickFirstDefinedValue(
+        (defaults as any)?.voicePreset,
+        (defaults as any)?.voice_preset,
+        (defaults as any)?.voiceEffect,
+        (defaults as any)?.voice_effect,
+        (defaults as any)?.verticalVoicePreset,
+        (defaults as any)?.vertical_voice_preset,
+        (defaults as any)?.verticalCaptionVoicePreset,
+        (defaults as any)?.vertical_caption_voice_preset
+      )
+    ) || fallbackPresetStyle.voicePreset,
     highlightWords: typeof defaults?.highlightWords === 'boolean' ? defaults.highlightWords : fallbackPresetStyle.highlightWords,
     autoEmphasis: typeof defaults?.autoEmphasis === 'boolean' ? defaults.autoEmphasis : fallbackPresetStyle.autoEmphasis,
     autoEmoji: typeof defaults?.autoEmoji === 'boolean' ? defaults.autoEmoji : fallbackPresetStyle.autoEmoji,
@@ -5171,6 +5292,8 @@ const resolveVerticalCaptionConfig = (
     resolvedAnimation = 'pop'
   }
   const resolvedAnimationSpeed = parseVerticalCaptionAnimationSpeed(override.animationSpeed) ?? styleBaseline.animationSpeed
+  const resolvedDynamicMode = parseVerticalCaptionDynamicMode(override.dynamicMode) ?? styleBaseline.dynamicMode
+  const resolvedVoicePreset = parseVerticalVoicePreset((override as any).voicePreset) ?? styleBaseline.voicePreset
 
   return {
     enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
@@ -5191,6 +5314,8 @@ const resolveVerticalCaptionConfig = (
     animationEnabled: resolvedAnimation !== 'none',
     animation: resolvedAnimation,
     animationSpeed: resolvedAnimationSpeed,
+    dynamicMode: resolvedDynamicMode,
+    voicePreset: resolvedVoicePreset,
     highlightWords: typeof override.highlightWords === 'boolean' ? override.highlightWords : styleBaseline.highlightWords,
     autoEmphasis: typeof override.autoEmphasis === 'boolean' ? override.autoEmphasis : styleBaseline.autoEmphasis,
     autoEmoji: typeof override.autoEmoji === 'boolean' ? override.autoEmoji : styleBaseline.autoEmoji,
@@ -5209,6 +5334,8 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     animationEnabled: true,
     animation: 'pop',
     animationSpeed: 1.1,
+    dynamicMode: 'karaoke_word',
+    voicePreset: 'none',
     highlightWords: true,
     autoEmphasis: true,
     autoEmoji: true,
@@ -5264,6 +5391,8 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     resolvedAnimation = 'pop'
   }
   const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? defaults.animationSpeed
+  const dynamicMode = parseVerticalCaptionDynamicMode((config as any).dynamicMode) ?? defaults.dynamicMode
+  const voicePreset = parseVerticalVoicePreset((config as any).voicePreset) ?? defaults.voicePreset
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
@@ -5271,6 +5400,8 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     animationEnabled: resolvedAnimation !== 'none',
     animation: resolvedAnimation,
     animationSpeed,
+    dynamicMode,
+    voicePreset,
     highlightWords: typeof config.highlightWords === 'boolean' ? config.highlightWords : defaults.highlightWords,
     autoEmphasis: typeof config.autoEmphasis === 'boolean' ? config.autoEmphasis : defaults.autoEmphasis,
     autoEmoji: typeof config.autoEmoji === 'boolean' ? config.autoEmoji : defaults.autoEmoji,
@@ -5303,6 +5434,12 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       animation_mode: animationMode,
       animationSpeed: normalized.animationSpeed,
       animation_speed: normalized.animationSpeed,
+      dynamicMode: normalized.dynamicMode,
+      dynamic_mode: normalized.dynamicMode,
+      voicePreset: normalized.voicePreset,
+      voice_preset: normalized.voicePreset,
+      voiceEffect: normalized.voicePreset,
+      voice_effect: normalized.voicePreset,
       highlightWords: normalized.highlightWords,
       highlight_words: normalized.highlightWords,
       autoEmphasis: normalized.autoEmphasis,
@@ -5339,6 +5476,12 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     vertical_caption_animation: animationMode,
     verticalCaptionAnimationSpeed: normalized.animationSpeed,
     vertical_caption_animation_speed: normalized.animationSpeed,
+    verticalCaptionDynamicMode: normalized.dynamicMode,
+    vertical_caption_dynamic_mode: normalized.dynamicMode,
+    verticalCaptionVoicePreset: normalized.voicePreset,
+    vertical_caption_voice_preset: normalized.voicePreset,
+    verticalVoicePreset: normalized.voicePreset,
+    vertical_voice_preset: normalized.voicePreset,
     verticalCaptionHighlightWords: normalized.highlightWords,
     vertical_caption_highlight_words: normalized.highlightWords,
     verticalCaptionAutoEmphasis: normalized.autoEmphasis,
@@ -9771,6 +9914,12 @@ const enforceSegmentLengths = (
       continue
     }
     const prev = merged[merged.length - 1]
+    const contiguous = seg.start <= prev.end + 0.02
+    if (!contiguous) {
+      // Preserve intentional dead-air removals between non-adjacent segments.
+      merged.push({ ...seg })
+      continue
+    }
     const prevLen = prev.end - prev.start
     if (prevLen + len <= maxLen + 0.25) {
       prev.end = seg.end
@@ -10720,6 +10869,7 @@ const buildVerticalClipCaptionOverlays = ({
   userCaptionText,
   transcriptCues,
   captionPreset,
+  dynamicMode,
   animationEnabled,
   animationMode,
   autoGenerateFromTranscript,
@@ -10736,6 +10886,7 @@ const buildVerticalClipCaptionOverlays = ({
   userCaptionText: string
   transcriptCues?: TranscriptCue[]
   captionPreset?: VerticalCaptionPreset
+  dynamicMode?: VerticalCaptionDynamicMode | null
   animationEnabled?: boolean
   animationMode?: VerticalClipCaptionAnimation | null
   autoGenerateFromTranscript?: boolean
@@ -10750,6 +10901,8 @@ const buildVerticalClipCaptionOverlays = ({
   if (clipDuration <= 0.35) return []
   const normalizedUserCaptionText = normalizeVerticalCaptionTextInput(userCaptionText)
   const preferredAnimation = parseVerticalCaptionAnimationMode(animationMode)
+  const resolvedDynamicMode = parseVerticalCaptionDynamicMode(dynamicMode) || 'classic'
+  const kineticMode = resolvedDynamicMode === 'kinetic_word'
   if (!autoGenerateFromTranscript && isLikelyManualVerticalCaptionText(normalizedUserCaptionText)) {
     const resolvedAnimation: VerticalClipCaptionAnimation = (
       animationEnabled === false || preferredAnimation === 'none'
@@ -10781,9 +10934,11 @@ const buildVerticalClipCaptionOverlays = ({
     nicheProfile
   })
   const phraseCount = Math.round(clamp(
-    clipDuration / (highEnergy ? 11 : 16),
-    1,
-    3
+    kineticMode
+      ? clipDuration / 5.8
+      : clipDuration / (highEnergy ? 11 : 16),
+    kineticMode ? 2 : 1,
+    kineticMode ? 7 : 3
   ))
   const effectivePreset: VerticalCaptionPreset = captionPreset || 'mrbeast_animated'
   const selectedPhrases: string[] = []
@@ -10855,7 +11010,9 @@ const buildVerticalClipCaptionOverlays = ({
     ? ['none']
     : preferredAnimation
       ? [preferredAnimation]
-      : (highEnergy
+      : (kineticMode
+        ? ['glitch', 'bounce', 'slide', 'pop']
+        : highEnergy
         ? ['pop', 'slide', 'fade']
         : ['fade', 'slide', 'fade'])
   const overlays: VerticalClipCaptionOverlay[] = []
@@ -10880,18 +11037,20 @@ const buildVerticalClipCaptionOverlays = ({
       ? clamp(ranked.time - range.start - 0.3, 0.08, maxStart)
       : clamp(clipDuration * fallbackAnchors[Math.min(index, fallbackAnchors.length - 1)], 0.08, maxStart)
     const start = clamp(Math.max(cursor, anchor), 0, maxStart)
-    const duration = clamp(2 + phrase.length / 22 + (highEnergy ? 0.35 : 0), 2, 5)
+    const duration = kineticMode
+      ? clamp(0.95 + phrase.length / 28 + (highEnergy ? 0.25 : 0), 0.9, 2.35)
+      : clamp(2 + phrase.length / 22 + (highEnergy ? 0.35 : 0), 2, 5)
     const end = clamp(start + duration, start + 0.4, clipDuration)
     overlays.push({
       text: phrase,
       start: Number(start.toFixed(3)),
       end: Number(end.toFixed(3)),
       animation: animations[index % animations.length],
-      position: highEnergy || index === 0 ? 'center' : 'bottom',
+      position: kineticMode || highEnergy || index === 0 ? 'center' : 'bottom',
       emphasisWords: autoEmphasis ? extractCaptionEmphasisWords(phrase, 3) : undefined,
       emoji: autoEmoji ? inferCaptionEmoji(phrase) : null
     })
-    cursor = Math.min(maxStart, end + 0.12)
+    cursor = Math.min(maxStart, end + (kineticMode ? 0.04 : 0.12))
   }
   return overlays
 }
@@ -12416,15 +12575,17 @@ const enforceEndingSpike = ({
 const detectSilences = async (
   filePath: string,
   durationSeconds: number,
-  minimumSilenceSeconds = SILENCE_MIN
+  minimumSilenceSeconds = SILENCE_MIN,
+  silenceDbThreshold = SILENCE_DB
 ) => {
   if (!hasFfmpeg()) return [] as TimeRange[]
   const silenceMinSeconds = Number(clamp(minimumSilenceSeconds, 0.08, 2).toFixed(3))
+  const silenceDb = Number(clamp(silenceDbThreshold, -60, -16).toFixed(1))
   const args = [
     '-hide_banner',
     '-nostdin',
     '-i', filePath,
-    '-af', `silencedetect=noise=${SILENCE_DB}dB:d=${silenceMinSeconds}`,
+    '-af', `silencedetect=noise=${silenceDb}dB:d=${silenceMinSeconds}`,
     '-f', 'null',
     '-'
   ]
@@ -12441,7 +12602,7 @@ const detectSilences = async (
       const match = line.match(/silence_end:\s*([0-9.]+)/)
       if (match) {
         const end = Number.parseFloat(match[1])
-        const start = currentStart ?? Math.max(0, end - SILENCE_MIN)
+        const start = currentStart ?? Math.max(0, end - silenceMinSeconds)
         silences.push({ start, end })
         currentStart = null
       }
@@ -15023,14 +15184,19 @@ const buildContinuityProtectionRanges = (windows: EngagementWindow[], aggressive
 const applyContinuityGuardsToCuts = (
   candidateCuts: TimeRange[],
   windows: EngagementWindow[],
-  aggressiveMode = false
+  aggressiveMode = false,
+  opts?: {
+    minCutSeconds?: number | null
+  }
 ) => {
   if (!candidateCuts.length) return [] as TimeRange[]
   const protectionRanges = buildContinuityProtectionRanges(windows, aggressiveMode)
   if (!protectionRanges.length) return mergeRanges(candidateCuts)
   const removable = candidateCuts.map((range) => ({ start: range.start, end: range.end, speed: 1 }))
   const guarded = subtractRanges(removable, protectionRanges)
-  const minCut = aggressiveMode ? 0.28 : 0.34
+  const minCut = Number.isFinite(Number(opts?.minCutSeconds))
+    ? clamp(Number(opts?.minCutSeconds), 0.08, 0.5)
+    : (aggressiveMode ? 0.28 : 0.34)
   return mergeRanges(
     guarded
       .filter((range) => range.end - range.start >= minCut)
@@ -15445,7 +15611,18 @@ const buildEditPlan = async (
   })
   const silenceDetectionMinimum = longFormRuntimeTuning.isLongForm
     ? clamp(longFormRuntimeTuning.maxSilenceSeconds * 0.85, 0.08, 0.45)
-    : SILENCE_MIN
+    : clamp(
+        options.onlyCuts
+          ? 0.16
+          : (options.aggressiveMode ? 0.22 : 0.32),
+        0.12,
+        0.6
+      )
+  const silenceDetectionDb = resolveAdaptiveSilenceDbThreshold({
+    options,
+    longFormRuntimeTuning,
+    durationSeconds
+  })
   if (onStage) await onStage('cutting')
   // Run independent analysis tasks in parallel to save wall-clock time.
   const fastMode = Boolean(options.fastMode)
@@ -15453,7 +15630,9 @@ const buildEditPlan = async (
   const skipTextDensity = fastMode || ANALYSIS_DISABLE_TEXT_DENSITY
   const skipEmotionModel = fastMode || ANALYSIS_DISABLE_EMOTION_MODEL
   const tasks: Array<Promise<any>> = []
-  tasks.push(detectSilences(filePath, durationSeconds, silenceDetectionMinimum).catch(() => []))
+  tasks.push(
+    detectSilences(filePath, durationSeconds, silenceDetectionMinimum, silenceDetectionDb).catch(() => [])
+  )
   tasks.push(detectAudioEnergy(filePath, durationSeconds).catch(() => []))
   tasks.push(detectSceneChanges(filePath, durationSeconds).catch(() => []))
   // Face detection can be skipped in fast mode to cut analysis latency.
@@ -15514,7 +15693,7 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel,
     editorMode: options.editorMode
   })
-  const silenceTrimCuts = options.removeBoring
+  const rawSilenceTrimCuts = options.removeBoring
     ? buildSilenceTrimCuts(
         silences,
         durationSeconds,
@@ -15524,6 +15703,11 @@ const buildEditPlan = async (
           clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed
         }
       )
+    : []
+  const silenceTrimCuts = options.removeBoring
+    ? applyContinuityGuardsToCuts(rawSilenceTrimCuts, windows, options.aggressiveMode, {
+        minCutSeconds: 0.12
+      })
     : []
 
   const boringFlags = options.removeBoring
@@ -17215,6 +17399,7 @@ const buildAssCueText = ({
   cue,
   words,
   highlightWords,
+  dynamicMode,
   autoEmoji,
   uppercase,
   animationSpeed,
@@ -17224,6 +17409,7 @@ const buildAssCueText = ({
   cue: TranscriptCue
   words: TranscriptWord[]
   highlightWords: boolean
+  dynamicMode: VerticalCaptionDynamicMode
   autoEmoji: boolean
   uppercase: boolean
   animationSpeed: number
@@ -17241,6 +17427,7 @@ const buildAssCueText = ({
     )
     : null
   const hasEmojiInBasePhrase = CAPTION_EMOJI_PATTERN.test(basePhrase)
+  const resolvedDynamicMode = parseVerticalCaptionDynamicMode(dynamicMode) || 'classic'
   if (!highlightWords || words.length < 2) {
     let plain = uppercase ? basePhrase.toUpperCase() : basePhrase
     if (candidateEmoji && !CAPTION_EMOJI_PATTERN.test(plain)) {
@@ -17255,11 +17442,23 @@ const buildAssCueText = ({
     const tokenText = escapeAssDialogueText(tokenTextRaw.trim())
     if (!tokenText) continue
     const durationSeconds = Math.max(0.03, Number(word.end) - Number(word.start))
-    const durationCs = toAssKaraokeCentiseconds(durationSeconds, animationSpeed)
+    const baseDurationCs = toAssKaraokeCentiseconds(durationSeconds, animationSpeed)
+    const durationCs = resolvedDynamicMode === 'kinetic_word'
+      ? Math.max(3, Math.round(baseDurationCs * 0.72))
+      : baseDurationCs
     const emphasis = Boolean(word.emphasis)
     const color = emphasis ? emphasisColor : primaryColor
-    const scale = emphasis ? 112 : 100
-    const wordTag = `{\\k${durationCs}\\1c${color}\\fscx${scale}\\fscy${scale}\\b1}`
+    const scale = resolvedDynamicMode === 'kinetic_word'
+      ? (emphasis ? 124 : 112)
+      : (emphasis ? 112 : 100)
+    const kineticTag = resolvedDynamicMode === 'kinetic_word'
+      ? (() => {
+          const sign = index % 2 === 0 ? -1.7 : 1.4
+          const settleMs = Math.max(55, Math.round(120 / clamp(animationSpeed, 0.5, 2.2)))
+          return `\\frz${sign}\\fsp1\\t(0,${settleMs},\\frz0\\fsp0\\fscx${Math.max(100, scale - 6)}\\fscy${Math.max(100, scale - 6)})`
+        })()
+      : ''
+    const wordTag = `{\\k${durationCs}\\1c${color}\\fscx${scale}\\fscy${scale}\\b1${kineticTag}}`
     tokenParts.push(`${wordTag}${tokenText}`)
   }
   if (!tokenParts.length) return ''
@@ -17329,6 +17528,7 @@ const buildMrBeastAnimatedAss = ({
       cue,
       words,
       highlightWords: true,
+      dynamicMode: 'karaoke_word',
       autoEmoji: true,
       uppercase: true,
       animationSpeed,
@@ -17531,6 +17731,11 @@ const buildVerticalCaptionAss = ({
   const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
   const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
     (config.animationEnabled ? 'pop' : 'none')
+  const effectiveAnimationMode: VerticalClipCaptionAnimation = (
+    animationMode === 'none' && config.dynamicMode === 'kinetic_word'
+  )
+    ? 'pop'
+    : animationMode
   const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? 1
   const highlightWords = Boolean(config.highlightWords)
   const autoEmphasis = Boolean(config.autoEmphasis)
@@ -17583,6 +17788,7 @@ const buildVerticalCaptionAss = ({
       cue: cueForRender,
       words,
       highlightWords,
+      dynamicMode: config.dynamicMode,
       autoEmoji,
       uppercase: useUppercase,
       animationSpeed,
@@ -17591,19 +17797,19 @@ const buildVerticalCaptionAss = ({
     })
     if (!text) continue
     const animationTag = (() => {
-      if (animationMode === 'none') {
+      if (effectiveAnimationMode === 'none') {
         return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
       }
-      if (animationMode === 'slide') {
+      if (effectiveAnimationMode === 'slide') {
         return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,${scaledMs(180)})\\bord${outlineWidth}}`
       }
-      if (animationMode === 'fade') {
+      if (effectiveAnimationMode === 'fade') {
         return `{\\an5\\pos(${posX},${posY})\\fad(${scaledMs(80)},${scaledMs(70)})\\bord${outlineWidth}}`
       }
-      if (animationMode === 'bounce') {
+      if (effectiveAnimationMode === 'bounce') {
         return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx110\\fscy110)\\t(${scaledMs(120)},${scaledMs(240)},\\fscx100\\fscy100)}`
       }
-      if (animationMode === 'glitch') {
+      if (effectiveAnimationMode === 'glitch') {
         return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,${scaledMs(80)},\\frz-2)\\t(${scaledMs(80)},${scaledMs(160)},\\frz1.4)\\t(${scaledMs(160)},${scaledMs(260)},\\frz0)}`
       }
       return `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx100\\fscy100)}`
@@ -20326,14 +20532,14 @@ const renderVerticalClip = async ({
   const shouldApplyWatermark = Boolean(watermarkEnabled)
   const shouldOverlayWatermarkImage = shouldApplyWatermark && Boolean(watermarkImagePath)
   if (shouldOverlayWatermarkImage) {
-    graphParts.push('[1:v]scale=32:-1[wmraw]')
+    graphParts.push('[1:v]format=rgba,colorchannelmixer=aa=0.92,scale=24:-1[wmraw]')
     graphParts.push(`[${videoLabel}][wmraw]overlay=x=main_w-overlay_w-10:y=main_h-overlay_h-10:format=auto[vwm]`)
     videoLabel = 'vwm'
   } else if (shouldApplyWatermark) {
     const watermarkFont = getSystemFontFile()
     const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
     graphParts.push(
-      `[${videoLabel}]drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72[vwm]`
+      `[${videoLabel}]drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=12:fontcolor=white@0.72[vwm]`
     )
     videoLabel = 'vwm'
   }
@@ -20512,6 +20718,46 @@ const buildAudioFilters = ({
     filters.push('alimiter=limit=0.97:level=true')
   }
   return filters
+}
+
+const buildVerticalVoiceFilters = (preset: VerticalVoicePreset): string[] => {
+  const resolved = parseVerticalVoicePreset(preset) || 'none'
+  if (resolved === 'none') return []
+  if (resolved === 'deep') {
+    const tempo = buildAtempoChain(1 / 0.9)
+    return [
+      'asetrate=48000*0.9',
+      'aresample=48000',
+      ...(tempo ? [tempo] : []),
+      'bass=g=4:f=120:w=0.6',
+      'equalizer=f=2400:t=q:w=1.0:g=0.9'
+    ]
+  }
+  if (resolved === 'helium') {
+    const tempo = buildAtempoChain(1 / 1.12)
+    return [
+      'asetrate=48000*1.12',
+      'aresample=48000',
+      ...(tempo ? [tempo] : []),
+      'highpass=f=140',
+      'equalizer=f=5600:t=q:w=1.2:g=2.0'
+    ]
+  }
+  if (resolved === 'radio') {
+    return [
+      'highpass=f=280',
+      'lowpass=f=3300',
+      'acompressor=threshold=-22dB:ratio=3.4:attack=8:release=120:makeup=3'
+    ]
+  }
+  // Robot-style shape without requiring optional FFmpeg filters.
+  return [
+    'highpass=f=130',
+    'lowpass=f=4300',
+    'equalizer=f=900:t=q:w=0.7:g=3.8',
+    'equalizer=f=2600:t=q:w=1.1:g=2.2',
+    'acompressor=threshold=-24dB:ratio=4.2:attack=6:release=95:makeup=2'
+  ]
 }
 
 const RETENTION_RENDER_THRESHOLD = 58
@@ -21955,7 +22201,7 @@ const getEditOptionsForUser = async (
       ? requestedAggression
       : (requestedAggression === 'low' ? 'low' : 'medium')
   const allowedStrategy = strategyFromAggressionLevel(allowedAggression)
-  const aggressiveMode = onlyCuts ? false : isAggressiveRetentionLevel(allowedAggression)
+  const aggressiveMode = onlyCuts ? true : isAggressiveRetentionLevel(allowedAggression)
   const modeForcesAdvancedBehavior = ultraModeRequested || retentionKingModeRequested
   const baseOptions: EditOptions = {
     autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
@@ -22128,7 +22374,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
                 retentionAggressionLevel: aggressionLevel,
                 retentionStrategyProfile: strategyProfile,
                 fastMode: editorModePlaybook.id === 'ultra' ? true : options.fastMode,
-                aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
+                aggressiveMode: options.onlyCuts ? true : isAggressiveRetentionLevel(aggressionLevel)
               },
               async (stage) => {
                 if (stage === 'cutting') {
@@ -22805,7 +23051,7 @@ const processJob = async (
       const outputPaths: string[] = []
       const hasInputAudio = hasAudioStream(tmpIn)
       const verticalAudioProfile = hasInputAudio ? probeAudioStream(tmpIn) : null
-      const verticalAudioFilters = hasInputAudio
+      const verticalBaseAudioFilters = hasInputAudio
         ? buildAudioFilters({
             aggressionLevel,
             styleProfile: null,
@@ -22846,6 +23092,10 @@ const processJob = async (
         analysis: verticalAnalysis,
         renderSettings: (job as any)?.renderSettings
       })
+      const verticalVoiceFilters = hasInputAudio
+        ? buildVerticalVoiceFilters(verticalCaptionConfig.voicePreset)
+        : []
+      const verticalAudioFilters = [...verticalBaseAudioFilters, ...verticalVoiceFilters]
       const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
       const shouldApplyVerticalCaptionOverlays = Boolean(verticalCaptionConfig.enabled)
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
@@ -22863,14 +23113,18 @@ const processJob = async (
       const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
       const watermarkImageCandidates = [
         configuredWatermarkImage,
-        path.join(process.cwd(), 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'assets', 'watermark-free-small.png'),
         path.join(process.cwd(), 'assets', 'watermark-free.png'),
-        path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark-free-small.png'),
         path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
-        path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
+        path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark-free-small.png'),
         path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
-        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
+        path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free-small.png'),
         path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
+        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
         path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
       ].filter(Boolean)
       const watermarkImagePath = watermarkEnabled
@@ -22966,6 +23220,7 @@ const processJob = async (
               userCaptionText: verticalCaptionTextInput,
               transcriptCues: verticalSourceCues,
               captionPreset: verticalCaptionConfig.preset,
+              dynamicMode: verticalCaptionConfig.dynamicMode,
               animationEnabled: verticalCaptionConfig.animationEnabled,
               animationMode: verticalCaptionConfig.animation,
               autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
@@ -23460,7 +23715,7 @@ const processJob = async (
             retentionAggressionLevel: aggressionLevel,
             retentionStrategyProfile: strategyProfile,
             editorMode: editorModeForRender,
-            aggressiveMode: options.onlyCuts ? false : isAggressiveRetentionLevel(aggressionLevel)
+            aggressiveMode: options.onlyCuts ? true : isAggressiveRetentionLevel(aggressionLevel)
           }, undefined, {
             transcriptCues: processTranscriptCues,
             aggressionLevel,
@@ -29189,6 +29444,7 @@ export const __retentionTestUtils = {
   detectEmotionalBeatAnchors,
   applyEmotionalBeatCuts,
   alignSegmentsToRhythm,
+  enforceSegmentLengthsForTest: enforceSegmentLengths,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,

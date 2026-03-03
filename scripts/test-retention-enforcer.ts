@@ -19,6 +19,7 @@ const {
   detectEmotionalBeatAnchors,
   applyEmotionalBeatCuts,
   alignSegmentsToRhythm,
+  enforceSegmentLengthsForTest,
   selectRenderableHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
@@ -174,6 +175,20 @@ const run = () => {
   })
   assert.strictEqual(Number(rhythmAligned[0].end.toFixed(2)), 3.0, 'first rhythm boundary should snap to nearest anchor')
   assert.strictEqual(Number(rhythmAligned[1].end.toFixed(2)), 6.0, 'second rhythm boundary should snap to nearest anchor')
+
+  // 1d2) Segment length normalization must not merge across non-contiguous gaps.
+  const nonContiguous = enforceSegmentLengthsForTest(
+    [
+      { start: 0, end: 4.9, speed: 1 },
+      { start: 8, end: 8.3, speed: 1 }
+    ],
+    5,
+    8,
+    []
+  )
+  assert.strictEqual(nonContiguous.length, 2, 'non-adjacent segments must stay split')
+  assert.strictEqual(Number(nonContiguous[0].end.toFixed(3)), 4.9, 'first segment end should stay unchanged')
+  assert.strictEqual(Number(nonContiguous[1].start.toFixed(3)), 8, 'gap boundary should stay unchanged')
 
   // 1e) Retention feedback payload parsing should normalize 0-100 and 0-1 values.
   const parsedFeedback = parseRetentionFeedbackPayload({
