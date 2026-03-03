@@ -1475,6 +1475,7 @@ type EditPlan = {
   visualIntelligence?: VisualIntelligenceSummary | null
   storyBeatGraph?: StoryBeatGraph | null
   microRehookAnchors?: number[]
+  protectedPeakRanges?: TimeRange[]
   variantPolicyId?: string | null
   planner?: {
     provider: 'ruthless_retention_prompt' | 'heuristic'
@@ -11972,6 +11973,7 @@ const applyBoredomModelToSegments = ({
   windows,
   aggressionLevel,
   hookRange,
+  protectedRanges,
   silences,
   tuning,
   editorMode
@@ -11980,6 +11982,7 @@ const applyBoredomModelToSegments = ({
   windows: EngagementWindow[]
   aggressionLevel: RetentionAggressionLevel
   hookRange: TimeRange | null
+  protectedRanges?: TimeRange[]
   silences: TimeRange[]
   tuning: LongFormRuntimeTuning
   editorMode?: EditorModeSelection | null
@@ -12011,19 +12014,24 @@ const applyBoredomModelToSegments = ({
     effectiveCandidateThreshold,
     effectiveHardCutThreshold
   )
-  const protectedRanges: TimeRange[] = []
-  if (hookRange) protectedRanges.push(hookRange)
+  const guardRanges: TimeRange[] = []
+  for (const range of protectedRanges || []) {
+    const normalized = normalizeProtectionRange(range, Math.max(0, windows[windows.length - 1]?.time ?? 0) + 1)
+    if (normalized) guardRanges.push(normalized)
+  }
+  if (hookRange) guardRanges.push(hookRange)
   for (const window of windows) {
     const isEmotional = (window.emotionIntensity > 0.7 || window.emotionalSpike > 0) && (window.hookScore ?? window.score) > 0.58
     if (!isEmotional) continue
-    protectedRanges.push({
+    guardRanges.push({
       start: Math.max(0, window.time - 0.4),
       end: window.time + 1.2
     })
   }
+  const mergedGuardRanges = mergeRanges(guardRanges)
   const severeForHardCut = boredom.severe
     .filter((range) => range.end - range.start >= 1.5)
-    .filter((range) => !protectedRanges.some((guard) => overlapsRange(range, guard)))
+    .filter((range) => !mergedGuardRanges.some((guard) => overlapsRange(range, guard)))
   const hardCutActions: BoredomEditAction[] = severeForHardCut.map((range) => ({
     type: 'hard_cut',
     start: Number(range.start.toFixed(3)),
@@ -12035,7 +12043,7 @@ const applyBoredomModelToSegments = ({
     silences,
     durationSeconds: Math.max(0, windows[windows.length - 1]?.time ?? 0) + 1,
     maxSilenceSeconds: tuning.maxSilenceSeconds,
-    protectedRanges,
+    protectedRanges: mergedGuardRanges,
     windows
   })
   const removedRanges = mergeRanges([
@@ -12056,6 +12064,7 @@ const applyBoredomModelToSegments = ({
     const overlapMild = boredom.mild.some((range) => overlapsRange(range, { start: segment.start, end: segment.end }))
     if (!overlapMild) return { ...segment }
     const segmentRange = { start: segment.start, end: segment.end }
+    if (mergedGuardRanges.some((guard) => overlapsRange(segmentRange, guard))) return { ...segment }
     const overlapDuration = boredom.mild.reduce((sum, range) => sum + getRangeOverlapSeconds(segmentRange, range), 0)
     const overlapRatio = clamp01(overlapDuration / Math.max(0.1, segment.end - segment.start))
     if (overlapRatio < compressionThresholdByIntensity) return { ...segment }
@@ -12739,6 +12748,169 @@ const mergeRanges = (ranges: TimeRange[]) => {
   }
   merged.push(current)
   return merged
+}
+
+const normalizeProtectionRange = (
+  range: TimeRange | null | undefined,
+  durationSeconds: number,
+  minDuration = 0.12
+) => {
+  if (!range) return null
+  const safeDuration = Math.max(0, Number(durationSeconds || 0))
+  if (safeDuration <= 0.08) return null
+  const start = Number(clamp(Number(range.start || 0), 0, safeDuration).toFixed(3))
+  const end = Number(clamp(Number(range.end || 0), start + 0.02, safeDuration).toFixed(3))
+  if (end - start < minDuration) return null
+  return { start, end }
+}
+
+const padProtectionRange = (
+  range: TimeRange | null | undefined,
+  durationSeconds: number,
+  preSeconds: number,
+  postSeconds: number
+) => {
+  if (!range) return null
+  return normalizeProtectionRange(
+    {
+      start: Number(range.start || 0) - Math.max(0, preSeconds),
+      end: Number(range.end || 0) + Math.max(0, postSeconds)
+    },
+    durationSeconds
+  )
+}
+
+const buildPeakProtectionRanges = ({
+  windows,
+  durationSeconds,
+  hookRange,
+  hookCandidates,
+  storyBeatGraph,
+  seedRanges
+}: {
+  windows: EngagementWindow[]
+  durationSeconds: number
+  hookRange?: TimeRange | null
+  hookCandidates?: HookCandidate[] | null
+  storyBeatGraph?: StoryBeatGraph | null
+  seedRanges?: TimeRange[] | null
+}) => {
+  const safeDuration = Math.max(0, Number(durationSeconds || 0))
+  if (safeDuration <= 0.2) return [] as TimeRange[]
+  const candidateRanges: Array<{ range: TimeRange; score: number }> = []
+  const pushCandidate = (range: TimeRange | null, score: number) => {
+    if (!range) return
+    candidateRanges.push({
+      range,
+      score: Number(clamp01(score).toFixed(4))
+    })
+  }
+
+  for (const range of seedRanges || []) {
+    pushCandidate(normalizeProtectionRange(range, safeDuration), 0.98)
+  }
+  pushCandidate(padProtectionRange(hookRange || null, safeDuration, 0.2, 0.45), 1)
+  const resolvedHookCandidates = (hookCandidates || [])
+    .filter((candidate) => Number.isFinite(Number(candidate.start)) && Number.isFinite(Number(candidate.duration)))
+    .sort((a, b) => (
+      Number(Boolean(b.auditPassed)) - Number(Boolean(a.auditPassed)) ||
+      Number(b.auditScore || 0) - Number(a.auditScore || 0) ||
+      Number(b.score || 0) - Number(a.score || 0)
+    ))
+    .slice(0, 5)
+  for (const candidate of resolvedHookCandidates) {
+    const range = normalizeProtectionRange(
+      {
+        start: Number(candidate.start || 0),
+        end: Number((Number(candidate.start || 0) + Number(candidate.duration || 0)).toFixed(3))
+      },
+      safeDuration
+    )
+    const padded = padProtectionRange(range, safeDuration, 0.12, 0.35)
+    pushCandidate(
+      padded,
+      clamp01(
+        0.56 * Number(candidate.score || 0) +
+        0.34 * Number(candidate.auditScore || 0) +
+        0.1 * Number(Boolean(candidate.auditPassed))
+      )
+    )
+  }
+
+  const longForm = safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
+  const windowPrePad = longForm ? 0.85 : 0.55
+  const windowPostPad = longForm ? 1.25 : 0.85
+  const topWindowTarget = longForm ? 10 : 6
+  const rankedWindows = windows
+    .map((window) => {
+      const impact = clamp01(
+        0.31 * (window.hookScore ?? window.score) +
+        0.23 * window.emotionIntensity +
+        0.17 * (window.curiosityTrigger ?? 0) +
+        0.11 * (window.actionSpike ?? 0) +
+        0.1 * window.sceneChangeRate +
+        0.08 * window.vocalExcitement
+      )
+      return {
+        impact,
+        range: normalizeProtectionRange(
+          {
+            start: Number(window.time || 0) - windowPrePad,
+            end: Number(window.time || 0) + windowPostPad
+          },
+          safeDuration
+        )
+      }
+    })
+    .filter((entry): entry is { impact: number; range: TimeRange } => Boolean(entry.range))
+    .sort((a, b) => b.impact - a.impact)
+  let acceptedWindows = 0
+  for (const entry of rankedWindows) {
+    if (acceptedWindows >= topWindowTarget) break
+    if (entry.impact < 0.58 && acceptedWindows >= 3) break
+    pushCandidate(entry.range, entry.impact)
+    acceptedWindows += 1
+  }
+
+  pushCandidate(padProtectionRange(storyBeatGraph?.peakWindow || null, safeDuration, 0.5, 1.1), 0.96)
+  pushCandidate(padProtectionRange(storyBeatGraph?.sequelHookWindow || null, safeDuration, 0.35, 0.95), 0.93)
+  for (const node of (storyBeatGraph?.nodes || [])) {
+    if (!node || (node.role !== 'peak' && node.role !== 'sequel_hook')) continue
+    const baseRange = normalizeProtectionRange(
+      {
+        start: Number(node.start || 0),
+        end: Number(node.end || 0)
+      },
+      safeDuration
+    )
+    const padded = padProtectionRange(
+      baseRange,
+      safeDuration,
+      node.role === 'peak' ? 0.45 : 0.3,
+      node.role === 'peak' ? 1 : 0.9
+    )
+    pushCandidate(padded, clamp01(0.7 * Number(node.strength || 0) + (node.role === 'peak' ? 0.22 : 0.16)))
+  }
+
+  if (!candidateRanges.length) return []
+  const maxRanges = longForm ? 16 : 10
+  const selected: Array<{ range: TimeRange; score: number }> = []
+  const sorted = candidateRanges.sort((a, b) => b.score - a.score || a.range.start - b.range.start)
+  for (const entry of sorted) {
+    if (selected.length >= maxRanges) break
+    const center = (entry.range.start + entry.range.end) / 2
+    const tooClose = selected.some((existing) => {
+      const overlap = getRangeOverlapSeconds(existing.range, entry.range)
+      if (overlap >= 0.32) return true
+      const existingCenter = (existing.range.start + existing.range.end) / 2
+      return Math.abs(existingCenter - center) < (longForm ? 2.3 : 1.2)
+    })
+    if (tooClose) continue
+    selected.push(entry)
+  }
+  const fallback = normalizeProtectionRange(hookRange || null, safeDuration)
+  if (!selected.length && fallback) selected.push({ range: fallback, score: 1 })
+  return mergeRanges(selected.map((entry) => entry.range))
 }
 
 const subtractRanges = (segments: Segment[], ranges: TimeRange[]) => {
@@ -15314,6 +15486,12 @@ const buildEditPlan = async (
     start: hook.start,
     end: Number((hook.start + hook.duration).toFixed(3))
   }
+  let protectedPeakRanges = buildPeakProtectionRanges({
+    windows,
+    durationSeconds,
+    hookRange,
+    hookCandidates: hookVariants
+  })
 
   if (onStage) await onStage('pacing')
   const shouldMoveHook = options.autoHookMove && !options.onlyCuts
@@ -15330,6 +15508,7 @@ const buildEditPlan = async (
     windows,
     aggressionLevel: styleAdjustedAggressionLevel,
     hookRange,
+    protectedRanges: protectedPeakRanges,
     silences,
     tuning: longFormRuntimeTuning,
     editorMode: options.editorMode
@@ -15569,6 +15748,14 @@ const buildEditPlan = async (
     hookCandidates: hookVariants,
     visualIntelligence
   })
+  protectedPeakRanges = buildPeakProtectionRanges({
+    windows,
+    durationSeconds,
+    hookRange,
+    hookCandidates: hookVariants,
+    storyBeatGraph,
+    seedRanges: protectedPeakRanges
+  })
   const microRehookAnchors = buildLongFormMicroRehookAnchors({
     durationSeconds,
     storyBeatGraph
@@ -15643,6 +15830,7 @@ const buildEditPlan = async (
     visualIntelligence,
     storyBeatGraph,
     microRehookAnchors,
+    protectedPeakRanges,
     planner: plannerSummary
   }
 }
@@ -16251,6 +16439,7 @@ const applyEliteCutRefinement = ({
   aggressionLevel,
   contentFormat,
   hookRange,
+  protectedRanges,
   allowSpeedChanges
 }: {
   segments: Segment[]
@@ -16260,6 +16449,7 @@ const applyEliteCutRefinement = ({
   aggressionLevel: RetentionAggressionLevel
   contentFormat: RetentionContentFormat
   hookRange?: TimeRange | null
+  protectedRanges?: TimeRange[] | null
   allowSpeedChanges: boolean
 }) => {
   const audit: EliteCutAudit = {
@@ -16327,10 +16517,16 @@ const applyEliteCutRefinement = ({
     }
   }
 
-  const overlapsHookRange = (segment: Segment) => {
-    if (!hookRange) return false
-    return segment.start < hookRange.end && segment.end > hookRange.start
-  }
+  const mergedProtectedRanges = mergeRanges([
+    ...(hookRange ? [hookRange] : []),
+    ...(protectedRanges || [])
+  ]
+    .map((range) => normalizeProtectionRange(range, safeDuration))
+    .filter((range): range is TimeRange => Boolean(range)))
+
+  const overlapsProtectedRange = (segment: Segment) => (
+    mergedProtectedRanges.some((range) => segment.start < range.end && segment.end > range.start)
+  )
 
   const cache = new Map<string, SegmentSignalProfileForCut>()
   const deduped: Segment[] = []
@@ -16358,8 +16554,8 @@ const applyEliteCutRefinement = ({
       similarity >= duplicateSimilarityThreshold &&
       repeatedLowNovelty &&
       !protectedIntent &&
-      !overlapsHookRange(prev) &&
-      !overlapsHookRange(segment)
+      !overlapsProtectedRange(prev) &&
+      !overlapsProtectedRange(segment)
     ) {
       audit.duplicateDrops += 1
       if (currentQuality > prevQuality + 0.04) {
@@ -16400,7 +16596,7 @@ const applyEliteCutRefinement = ({
     if (
       currentDuration > minSegmentDuration + trimStep + 0.08 &&
       tailSignal < lowSignalBoundaryThreshold &&
-      !overlapsHookRange(current)
+      !overlapsProtectedRange(current)
     ) {
       current.end = Number((current.end - trimStep).toFixed(3))
       audit.lowEnergyTailTrims += 1
@@ -16408,7 +16604,7 @@ const applyEliteCutRefinement = ({
     if (
       nextDuration > minSegmentDuration + trimStep + 0.08 &&
       headSignal < lowSignalBoundaryThreshold &&
-      !overlapsHookRange(next)
+      !overlapsProtectedRange(next)
     ) {
       next.start = Number((next.start + trimStep).toFixed(3))
       audit.lowEnergyHeadTrims += 1
@@ -16443,7 +16639,7 @@ const applyEliteCutRefinement = ({
 
   if (allowSpeedChanges) {
     for (const segment of out) {
-      if (overlapsHookRange(segment)) continue
+      if (overlapsProtectedRange(segment)) continue
       const baseSpeed = Number(segment.speed && segment.speed > 0 ? segment.speed : 1)
       const runtime = Math.max(0.001, (segment.end - segment.start) / baseSpeed)
       if (runtime < 2.25) continue
@@ -23560,7 +23756,7 @@ const processJob = async (
       }
       const allowAggressiveEmotionReorder = selectedContentFormat === 'tiktok_short'
 
-      const applyPacingRetry = (segments: Segment[]) => {
+      const applyPacingRetry = (segments: Segment[], protectedRanges: TimeRange[] = []) => {
         if (!editPlan) return segments
         const stricter = enforceSegmentLengths(
           segments.map((segment) => ({ ...segment })),
@@ -23569,6 +23765,8 @@ const processJob = async (
           editPlan.engagementWindows
         )
         return stricter.map((segment) => {
+          const range = { start: segment.start, end: segment.end }
+          if (protectedRanges.some((guard) => overlapsRange(range, guard))) return segment
           const score = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.score)
           const speech = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.speechIntensity)
           const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
@@ -23598,6 +23796,17 @@ const processJob = async (
           duration: Number(Math.max(0.2, hookRange.end - hookRange.start).toFixed(3))
         }
         const hookSegment: Segment = { ...hookRange, speed: 1, emphasize: true }
+        const attemptProtectedRanges = buildPeakProtectionRanges({
+          windows: editPlan?.engagementWindows ?? [],
+          durationSeconds,
+          hookRange,
+          hookCandidates: [effectiveHookCandidate, ...hookVariantsForAnalysis].slice(0, 6),
+          storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null,
+          seedRanges: editPlan?.protectedPeakRanges ?? []
+        })
+        const isProtectedAttemptRange = (range: TimeRange) => (
+          attemptProtectedRanges.some((guard) => overlapsRange(range, guard))
+        )
         let story = storySegments.map((segment) => ({ ...segment }))
         if (shouldMoveHookForRender) {
           story = subtractRange(story, hookRange)
@@ -23606,17 +23815,18 @@ const processJob = async (
           // Trim early exposition after the hook so payoff is approached faster.
           story = story.map((segment, index) => {
             if (index > 0) return segment
+            if (isProtectedAttemptRange({ start: segment.start, end: segment.end })) return segment
             const start = segment.start
             const end = Math.min(segment.end, start + 4.8)
             const speed = Number(clamp((segment.speed ?? 1) + 0.08, 1, 1.16).toFixed(3))
             return { ...segment, start, end, speed }
           })
         } else if (strategy === 'EMOTION_FIRST') {
-          story = allowAggressiveEmotionReorder ? reorderForEmotion(story) : applyPacingRetry(story)
+          story = allowAggressiveEmotionReorder ? reorderForEmotion(story) : applyPacingRetry(story, attemptProtectedRanges)
         } else if (strategy === 'PACING_FIRST') {
-          story = applyPacingRetry(story)
+          story = applyPacingRetry(story, attemptProtectedRanges)
         } else if (strategy === 'RESCUE_MODE') {
-          story = applyPacingRetry(story)
+          story = applyPacingRetry(story, attemptProtectedRanges)
           if (editPlan) {
             const scored = story
               .map((segment, index) => ({
@@ -23633,6 +23843,7 @@ const processJob = async (
               if (removedSeconds >= maxRemovableSeconds) break
               if (entry.index === 0) continue
               if (entry.runtime < 1.7) continue
+              if (isProtectedAttemptRange({ start: entry.segment.start, end: entry.segment.end })) continue
               if (entry.score > 0.5 || entry.speech > 0.58) continue
               removeIndexes.add(entry.index)
               removedSeconds += entry.runtime
@@ -23640,6 +23851,7 @@ const processJob = async (
             const filteredStory = story.filter((_, index) => !removeIndexes.has(index))
             story = filteredStory.length ? filteredStory : story
             story = enforceSegmentLengths(story, CUT_MIN, CUT_MAX, editPlan.engagementWindows).map((segment) => {
+              if (isProtectedAttemptRange({ start: segment.start, end: segment.end })) return segment
               const score = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.score)
               const speech = averageWindowMetric(editPlan.engagementWindows, segment.start, segment.end, (window) => window.speechIntensity)
               const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
@@ -23762,6 +23974,7 @@ const processJob = async (
           aggressionLevel,
           contentFormat: selectedContentFormat,
           hookRange,
+          protectedRanges: attemptProtectedRanges,
           allowSpeedChanges: !options.onlyCuts
         })
         const governedAttemptSegments = eliteCutRefined.segments
@@ -24650,6 +24863,14 @@ const processJob = async (
             start: Number(recoveredHook.start.toFixed(3)),
             end: Number((recoveredHook.start + recoveredHook.duration).toFixed(3))
           }
+          const recoveryProtectedRanges = buildPeakProtectionRanges({
+            windows: engagementWindowsForAnalysis,
+            durationSeconds,
+            hookRange: hookRangeForRecovery,
+            hookCandidates: [recoveredHook, ...hookVariantsForAnalysis].slice(0, 6),
+            storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null,
+            seedRanges: editPlan?.protectedPeakRanges ?? []
+          })
           const noveltyRecovery = applyEliteCutRefinement({
             segments: recoveredSegments,
             windows: engagementWindowsForAnalysis,
@@ -24658,6 +24879,7 @@ const processJob = async (
             aggressionLevel: 'viral',
             contentFormat: selectedContentFormat,
             hookRange: hookRangeForRecovery,
+            protectedRanges: recoveryProtectedRanges,
             allowSpeedChanges: !options.onlyCuts
           })
           if (noveltyRecovery.segments.length) {
