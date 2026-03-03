@@ -893,6 +893,18 @@ type YouTubeRetentionPoint = {
   relativeRetentionPerformance: number | null
 }
 
+type YouTubeSignalState = {
+  coldStartMode: boolean
+  trustWeight: number
+  qualifyingVideos: number
+  requiredVideos: number
+  averageViewsPerVideo: number | null
+  currentVideoViews: number
+  requiredAverageViewsPerVideo: number
+  highTrustAverageViewsPerVideo: number
+  recommendation: string
+}
+
 type YouTubePlatformFeedback = {
   watchPercent: number | null
   hookHoldPercent: number | null
@@ -909,7 +921,12 @@ type YouTubePlatformFeedback = {
   sourceType: 'platform'
   notes: string | null
   submittedAt: string
+  youtubeSignal: YouTubeSignalState | null
 }
+
+const YOUTUBE_SIGNAL_REQUIRED_VIDEOS = 3
+const YOUTUBE_SIGNAL_MIN_AVG_VIEWS = 200
+const YOUTUBE_SIGNAL_HIGH_AVG_VIEWS = 500
 
 const parseYmdDate = (value: any): string | null => {
   const raw = String(value || '').trim()
@@ -1033,13 +1050,15 @@ const derivePlatformFeedbackFromYouTube = ({
   retentionCurve,
   videoId,
   startDate,
-  endDate
+  endDate,
+  youtubeSignal
 }: {
   summary: YouTubeAnalyticsSummary
   retentionCurve: YouTubeRetentionPoint[]
   videoId: string
   startDate: string
   endDate: string
+  youtubeSignal: YouTubeSignalState | null
 }): YouTubePlatformFeedback => {
   const safeViews = Math.max(0, Number(summary.views || 0))
   const likesPerView = safeViews > 0 ? Number(clamp((summary.likes / safeViews) * 100, 0, 100).toFixed(4)) : null
@@ -1078,7 +1097,112 @@ const derivePlatformFeedbackFromYouTube = ({
     source: 'youtube_analytics_oauth',
     sourceType: 'platform',
     notes: `youtube_video:${videoId}; window:${startDate}..${endDate}`,
-    submittedAt: new Date().toISOString()
+    submittedAt: new Date().toISOString(),
+    youtubeSignal
+  }
+}
+
+const extractMappedYouTubeVideoId = (analysis: any): string | null => {
+  const mapped = parseYouTubeVideoId(
+    analysis?.youtube_video_id ??
+    analysis?.youtubeVideoId ??
+    analysis?.youtube_sync?.videoId ??
+    analysis?.youtubeSync?.videoId
+  )
+  return mapped || null
+}
+
+const extractYouTubeViewsFromAnalysis = (analysis: any): number | null => {
+  const candidates = [
+    analysis?.youtube_sync?.analyticsSummary?.views,
+    analysis?.youtubeSync?.analyticsSummary?.views,
+    analysis?.retention_feedback?.youtubeSignal?.currentVideoViews,
+    analysis?.retention_feedback?.youtube_signal?.currentVideoViews
+  ]
+  for (const candidate of candidates) {
+    const parsed = Number(candidate)
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed
+    }
+  }
+  return null
+}
+
+const collectHistoricalYouTubeViewsForUser = async ({
+  userId,
+  excludeJobId
+}: {
+  userId: string
+  excludeJobId?: string | null
+}) => {
+  const rows = await prisma.job.findMany({
+    where: {
+      userId,
+      status: 'completed' as any,
+      ...(excludeJobId ? { NOT: { id: excludeJobId } } : {})
+    },
+    orderBy: { createdAt: 'desc' },
+    take: 300,
+    select: {
+      analysis: true
+    }
+  })
+  const views: number[] = []
+  for (const row of rows) {
+    const analysis = row.analysis && typeof row.analysis === 'object'
+      ? (row.analysis as Record<string, any>)
+      : {}
+    const parsed = extractYouTubeViewsFromAnalysis(analysis)
+    if (parsed !== null) views.push(parsed)
+  }
+  return views
+}
+
+const deriveYouTubeSignalState = ({
+  historicalViews,
+  currentVideoViews
+}: {
+  historicalViews: number[]
+  currentVideoViews: number
+}): YouTubeSignalState => {
+  const mergedViews = [...historicalViews]
+  if (Number.isFinite(currentVideoViews) && currentVideoViews >= 0) {
+    mergedViews.push(currentVideoViews)
+  }
+
+  const qualifyingVideos = mergedViews.filter((value) => Number.isFinite(value) && value >= 0).length
+  const averageViewsPerVideo = qualifyingVideos > 0
+    ? Number((mergedViews.reduce((sum, value) => sum + value, 0) / qualifyingVideos).toFixed(3))
+    : null
+  const hasVideoVolume = qualifyingVideos >= YOUTUBE_SIGNAL_REQUIRED_VIDEOS
+  const hasViewDepth = averageViewsPerVideo !== null && averageViewsPerVideo >= YOUTUBE_SIGNAL_MIN_AVG_VIEWS
+  const coldStartMode = !(hasVideoVolume && hasViewDepth)
+
+  const trustWeight = (() => {
+    if (coldStartMode) {
+      const volumeFactor = clamp01(qualifyingVideos / YOUTUBE_SIGNAL_REQUIRED_VIDEOS)
+      const depthFactor = clamp01((averageViewsPerVideo ?? 0) / YOUTUBE_SIGNAL_MIN_AVG_VIEWS)
+      return Number((0.15 + ((volumeFactor * 0.6 + depthFactor * 0.4) * 0.45)).toFixed(3))
+    }
+    const highTrustSpan = Math.max(1, YOUTUBE_SIGNAL_HIGH_AVG_VIEWS - YOUTUBE_SIGNAL_MIN_AVG_VIEWS)
+    const highTrustFactor = clamp01(((averageViewsPerVideo ?? YOUTUBE_SIGNAL_MIN_AVG_VIEWS) - YOUTUBE_SIGNAL_MIN_AVG_VIEWS) / highTrustSpan)
+    return Number((0.62 + highTrustFactor * 0.33).toFixed(3))
+  })()
+
+  const recommendation = coldStartMode
+    ? 'Cold-start mode active: blend global defaults + boundary critic + in-app watch/skip/thumb signals.'
+    : 'YouTube retention has enough signal for stronger policy weighting.'
+
+  return {
+    coldStartMode,
+    trustWeight,
+    qualifyingVideos,
+    requiredVideos: YOUTUBE_SIGNAL_REQUIRED_VIDEOS,
+    averageViewsPerVideo,
+    currentVideoViews: Number.isFinite(currentVideoViews) ? Math.max(0, currentVideoViews) : 0,
+    requiredAverageViewsPerVideo: YOUTUBE_SIGNAL_MIN_AVG_VIEWS,
+    highTrustAverageViewsPerVideo: YOUTUBE_SIGNAL_HIGH_AVG_VIEWS,
+    recommendation
   }
 }
 
@@ -1245,11 +1369,19 @@ const fetchYouTubeAnalyticsReport = async ({
 const persistPlatformFeedbackForJob = async ({
   userId,
   jobId,
-  feedback
+  feedback,
+  youtubeSync
 }: {
   userId: string
   jobId: string
   feedback: YouTubePlatformFeedback
+  youtubeSync?: {
+    videoId: string
+    startDate: string
+    endDate: string
+    analyticsSummary: YouTubeAnalyticsSummary
+    signalState: YouTubeSignalState
+  } | null
 }) => {
   const job = await prisma.job.findUnique({ where: { id: jobId } })
   if (!job || String(job.userId) !== String(userId)) {
@@ -1268,6 +1400,23 @@ const persistPlatformFeedbackForJob = async ({
   const history = Array.isArray(existingAnalysis.retention_feedback_history)
     ? existingAnalysis.retention_feedback_history
     : []
+  const priorYouTubeSync = existingAnalysis.youtube_sync && typeof existingAnalysis.youtube_sync === 'object'
+    ? existingAnalysis.youtube_sync
+    : {}
+  const nextYouTubeSync = youtubeSync
+    ? {
+      ...priorYouTubeSync,
+      videoId: youtubeSync.videoId,
+      linkedAt: priorYouTubeSync.linkedAt || new Date().toISOString(),
+      lastSyncedAt: new Date().toISOString(),
+      dateRange: {
+        startDate: youtubeSync.startDate,
+        endDate: youtubeSync.endDate
+      },
+      analyticsSummary: youtubeSync.analyticsSummary,
+      signalState: youtubeSync.signalState
+    }
+    : priorYouTubeSync
   const nextAnalysis = {
     ...existingAnalysis,
     retention_feedback: feedback,
@@ -1275,7 +1424,14 @@ const persistPlatformFeedbackForJob = async ({
       ...history.slice(-39),
       feedback
     ],
-    retention_feedback_updated_at: new Date().toISOString()
+    retention_feedback_updated_at: new Date().toISOString(),
+    ...(youtubeSync
+      ? {
+        youtube_video_id: youtubeSync.videoId,
+        youtubeVideoId: youtubeSync.videoId,
+        youtube_sync: nextYouTubeSync
+      }
+      : {})
   }
   await prisma.job.update({
     where: { id: jobId },
@@ -1628,6 +1784,70 @@ router.post('/youtube/oauth/disconnect', async (req: any, res) => {
   }
 })
 
+router.post('/youtube/job-video/link', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = String(req.body?.jobId || req.body?.job_id || '').trim()
+    if (!jobId) {
+      return res.status(400).json({
+        error: 'missing_job_id',
+        message: 'Provide a jobId to link with YouTube video ID.'
+      })
+    }
+    const videoId = parseYouTubeVideoId(
+      req.body?.videoId ??
+      req.body?.video_id ??
+      req.body?.videoUrl ??
+      req.body?.video_url ??
+      req.body?.video
+    )
+    if (!videoId) {
+      return res.status(400).json({
+        error: 'invalid_youtube_video',
+        message: 'Provide a valid YouTube video ID or URL.'
+      })
+    }
+
+    const job = await prisma.job.findUnique({ where: { id: jobId } })
+    if (!job || String(job.userId) !== userId) {
+      return res.status(404).json({ error: 'job_not_found' })
+    }
+
+    const existingAnalysis = job.analysis && typeof job.analysis === 'object'
+      ? (job.analysis as Record<string, any>)
+      : {}
+    const priorSync = existingAnalysis.youtube_sync && typeof existingAnalysis.youtube_sync === 'object'
+      ? existingAnalysis.youtube_sync
+      : {}
+    const nextAnalysis = {
+      ...existingAnalysis,
+      youtube_video_id: videoId,
+      youtubeVideoId: videoId,
+      youtube_sync: {
+        ...priorSync,
+        videoId,
+        linkedAt: new Date().toISOString()
+      }
+    }
+
+    await prisma.job.update({
+      where: { id: jobId },
+      data: {
+        analysis: nextAnalysis
+      }
+    })
+
+    return res.json({
+      ok: true,
+      jobId,
+      videoId
+    })
+  } catch {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
 router.post('/youtube/video-metrics', async (req: any, res) => {
   try {
     const userId = String(req.user?.id || '').trim()
@@ -1730,12 +1950,18 @@ router.post('/youtube/analytics/video-report', async (req: any, res) => {
       startDate,
       endDate
     })
+    const historicalViews = await collectHistoricalYouTubeViewsForUser({ userId })
+    const youtubeSignal = deriveYouTubeSignalState({
+      historicalViews,
+      currentVideoViews: report.summary.views
+    })
     const platformFeedback = derivePlatformFeedbackFromYouTube({
       summary: report.summary,
       retentionCurve: report.retentionCurve,
       videoId,
       startDate,
-      endDate
+      endDate,
+      youtubeSignal
     })
     const metrics = await fetchYouTubeVideoMetrics({
       userId,
@@ -1752,7 +1978,8 @@ router.post('/youtube/analytics/video-report', async (req: any, res) => {
       },
       video: metrics,
       analytics: report,
-      platformFeedback
+      platformFeedback,
+      youtubeSignal
     })
   } catch (error: any) {
     const code = String(error?.code || '')
@@ -1796,11 +2023,29 @@ router.post('/youtube/analytics/sync-job-feedback', async (req: any, res) => {
       req.body?.video_url ??
       req.body?.video ??
       req.body?.id
-    const videoId = parseYouTubeVideoId(rawVideoInput)
+    let videoId = parseYouTubeVideoId(rawVideoInput)
+    if (!videoId) {
+      const existingJob = await prisma.job.findUnique({
+        where: { id: jobId },
+        select: {
+          userId: true,
+          analysis: true
+        }
+      })
+      if (!existingJob || String(existingJob.userId) !== userId) {
+        const error = new Error('job_not_found')
+        ;(error as any).code = 'job_not_found'
+        throw error
+      }
+      const existingAnalysis = existingJob.analysis && typeof existingJob.analysis === 'object'
+        ? (existingJob.analysis as Record<string, any>)
+        : {}
+      videoId = extractMappedYouTubeVideoId(existingAnalysis)
+    }
     if (!videoId) {
       return res.status(400).json({
         error: 'invalid_youtube_video',
-        message: 'Provide a valid YouTube video ID or URL.'
+        message: 'Provide a valid YouTube video ID/URL or link this job to a YouTube video first.'
       })
     }
     const { startDate, endDate } = resolveYouTubeAnalyticsDateRange(req.body || {})
@@ -1810,17 +2055,33 @@ router.post('/youtube/analytics/sync-job-feedback', async (req: any, res) => {
       startDate,
       endDate
     })
+    const historicalViews = await collectHistoricalYouTubeViewsForUser({
+      userId,
+      excludeJobId: jobId
+    })
+    const youtubeSignal = deriveYouTubeSignalState({
+      historicalViews,
+      currentVideoViews: report.summary.views
+    })
     const platformFeedback = derivePlatformFeedbackFromYouTube({
       summary: report.summary,
       retentionCurve: report.retentionCurve,
       videoId,
       startDate,
-      endDate
+      endDate,
+      youtubeSignal
     })
     const persisted = await persistPlatformFeedbackForJob({
       userId,
       jobId,
-      feedback: platformFeedback
+      feedback: platformFeedback,
+      youtubeSync: {
+        videoId,
+        startDate,
+        endDate,
+        analyticsSummary: report.summary,
+        signalState: youtubeSignal
+      }
     })
     return res.json({
       ok: true,
@@ -1832,7 +2093,8 @@ router.post('/youtube/analytics/sync-job-feedback', async (req: any, res) => {
       },
       analytics: report,
       feedback: persisted.feedback,
-      feedbackLoop: persisted.feedbackLoop
+      feedbackLoop: persisted.feedbackLoop,
+      youtubeSignal
     })
   } catch (error: any) {
     const code = String(error?.code || '')
