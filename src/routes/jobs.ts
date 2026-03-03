@@ -1163,7 +1163,7 @@ type StoryBeatGraph = {
   curiosityScore: number
 }
 type HardQualityGateCheck = {
-  key: 'hook_source_timing' | 'edit_delta' | 'body_novelty' | 'cliffhanger_tension' | 'long_form_chapters' | 'hook_cliff_separation'
+  key: 'hook_source_timing' | 'edit_delta' | 'body_novelty' | 'cliffhanger_tension' | 'long_form_chapters' | 'hook_cliff_separation' | 'boundary_pathology'
   passed: boolean
   score: number
   threshold: number
@@ -1174,6 +1174,7 @@ type HardQualityGateAudit = {
   checks: HardQualityGateCheck[]
   summary: string
   generatedAt: string
+  boundaryPathologySummary?: BoundaryPathologySummary
 }
 type EliteCutAudit = {
   duplicateDrops: number
@@ -1182,6 +1183,22 @@ type EliteCutAudit = {
   speedRamps: number
   jlBoosts: number
   avgBoundaryJerk: number
+}
+type BoundaryPathologyBoundary = {
+  time: number
+  pathology: number
+  jerk: number
+  deadRiskTail: number
+  deadRiskHead: number
+}
+type BoundaryPathologySummary = {
+  worst: number
+  avg: number
+  highCount: number
+  boundaryCount: number
+  highPathologyBoundariesPerMinute: number
+  fixesApplied: number
+  worstTimes: number[]
 }
 type VariantSelectionAuditEntry = {
   rank: number
@@ -1888,6 +1905,13 @@ const HARD_GATE_CLIFFHANGER_TENSION_LONG = 0.46
 const HARD_GATE_MIN_LONG_FORM_CHAPTERS = 3
 const HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_SECONDS = 45
 const HARD_GATE_MIN_HOOK_CLIFF_SEPARATION_RATIO = 0.2
+const BOUNDARY_PATHOLOGY_HIGH_THRESHOLD = 0.7
+const BOUNDARY_PATHOLOGY_REANCHOR_THRESHOLD = 0.55
+const BOUNDARY_PATHOLOGY_REANCHOR_MIN_IMPROVEMENT = 0.06
+const BOUNDARY_PATHOLOGY_HARD_FAIL_WORST = 0.82
+const BOUNDARY_PATHOLOGY_HARD_FAIL_PER_MIN = 3
+const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
+const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
 const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
 const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
 const MANDATORY_VARIANT_MIN = 3
@@ -13617,6 +13641,7 @@ const buildRetentionMetadataSummary = ({
   boredomRemovedRatio,
   cutQualityScore,
   cuttingAudit,
+  boundaryPathologySummary,
   qualityGateOverride,
   optimizationNotes,
   hookSelectionSource,
@@ -13648,6 +13673,7 @@ const buildRetentionMetadataSummary = ({
   boredomRemovedRatio?: number
   cutQualityScore?: number | null
   cuttingAudit?: EliteCutAudit | null
+  boundaryPathologySummary?: BoundaryPathologySummary | null
   qualityGateOverride?: { applied: boolean; reason: string } | null
   optimizationNotes?: string[]
   hookSelectionSource?: 'auto' | 'user_selected' | 'fallback'
@@ -13659,6 +13685,13 @@ const buildRetentionMetadataSummary = ({
   outcomeMenuApply?: OutcomeMenuApplyResult | null
 }) => {
   const segmentStats = buildSegmentStatsSummary(segments)
+  const resolvedBoundaryPathologySummary = boundaryPathologySummary || summarizeBoundaryPathology({
+    segments,
+    windows,
+    durationSeconds,
+    cache: new Map<string, SegmentSignalProfileForCut>(),
+    fixesApplied: 0
+  })
   const hookRangeEnd = hook ? hook.start + hook.duration : null
   const hookEmotion = hook && hookRangeEnd !== null
     ? computeHookEmotionProfile(windows, hook.start, hookRangeEnd)
@@ -13712,6 +13745,11 @@ const buildRetentionMetadataSummary = ({
   }
   if (Number.isFinite(Number(cutQualityScore))) {
     improvements.push(`Elite cut refinement quality score: ${(clamp01(Number(cutQualityScore)) * 100).toFixed(0)}%.`)
+  }
+  if (resolvedBoundaryPathologySummary.boundaryCount > 0) {
+    improvements.push(
+      `Boundary pathology audit: worst ${resolvedBoundaryPathologySummary.worst.toFixed(2)}, high-risk cuts ${resolvedBoundaryPathologySummary.highCount}, fixes ${resolvedBoundaryPathologySummary.fixesApplied}.`
+    )
   }
   if (cuttingAudit && (cuttingAudit.lowEnergyHeadTrims > 0 || cuttingAudit.lowEnergyTailTrims > 0)) {
     const trims = cuttingAudit.lowEnergyHeadTrims + cuttingAudit.lowEnergyTailTrims
@@ -13809,7 +13847,8 @@ const buildRetentionMetadataSummary = ({
       : null,
     pacing: {
       targetWindowSeconds: { min: CUT_MIN, max: CUT_MAX },
-      ...segmentStats
+      ...segmentStats,
+      boundaryPathology: resolvedBoundaryPathologySummary
     },
     niche: nicheProfile
       ? {
@@ -13860,6 +13899,7 @@ const buildRetentionMetadataSummary = ({
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
       cutQualityScore: Number(clamp01(Number(cutQualityScore ?? 0)).toFixed(4)),
+      boundaryPathologySummary: resolvedBoundaryPathologySummary,
       styleTimelineFeatures: styleFeatureSnapshot ?? null,
       whyKeepWatching: Array.isArray(judge?.why_keep_watching) ? judge!.why_keep_watching.slice(0, 3) : [],
       genericFlags: Array.isArray(judge?.what_is_generic) ? judge!.what_is_generic.slice(0, 3) : [],
@@ -13895,9 +13935,11 @@ const buildRetentionMetadataSummary = ({
           },
           thresholds: judge.applied_thresholds,
           gateMode: judge.gate_mode,
-          override: qualityGateOverride
+          override: qualityGateOverride,
+          boundaryPathologySummary: resolvedBoundaryPathologySummary
         }
       : null,
+    boundaryPathologySummary: resolvedBoundaryPathologySummary,
     attempts: (attempts || []).slice(0, 6).map((attempt) => ({
       attempt: attempt.attempt,
       strategy: attempt.strategy,
@@ -14798,6 +14840,25 @@ const evaluateHardQualityBar = ({
   const hookCliffSeparation = Math.max(0, cliffStart - hookSourceStart)
   const hookCliffSeparationScore = clamp01(hookCliffSeparation / Math.max(0.1, requiredSeparation))
   const hookCliffSeparationPass = hookCliffSeparation >= requiredSeparation
+  const boundaryPathologySummary = summarizeBoundaryPathology({
+    segments,
+    windows,
+    durationSeconds,
+    cache: new Map<string, SegmentSignalProfileForCut>(),
+    fixesApplied: 0
+  })
+  const worstBoundaryPathology = Number(boundaryPathologySummary.worst || 0)
+  const highPathologyBoundariesPerMinute = Number(boundaryPathologySummary.highPathologyBoundariesPerMinute || 0)
+  const boundaryPathologyPass = (
+    worstBoundaryPathology < BOUNDARY_PATHOLOGY_HARD_FAIL_WORST &&
+    highPathologyBoundariesPerMinute <= BOUNDARY_PATHOLOGY_HARD_FAIL_PER_MIN
+  )
+  const boundaryPathologyScore = clamp01(
+    1 - (
+      0.62 * clamp01(worstBoundaryPathology / Math.max(0.01, BOUNDARY_PATHOLOGY_HARD_FAIL_WORST)) +
+      0.38 * clamp01(highPathologyBoundariesPerMinute / Math.max(0.01, BOUNDARY_PATHOLOGY_HARD_FAIL_PER_MIN))
+    )
+  )
   const checks: HardQualityGateCheck[] = [
     {
       key: 'hook_source_timing',
@@ -14852,6 +14913,15 @@ const evaluateHardQualityBar = ({
       reason: hookCliffSeparationPass
         ? `Hook/cliffhanger separation passed (${hookCliffSeparation.toFixed(1)}s).`
         : `Hook/cliffhanger separation too tight (${hookCliffSeparation.toFixed(1)}s < ${requiredSeparation.toFixed(1)}s).`
+    },
+    {
+      key: 'boundary_pathology',
+      passed: boundaryPathologyPass,
+      score: Number(boundaryPathologyScore.toFixed(4)),
+      threshold: 0,
+      reason: boundaryPathologyPass
+        ? `Boundary pathology passed (worst=${worstBoundaryPathology.toFixed(3)}, high/min=${highPathologyBoundariesPerMinute.toFixed(2)}).`
+        : `Boundary pathology failed (worst=${worstBoundaryPathology.toFixed(3)} threshold=${BOUNDARY_PATHOLOGY_HARD_FAIL_WORST.toFixed(2)}, high/min=${highPathologyBoundariesPerMinute.toFixed(2)} threshold=${BOUNDARY_PATHOLOGY_HARD_FAIL_PER_MIN.toFixed(2)}).`
     }
   ]
   const hardFailures = checks.filter((check) => !check.passed)
@@ -14863,7 +14933,8 @@ const evaluateHardQualityBar = ({
     passed,
     checks,
     summary,
-    generatedAt: toIsoNow()
+    generatedAt: toIsoNow(),
+    boundaryPathologySummary
   }
 }
 
@@ -16762,6 +16833,130 @@ const scoreEliteCutAudit = (audit: EliteCutAudit, segmentCount: number) => {
   ).toFixed(4))
 }
 
+type BoundaryPathologyMetrics = {
+  jerk: number
+  deadRiskTail: number
+  deadRiskHead: number
+  deadRisk: number
+  pathology: number
+}
+
+const buildEmptyBoundaryPathologySummary = (fixesApplied = 0): BoundaryPathologySummary => ({
+  worst: 0,
+  avg: 0,
+  highCount: 0,
+  boundaryCount: 0,
+  highPathologyBoundariesPerMinute: 0,
+  fixesApplied: Number(Math.max(0, fixesApplied)),
+  worstTimes: []
+})
+
+const computeBoundaryPathologyMetrics = ({
+  leftSegment,
+  rightSegment,
+  windows,
+  cache
+}: {
+  leftSegment: Segment
+  rightSegment: Segment
+  windows: EngagementWindow[]
+  cache: Map<string, SegmentSignalProfileForCut>
+}): BoundaryPathologyMetrics => {
+  const left = buildSegmentSignalProfileForCut({ segment: leftSegment, windows, cache })
+  const right = buildSegmentSignalProfileForCut({ segment: rightSegment, windows, cache })
+  const jerk = clamp01(
+    0.45 * Math.abs(left.energy - right.energy) +
+    0.23 * Math.abs(left.motion - right.motion) +
+    0.2 * Math.abs(left.speech - right.speech) +
+    0.12 * Math.abs(left.novelty - right.novelty)
+  )
+  const deadRiskTail = clamp01(1 - (
+    0.55 * left.score +
+    0.25 * left.speech +
+    0.2 * left.motion
+  ))
+  const deadRiskHead = clamp01(1 - (
+    0.55 * right.score +
+    0.25 * right.speech +
+    0.2 * right.motion
+  ))
+  const deadRisk = clamp01((deadRiskTail + deadRiskHead) / 2)
+  const pathology = clamp01(
+    0.5 * jerk +
+    0.25 * deadRiskTail +
+    0.25 * deadRiskHead
+  )
+  return {
+    jerk: Number(jerk.toFixed(4)),
+    deadRiskTail: Number(deadRiskTail.toFixed(4)),
+    deadRiskHead: Number(deadRiskHead.toFixed(4)),
+    deadRisk: Number(deadRisk.toFixed(4)),
+    pathology: Number(pathology.toFixed(4))
+  }
+}
+
+const summarizeBoundaryPathology = ({
+  segments,
+  windows,
+  durationSeconds,
+  cache = new Map<string, SegmentSignalProfileForCut>(),
+  fixesApplied = 0
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  cache?: Map<string, SegmentSignalProfileForCut>
+  fixesApplied?: number
+}): BoundaryPathologySummary => {
+  if (!Array.isArray(segments) || segments.length < 2 || !Array.isArray(windows) || !windows.length) {
+    return buildEmptyBoundaryPathologySummary(fixesApplied)
+  }
+  const boundaries: BoundaryPathologyBoundary[] = []
+  for (let index = 0; index < segments.length - 1; index += 1) {
+    const left = segments[index]
+    const right = segments[index + 1]
+    if (!left || !right) continue
+    if (!Number.isFinite(left.start) || !Number.isFinite(left.end) || !Number.isFinite(right.start) || !Number.isFinite(right.end)) continue
+    if (left.end <= left.start + 0.05 || right.end <= right.start + 0.05) continue
+    const metrics = computeBoundaryPathologyMetrics({
+      leftSegment: left,
+      rightSegment: right,
+      windows,
+      cache
+    })
+    boundaries.push({
+      time: Number((((left.end + right.start) / 2)).toFixed(3)),
+      pathology: Number(metrics.pathology.toFixed(4)),
+      jerk: Number(metrics.jerk.toFixed(4)),
+      deadRiskTail: Number(metrics.deadRiskTail.toFixed(4)),
+      deadRiskHead: Number(metrics.deadRiskHead.toFixed(4))
+    })
+  }
+  if (!boundaries.length) {
+    return buildEmptyBoundaryPathologySummary(fixesApplied)
+  }
+  const boundaryCount = boundaries.length
+  const worst = boundaries.reduce((maxValue, boundary) => Math.max(maxValue, boundary.pathology), 0)
+  const avg = boundaries.reduce((sum, boundary) => sum + boundary.pathology, 0) / boundaryCount
+  const highCount = boundaries.filter((boundary) => boundary.pathology >= BOUNDARY_PATHOLOGY_HIGH_THRESHOLD).length
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const highPathologyBoundariesPerMinute = highCount / Math.max(1e-6, safeDuration / 60)
+  const worstTimes = boundaries
+    .slice()
+    .sort((a, b) => b.pathology - a.pathology || a.time - b.time)
+    .slice(0, 3)
+    .map((boundary) => Number(boundary.time.toFixed(3)))
+  return {
+    worst: Number(worst.toFixed(4)),
+    avg: Number(avg.toFixed(4)),
+    highCount,
+    boundaryCount,
+    highPathologyBoundariesPerMinute: Number(highPathologyBoundariesPerMinute.toFixed(4)),
+    fixesApplied: Number(Math.max(0, fixesApplied)),
+    worstTimes
+  }
+}
+
 const applyEliteCutRefinement = ({
   segments,
   windows,
@@ -16795,7 +16990,8 @@ const applyEliteCutRefinement = ({
     return {
       segments: [] as Segment[],
       audit,
-      cutQualityScore: 0
+      cutQualityScore: 0,
+      boundaryPathologySummary: buildEmptyBoundaryPathologySummary(0)
     }
   }
   const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
@@ -16844,7 +17040,8 @@ const applyEliteCutRefinement = ({
     return {
       segments: segments.map((segment) => ({ ...segment })),
       audit,
-      cutQualityScore: 0.32
+      cutQualityScore: 0.32,
+      boundaryPathologySummary: buildEmptyBoundaryPathologySummary(0)
     }
   }
 
@@ -16899,6 +17096,13 @@ const applyEliteCutRefinement = ({
 
   const out = deduped.length ? deduped : normalized.map((segment) => ({ ...segment }))
   const boundaryJerks: number[] = []
+  let boundaryFixesApplied = 0
+  const minRenderableDuration = minSegmentDuration * 0.48
+  const computeBoundaryDurationPenalty = (leftDuration: number, rightDuration: number) => {
+    const leftMargin = clamp01((leftDuration - minRenderableDuration) / Math.max(0.05, minSegmentDuration * 1.2))
+    const rightMargin = clamp01((rightDuration - minRenderableDuration) / Math.max(0.05, minSegmentDuration * 1.2))
+    return clamp01(1 - Math.min(leftMargin, rightMargin))
+  }
   for (let index = 0; index < out.length - 1; index += 1) {
     const current = out[index]
     const next = out[index + 1]
@@ -16940,17 +17144,87 @@ const applyEliteCutRefinement = ({
       next.start = Number((next.start + trimStep).toFixed(3))
       audit.lowEnergyHeadTrims += 1
     }
-    if (current.end - current.start <= minSegmentDuration * 0.48) continue
-    if (next.end - next.start <= minSegmentDuration * 0.48) continue
-    const leftProfile = buildSegmentSignalProfileForCut({ segment: current, windows, cache })
-    const rightProfile = buildSegmentSignalProfileForCut({ segment: next, windows, cache })
-    const jerk = clamp01(
-      0.45 * Math.abs(leftProfile.energy - rightProfile.energy) +
-      0.23 * Math.abs(leftProfile.motion - rightProfile.motion) +
-      0.2 * Math.abs(leftProfile.speech - rightProfile.speech) +
-      0.12 * Math.abs(leftProfile.novelty - rightProfile.novelty)
+    if (current.end - current.start <= minRenderableDuration) continue
+    if (next.end - next.start <= minRenderableDuration) continue
+
+    let boundaryMetrics = computeBoundaryPathologyMetrics({
+      leftSegment: current,
+      rightSegment: next,
+      windows,
+      cache
+    })
+    const baseDurationPenalty = computeBoundaryDurationPenalty(current.end - current.start, next.end - next.start)
+    const baseObjective = (
+      0.6 * boundaryMetrics.jerk +
+      0.25 * boundaryMetrics.deadRisk +
+      0.15 * baseDurationPenalty
     )
+
+    if (
+      boundaryMetrics.pathology >= BOUNDARY_PATHOLOGY_REANCHOR_THRESHOLD &&
+      !overlapsProtectedRange(current) &&
+      !overlapsProtectedRange(next)
+    ) {
+      let bestCandidate: {
+        end: number
+        start: number
+        objective: number
+      } | null = null
+      for (const tailTrim of BOUNDARY_REANCHOR_CANDIDATES) {
+        for (const headTrim of BOUNDARY_REANCHOR_CANDIDATES) {
+          if (tailTrim <= 0 && headTrim <= 0) continue
+          const candidateEnd = Number((current.end - tailTrim).toFixed(3))
+          const candidateStart = Number((next.start + headTrim).toFixed(3))
+          const candidateLeftDuration = candidateEnd - current.start
+          const candidateRightDuration = next.end - candidateStart
+          if (candidateLeftDuration <= minRenderableDuration || candidateRightDuration <= minRenderableDuration) continue
+          const candidateLeft = { ...current, end: candidateEnd }
+          const candidateRight = { ...next, start: candidateStart }
+          const candidateMetrics = computeBoundaryPathologyMetrics({
+            leftSegment: candidateLeft,
+            rightSegment: candidateRight,
+            windows,
+            cache
+          })
+          const durationPenalty = computeBoundaryDurationPenalty(candidateLeftDuration, candidateRightDuration)
+          const candidateObjective = (
+            0.6 * candidateMetrics.jerk +
+            0.25 * candidateMetrics.deadRisk +
+            0.15 * durationPenalty
+          )
+          if (!bestCandidate || candidateObjective < bestCandidate.objective) {
+            bestCandidate = {
+              end: candidateEnd,
+              start: candidateStart,
+              objective: candidateObjective
+            }
+          }
+        }
+      }
+      if (bestCandidate && baseObjective - bestCandidate.objective >= BOUNDARY_PATHOLOGY_REANCHOR_MIN_IMPROVEMENT) {
+        current.end = bestCandidate.end
+        next.start = bestCandidate.start
+        boundaryFixesApplied += 1
+      }
+    }
+
+    boundaryMetrics = computeBoundaryPathologyMetrics({
+      leftSegment: current,
+      rightSegment: next,
+      windows,
+      cache
+    })
+    const jerk = boundaryMetrics.jerk
     boundaryJerks.push(jerk)
+    if (boundaryMetrics.pathology >= BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD) {
+      current.transitionStyle = 'smooth'
+      next.transitionStyle = 'smooth'
+      current.audioTailMs = Number(clamp(Math.max(Number(current.audioTailMs ?? 0), 120), 20, 320).toFixed(0))
+      next.audioLeadInMs = Number(clamp(Math.max(Number(next.audioLeadInMs ?? 0), 120), 20, 280).toFixed(0))
+      boundaryFixesApplied += 1
+      continue
+    }
+
     const jumpThreshold = styleProfile?.style === 'tutorial' ? 0.27 : 0.2
     if (jerk >= jumpThreshold) {
       current.transitionStyle = 'jump'
@@ -17006,11 +17280,19 @@ const applyEliteCutRefinement = ({
     ? boundaryJerks.reduce((sum, value) => sum + value, 0) / boundaryJerks.length
     : 0
   audit.avgBoundaryJerk = Number(avgBoundaryJerk.toFixed(4))
+  const boundaryPathologySummary = summarizeBoundaryPathology({
+    segments: finalSegments.length ? finalSegments : normalized,
+    windows,
+    durationSeconds: safeDuration,
+    cache,
+    fixesApplied: boundaryFixesApplied
+  })
   const cutQualityScore = scoreEliteCutAudit(audit, finalSegments.length)
   return {
     segments: finalSegments.length ? finalSegments : normalized.map((segment) => ({ ...segment })),
     audit,
-    cutQualityScore
+    cutQualityScore,
+    boundaryPathologySummary
   }
 }
 
@@ -23649,6 +23931,8 @@ const processJob = async (
     let selectedCutQualityScore = Number.isFinite(Number((job.analysis as any)?.cut_quality_score))
       ? Number((job.analysis as any).cut_quality_score)
       : 0
+    let selectedBoundaryPathologySummary: BoundaryPathologySummary | null =
+      ((job.analysis as any)?.boundary_pathology_summary as BoundaryPathologySummary) || null
     let selectedContentFormat: RetentionContentFormat = inferRetentionContentFormat({
       runtimeSeconds: durationSeconds,
       windows: [],
@@ -24390,7 +24674,8 @@ const processJob = async (
           patternInterruptCount: totalPatternInterruptCount,
           patternInterruptDensity: Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4)),
           eliteCutAudit: eliteCutRefined.audit,
-          cutQualityScore: eliteCutRefined.cutQualityScore
+          cutQualityScore: eliteCutRefined.cutQualityScore,
+          boundaryPathologySummary: eliteCutRefined.boundaryPathologySummary
         }
       }
 
@@ -24428,6 +24713,7 @@ const processJob = async (
         autoEscalationEvents: AutoEscalationEvent[]
         eliteCutAudit: EliteCutAudit
         cutQualityScore: number
+        boundaryPathologySummary: BoundaryPathologySummary
         pacingCurve: 'aggressive' | 'balanced' | 'steady'
         cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
         policyId: string
@@ -24543,6 +24829,7 @@ const processJob = async (
           autoEscalationEvents: attempt.autoEscalationEvents,
           eliteCutAudit: attempt.eliteCutAudit,
           cutQualityScore: attempt.cutQualityScore,
+          boundaryPathologySummary: attempt.boundaryPathologySummary,
           pacingCurve,
           cliffhangerStyle,
           policyId
@@ -24601,6 +24888,7 @@ const processJob = async (
           selectedStrategy = winner.strategy
           selectedEliteCutAudit = winner.eliteCutAudit
           selectedCutQualityScore = winner.cutQualityScore
+          selectedBoundaryPathologySummary = winner.boundaryPathologySummary
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -25293,6 +25581,7 @@ const processJob = async (
             }))
             selectedEliteCutAudit = noveltyRecovery.audit
             selectedCutQualityScore = Math.max(selectedCutQualityScore, noveltyRecovery.cutQualityScore)
+            selectedBoundaryPathologySummary = noveltyRecovery.boundaryPathologySummary
             recoveryMutated = true
             recoveryNotes.push(
               `Hard quality recovery: applied aggressive anti-repeat refinement (cut quality ${(noveltyRecovery.cutQualityScore * 100).toFixed(0)}%).`
@@ -25387,6 +25676,7 @@ const processJob = async (
           })
         }
       }
+      selectedBoundaryPathologySummary = hardQualityAudit.boundaryPathologySummary || selectedBoundaryPathologySummary
       hardQualityGateForAnalysis = hardQualityAudit
       if (!hardQualityAudit.passed) {
         const failureReason = `Hard quality bar failed: ${hardQualityAudit.checks.filter((check) => !check.passed).map((check) => check.key).join(', ')}`
@@ -26080,6 +26370,7 @@ const processJob = async (
       boredomRemovedRatio: selectedBoredomRemovalRatio,
       cutQualityScore: selectedCutQualityScore,
       cuttingAudit: selectedEliteCutAudit,
+      boundaryPathologySummary: selectedBoundaryPathologySummary,
       qualityGateOverride,
       optimizationNotes,
       hookSelectionSource: selectedHookSelectionSource,
@@ -26179,6 +26470,8 @@ const processJob = async (
         boredom_removed_ratio: selectedBoredomRemovalRatio || (job.analysis as any)?.boredom_removed_ratio || 0,
         cut_quality_score: Number(clamp01(selectedCutQualityScore || 0).toFixed(4)),
         cutting_audit: selectedEliteCutAudit,
+        boundary_pathology_summary: selectedBoundaryPathologySummary,
+        boundaryPathologySummary: selectedBoundaryPathologySummary,
         story_reorder_map: selectedStoryReorderMap,
         style_profile: styleProfileForAnalysis,
         niche_profile: nicheProfileForAnalysis,
@@ -29453,6 +29746,8 @@ export const __retentionTestUtils = {
   buildPersistedRenderAnalysis,
   buildVisualIntelligenceSummary,
   buildStoryBeatGraph,
+  applyEliteCutRefinementForTest: applyEliteCutRefinement,
+  summarizeBoundaryPathologyForTest: summarizeBoundaryPathology,
   evaluateHardQualityBar,
   aggregatePlayerTelemetrySessions,
   summarizePlayerTelemetry,

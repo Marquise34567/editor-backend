@@ -25,7 +25,10 @@ const {
   executeQualityGateRetriesForTest,
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
-  buildPersistedRenderAnalysis
+  buildPersistedRenderAnalysis,
+  applyEliteCutRefinementForTest,
+  summarizeBoundaryPathologyForTest,
+  evaluateHardQualityBar
 } = __retentionTestUtils
 
 const makeWindow = (time: number, overrides: Record<string, any> = {}) => ({
@@ -521,6 +524,172 @@ const run = () => {
     passed: false
   })
   assert.ok(!rescueIneligible, 'rescue override should still reject unwatchable output')
+
+  // 2e) Boundary pathology scoring and re-anchor should repair high-risk cut boundaries.
+  const boundaryDuration = 15
+  const boundaryWindows: any[] = []
+  for (let raw = 0; raw < boundaryDuration; raw += 0.04) {
+    const time = Number(raw.toFixed(3))
+    let overrides: Record<string, any> = {
+      score: 0.36,
+      hookScore: 0.38,
+      speechIntensity: 0.34,
+      motionScore: 0.32,
+      audioEnergy: 0.36,
+      emotionIntensity: 0.4,
+      sceneChangeRate: 0.34,
+      curiosityTrigger: 0.32,
+      actionSpike: 0.28
+    }
+    if (time >= 11) {
+      overrides = {
+        ...overrides,
+        score: 0.78,
+        hookScore: 0.82,
+        speechIntensity: 0.72,
+        motionScore: 0.78,
+        audioEnergy: 0.74,
+        emotionIntensity: 0.86,
+        sceneChangeRate: 0.8,
+        curiosityTrigger: 0.9,
+        actionSpike: 0.84
+      }
+    }
+    if (time >= 1.8 && time < 2.2) {
+      if (time >= 1.96) {
+        overrides = {
+          ...overrides,
+          score: 0.1,
+          speechIntensity: 1,
+          motionScore: 1,
+          audioEnergy: 1,
+          sceneChangeRate: 1,
+          curiosityTrigger: 1,
+          actionSpike: 1
+        }
+      } else {
+        overrides = {
+          ...overrides,
+          score: 0.1,
+          speechIntensity: 0,
+          motionScore: 0,
+          audioEnergy: 0.5,
+          sceneChangeRate: 0.5,
+          curiosityTrigger: 0.5,
+          actionSpike: 0.5
+        }
+      }
+    }
+    if (time >= 2.2 && time < 2.6) {
+      if (time < 2.44) {
+        overrides = {
+          ...overrides,
+          score: 0.1,
+          speechIntensity: 0,
+          motionScore: 0,
+          audioEnergy: 0,
+          sceneChangeRate: 0,
+          curiosityTrigger: 0,
+          actionSpike: 0
+        }
+      } else {
+        overrides = {
+          ...overrides,
+          score: 0.1,
+          speechIntensity: 0,
+          motionScore: 0,
+          audioEnergy: 0.5,
+          sceneChangeRate: 0.5,
+          curiosityTrigger: 0.5,
+          actionSpike: 0.5
+        }
+      }
+    }
+    boundaryWindows.push(makeWindow(time, overrides))
+  }
+  const boundarySegments = [
+    { start: 1.8, end: 2.2, speed: 1 },
+    { start: 2.2, end: 2.6, speed: 1, transitionStyle: 'jump' as const }
+  ]
+  const boundarySummaryBefore = summarizeBoundaryPathologyForTest({
+    segments: boundarySegments as any,
+    windows: boundaryWindows as any,
+    durationSeconds: boundaryDuration
+  })
+  assert.ok(boundarySummaryBefore.boundaryCount === 1, 'boundary pathology summary should detect one cut boundary')
+  assert.ok(boundarySummaryBefore.worst >= 0 && boundarySummaryBefore.worst <= 1, 'boundary pathology worst score should stay normalized')
+  assert.ok(boundarySummaryBefore.highPathologyBoundariesPerMinute > 3, 'pathology-per-minute should capture high-risk rapid cuts')
+
+  const boundaryRefined = applyEliteCutRefinementForTest({
+    segments: boundarySegments as any,
+    windows: boundaryWindows as any,
+    durationSeconds: boundaryDuration,
+    styleProfile: null,
+    aggressionLevel: 'viral',
+    contentFormat: 'tiktok_short',
+    hookRange: null,
+    protectedRanges: [],
+    allowSpeedChanges: false
+  })
+  assert.ok(boundaryRefined.boundaryPathologySummary.fixesApplied > 0, 're-anchor should apply at least one boundary fix')
+  assert.ok(
+    boundaryRefined.boundaryPathologySummary.worst < boundarySummaryBefore.worst,
+    're-anchor should reduce worst boundary pathology score'
+  )
+  const refinedMinSegmentDuration = Math.min(...boundaryRefined.segments.map((segment: any) => segment.end - segment.start))
+  assert.ok(refinedMinSegmentDuration >= 0.115, 'refinement should keep segments above renderable minimum duration')
+
+  const boundaryTranscript = [
+    {
+      start: 11.2,
+      end: 14.8,
+      text: 'But the final twist is coming up next... what happens next?',
+      keywordIntensity: 0.82,
+      curiosityTrigger: 0.9,
+      fillerDensity: 0
+    }
+  ]
+  const toStoryMap = (segmentsInput: Array<{ start: number; end: number }>) =>
+    segmentsInput.map((segment, orderedIndex) => ({
+      sourceStart: Number(segment.start.toFixed(3)),
+      sourceEnd: Number(segment.end.toFixed(3)),
+      orderedIndex
+    }))
+  const boundaryAuditBefore = evaluateHardQualityBar({
+    durationSeconds: boundaryDuration,
+    contentFormat: 'tiktok_short',
+    hookSourceStart: 1,
+    segments: boundarySegments as any,
+    removedRanges: [{ start: 0, end: 1.8 }, { start: 2.6, end: 15 }],
+    compressedRanges: [],
+    storyReorderMap: toStoryMap(boundarySegments),
+    windows: boundaryWindows as any,
+    transcriptCues: boundaryTranscript as any,
+    visualIntelligence: null,
+    storyBeatGraph: null,
+    beatAnchors: []
+  })
+  const boundaryCheckBefore = boundaryAuditBefore.checks.find((check: any) => check.key === 'boundary_pathology')
+  assert.ok(Boolean(boundaryCheckBefore && !boundaryCheckBefore.passed), 'hard gate should fail boundary pathology on bad cut boundary')
+  assert.ok(!boundaryAuditBefore.passed, 'hard gate should fail for pathological boundary scenario')
+
+  const boundaryAuditAfter = evaluateHardQualityBar({
+    durationSeconds: boundaryDuration,
+    contentFormat: 'tiktok_short',
+    hookSourceStart: 1,
+    segments: boundaryRefined.segments as any,
+    removedRanges: [{ start: 0, end: 1.8 }, { start: 2.6, end: 15 }],
+    compressedRanges: [],
+    storyReorderMap: toStoryMap(boundaryRefined.segments as any),
+    windows: boundaryWindows as any,
+    transcriptCues: boundaryTranscript as any,
+    visualIntelligence: null,
+    storyBeatGraph: null,
+    beatAnchors: []
+  })
+  const boundaryCheckAfter = boundaryAuditAfter.checks.find((check: any) => check.key === 'boundary_pathology')
+  assert.ok(Boolean(boundaryCheckAfter?.passed), 'hard gate should pass boundary pathology after dynamic re-anchor repair')
+  assert.ok(boundaryAuditAfter.passed, 'hard quality gate should pass after successful boundary re-anchor scenario')
 
   // 3) Retry loop max attempts (baseline + up to 3 retries)
   const attemptsAllFail = executeQualityGateRetriesForTest([false, false, false, false, false], 3)
