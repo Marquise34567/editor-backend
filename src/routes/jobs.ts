@@ -67,6 +67,7 @@ import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '
 import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
 import { buildFullAutoYoutubePreset, parseFullAutoYoutubeRequest } from '../services/fullAutoYoutube'
 import {
+  bootstrapBoundaryLabelsFromCompletedJobs,
   derivePerSecondRewardSignal,
   getActiveBoundaryCriticModel,
   getCreatorStyleProfile,
@@ -29084,6 +29085,18 @@ router.post('/:id/reprocess', async (req: any, res) => {
   }
 })
 
+const runBoundaryBaselineBootstrapForJob = (userId: string, jobId: string) => {
+  if (!userId || !jobId) return
+  void bootstrapBoundaryLabelsFromCompletedJobs({
+    userId,
+    focusJobId: jobId,
+    maxJobs: 80,
+    maxLabelsPerJob: 24
+  }).catch((error) => {
+    console.warn('boundary label bootstrap failed after feedback ingest', error)
+  })
+}
+
 router.post('/:id/retention-feedback', async (req: any, res) => {
   try {
     const id = req.params.id
@@ -29137,6 +29150,7 @@ router.post('/:id/retention-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after retention feedback', error)
     }
+    runBoundaryBaselineBootstrapForJob(job.userId, id)
     return res.json({
       ok: true,
       feedback,
@@ -29242,6 +29256,7 @@ router.post('/:id/platform-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after platform feedback', error)
     }
+    runBoundaryBaselineBootstrapForJob(job.userId, id)
     return res.json({
       ok: true,
       feedback,
@@ -29337,6 +29352,7 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after creator feedback', error)
     }
+    runBoundaryBaselineBootstrapForJob(job.userId, id)
     return res.json({
       ok: true,
       creatorFeedback,
@@ -29443,6 +29459,7 @@ router.post('/:id/player-events', async (req: any, res) => {
       } catch (error) {
         console.warn('feedback loop run failed after player telemetry', error)
       }
+      runBoundaryBaselineBootstrapForJob(job.userId, id)
       return res.json({
         ok: true,
         ingested: events.length,
@@ -29573,6 +29590,7 @@ router.post('/:id/editor-taste-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after editor taste feedback', error)
     }
+    runBoundaryBaselineBootstrapForJob(job.userId, id)
     return res.json({
       ok: true,
       feedback: payload,

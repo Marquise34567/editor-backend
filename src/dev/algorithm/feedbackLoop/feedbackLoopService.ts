@@ -119,7 +119,7 @@ const DEFAULT_SETTINGS: FeedbackLoopSettings = {
   enabled: true,
   auto_apply: true,
   min_feedback_samples: 8,
-  lookback_limit: 220,
+  lookback_limit: 420,
   cooldown_minutes: 30,
   min_confidence: 0.58,
   min_delta_score: 0.012
@@ -379,6 +379,41 @@ const averageOf = (values: Array<number | null>) => {
   return roundTo(valid.reduce((sum, value) => sum + value, 0) / valid.length, 4)
 }
 
+const ageDaysFromIso = (iso: string) => {
+  const parsed = new Date(iso)
+  if (Number.isNaN(parsed.getTime())) return 0
+  return Math.max(0, (Date.now() - parsed.getTime()) / (24 * 60 * 60 * 1000))
+}
+
+const recencyWeight = (iso: string) => {
+  const ageDays = ageDaysFromIso(iso)
+  return clamp(Math.exp(-ageDays / 21), 0.18, 1)
+}
+
+const averageSignalFromEvents = (
+  events: FeedbackSignalEvent[],
+  selector: (event: FeedbackSignalEvent) => number | null
+) => {
+  const values = events
+    .map(selector)
+    .filter((value): value is number => value !== null && Number.isFinite(value))
+  if (!values.length) return null
+  return roundTo(values.reduce((sum, value) => sum + value, 0) / values.length, 4)
+}
+
+const blendedSignalFromEvents = (
+  events: FeedbackSignalEvent[],
+  selector: (event: FeedbackSignalEvent) => number | null,
+  recentEvents: FeedbackSignalEvent[]
+) => {
+  const longAvg = averageSignalFromEvents(events, selector)
+  const recentAvg = averageSignalFromEvents(recentEvents, selector)
+  if (longAvg === null && recentAvg === null) return null
+  if (longAvg === null) return recentAvg
+  if (recentAvg === null) return longAvg
+  return roundTo(clamp((0.62 * recentAvg) + (0.38 * longAvg), 0, 1), 4)
+}
+
 const computeFeedbackOutcome = ({
   watchPercent,
   hookHoldPercent,
@@ -610,20 +645,22 @@ const aggregatePerformance = (
   events: FeedbackSignalEvent[],
   keyFn: (event: FeedbackSignalEvent) => string | null
 ) => {
-  const map = new Map<string, { count: number; outcomeTotal: number }>()
+  const map = new Map<string, { count: number; weightedOutcomeTotal: number; weightedTotal: number }>()
   for (const event of events) {
     const key = keyFn(event)
     if (!key) continue
-    const current = map.get(key) || { count: 0, outcomeTotal: 0 }
+    const weight = recencyWeight(event.created_at)
+    const current = map.get(key) || { count: 0, weightedOutcomeTotal: 0, weightedTotal: 0 }
     current.count += 1
-    current.outcomeTotal += event.signal_outcome
+    current.weightedOutcomeTotal += event.signal_outcome * weight
+    current.weightedTotal += weight
     map.set(key, current)
   }
   const rows: PerformanceRow[] = Array.from(map.entries())
     .map(([key, entry]) => ({
       key,
       count: entry.count,
-      avg_outcome: roundTo(entry.outcomeTotal / Math.max(1, entry.count), 4)
+      avg_outcome: roundTo(entry.weightedOutcomeTotal / Math.max(0.0001, entry.weightedTotal), 4)
     }))
     .sort((a, b) => (
       b.avg_outcome - a.avg_outcome ||
@@ -728,12 +765,20 @@ const buildSnapshot = (events: FeedbackSignalEvent[]): FeedbackBrainSnapshot => 
     }
   }
 
-  const avgOutcome = roundTo(events.reduce((sum, event) => sum + event.signal_outcome, 0) / sampleSize, 4)
-  const avgHookHold = averageOf(events.map((event) => event.hook_hold_percent))
-  const avgCompletion = averageOf(events.map((event) => event.completion_percent))
-  const avgModelHook = averageOf(events.map((event) => event.model_hook_score))
-  const avgModelPacing = averageOf(events.map((event) => event.model_pacing_score))
-  const avgModelJank = averageOf(events.map((event) => event.model_jank_score))
+  const recentWindowSize = clamp(Math.round(Math.max(36, sampleSize * 0.34)), 24, Math.min(sampleSize, 180))
+  const recentEvents = events.slice(0, recentWindowSize)
+  const longOutcome = roundTo(events.reduce((sum, event) => sum + event.signal_outcome, 0) / sampleSize, 4)
+  const recentOutcome = roundTo(
+    recentEvents.reduce((sum, event) => sum + event.signal_outcome, 0) / Math.max(1, recentEvents.length),
+    4
+  )
+  const outcomeDrift = roundTo(recentOutcome - longOutcome, 4)
+  const avgOutcome = roundTo(clamp((0.62 * recentOutcome) + (0.38 * longOutcome), 0, 1), 4)
+  const avgHookHold = blendedSignalFromEvents(events, (event) => event.hook_hold_percent, recentEvents)
+  const avgCompletion = blendedSignalFromEvents(events, (event) => event.completion_percent, recentEvents)
+  const avgModelHook = blendedSignalFromEvents(events, (event) => event.model_hook_score, recentEvents)
+  const avgModelPacing = blendedSignalFromEvents(events, (event) => event.model_pacing_score, recentEvents)
+  const avgModelJank = blendedSignalFromEvents(events, (event) => event.model_jank_score, recentEvents)
   const platformShare = roundTo(
     events.filter((event) => event.source_type === 'platform').length / Math.max(1, sampleSize),
     4
@@ -760,6 +805,7 @@ const buildSnapshot = (events: FeedbackSignalEvent[]): FeedbackBrainSnapshot => 
     clamp(
       (0.72 - avgOutcome) * 0.45 +
       deltaMagnitude * 0.0024 +
+      Math.max(0, -outcomeDrift) * 0.28 +
       (topMode.margin > 0 ? Math.min(0.03, topMode.margin * 0.55) : 0),
       0,
       0.18
@@ -771,7 +817,8 @@ const buildSnapshot = (events: FeedbackSignalEvent[]): FeedbackBrainSnapshot => 
       (sampleSize / 120) * 0.62 +
       platformShare * 0.18 +
       Math.max(0, topMode.margin) * 1.9 +
-      Math.max(0, topStrategy.margin) * 1.2,
+      Math.max(0, topStrategy.margin) * 1.2 +
+      Math.max(0, 0.18 - Math.abs(outcomeDrift)) * 0.52,
       0,
       1
     ),
@@ -780,8 +827,12 @@ const buildSnapshot = (events: FeedbackSignalEvent[]): FeedbackBrainSnapshot => 
 
   const rationale: string[] = [
     `Built from ${sampleSize} feedback-linked completed renders.`,
-    `Platform-verified feedback share: ${(platformShare * 100).toFixed(0)}%.`
+    `Platform-verified feedback share: ${(platformShare * 100).toFixed(0)}%.`,
+    `Blended recent (${recentEvents.length}) + long-horizon (${sampleSize}) outcomes for stability.`
   ]
+  if (Math.abs(outcomeDrift) >= 0.02) {
+    rationale.push(`Outcome drift vs long horizon: ${(outcomeDrift * 100).toFixed(1)} pts.`)
+  }
   if (avgOutcome < 0.58) rationale.push('Global outcome trend is below target; applying stronger retention pressure.')
   else if (avgOutcome > 0.74) rationale.push('Outcome trend is healthy; only small adaptive steps are recommended.')
   if (topMode.key && topMode.margin > 0) rationale.push(`Best observed editor mode: ${topMode.key} (+${(topMode.margin * 100).toFixed(1)} pts).`)

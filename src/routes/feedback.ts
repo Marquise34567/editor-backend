@@ -15,6 +15,7 @@ import {
   getYouTubeOAuthConnectionForUser
 } from '../services/youtubeOAuth'
 import {
+  bootstrapBoundaryLabelsFromCompletedJobs,
   derivePerSecondRewardSignal,
   ingestPlatformRewardSignal,
   registerPolicyOutcomeForJob,
@@ -1502,6 +1503,14 @@ const persistPlatformFeedbackForJob = async ({
   } catch (error) {
     console.warn('feedback loop run failed after youtube platform sync', error)
   }
+  await bootstrapBoundaryLabelsFromCompletedJobs({
+    userId,
+    focusJobId: jobId,
+    maxJobs: 80,
+    maxLabelsPerJob: 24
+  }).catch((error) => {
+    console.warn('boundary label bootstrap failed after youtube platform sync', error)
+  })
 
   return {
     jobId,

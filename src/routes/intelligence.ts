@@ -2,6 +2,7 @@ import express from 'express'
 import { prisma } from '../db/prisma'
 import {
   applyBoundaryCriticHardGate,
+  bootstrapBoundaryLabelsFromCompletedJobs,
   collectHumanBaselineSample,
   derivePerSecondRewardSignal,
   ensureEditorIntelligenceInfra,
@@ -138,6 +139,33 @@ router.post('/baseline/collect', async (req: any, res) => {
   } catch (error: any) {
     return res.status(500).json({
       error: 'baseline_collect_failed',
+      reason: String(error?.message || 'unknown_error')
+    })
+  }
+})
+
+router.post('/baseline/bootstrap-from-jobs', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const maxJobs = clamp(Math.round(asNumber(req.body?.maxJobs ?? req.body?.max_jobs, 120)), 8, 400)
+    const maxLabelsPerJob = clamp(Math.round(asNumber(req.body?.maxLabelsPerJob ?? req.body?.max_labels_per_job, 22)), 4, 60)
+    const focusJobId = String(req.body?.focusJobId || req.body?.focus_job_id || '').trim() || null
+    const summary = await bootstrapBoundaryLabelsFromCompletedJobs({
+      userId,
+      focusJobId,
+      maxJobs,
+      maxLabelsPerJob
+    })
+    const stats = await getHumanBaselineDatasetStats(userId)
+    return res.json({
+      ok: true,
+      summary,
+      stats
+    })
+  } catch (error: any) {
+    return res.status(500).json({
+      error: 'baseline_bootstrap_failed',
       reason: String(error?.message || 'unknown_error')
     })
   }

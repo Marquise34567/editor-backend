@@ -44,6 +44,14 @@ type HumanBaselineSample = {
   updatedAt: string
 }
 
+type BoundaryBootstrapSummary = {
+  scannedJobs: number
+  labeledJobs: number
+  newSamples: number
+  updatedSamples: number
+  totalLabelsGenerated: number
+}
+
 export type BoundaryCriticModel = {
   version: string
   threshold: number
@@ -1482,6 +1490,280 @@ const normalizeBoundaryLabel = (entry: any): BaselineBoundaryLabel | null => {
   }
 }
 
+const normalizeBoundaryPercentMetric = (value: unknown): number | null => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  if (numeric >= 0 && numeric <= 1.5) return clamp(numeric * 100, 0, 100)
+  return clamp(numeric, 0, 100)
+}
+
+const averageNullable = (values: Array<number | null>) => {
+  const valid = values.filter((value): value is number => value !== null && Number.isFinite(value))
+  if (!valid.length) return null
+  return valid.reduce((sum, value) => sum + value, 0) / valid.length
+}
+
+const normalizeBoundarySegment = (entry: any, durationSeconds: number): SegmentLike | null => {
+  if (!entry || typeof entry !== 'object') return null
+  const startRaw = toNullableNumber(
+    (entry as any).start ??
+    (entry as any).startSec ??
+    (entry as any).sourceStart ??
+    (entry as any).from ??
+    (entry as any).in
+  )
+  const endRaw = toNullableNumber(
+    (entry as any).end ??
+    (entry as any).endSec ??
+    (entry as any).sourceEnd ??
+    (entry as any).to ??
+    (entry as any).out
+  )
+  if (startRaw === null || endRaw === null) return null
+  const start = clamp(startRaw, 0, Math.max(0, durationSeconds - 0.05))
+  const end = clamp(endRaw, start + 0.05, durationSeconds)
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end - start < 0.05) return null
+  const speed = clamp(toFiniteNumber((entry as any).speed, 1), 0.8, 1.8)
+  return {
+    ...entry,
+    start: Number(start.toFixed(3)),
+    end: Number(end.toFixed(3)),
+    speed: Number(speed.toFixed(3))
+  }
+}
+
+const pickSegmentsFromCandidate = (candidate: unknown, durationSeconds: number) => {
+  if (!Array.isArray(candidate)) return [] as SegmentLike[]
+  return candidate
+    .map((entry) => normalizeBoundarySegment(entry, durationSeconds))
+    .filter((entry): entry is SegmentLike => Boolean(entry))
+}
+
+const extractSegmentsForBoundaryBootstrap = ({
+  analysis,
+  durationSeconds
+}: {
+  analysis: Record<string, any>
+  durationSeconds: number
+}) => {
+  const retentionAttempts = Array.isArray(analysis?.retention_attempts)
+    ? analysis.retention_attempts
+    : []
+  const selectedAttempt = retentionAttempts.find((attempt: any) => attempt?.judge?.passed)
+    || retentionAttempts[0]
+    || null
+  const metadataSummary = analysis?.metadata_summary && typeof analysis.metadata_summary === 'object'
+    ? analysis.metadata_summary
+    : {}
+  const timeline = metadataSummary?.timeline && typeof metadataSummary.timeline === 'object'
+    ? metadataSummary.timeline
+    : {}
+  const candidatePools: unknown[] = [
+    analysis?.segments,
+    analysis?.edl,
+    analysis?.selected_segments,
+    selectedAttempt?.segments,
+    timeline?.segments,
+    analysis?.story_reorder_map
+  ]
+  for (const pool of candidatePools) {
+    const segments = pickSegmentsFromCandidate(pool, durationSeconds)
+    if (segments.length >= 2) return normalizeSegments(segments, durationSeconds)
+  }
+  return [] as SegmentLike[]
+}
+
+const extractWindowsForBoundaryBootstrap = ({
+  analysis,
+  durationSeconds
+}: {
+  analysis: Record<string, any>
+  durationSeconds: number
+}) => {
+  const retentionCurve = Array.isArray(
+    analysis?.retentionCurve ??
+    analysis?.retention_curve ??
+    analysis?.metadata_summary?.retention?.curve
+  )
+    ? (
+      analysis?.retentionCurve ??
+      analysis?.retention_curve ??
+      analysis?.metadata_summary?.retention?.curve
+    )
+    : []
+  if (!retentionCurve.length) return [] as EngagementWindowLike[]
+  const safeDuration = Math.max(0.1, durationSeconds)
+  return retentionCurve
+    .map((point: any) => {
+      const at = toNullableNumber(point?.atSec ?? point?.time ?? point?.timestamp)
+      const predicted = normalizeBoundaryPercentMetric(point?.predicted ?? point?.watchedPct ?? point?.value)
+      if (at === null || predicted === null) return null
+      const start = clamp(at - 0.24, 0, safeDuration)
+      const end = clamp(at + 0.24, start + 0.01, safeDuration)
+      return {
+        start,
+        end,
+        score: clamp01(predicted / 100),
+        speechIntensity: clamp01(predicted / 100)
+      } satisfies EngagementWindowLike
+    })
+    .filter((entry): entry is EngagementWindowLike => Boolean(entry))
+}
+
+const resolveBoundaryPathologySummaryForBootstrap = (analysis: Record<string, any>) => {
+  const direct = analysis?.boundary_pathology_summary && typeof analysis.boundary_pathology_summary === 'object'
+    ? analysis.boundary_pathology_summary
+    : null
+  if (direct) return direct
+  const metadataSummary = analysis?.metadata_summary && typeof analysis.metadata_summary === 'object'
+    ? analysis.metadata_summary
+    : {}
+  const fromRetention = metadataSummary?.retention?.boundaryPathologySummary
+  return fromRetention && typeof fromRetention === 'object' ? fromRetention : null
+}
+
+const nearestBoundaryIndexForTime = (features: BoundaryFeature[], time: number) => {
+  if (!features.length) return -1
+  let bestIndex = -1
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const feature of features) {
+    const distance = Math.abs(feature.time - time)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      bestIndex = feature.boundaryIndex
+    }
+  }
+  return bestIndex
+}
+
+const deriveBoundaryOutcomePercent = (analysis: Record<string, any>) => {
+  const feedback = analysis?.retention_feedback && typeof analysis.retention_feedback === 'object'
+    ? analysis.retention_feedback
+    : {}
+  return averageNullable([
+    normalizeBoundaryPercentMetric(feedback?.watchPercent ?? feedback?.watch_percent),
+    normalizeBoundaryPercentMetric(feedback?.completionPercent ?? feedback?.completion_percent),
+    normalizeBoundaryPercentMetric(feedback?.hookHoldPercent ?? feedback?.hook_hold_percent),
+    normalizeBoundaryPercentMetric(feedback?.manualScore ?? feedback?.manual_score)
+  ])
+}
+
+const synthesizeBoundaryLabelsFromAnalysis = ({
+  analysis,
+  durationSeconds,
+  maxLabelsPerJob = 22
+}: {
+  analysis: Record<string, any>
+  durationSeconds: number
+  maxLabelsPerJob?: number
+}) => {
+  const safeDuration = Math.max(0.5, durationSeconds)
+  const segments = extractSegmentsForBoundaryBootstrap({
+    analysis,
+    durationSeconds: safeDuration
+  })
+  if (segments.length < 2) return [] as BaselineBoundaryLabel[]
+  const windows = extractWindowsForBoundaryBootstrap({
+    analysis,
+    durationSeconds: safeDuration
+  })
+  const features = buildBoundaryFeatures({
+    segments,
+    durationSeconds: safeDuration,
+    windows
+  })
+  if (!features.length) return [] as BaselineBoundaryLabel[]
+
+  const scored = features.map((feature) => ({
+    feature,
+    score: scoreBoundaryFeature(feature, DEFAULT_BOUNDARY_MODEL),
+    risk: clamp01(1 - scoreBoundaryFeature(feature, DEFAULT_BOUNDARY_MODEL))
+  }))
+  const pathologySummary = resolveBoundaryPathologySummaryForBootstrap(analysis)
+  const outcomePercent = deriveBoundaryOutcomePercent(analysis)
+  const badIndices = new Set<number>()
+  const goodIndices = new Set<number>()
+
+  const worstTimes = Array.isArray(pathologySummary?.worstTimes)
+    ? pathologySummary.worstTimes
+        .map((value: unknown) => toNullableNumber(value))
+        .filter((value): value is number => value !== null)
+    : []
+  for (const worstTime of worstTimes.slice(0, 4)) {
+    const index = nearestBoundaryIndexForTime(features, worstTime)
+    if (index >= 0) badIndices.add(index)
+  }
+
+  const highRiskCount = Math.max(1, Math.min(6, Math.round(scored.length * 0.2)))
+  const riskSorted = scored
+    .slice()
+    .sort((left, right) => right.risk - left.risk || left.feature.boundaryIndex - right.feature.boundaryIndex)
+  for (const entry of riskSorted.slice(0, highRiskCount)) {
+    if (entry.score <= 0.56) badIndices.add(entry.feature.boundaryIndex)
+  }
+  if (outcomePercent !== null && outcomePercent <= 45) {
+    for (const entry of riskSorted.slice(0, Math.min(8, Math.max(2, highRiskCount + 2)))) {
+      if (entry.score <= 0.62) badIndices.add(entry.feature.boundaryIndex)
+    }
+  }
+
+  const preferredGoodCountBase = outcomePercent !== null && outcomePercent >= 62
+    ? 8
+    : outcomePercent !== null && outcomePercent >= 54
+      ? 6
+      : 4
+  const goodSorted = scored
+    .slice()
+    .sort((left, right) => right.score - left.score || left.feature.boundaryIndex - right.feature.boundaryIndex)
+  for (const entry of goodSorted) {
+    if (goodIndices.size >= preferredGoodCountBase) break
+    if (badIndices.has(entry.feature.boundaryIndex)) continue
+    if (entry.score < 0.58) continue
+    goodIndices.add(entry.feature.boundaryIndex)
+  }
+
+  const maxLabels = clamp(Math.round(toFiniteNumber(maxLabelsPerJob, 22)), 4, 60)
+  const labels: BaselineBoundaryLabel[] = []
+  const used = new Set<number>()
+  const pushLabel = (entry: { feature: BoundaryFeature; score: number }, label: 'good' | 'bad', notes: string) => {
+    if (labels.length >= maxLabels) return
+    if (used.has(entry.feature.boundaryIndex)) return
+    used.add(entry.feature.boundaryIndex)
+    labels.push({
+      boundaryIndex: entry.feature.boundaryIndex,
+      time: Number(entry.feature.time.toFixed(3)),
+      label,
+      continuity: Number(entry.feature.continuity.toFixed(4)),
+      context: Number(entry.feature.context.toFixed(4)),
+      motion: Number(entry.feature.motion.toFixed(4)),
+      audio: Number(entry.feature.audio.toFixed(4)),
+      narrative: Number(entry.feature.narrative.toFixed(4)),
+      notes: `${notes}; auto_score=${entry.score.toFixed(3)}`
+    })
+  }
+
+  for (const index of badIndices) {
+    const entry = scored.find((candidate) => candidate.feature.boundaryIndex === index)
+    if (!entry) continue
+    pushLabel(entry, 'bad', 'auto_bootstrap_bad_boundary')
+  }
+  for (const index of goodIndices) {
+    const entry = scored.find((candidate) => candidate.feature.boundaryIndex === index)
+    if (!entry) continue
+    pushLabel(entry, 'good', 'auto_bootstrap_good_boundary')
+  }
+
+  if (labels.length < 4) {
+    for (const entry of goodSorted.slice(0, 10)) {
+      if (labels.length >= 4) break
+      if (badIndices.has(entry.feature.boundaryIndex)) continue
+      pushLabel(entry, 'good', 'auto_bootstrap_backfill_good_boundary')
+    }
+  }
+
+  return labels.sort((left, right) => left.boundaryIndex - right.boundaryIndex)
+}
+
 const rowToBaselineSample = (row: any): HumanBaselineSample | null => {
   if (!row || typeof row !== 'object') return null
   const id = String(row.id || '').trim()
@@ -1719,6 +2001,158 @@ export const getHumanBaselineDatasetStats = async (userId: string) => {
       ? Number(clamp((labels.length / samples.length) * 10, 0, 100).toFixed(2))
       : 0
   }
+}
+
+export const bootstrapBoundaryLabelsFromCompletedJobs = async ({
+  userId,
+  focusJobId = null,
+  maxJobs = 120,
+  maxLabelsPerJob = 22
+}: {
+  userId: string
+  focusJobId?: string | null
+  maxJobs?: number
+  maxLabelsPerJob?: number
+}) => {
+  const safeUserId = String(userId || '').trim()
+  if (!safeUserId) {
+    return {
+      scannedJobs: 0,
+      labeledJobs: 0,
+      newSamples: 0,
+      updatedSamples: 0,
+      totalLabelsGenerated: 0
+    } satisfies BoundaryBootstrapSummary
+  }
+
+  const limit = clamp(Math.round(toFiniteNumber(maxJobs, 120)), 8, 400)
+  const rows = await prisma.job.findMany({
+    where: {
+      userId: safeUserId,
+      status: 'completed' as any
+    },
+    orderBy: { updatedAt: 'desc' },
+    take: limit,
+    select: {
+      id: true,
+      inputPath: true,
+      outputPath: true,
+      inputDurationSeconds: true,
+      analysis: true
+    }
+  })
+
+  let focusedJob: {
+    id: string
+    inputPath: string | null
+    outputPath: string | null
+    inputDurationSeconds: number | null
+    analysis: unknown
+  } | null = null
+  if (focusJobId) {
+    focusedJob = await prisma.job.findUnique({
+      where: { id: focusJobId },
+      select: {
+        id: true,
+        userId: true,
+        status: true,
+        inputPath: true,
+        outputPath: true,
+        inputDurationSeconds: true,
+        analysis: true
+      }
+    }) as any
+    if (!focusedJob || String((focusedJob as any).userId || '') !== safeUserId || String((focusedJob as any).status || '').toLowerCase() !== 'completed') {
+      focusedJob = null
+    }
+  }
+
+  const candidates = rows.slice()
+  if (focusedJob && !candidates.some((row) => row.id === focusedJob!.id)) {
+    candidates.unshift({
+      id: focusedJob.id,
+      inputPath: focusedJob.inputPath || '',
+      outputPath: focusedJob.outputPath || '',
+      inputDurationSeconds: focusedJob.inputDurationSeconds,
+      analysis: focusedJob.analysis
+    } as any)
+  }
+
+  const existingSamples = await listHumanBaselineSamples({
+    userId: safeUserId,
+    limit: 5000
+  })
+  const sampleByJobId = new Map<string, HumanBaselineSample>()
+  for (const sample of existingSamples) {
+    if (!sample.sourceJobId) continue
+    sampleByJobId.set(String(sample.sourceJobId), sample)
+  }
+
+  const summary: BoundaryBootstrapSummary = {
+    scannedJobs: 0,
+    labeledJobs: 0,
+    newSamples: 0,
+    updatedSamples: 0,
+    totalLabelsGenerated: 0
+  }
+
+  for (const row of candidates) {
+    summary.scannedJobs += 1
+    const analysis = row.analysis && typeof row.analysis === 'object'
+      ? (row.analysis as Record<string, any>)
+      : {}
+    const duration = Math.max(
+      0.5,
+      toFiniteNumber(
+        row.inputDurationSeconds ??
+        analysis?.metadata_summary?.timeline?.sourceDurationSeconds ??
+        analysis?.duration_seconds ??
+        analysis?.duration ??
+        0,
+        0
+      )
+    )
+    const labels = synthesizeBoundaryLabelsFromAnalysis({
+      analysis,
+      durationSeconds: duration,
+      maxLabelsPerJob
+    })
+    if (labels.length < 2) continue
+    summary.labeledJobs += 1
+    summary.totalLabelsGenerated += labels.length
+
+    const existing = sampleByJobId.get(String(row.id))
+    if (existing) {
+      await labelHumanBaselineSampleBoundaries({
+        userId: safeUserId,
+        sampleId: existing.id,
+        boundaryLabels: labels,
+        replace: false
+      })
+      summary.updatedSamples += 1
+      continue
+    }
+
+    await collectHumanBaselineSample({
+      userId: safeUserId,
+      sourceType: 'auto_feedback_bootstrap',
+      sourceJobId: String(row.id),
+      videoUrl: String(row.outputPath || row.inputPath || ''),
+      durationSeconds: duration,
+      edl: extractSegmentsForBoundaryBootstrap({
+        analysis,
+        durationSeconds: duration
+      }),
+      boundaryLabels: labels,
+      metadata: {
+        source: 'completed_jobs_bootstrap',
+        generatedAt: nowIso()
+      }
+    })
+    summary.newSamples += 1
+  }
+
+  return summary
 }
 
 const featureVectorFromLabel = (label: BaselineBoundaryLabel) => ({
