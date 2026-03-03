@@ -5,6 +5,15 @@ import { getUserPlan } from '../services/plans'
 import { isPaidTier } from '../shared/planConfig'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
 import { buildVideoFeedbackAnalysis, type VideoFeedbackInput } from '../services/videoFeedback'
+import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
+import {
+  buildYouTubeOAuthAuthorizeUrl,
+  disconnectYouTubeOAuthForUser,
+  exchangeYouTubeOAuthCodeForUser,
+  getYouTubeAccessTokenForUser,
+  getYouTubeOAuthConfigStatus,
+  getYouTubeOAuthConnectionForUser
+} from '../services/youtubeOAuth'
 
 const router = express.Router()
 
@@ -848,6 +857,455 @@ const buildUploadInput = (summary: any): VideoFeedbackInput => {
   }
 }
 
+type YouTubeVideoMetrics = {
+  dataSource: 'oauth' | 'api_key'
+  videoId: string
+  title: string
+  channelId: string
+  channelTitle: string
+  publishedAt: string | null
+  durationSeconds: number | null
+  viewCount: number
+  likeCount: number
+  commentCount: number
+  engagementRate: number
+}
+
+type YouTubeAnalyticsSummary = {
+  views: number
+  estimatedMinutesWatched: number
+  averageViewDurationSeconds: number | null
+  averageViewPercentage: number | null
+  likes: number
+  comments: number
+  shares: number
+}
+
+type YouTubeRetentionPoint = {
+  elapsedVideoTimeRatio: number
+  audienceWatchRatio: number | null
+  relativeRetentionPerformance: number | null
+}
+
+type YouTubePlatformFeedback = {
+  watchPercent: number | null
+  hookHoldPercent: number | null
+  completionPercent: number | null
+  rewatchRate: number | null
+  first30Retention: number | null
+  avgViewDurationSeconds: number | null
+  clickThroughRate: number | null
+  sharesPerView: number | null
+  likesPerView: number | null
+  commentsPerView: number | null
+  manualScore: number | null
+  source: string
+  sourceType: 'platform'
+  notes: string | null
+  submittedAt: string
+}
+
+const parseYmdDate = (value: any): string | null => {
+  const raw = String(value || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) return null
+  const parsed = new Date(`${raw}T00:00:00.000Z`)
+  if (!Number.isFinite(parsed.getTime())) return null
+  return raw
+}
+
+const toYmd = (date: Date) => date.toISOString().slice(0, 10)
+
+const resolveYouTubeAnalyticsDateRange = (payload: any) => {
+  const endRaw = parseYmdDate(payload?.endDate ?? payload?.end_date)
+  const startRaw = parseYmdDate(payload?.startDate ?? payload?.start_date)
+  const defaultEndDate = new Date(Date.now() - 24 * 60 * 60 * 1000)
+  const defaultStartDate = new Date(defaultEndDate.getTime() - (27 * 24 * 60 * 60 * 1000))
+  const end = endRaw || toYmd(defaultEndDate)
+  const start = startRaw || toYmd(defaultStartDate)
+  if (start > end) {
+    return {
+      startDate: end,
+      endDate: start
+    }
+  }
+  return {
+    startDate: start,
+    endDate: end
+  }
+}
+
+const parseGoogleApiReason = (payload: any): string | null =>
+  String(payload?.error?.message || payload?.error_description || '').trim() || null
+
+const fetchGoogleJson = async ({
+  url,
+  accessToken,
+  timeoutMs = 12_000
+}: {
+  url: string
+  accessToken?: string | null
+  timeoutMs?: number
+}) => {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const headers: Record<string, string> = {}
+    if (accessToken) headers.Authorization = `Bearer ${accessToken}`
+    const response = await fetch(url, {
+      method: 'GET',
+      signal: controller.signal,
+      headers
+    })
+    const payload = await response.json().catch(() => ({} as any))
+    return {
+      ok: response.ok,
+      status: response.status,
+      payload
+    }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+const parseAnalyticsScalarMetric = ({
+  report,
+  metric
+}: {
+  report: any
+  metric: string
+}): number | null => {
+  const headers = Array.isArray(report?.columnHeaders) ? report.columnHeaders : []
+  const rows = Array.isArray(report?.rows) ? report.rows : []
+  if (!rows.length) return null
+  const index = headers.findIndex((entry: any) => String(entry?.name || '').trim() === metric)
+  if (index === -1) return null
+  const value = Number(rows[0]?.[index])
+  return Number.isFinite(value) ? value : null
+}
+
+const parseYouTubeRetentionCurve = (report: any): YouTubeRetentionPoint[] => {
+  const headers = Array.isArray(report?.columnHeaders) ? report.columnHeaders : []
+  const rows = Array.isArray(report?.rows) ? report.rows : []
+  if (!rows.length) return []
+  const elapsedIndex = headers.findIndex((entry: any) => String(entry?.name || '').trim() === 'elapsedVideoTimeRatio')
+  const watchIndex = headers.findIndex((entry: any) => String(entry?.name || '').trim() === 'audienceWatchRatio')
+  const relativeIndex = headers.findIndex((entry: any) => String(entry?.name || '').trim() === 'relativeRetentionPerformance')
+  if (elapsedIndex === -1) return []
+  const parsed = rows
+    .map((row: any) => {
+      const elapsed = Number(row?.[elapsedIndex])
+      if (!Number.isFinite(elapsed)) return null
+      const watchRaw = Number(row?.[watchIndex])
+      const relativeRaw = Number(row?.[relativeIndex])
+      return {
+        elapsedVideoTimeRatio: clamp(elapsed, 0, 1),
+        audienceWatchRatio: Number.isFinite(watchRaw) ? watchRaw : null,
+        relativeRetentionPerformance: Number.isFinite(relativeRaw) ? relativeRaw : null
+      } satisfies YouTubeRetentionPoint
+    })
+    .filter((point: YouTubeRetentionPoint | null): point is YouTubeRetentionPoint => point !== null)
+  return parsed.sort((left, right) => left.elapsedVideoTimeRatio - right.elapsedVideoTimeRatio)
+}
+
+const ratioMetricToPercent = (value: number | null) => {
+  if (value === null || !Number.isFinite(value)) return null
+  if (value >= 0 && value <= 1.5) return Number(clamp(value * 100, 0, 100).toFixed(3))
+  return Number(clamp(value, 0, 100).toFixed(3))
+}
+
+const averagePercentForRange = (points: YouTubeRetentionPoint[], maxElapsedRatio: number) => {
+  const sampled = points
+    .filter((point) => point.elapsedVideoTimeRatio <= maxElapsedRatio)
+    .map((point) => ratioMetricToPercent(point.audienceWatchRatio))
+    .filter((value): value is number => value !== null)
+  if (!sampled.length) return null
+  return Number((sampled.reduce((sum, value) => sum + value, 0) / sampled.length).toFixed(3))
+}
+
+const derivePlatformFeedbackFromYouTube = ({
+  summary,
+  retentionCurve,
+  videoId,
+  startDate,
+  endDate
+}: {
+  summary: YouTubeAnalyticsSummary
+  retentionCurve: YouTubeRetentionPoint[]
+  videoId: string
+  startDate: string
+  endDate: string
+}): YouTubePlatformFeedback => {
+  const safeViews = Math.max(0, Number(summary.views || 0))
+  const likesPerView = safeViews > 0 ? Number(clamp((summary.likes / safeViews) * 100, 0, 100).toFixed(4)) : null
+  const commentsPerView = safeViews > 0 ? Number(clamp((summary.comments / safeViews) * 100, 0, 100).toFixed(4)) : null
+  const sharesPerView = safeViews > 0 ? Number(clamp((summary.shares / safeViews) * 100, 0, 100).toFixed(4)) : null
+  const hookHoldPercent = averagePercentForRange(retentionCurve, 0.08)
+  const first30Retention = averagePercentForRange(retentionCurve, 0.3)
+  const completionFromCurve = ratioMetricToPercent(
+    retentionCurve.length ? retentionCurve[retentionCurve.length - 1].audienceWatchRatio : null
+  )
+  const rewatchRate = retentionCurve.length
+    ? Number(
+        (
+          (retentionCurve.filter((point) => (point.relativeRetentionPerformance || 0) > 1.04).length / retentionCurve.length) *
+          100
+        ).toFixed(3)
+      )
+    : null
+
+  const watchPercent = summary.averageViewPercentage !== null
+    ? Number(clamp(summary.averageViewPercentage, 0, 100).toFixed(3))
+    : null
+
+  return {
+    watchPercent,
+    hookHoldPercent,
+    completionPercent: completionFromCurve ?? watchPercent,
+    rewatchRate,
+    first30Retention,
+    avgViewDurationSeconds: summary.averageViewDurationSeconds,
+    clickThroughRate: null,
+    sharesPerView,
+    likesPerView,
+    commentsPerView,
+    manualScore: null,
+    source: 'youtube_analytics_oauth',
+    sourceType: 'platform',
+    notes: `youtube_video:${videoId}; window:${startDate}..${endDate}`,
+    submittedAt: new Date().toISOString()
+  }
+}
+
+const fetchYouTubeVideoMetrics = async ({
+  userId,
+  apiKey,
+  videoId
+}: {
+  userId: string
+  apiKey: string
+  videoId: string
+}): Promise<YouTubeVideoMetrics> => {
+  let dataSource: 'oauth' | 'api_key' = 'api_key'
+  let accessToken: string | null = null
+  if (!apiKey) {
+    accessToken = await getYouTubeAccessTokenForUser(userId)
+    if (!accessToken) {
+      const error = new Error('youtube_auth_missing')
+      ;(error as any).code = 'youtube_auth_missing'
+      throw error
+    }
+    dataSource = 'oauth'
+  }
+
+  const endpoint = new URL('https://www.googleapis.com/youtube/v3/videos')
+  endpoint.searchParams.set('part', 'snippet,statistics,contentDetails')
+  endpoint.searchParams.set('id', videoId)
+  if (apiKey) endpoint.searchParams.set('key', apiKey)
+
+  const response = await fetchGoogleJson({
+    url: endpoint.toString(),
+    accessToken
+  })
+  if (!response.ok) {
+    const error = new Error(parseGoogleApiReason(response.payload) || 'youtube_data_api_failed')
+    ;(error as any).code = 'youtube_data_api_failed'
+    ;(error as any).status = response.status
+    throw error
+  }
+
+  const item = Array.isArray(response.payload?.items) ? response.payload.items[0] : null
+  if (!item) {
+    const error = new Error('youtube_video_not_found')
+    ;(error as any).code = 'youtube_video_not_found'
+    throw error
+  }
+  const viewCount = Math.max(0, Number(item?.statistics?.viewCount || 0))
+  const likeCount = Math.max(0, Number(item?.statistics?.likeCount || 0))
+  const commentCount = Math.max(0, Number(item?.statistics?.commentCount || 0))
+  const engagementRate = viewCount > 0
+    ? Number(clamp01((likeCount + commentCount) / viewCount).toFixed(4))
+    : 0
+
+  return {
+    dataSource,
+    videoId,
+    title: String(item?.snippet?.title || ''),
+    channelId: String(item?.snippet?.channelId || ''),
+    channelTitle: String(item?.snippet?.channelTitle || ''),
+    publishedAt: item?.snippet?.publishedAt || null,
+    durationSeconds: parseIso8601DurationSeconds(item?.contentDetails?.duration),
+    viewCount,
+    likeCount,
+    commentCount,
+    engagementRate
+  }
+}
+
+const fetchYouTubeAnalyticsReport = async ({
+  userId,
+  videoId,
+  startDate,
+  endDate
+}: {
+  userId: string
+  videoId: string
+  startDate: string
+  endDate: string
+}) => {
+  const accessToken = await getYouTubeAccessTokenForUser(userId)
+  if (!accessToken) {
+    const error = new Error('youtube_auth_missing')
+    ;(error as any).code = 'youtube_auth_missing'
+    throw error
+  }
+
+  const summaryEndpoint = new URL('https://youtubeanalytics.googleapis.com/v2/reports')
+  summaryEndpoint.searchParams.set('ids', 'channel==MINE')
+  summaryEndpoint.searchParams.set('startDate', startDate)
+  summaryEndpoint.searchParams.set('endDate', endDate)
+  summaryEndpoint.searchParams.set(
+    'metrics',
+    [
+      'views',
+      'estimatedMinutesWatched',
+      'averageViewDuration',
+      'averageViewPercentage',
+      'likes',
+      'comments',
+      'shares'
+    ].join(',')
+  )
+  summaryEndpoint.searchParams.set('filters', `video==${videoId}`)
+
+  const summaryResponse = await fetchGoogleJson({
+    url: summaryEndpoint.toString(),
+    accessToken
+  })
+  if (!summaryResponse.ok) {
+    const error = new Error(parseGoogleApiReason(summaryResponse.payload) || 'youtube_analytics_summary_failed')
+    ;(error as any).code = 'youtube_analytics_summary_failed'
+    ;(error as any).status = summaryResponse.status
+    throw error
+  }
+
+  const summary: YouTubeAnalyticsSummary = {
+    views: Math.max(0, Number(parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'views' }) || 0)),
+    estimatedMinutesWatched: Math.max(
+      0,
+      Number(parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'estimatedMinutesWatched' }) || 0)
+    ),
+    averageViewDurationSeconds: (() => {
+      const metric = parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'averageViewDuration' })
+      return metric === null ? null : Number(clamp(metric, 0, 86400).toFixed(3))
+    })(),
+    averageViewPercentage: (() => {
+      const metric = parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'averageViewPercentage' })
+      return metric === null ? null : Number(clamp(metric, 0, 100).toFixed(3))
+    })(),
+    likes: Math.max(0, Number(parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'likes' }) || 0)),
+    comments: Math.max(
+      0,
+      Number(parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'comments' }) || 0)
+    ),
+    shares: Math.max(0, Number(parseAnalyticsScalarMetric({ report: summaryResponse.payload, metric: 'shares' }) || 0))
+  }
+
+  const retentionEndpoint = new URL('https://youtubeanalytics.googleapis.com/v2/reports')
+  retentionEndpoint.searchParams.set('ids', 'channel==MINE')
+  retentionEndpoint.searchParams.set('startDate', startDate)
+  retentionEndpoint.searchParams.set('endDate', endDate)
+  retentionEndpoint.searchParams.set('dimensions', 'elapsedVideoTimeRatio')
+  retentionEndpoint.searchParams.set('metrics', 'audienceWatchRatio,relativeRetentionPerformance')
+  retentionEndpoint.searchParams.set('filters', `video==${videoId}`)
+  retentionEndpoint.searchParams.set('sort', 'elapsedVideoTimeRatio')
+
+  const retentionResponse = await fetchGoogleJson({
+    url: retentionEndpoint.toString(),
+    accessToken
+  })
+  if (!retentionResponse.ok) {
+    const error = new Error(parseGoogleApiReason(retentionResponse.payload) || 'youtube_analytics_retention_failed')
+    ;(error as any).code = 'youtube_analytics_retention_failed'
+    ;(error as any).status = retentionResponse.status
+    throw error
+  }
+
+  return {
+    summary,
+    retentionCurve: parseYouTubeRetentionCurve(retentionResponse.payload)
+  }
+}
+
+const persistPlatformFeedbackForJob = async ({
+  userId,
+  jobId,
+  feedback
+}: {
+  userId: string
+  jobId: string
+  feedback: YouTubePlatformFeedback
+}) => {
+  const job = await prisma.job.findUnique({ where: { id: jobId } })
+  if (!job || String(job.userId) !== String(userId)) {
+    const error = new Error('job_not_found')
+    ;(error as any).code = 'job_not_found'
+    throw error
+  }
+  if (String(job.status || '').toLowerCase() !== 'completed') {
+    const error = new Error('job_not_ready')
+    ;(error as any).code = 'job_not_ready'
+    throw error
+  }
+  const existingAnalysis = (job.analysis && typeof job.analysis === 'object')
+    ? (job.analysis as Record<string, any>)
+    : {}
+  const history = Array.isArray(existingAnalysis.retention_feedback_history)
+    ? existingAnalysis.retention_feedback_history
+    : []
+  const nextAnalysis = {
+    ...existingAnalysis,
+    retention_feedback: feedback,
+    retention_feedback_history: [
+      ...history.slice(-39),
+      feedback
+    ],
+    retention_feedback_updated_at: new Date().toISOString()
+  }
+  await prisma.job.update({
+    where: { id: jobId },
+    data: {
+      analysis: nextAnalysis
+    }
+  })
+
+  let feedbackLoop: {
+    applied: boolean
+    reason: string
+    last_applied_at: string | null
+    last_applied_config_version_id: string | null
+  } | null = null
+  try {
+    const loop = await runFeedbackLoop({
+      trigger: 'platform_feedback_submission',
+      actorUserId: userId
+    })
+    feedbackLoop = {
+      applied: loop.applied,
+      reason: loop.reason,
+      last_applied_at: loop.status.runtime.last_applied_at,
+      last_applied_config_version_id: loop.status.runtime.last_applied_config_version_id
+    }
+  } catch (error) {
+    console.warn('feedback loop run failed after youtube platform sync', error)
+  }
+
+  return {
+    jobId,
+    feedback,
+    feedbackLoop
+  }
+}
+
 router.get('/jobs', async (req: any, res) => {
   try {
     const userId = req.user?.id
@@ -1016,16 +1474,117 @@ router.get('/realtime-predictions', async (req: any, res) => {
   }
 })
 
-router.post('/youtube/video-metrics', async (req: any, res) => {
+router.get('/youtube/oauth/status', async (req: any, res) => {
   try {
-    const apiKey = String(process.env.YOUTUBE_API_KEY || '').trim()
-    if (!apiKey) {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const config = getYouTubeOAuthConfigStatus()
+    const connection = await getYouTubeOAuthConnectionForUser(userId)
+    return res.json({
+      ...connection,
+      authConfigured: config.configured,
+      missingConfig: config.missing
+    })
+  } catch {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/youtube/oauth/authorize', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const config = getYouTubeOAuthConfigStatus()
+    if (!config.configured) {
       return res.status(503).json({
-        error: 'youtube_api_key_missing',
-        message: 'YOUTUBE_API_KEY is not configured on the backend.'
+        error: 'youtube_oauth_not_configured',
+        missingConfig: config.missing
       })
     }
+    const session = await buildYouTubeOAuthAuthorizeUrl(userId)
+    return res.json({
+      ok: true,
+      authUrl: session.authUrl,
+      state: session.state,
+      expiresAt: session.expiresAt
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '')
+    if (code === 'youtube_oauth_not_configured') {
+      return res.status(503).json({
+        error: code,
+        message: 'Google OAuth client credentials are missing.'
+      })
+    }
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
 
+router.post('/youtube/oauth/exchange', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const code = String(req.body?.code || '').trim()
+    const state = String(req.body?.state || '').trim() || null
+    if (!code) {
+      return res.status(400).json({
+        error: 'missing_oauth_code',
+        message: 'Provide the OAuth authorization code.'
+      })
+    }
+    const connection = await exchangeYouTubeOAuthCodeForUser({
+      userId,
+      code,
+      state
+    })
+    return res.json({
+      ok: true,
+      connection
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '')
+    if (code === 'invalid_oauth_state') {
+      return res.status(400).json({
+        error: code,
+        message: 'OAuth state is invalid or expired. Start authorization again.'
+      })
+    }
+    if (code === 'youtube_oauth_not_configured') {
+      return res.status(503).json({
+        error: code,
+        message: 'Google OAuth client credentials are missing.'
+      })
+    }
+    if (code === 'oauth_exchange_missing_access_token' || code === 'missing_oauth_code') {
+      return res.status(400).json({
+        error: code
+      })
+    }
+    return res.status(502).json({
+      error: 'youtube_oauth_exchange_failed',
+      reason: String(error?.message || 'oauth_exchange_failed')
+    })
+  }
+})
+
+router.post('/youtube/oauth/disconnect', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    await disconnectYouTubeOAuthForUser(userId)
+    return res.json({
+      ok: true
+    })
+  } catch {
+    return res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/youtube/video-metrics', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const apiKey = String(process.env.YOUTUBE_API_KEY || '').trim()
     const rawVideoInput =
       req.body?.videoId ??
       req.body?.video_id ??
@@ -1040,67 +1599,51 @@ router.post('/youtube/video-metrics', async (req: any, res) => {
         message: 'Provide a valid YouTube video ID or URL.'
       })
     }
-
-    const endpoint = new URL('https://www.googleapis.com/youtube/v3/videos')
-    endpoint.searchParams.set('part', 'snippet,statistics,contentDetails')
-    endpoint.searchParams.set('id', videoId)
-    endpoint.searchParams.set('key', apiKey)
-
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 12000)
-    let response: Response
-    try {
-      response = await fetch(endpoint.toString(), {
-        method: 'GET',
-        signal: controller.signal
-      })
-    } finally {
-      clearTimeout(timer)
-    }
-
-    const payload = await response.json().catch(() => ({} as any))
-    if (!response.ok) {
-      return res.status(502).json({
-        error: 'youtube_api_request_failed',
-        message: 'YouTube Data API request failed.',
-        status: response.status,
-        reason: payload?.error?.message || null
-      })
-    }
-
-    const item = Array.isArray(payload?.items) ? payload.items[0] : null
-    if (!item) {
-      return res.status(404).json({
-        error: 'youtube_video_not_found',
-        message: 'No public YouTube video found for that ID.'
-      })
-    }
-
-    const viewCount = Math.max(0, Number(item?.statistics?.viewCount || 0))
-    const likeCount = Math.max(0, Number(item?.statistics?.likeCount || 0))
-    const commentCount = Math.max(0, Number(item?.statistics?.commentCount || 0))
-    const engagementRate = viewCount > 0
-      ? clamp01((likeCount + commentCount) / viewCount)
-      : 0
-    const durationSeconds = parseIso8601DurationSeconds(item?.contentDetails?.duration)
+    const metrics = await fetchYouTubeVideoMetrics({
+      userId,
+      videoId,
+      apiKey
+    })
 
     return res.json({
       ok: true,
-      videoId,
-      title: String(item?.snippet?.title || ''),
-      channelId: String(item?.snippet?.channelId || ''),
-      channelTitle: String(item?.snippet?.channelTitle || ''),
-      publishedAt: item?.snippet?.publishedAt || null,
-      durationSeconds,
+      dataSource: metrics.dataSource,
+      videoId: metrics.videoId,
+      title: metrics.title,
+      channelId: metrics.channelId,
+      channelTitle: metrics.channelTitle,
+      publishedAt: metrics.publishedAt,
+      durationSeconds: metrics.durationSeconds,
       stats: {
-        viewCount,
-        likeCount,
-        commentCount,
-        engagementRate: Number(engagementRate.toFixed(4))
+        viewCount: metrics.viewCount,
+        likeCount: metrics.likeCount,
+        commentCount: metrics.commentCount,
+        engagementRate: metrics.engagementRate
       }
     })
   } catch (error: any) {
-    const message = String(error?.message || error || '')
+    const code = String(error?.code || '')
+    const message = String(error?.message || '')
+    if (code === 'youtube_auth_missing') {
+      return res.status(503).json({
+        error: code,
+        message: 'Connect YouTube OAuth or configure YOUTUBE_API_KEY.'
+      })
+    }
+    if (code === 'youtube_video_not_found') {
+      return res.status(404).json({
+        error: code,
+        message: 'No public YouTube video found for that ID.'
+      })
+    }
+    if (code === 'youtube_data_api_failed') {
+      return res.status(502).json({
+        error: code,
+        message: 'YouTube Data API request failed.',
+        reason: message || null,
+        status: Number(error?.status || 0) || null
+      })
+    }
     if (message.toLowerCase().includes('aborted')) {
       return res.status(504).json({
         error: 'youtube_api_timeout',
@@ -1110,6 +1653,170 @@ router.post('/youtube/video-metrics', async (req: any, res) => {
     return res.status(500).json({
       error: 'youtube_api_server_error',
       message: 'Could not fetch YouTube metrics.'
+    })
+  }
+})
+
+router.post('/youtube/analytics/video-report', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const rawVideoInput =
+      req.body?.videoId ??
+      req.body?.video_id ??
+      req.body?.videoUrl ??
+      req.body?.video_url ??
+      req.body?.video ??
+      req.body?.id
+    const videoId = parseYouTubeVideoId(rawVideoInput)
+    if (!videoId) {
+      return res.status(400).json({
+        error: 'invalid_youtube_video',
+        message: 'Provide a valid YouTube video ID or URL.'
+      })
+    }
+    const { startDate, endDate } = resolveYouTubeAnalyticsDateRange(req.body || {})
+    const report = await fetchYouTubeAnalyticsReport({
+      userId,
+      videoId,
+      startDate,
+      endDate
+    })
+    const platformFeedback = derivePlatformFeedbackFromYouTube({
+      summary: report.summary,
+      retentionCurve: report.retentionCurve,
+      videoId,
+      startDate,
+      endDate
+    })
+    const metrics = await fetchYouTubeVideoMetrics({
+      userId,
+      videoId,
+      apiKey: String(process.env.YOUTUBE_API_KEY || '').trim()
+    }).catch(() => null)
+
+    return res.json({
+      ok: true,
+      videoId,
+      dateRange: {
+        startDate,
+        endDate
+      },
+      video: metrics,
+      analytics: report,
+      platformFeedback
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '')
+    const reason = String(error?.message || '')
+    if (code === 'youtube_auth_missing') {
+      return res.status(401).json({
+        error: code,
+        message: 'Connect YouTube OAuth first to read YouTube Analytics.'
+      })
+    }
+    if (code === 'youtube_analytics_summary_failed' || code === 'youtube_analytics_retention_failed') {
+      return res.status(502).json({
+        error: code,
+        message: 'YouTube Analytics API request failed.',
+        reason: reason || null,
+        status: Number(error?.status || 0) || null
+      })
+    }
+    return res.status(500).json({
+      error: 'youtube_analytics_server_error',
+      message: 'Could not fetch YouTube analytics report.'
+    })
+  }
+})
+
+router.post('/youtube/analytics/sync-job-feedback', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    const jobId = String(req.body?.jobId || req.body?.job_id || '').trim()
+    if (!jobId) {
+      return res.status(400).json({
+        error: 'missing_job_id',
+        message: 'Provide a completed jobId to sync platform feedback.'
+      })
+    }
+    const rawVideoInput =
+      req.body?.videoId ??
+      req.body?.video_id ??
+      req.body?.videoUrl ??
+      req.body?.video_url ??
+      req.body?.video ??
+      req.body?.id
+    const videoId = parseYouTubeVideoId(rawVideoInput)
+    if (!videoId) {
+      return res.status(400).json({
+        error: 'invalid_youtube_video',
+        message: 'Provide a valid YouTube video ID or URL.'
+      })
+    }
+    const { startDate, endDate } = resolveYouTubeAnalyticsDateRange(req.body || {})
+    const report = await fetchYouTubeAnalyticsReport({
+      userId,
+      videoId,
+      startDate,
+      endDate
+    })
+    const platformFeedback = derivePlatformFeedbackFromYouTube({
+      summary: report.summary,
+      retentionCurve: report.retentionCurve,
+      videoId,
+      startDate,
+      endDate
+    })
+    const persisted = await persistPlatformFeedbackForJob({
+      userId,
+      jobId,
+      feedback: platformFeedback
+    })
+    return res.json({
+      ok: true,
+      jobId,
+      videoId,
+      dateRange: {
+        startDate,
+        endDate
+      },
+      analytics: report,
+      feedback: persisted.feedback,
+      feedbackLoop: persisted.feedbackLoop
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '')
+    const reason = String(error?.message || '')
+    if (code === 'youtube_auth_missing') {
+      return res.status(401).json({
+        error: code,
+        message: 'Connect YouTube OAuth first to read YouTube Analytics.'
+      })
+    }
+    if (code === 'job_not_found') {
+      return res.status(404).json({
+        error: code
+      })
+    }
+    if (code === 'job_not_ready') {
+      return res.status(403).json({
+        error: code,
+        message: 'Job must be completed before syncing platform feedback.'
+      })
+    }
+    if (code === 'youtube_analytics_summary_failed' || code === 'youtube_analytics_retention_failed') {
+      return res.status(502).json({
+        error: code,
+        message: 'YouTube Analytics API request failed.',
+        reason: reason || null,
+        status: Number(error?.status || 0) || null
+      })
+    }
+    return res.status(500).json({
+      error: 'youtube_feedback_sync_failed',
+      message: 'Could not sync YouTube analytics feedback to job.'
     })
   }
 })
