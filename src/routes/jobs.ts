@@ -1579,6 +1579,7 @@ type EditOptions = {
   coldStartAutopilot: boolean
   continuityFirstMode: boolean
   exploreX3Mode: boolean
+  topHumanGuardMode: boolean
   creatorStyleLock: number
   manualTimestampConfig?: ManualTimestampConfig | null
 }
@@ -3317,6 +3318,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   coldStartAutopilot: false,
   continuityFirstMode: false,
   exploreX3Mode: false,
+  topHumanGuardMode: false,
   creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4))
 }
 
@@ -4501,6 +4503,19 @@ const getExploreX3ModeFromPayload = (payload?: any): boolean | null => {
     parseBooleanFlag((payload as any).explore_x3_mode) ??
     parseBooleanFlag((payload as any).exploreX3) ??
     parseBooleanFlag((payload as any).explore_x3) ??
+    null
+  )
+}
+
+const getTopHumanGuardModeFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).topHumanGuardMode) ??
+    parseBooleanFlag((payload as any).top_human_guard_mode) ??
+    parseBooleanFlag((payload as any).noExceptionsMode) ??
+    parseBooleanFlag((payload as any).no_exceptions_mode) ??
+    parseBooleanFlag((payload as any).failClosedQualityGate) ??
+    parseBooleanFlag((payload as any).fail_closed_quality_gate) ??
     null
   )
 }
@@ -5870,6 +5885,18 @@ const getExploreX3ModeFromJob = (job?: any): boolean => {
   )
 }
 
+const getTopHumanGuardModeFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.topHumanGuardMode) ??
+    parseBooleanFlag(settings?.top_human_guard_mode) ??
+    parseBooleanFlag(analysis?.topHumanGuardMode) ??
+    parseBooleanFlag(analysis?.top_human_guard_mode) ??
+    false
+  )
+}
+
 const getCreatorStyleLockPercentFromJob = (job?: any): number => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -6158,6 +6185,7 @@ const buildPersistedRenderSettings = (
     coldStartAutopilot?: boolean | null
     continuityFirstMode?: boolean | null
     exploreX3Mode?: boolean | null
+    topHumanGuardMode?: boolean | null
     creatorStyleLockPercent?: number | null
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
@@ -6186,6 +6214,7 @@ const buildPersistedRenderSettings = (
   const coldStartAutopilot = typeof opts?.coldStartAutopilot === 'boolean' ? opts.coldStartAutopilot : false
   const continuityFirstMode = typeof opts?.continuityFirstMode === 'boolean' ? opts.continuityFirstMode : false
   const exploreX3Mode = typeof opts?.exploreX3Mode === 'boolean' ? opts.exploreX3Mode : false
+  const topHumanGuardMode = typeof opts?.topHumanGuardMode === 'boolean' ? opts.topHumanGuardMode : false
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(opts?.creatorStyleLockPercent) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
@@ -6236,6 +6265,8 @@ const buildPersistedRenderSettings = (
     continuity_first_mode: continuityFirstMode,
     exploreX3Mode,
     explore_x3_mode: exploreX3Mode,
+    topHumanGuardMode,
+    top_human_guard_mode: topHumanGuardMode,
     creatorStyleLock: creatorStyleLockPercent,
     creator_style_lock: creatorStyleLockPercent,
     ...(fastMode === null ? {} : { fastMode, fast_mode: fastMode }),
@@ -6269,6 +6300,7 @@ const buildPersistedRenderAnalysis = ({
   coldStartAutopilot,
   continuityFirstMode,
   exploreX3Mode,
+  topHumanGuardMode,
   creatorStyleLockPercent,
   manualTimestampConfig,
   verticalCaptionConfig,
@@ -6293,6 +6325,7 @@ const buildPersistedRenderAnalysis = ({
   coldStartAutopilot?: boolean | null
   continuityFirstMode?: boolean | null
   exploreX3Mode?: boolean | null
+  topHumanGuardMode?: boolean | null
   creatorStyleLockPercent?: number | null
   manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
@@ -6408,6 +6441,14 @@ const buildPersistedRenderAnalysis = ({
       : (
         parseBooleanFlag((existing as any)?.exploreX3Mode) ??
         parseBooleanFlag((existing as any)?.explore_x3_mode)
+      )
+  ) ?? false
+  const resolvedTopHumanGuardMode = (
+    typeof topHumanGuardMode === 'boolean'
+      ? topHumanGuardMode
+      : (
+        parseBooleanFlag((existing as any)?.topHumanGuardMode) ??
+        parseBooleanFlag((existing as any)?.top_human_guard_mode)
       )
   ) ?? false
   const resolvedCreatorStyleLockPercent = parseCreatorStyleLockPercent(
@@ -6540,6 +6581,8 @@ const buildPersistedRenderAnalysis = ({
   payload.continuity_first_mode = resolvedContinuityFirstMode
   payload.exploreX3Mode = resolvedExploreX3Mode
   payload.explore_x3_mode = resolvedExploreX3Mode
+  payload.topHumanGuardMode = resolvedTopHumanGuardMode
+  payload.top_human_guard_mode = resolvedTopHumanGuardMode
   payload.creatorStyleLock = resolvedCreatorStyleLockPercent
   payload.creator_style_lock = resolvedCreatorStyleLockPercent
   if (resolvedFastMode !== null) {
@@ -22556,6 +22599,7 @@ const getEditOptionsForUser = async (
     coldStartAutopilot?: boolean | null
     continuityFirstMode?: boolean | null
     exploreX3Mode?: boolean | null
+    topHumanGuardMode?: boolean | null
     creatorStyleLockPercent?: number | null
   },
   userEmail?: string | null
@@ -22590,6 +22634,14 @@ const getEditOptionsForUser = async (
     typeof overrides?.exploreX3Mode === 'boolean'
       ? overrides.exploreX3Mode
       : parseBooleanFlag((settings as any)?.exploreX3Mode)
+  ) ?? false
+  const topHumanGuardMode = (
+    typeof overrides?.topHumanGuardMode === 'boolean'
+      ? overrides.topHumanGuardMode
+      : (
+        parseBooleanFlag((settings as any)?.topHumanGuardMode) ??
+        parseBooleanFlag((settings as any)?.top_human_guard_mode)
+      )
   ) ?? false
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(
     overrides?.creatorStyleLockPercent ??
@@ -22692,6 +22744,10 @@ const getEditOptionsForUser = async (
     tangentKiller = true
     resolvedFastMode = false
   }
+  if (topHumanGuardMode) {
+    tangentKiller = true
+    resolvedFastMode = false
+  }
   if (ultraModeRequested) {
     requestedStrategy = 'viral'
     requestedAggression = 'viral'
@@ -22750,6 +22806,7 @@ const getEditOptionsForUser = async (
     coldStartAutopilot,
     continuityFirstMode,
     exploreX3Mode,
+    topHumanGuardMode,
     creatorStyleLock,
     manualTimestampConfig,
     fastMode: resolvedFastMode
@@ -23233,6 +23290,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       coldStartAutopilot: options.coldStartAutopilot,
       continuityFirstMode: options.continuityFirstMode,
       exploreX3Mode: options.exploreX3Mode,
+      topHumanGuardMode: options.topHumanGuardMode,
       creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
@@ -23263,6 +23321,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         coldStartAutopilot: options.coldStartAutopilot,
         continuityFirstMode: options.continuityFirstMode,
         exploreX3Mode: options.exploreX3Mode,
+        topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
@@ -24050,6 +24109,7 @@ const processJob = async (
         coldStartAutopilot: options.coldStartAutopilot,
         continuityFirstMode: options.continuityFirstMode,
         exploreX3Mode: options.exploreX3Mode,
+        topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         verticalCaptionConfig,
         outputPaths
@@ -24117,6 +24177,7 @@ const processJob = async (
           coldStartAutopilot: options.coldStartAutopilot,
           continuityFirstMode: options.continuityFirstMode,
           exploreX3Mode: options.exploreX3Mode,
+          topHumanGuardMode: options.topHumanGuardMode,
           creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
           manualTimestampConfig: requestedManualTimestampConfig,
           verticalCaptionConfig
@@ -24757,6 +24818,9 @@ const processJob = async (
       if (options.continuityFirstMode) {
         optimizationNotes.push('Continuity-first mode active: stricter boundary threshold and slower pacing profile applied.')
       }
+      if (options.topHumanGuardMode) {
+        optimizationNotes.push('Top-human guard mode active: fail-closed quality gate, no forced low-signal fallback renders.')
+      }
       optimizationNotes.push(`Creator style lock applied at ${Math.round(clamp(options.creatorStyleLock, 0, 1) * 100)}%.`)
 
       const buildAttemptSegments = (strategy: RetentionRetryStrategy, hookCandidate: HookCandidate) => {
@@ -25331,13 +25395,15 @@ const processJob = async (
         )
       }
       if (!selectedJudge.passed || lowRetentionRecoveryRequested) {
-        let overrideReason = maybeAllowQualityGateOverride({
-          judge: selectedJudge,
-          thresholds: qualityGateThresholds,
-          hasTranscript: hasTranscriptSignals,
-          signalStrength: contentSignalStrength,
-          minimumRetentionScore: modeRetentionTargets.floor
-        })
+        let overrideReason = options.topHumanGuardMode
+          ? null
+          : maybeAllowQualityGateOverride({
+            judge: selectedJudge,
+            thresholds: qualityGateThresholds,
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength,
+            minimumRetentionScore: modeRetentionTargets.floor
+          })
         if (!overrideReason) {
           const rescueHookCandidate = preferredHookCandidate || orderedHookCandidates.find((candidate) => candidate.auditPassed) || initialHook
           const rescueAttempt = buildAttemptSegments('RESCUE_MODE', rescueHookCandidate)
@@ -25429,7 +25495,7 @@ const processJob = async (
           )
           if (rescueJudge.passed) {
             overrideReason = 'Rescue edit pass raised quality enough to render.'
-          } else if (shouldForceRescueRender(rescueJudge, modeRetentionTargets.floor)) {
+          } else if (!options.topHumanGuardMode && shouldForceRescueRender(rescueJudge, modeRetentionTargets.floor)) {
             overrideReason = 'Rescue render forced at adaptive floor to avoid hard-failing low-signal uploads.'
           }
         }
@@ -25437,6 +25503,51 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
+          if (options.topHumanGuardMode) {
+            const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
+            const strictReason = `Top-human guard blocked export: quality gate remained below strict target (${resolvedRetention.toFixed(1)}% vs target ${modeRetentionTargets.target}%, floor ${modeRetentionTargets.floor}%).`
+            await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+              status: 'failed',
+              completedAt: toIsoNow(),
+              lastError: strictReason,
+              meta: {
+                attempts: retentionAttempts,
+                thresholds: qualityGateThresholds,
+                hasTranscriptSignals,
+                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile,
+                topHumanGuardMode: true
+              }
+            })
+            await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+              status: 'failed',
+              completedAt: toIsoNow(),
+              lastError: strictReason,
+              meta: {
+                attempts: retentionAttempts,
+                thresholds: qualityGateThresholds,
+                hasTranscriptSignals,
+                contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile,
+                topHumanGuardMode: true
+              }
+            })
+            await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${strictReason}` })
+            throw new QualityGateError(strictReason, {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              topHumanGuardMode: true
+            })
+          }
           const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
           const belowMinimum = resolvedRetention < modeRetentionTargets.floor
           const belowTarget = resolvedRetention < modeRetentionTargets.target
@@ -26927,6 +27038,7 @@ const processJob = async (
       coldStartAutopilot: options.coldStartAutopilot,
       continuityFirstMode: options.continuityFirstMode,
       exploreX3Mode: options.exploreX3Mode,
+      topHumanGuardMode: options.topHumanGuardMode,
       creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
@@ -26964,6 +27076,7 @@ const processJob = async (
         coldStartAutopilot: options.coldStartAutopilot,
         continuityFirstMode: options.continuityFirstMode,
         exploreX3Mode: options.exploreX3Mode,
+        topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: persistedVerticalCaptionConfig
@@ -27033,6 +27146,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         coldStartAutopilot: getColdStartAutopilotFromJob(existing),
         continuityFirstMode: getContinuityFirstModeFromJob(existing),
         exploreX3Mode: getExploreX3ModeFromJob(existing),
+        topHumanGuardMode: getTopHumanGuardModeFromJob(existing),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
@@ -27063,6 +27177,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         coldStartAutopilot: getColdStartAutopilotFromJob(latestBeforeProcess),
         continuityFirstMode: getContinuityFirstModeFromJob(latestBeforeProcess),
         exploreX3Mode: getExploreX3ModeFromJob(latestBeforeProcess),
+        topHumanGuardMode: getTopHumanGuardModeFromJob(latestBeforeProcess),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(latestBeforeProcess),
         autoCaptions: getAutoCaptionsFromPayload((latestBeforeProcess.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((latestBeforeProcess.analysis as any) || {})
@@ -27421,6 +27536,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const coldStartAutopilotOverride = getColdStartAutopilotFromPayload(req.body)
     const continuityFirstModeOverride = getContinuityFirstModeFromPayload(req.body)
     const exploreX3ModeOverride = getExploreX3ModeFromPayload(req.body)
+    const topHumanGuardModeOverride = getTopHumanGuardModeFromPayload(req.body)
     const creatorStyleLockPercentOverride = getCreatorStyleLockPercentFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
@@ -27472,6 +27588,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const coldStartAutopilot = coldStartAutopilotOverride ?? false
     const continuityFirstMode = continuityFirstModeOverride ?? false
     const exploreX3Mode = exploreX3ModeOverride ?? false
+    const topHumanGuardMode = topHumanGuardModeOverride ?? false
     const creatorStyleLockPercent = creatorStyleLockPercentOverride ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
     if (coldStartAutopilot) {
       if (!retentionTuning.hasStrategyOverride) retentionStrategyProfile = 'safe'
@@ -27499,6 +27616,10 @@ const handleCreateJob = async (req: any, res: any) => {
       if (tangentKillerOverride === null) tangentKillerOverride = true
       requestedFastMode = false
     }
+    if (topHumanGuardMode) {
+      requestedFastMode = false
+      if (tangentKillerOverride === null) tangentKillerOverride = true
+    }
     const fullAutoYoutubeProfile = fullAutoYoutubePreset
       ? {
           ...fullAutoYoutubePreset.profile,
@@ -27523,6 +27644,7 @@ const handleCreateJob = async (req: any, res: any) => {
             coldStartAutopilot,
             continuityFirstMode,
             exploreX3Mode,
+            topHumanGuardMode,
             creatorStyleLock: creatorStyleLockPercent,
             autoCaptions: autoCaptionsOverride,
             subtitleStyle: subtitleStyleOverride
@@ -27638,6 +27760,7 @@ const handleCreateJob = async (req: any, res: any) => {
             coldStartAutopilot,
             continuityFirstMode,
             exploreX3Mode,
+            topHumanGuardMode,
             creatorStyleLockPercent,
             manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride
@@ -27674,6 +27797,8 @@ const handleCreateJob = async (req: any, res: any) => {
             continuity_first_mode: continuityFirstMode,
             exploreX3Mode,
             explore_x3_mode: exploreX3Mode,
+            topHumanGuardMode,
+            top_human_guard_mode: topHumanGuardMode,
             creatorStyleLock: creatorStyleLockPercent,
             creator_style_lock: creatorStyleLockPercent,
             ...(fullAutoYoutubeProfile
@@ -27717,6 +27842,7 @@ const handleCreateJob = async (req: any, res: any) => {
           coldStartAutopilot,
           continuityFirstMode,
           exploreX3Mode,
+          topHumanGuardMode,
           creatorStyleLockPercent,
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
@@ -28519,6 +28645,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
     const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra' ? true : analyzeRequestedFastMode
@@ -28555,6 +28682,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
@@ -28600,6 +28729,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
@@ -28624,6 +28755,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       coldStartAutopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
@@ -28711,6 +28843,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
     const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveProcessFastMode = requestedEditorMode === 'ultra' ? true : processRequestedFastMode
@@ -28747,6 +28880,8 @@ router.post('/:id/process', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
@@ -28792,6 +28927,8 @@ router.post('/:id/process', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
@@ -28816,6 +28953,7 @@ router.post('/:id/process', async (req: any, res) => {
       coldStartAutopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       autoCaptions: autoCaptionsOverride,
@@ -28991,6 +29129,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
     const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedHookSelectionModeRaw = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedHookSelectionMode = requestedManualTimestampConfig?.enabled ? 'manual' : requestedHookSelectionModeRaw
@@ -29018,6 +29157,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         coldStartAutopilot: requestedColdStartAutopilot,
         continuityFirstMode: requestedContinuityFirstMode,
         exploreX3Mode: requestedExploreX3Mode,
+        topHumanGuardMode: requestedTopHumanGuardMode,
         creatorStyleLockPercent: requestedCreatorStyleLockPercent,
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: verticalCaptionConfigOverride
@@ -29048,6 +29188,8 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         continuity_first_mode: requestedContinuityFirstMode,
         exploreX3Mode: requestedExploreX3Mode,
         explore_x3_mode: requestedExploreX3Mode,
+        topHumanGuardMode: requestedTopHumanGuardMode,
+        top_human_guard_mode: requestedTopHumanGuardMode,
         creatorStyleLock: requestedCreatorStyleLockPercent,
         creator_style_lock: requestedCreatorStyleLockPercent,
         style_archetype_blend_override: styleBlendOverride
@@ -29069,6 +29211,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       coldStartAutopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: verticalCaptionConfigOverride
@@ -29340,6 +29483,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
     const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
+    const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const reprocessRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveReprocessFastMode = requestedEditorMode === 'ultra' ? true : reprocessRequestedFastMode
@@ -29416,6 +29560,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
@@ -29478,6 +29624,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       continuity_first_mode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       explore_x3_mode: requestedExploreX3Mode,
+      topHumanGuardMode: requestedTopHumanGuardMode,
+      top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
