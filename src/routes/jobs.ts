@@ -24856,6 +24856,56 @@ const processJob = async (
         let story = storySegments.map((segment) => ({ ...segment }))
         if (shouldMoveHookForRender) {
           story = subtractRange(story, hookRange)
+          // If a long-form hook is relocated from later in the source to the
+          // opener, trim/remove a hook-like first follow-up segment to avoid
+          // an immediate "double-hook" feeling at the beginning.
+          if (effectiveHookCandidate.start >= HOOK_RELOCATE_MIN_START && story.length > 0) {
+            const [firstStorySegment, ...remainingStory] = story
+            if (firstStorySegment) {
+              const firstRange: TimeRange = {
+                start: firstStorySegment.start,
+                end: firstStorySegment.end
+              }
+              const overlapsAlternateHook = orderedHookCandidates
+                .filter((candidate) => (
+                  Math.abs(candidate.start - effectiveHookCandidate.start) > 0.01 ||
+                  Math.abs(candidate.duration - effectiveHookCandidate.duration) > 0.01
+                ))
+                .some((candidate) => {
+                  const candidateRange: TimeRange = {
+                    start: candidate.start,
+                    end: Number((candidate.start + candidate.duration).toFixed(3))
+                  }
+                  return getHookCandidateConfidence(candidate) >= 0.56 && overlapsRange(firstRange, candidateRange)
+                })
+              const firstSegmentHookPressure = averageWindowMetric(
+                editPlan?.engagementWindows ?? [],
+                firstStorySegment.start,
+                Math.min(firstStorySegment.end, firstStorySegment.start + 4.8),
+                (window) => (
+                  0.46 * (window.hookScore ?? window.score) +
+                  0.22 * window.emotionIntensity +
+                  0.16 * window.vocalExcitement +
+                  0.1 * (window.curiosityTrigger ?? 0) +
+                  0.06 * (window.actionSpike ?? 0)
+                )
+              )
+              if (overlapsAlternateHook || firstSegmentHookPressure >= 0.66) {
+                const trimmedStart = Number(
+                  clamp(
+                    firstStorySegment.start + 2.2,
+                    firstStorySegment.start,
+                    Math.max(firstStorySegment.start, firstStorySegment.end - 0.35)
+                  ).toFixed(3)
+                )
+                if (firstStorySegment.end - trimmedStart > 0.35) {
+                  story = [{ ...firstStorySegment, start: trimmedStart }, ...remainingStory]
+                } else {
+                  story = remainingStory
+                }
+              }
+            }
+          }
         }
         if (strategy === 'HOOK_FIRST') {
           // Trim early exposition after the hook so payoff is approached faster.
