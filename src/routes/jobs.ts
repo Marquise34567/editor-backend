@@ -2724,6 +2724,16 @@ const resolveInterruptIntervalRange = ({
     minSec = 2.6
     maxSec = 4.2
   }
+  if (!editorMode || editorMode === 'auto') {
+    minSec = Math.max(2, minSec - 0.22)
+    maxSec = Math.max(minSec + 0.2, maxSec - 0.34)
+  } else if (editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary') {
+    minSec = Math.max(2, minSec - 0.14)
+    maxSec = Math.max(minSec + 0.2, maxSec - 0.28)
+  } else {
+    minSec = Math.max(2, minSec - 0.35)
+    maxSec = Math.max(minSec + 0.2, maxSec - 0.55)
+  }
   if (styleProfile?.style === 'tutorial') {
     minSec = Math.max(minSec, 3)
     maxSec = Math.max(maxSec, 5)
@@ -2747,6 +2757,33 @@ const resolveInterruptTargetSeconds = ({
 }) => {
   const range = resolveInterruptIntervalRange({ strategyProfile, editorMode, styleProfile })
   return Number(((range.minSec + range.maxSec) / 2).toFixed(2))
+}
+
+const resolveV3PacingGovernorCaps = ({
+  editorMode,
+  maxGapSeconds,
+  maxTalkingHeadShotSeconds
+}: {
+  editorMode?: EditorModeSelection | null
+  maxGapSeconds: number
+  maxTalkingHeadShotSeconds: number
+}) => {
+  const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary'
+  const autoMode = !editorMode || editorMode === 'auto'
+  const tightenedGap = clamp(
+    maxGapSeconds - (contextHeavyMode ? 0.22 : autoMode ? 0.36 : 0.48),
+    1.9,
+    5
+  )
+  const tightenedTalkingHead = clamp(
+    maxTalkingHeadShotSeconds - (contextHeavyMode ? 0.18 : autoMode ? 0.42 : 0.58),
+    2.2,
+    6
+  )
+  return {
+    maxGapSeconds: Number(tightenedGap.toFixed(3)),
+    maxTalkingHeadShotSeconds: Number(tightenedTalkingHead.toFixed(3))
+  }
 }
 const getTranscriptTextInRange = (cues: TranscriptCue[], start: number, end: number) => {
   if (!Array.isArray(cues) || !cues.length) return ''
@@ -8888,6 +8925,22 @@ const getStyleAdjustedAggressionLevel = (
   return ranking[index]
 }
 
+const applyEditorModeAggressionFloor = (
+  baseLevel: RetentionAggressionLevel,
+  editorMode?: EditorModeSelection | null
+): RetentionAggressionLevel => {
+  const resolvedMode = editorMode && editorMode !== 'auto' ? editorMode : 'auto'
+  const floor: RetentionAggressionLevel =
+    resolvedMode === 'education' || resolvedMode === 'podcast' || resolvedMode === 'commentary' || resolvedMode === 'auto'
+      ? 'medium'
+      : 'high'
+  const ranking: RetentionAggressionLevel[] = ['low', 'medium', 'high', 'viral']
+  const baseIndex = ranking.indexOf(baseLevel)
+  const floorIndex = ranking.indexOf(floor)
+  if (baseIndex < 0 || floorIndex < 0) return baseLevel
+  return ranking[Math.max(baseIndex, floorIndex)]
+}
+
 const applyStyleToPacingProfile = (
   profile: PacingProfile,
   styleProfile?: ContentStyleProfile | null,
@@ -12517,6 +12570,13 @@ type EditorModeCutProfile = {
   compressionBoost: number
 }
 
+const NON_AUTO_BASE_CUT_PROFILE: EditorModeCutProfile = {
+  // Legacy v3 baseline cadence applied across all modes.
+  candidateThresholdDelta: -0.07,
+  hardCutThresholdDelta: -0.05,
+  compressionBoost: 1.18
+}
+
 const EDITOR_MODE_CUT_PROFILES: Partial<Record<EditorModeSelection, EditorModeCutProfile>> = {
   ultra: {
     candidateThresholdDelta: -0.06,
@@ -12527,6 +12587,18 @@ const EDITOR_MODE_CUT_PROFILES: Partial<Record<EditorModeSelection, EditorModeCu
     candidateThresholdDelta: -0.01,
     hardCutThresholdDelta: 0.03,
     compressionBoost: 1.06
+  }
+}
+
+const resolveEditorModeCutProfile = (
+  editorMode?: EditorModeSelection | null
+): EditorModeCutProfile => {
+  const modeProfile = editorMode ? (EDITOR_MODE_CUT_PROFILES[editorMode] || null) : null
+  if (!modeProfile) return NON_AUTO_BASE_CUT_PROFILE
+  return {
+    candidateThresholdDelta: Math.min(modeProfile.candidateThresholdDelta, NON_AUTO_BASE_CUT_PROFILE.candidateThresholdDelta),
+    hardCutThresholdDelta: Math.min(modeProfile.hardCutThresholdDelta, NON_AUTO_BASE_CUT_PROFILE.hardCutThresholdDelta),
+    compressionBoost: Math.max(modeProfile.compressionBoost, NON_AUTO_BASE_CUT_PROFILE.compressionBoost)
   }
 }
 
@@ -12558,19 +12630,17 @@ const applyBoredomModelToSegments = ({
     }
   }
   const preset = RETENTION_AGGRESSION_PRESET[aggressionLevel]
-  const modeCutProfile = editorMode
-    ? EDITOR_MODE_CUT_PROFILES[editorMode] || null
-    : null
+  const modeCutProfile = resolveEditorModeCutProfile(editorMode)
   const candidateThreshold = tuning.isLongForm ? tuning.boredomCandidateThreshold : preset.boredomThreshold
   const hardCutThreshold = tuning.isLongForm
     ? Math.max(candidateThreshold + 0.08, tuning.boredomHardCutThreshold)
     : Math.min(0.92, preset.boredomThreshold + 0.16)
-  const effectiveCandidateThreshold = modeCutProfile
-    ? clamp(candidateThreshold + modeCutProfile.candidateThresholdDelta, 0.42, 0.9)
-    : candidateThreshold
-  const effectiveHardCutThreshold = modeCutProfile
-    ? clamp(hardCutThreshold + modeCutProfile.hardCutThresholdDelta, effectiveCandidateThreshold + 0.04, 0.95)
-    : hardCutThreshold
+  const effectiveCandidateThreshold = clamp(candidateThreshold + modeCutProfile.candidateThresholdDelta, 0.42, 0.9)
+  const effectiveHardCutThreshold = clamp(
+    hardCutThreshold + modeCutProfile.hardCutThresholdDelta,
+    effectiveCandidateThreshold + 0.04,
+    0.95
+  )
   const boredom = buildBoredomRangesFromScores(
     windows,
     effectiveCandidateThreshold,
@@ -12633,7 +12703,7 @@ const applyBoredomModelToSegments = ({
     const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
     const overlapBoredom = getBoredomScoreForRange(windows, segmentRange)
     const compressionNudge = 0.04 * clamp01(overlapRatio * 1.25) + 0.05 * clamp01(overlapBoredom)
-    const modeCompressionBoost = modeCutProfile ? modeCutProfile.compressionBoost : 1
+    const modeCompressionBoost = modeCutProfile.compressionBoost
     const targetSpeed = clamp(
       baseSpeed + compressionNudge * preset.cutMultiplier * modeCompressionBoost,
       tuning.compressionSpeed.min,
@@ -15994,7 +16064,10 @@ const buildEditPlan = async (
     durationSeconds
   })
   const styleProfile = applyEditorModeToStyleProfile(styleProfileAuto, options.editorMode)
-  const styleAdjustedAggressionLevel = getStyleAdjustedAggressionLevel(aggressionLevel, styleProfile)
+  const styleAdjustedAggressionLevel = applyEditorModeAggressionFloor(
+    getStyleAdjustedAggressionLevel(aggressionLevel, styleProfile),
+    options.editorMode
+  )
   const basePacingProfile = applyStyleToPacingProfile(
     inferPacingProfile(windows, durationSeconds, options.aggressiveMode),
     styleProfile,
@@ -16250,13 +16323,18 @@ const buildEditPlan = async (
     durationSeconds,
     editorMode: options.editorMode
   })
+  const modePacingCaps = resolveV3PacingGovernorCaps({
+    editorMode: options.editorMode,
+    maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
+    maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds
+  })
   const pacingGoverned = applyPacingGovernor({
     segments: durationBandSegments,
     windows,
     transcriptCues,
     durationSeconds,
-    maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
-    maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds,
+    maxGapSeconds: modePacingCaps.maxGapSeconds,
+    maxTalkingHeadShotSeconds: modePacingCaps.maxTalkingHeadShotSeconds,
     clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
     enabled: longFormRuntimeTuning.isLongForm
   })
@@ -25028,9 +25106,9 @@ const processJob = async (
             : strategy === 'PACING_FIRST'
               ? (aggressionLevel === 'low' ? 'medium' : 'high')
               : aggressionLevel
-        const styleAdjustedInterruptAggression = getStyleAdjustedAggressionLevel(
-          interruptAggression,
-          editPlan?.styleProfile
+        const styleAdjustedInterruptAggression = applyEditorModeAggressionFloor(
+          getStyleAdjustedAggressionLevel(interruptAggression, editPlan?.styleProfile),
+          editorModeForRender
         )
         const styleInterruptTargetSeconds = resolveInterruptTargetSeconds({
           strategyProfile,
@@ -25085,13 +25163,18 @@ const processJob = async (
           durationSeconds,
           editorMode: editorModeForRender
         })
+        const attemptModePacingCaps = resolveV3PacingGovernorCaps({
+          editorMode: editorModeForRender,
+          maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
+          maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds
+        })
         const pacingGovernedAttempt = applyPacingGovernor({
           segments: runtimeBandAdjustedSegments,
           windows: editPlan?.engagementWindows ?? [],
           transcriptCues: processTranscriptCues,
           durationSeconds,
-          maxGapSeconds: longFormRuntimeTuning.maxGapBetweenMeaningfulMoments,
-          maxTalkingHeadShotSeconds: longFormRuntimeTuning.maxTalkingHeadShotSeconds,
+          maxGapSeconds: attemptModePacingCaps.maxGapSeconds,
+          maxTalkingHeadShotSeconds: attemptModePacingCaps.maxTalkingHeadShotSeconds,
           clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
           enabled: longFormRuntimeTuning.isLongForm
         })
