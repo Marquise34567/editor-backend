@@ -1933,6 +1933,7 @@ const LONG_FORM_MAX_REMOVAL_RATIO = 0.28
 const LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE = 0.36
 const LONG_FORM_SPEED_CAP_MIN = 1.08
 const LONG_FORM_SPEED_CAP_MAX = 1.18
+const LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS = 6 * 60
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
 const HARD_GATE_MIN_EDIT_DELTA_SHORT = 0.08
@@ -3380,11 +3381,11 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
 }
 
 const AUTO_MODE_V3_DEFAULTS = {
-  strategy: 'viral' as RetentionStrategyProfile,
-  aggression: 'high' as RetentionAggressionLevel,
-  longFormPreset: 'aggressive' as LongFormPreset,
-  longFormAggression: 88,
-  longFormClarityVsSpeed: 44,
+  strategy: 'balanced' as RetentionStrategyProfile,
+  aggression: 'medium' as RetentionAggressionLevel,
+  longFormPreset: 'balanced' as LongFormPreset,
+  longFormAggression: 42,
+  longFormClarityVsSpeed: 72,
   tangentKiller: true
 }
 
@@ -10104,15 +10105,117 @@ const pickAuditedOpeningCandidateFromPool = ({
       Number.isFinite(candidate.duration) &&
       candidate.duration >= HOOK_MIN - 0.01 &&
       candidate.start >= 0 &&
-      candidate.start <= maxStart &&
-      Boolean(candidate.auditPassed)
+      candidate.start <= maxStart
+    ))
+    .map((candidate) => {
+      const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
+      const auditScore = clamp01(Number(candidate.auditScore || 0))
+      const qualityScore = clamp01(
+        0.5 * auditScore +
+        0.18 * clamp01(Number(candidate.score || 0)) +
+        0.2 * textSignals.curiosityBlend +
+        0.12 * textSignals.specificity -
+        (textSignals.isGenericUtterance ? 0.22 : 0)
+      )
+      return {
+        candidate,
+        textSignals,
+        auditScore,
+        qualityScore
+      }
+    })
+    .sort((a, b) => (
+      Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+      b.qualityScore - a.qualityScore ||
+      b.auditScore - a.auditScore ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
+    ))
+  const strongPass = ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    !entry.textSignals.isGenericUtterance &&
+    (
+      entry.textSignals.specificity >= 0.24 ||
+      entry.textSignals.curiosityBlend >= 0.28
+    )
+  ))
+  if (strongPass) return strongPass.candidate
+  const curiosityNearPass = ranked.find((entry) => (
+    !entry.candidate.auditPassed &&
+    entry.auditScore >= 0.58 &&
+    entry.textSignals.curiosityBlend >= 0.34 &&
+    entry.textSignals.specificity >= 0.26 &&
+    !entry.textSignals.isGenericUtterance
+  ))
+  if (curiosityNearPass) {
+    return {
+      ...curiosityNearPass.candidate,
+      reason: 'Opening candidate selected from first 45s for stronger curiosity framing despite near-pass audit.'
+    } as HookCandidate
+  }
+  const nonGenericPass = ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    !entry.textSignals.isGenericUtterance
+  ))
+  return nonGenericPass?.candidate || null
+}
+
+const pickCuriosityDifferentPartCandidateFromPool = ({
+  candidates,
+  durationSeconds,
+  minStartSeconds = 24,
+  maxStartSeconds = 170
+}: {
+  candidates: HookCandidate[]
+  durationSeconds: number
+  minStartSeconds?: number
+  maxStartSeconds?: number
+}): HookCandidate | null => {
+  if (!Array.isArray(candidates) || !candidates.length) return null
+  const safeMin = Math.max(0, Number(minStartSeconds || 24))
+  const safeMax = Math.max(
+    safeMin + 0.2,
+    Math.min(Number(maxStartSeconds || 170), Math.max(0, durationSeconds - HOOK_MIN))
+  )
+  const ranked = candidates
+    .filter((candidate) => (
+      candidate &&
+      Number.isFinite(candidate.start) &&
+      Number.isFinite(candidate.duration) &&
+      candidate.start >= safeMin &&
+      candidate.start <= safeMax &&
+      candidate.duration >= HOOK_MIN - 0.01
+    ))
+    .map((candidate) => {
+      const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
+      const questionBoost = clamp01(textSignals.questionCount / 2)
+      const curiosityScore = clamp01(
+        0.34 * textSignals.curiosityBlend +
+        0.24 * textSignals.specificity +
+        0.2 * clamp01(Number(candidate.auditScore || 0)) +
+        0.1 * clamp01(Number(candidate.score || 0)) +
+        0.12 * questionBoost -
+        (textSignals.isGenericUtterance ? 0.24 : 0)
+      )
+      return {
+        candidate,
+        textSignals,
+        curiosityScore
+      }
+    })
+    .filter((entry) => (
+      !entry.textSignals.isGenericUtterance &&
+      entry.textSignals.curiosityBlend >= 0.3 &&
+      entry.textSignals.specificity >= 0.22 &&
+      clamp01(Number(entry.candidate.auditScore || 0)) >= 0.56
     ))
     .sort((a, b) => (
-      b.auditScore - a.auditScore ||
-      b.score - a.score ||
-      a.start - b.start
+      b.curiosityScore - a.curiosityScore ||
+      b.candidate.auditScore - a.candidate.auditScore ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
     ))
-  return ranked[0] || null
+  return ranked[0]?.candidate || null
 }
 
 const averageWindowMetric = (
@@ -12300,6 +12403,60 @@ const scoreHookOpenLoopSignal = (text: string) => {
   return clamp01(score - 0.42 * spoilerRisk)
 }
 
+const analyzeHookTextQualitySignals = (text: string) => {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) {
+    return {
+      wordCount: 0,
+      lexicalTokenCount: 0,
+      questionCount: 0,
+      curiosityBlend: 0,
+      specificity: 0,
+      isGenericUtterance: true
+    }
+  }
+  const words = normalized.split(/\s+/).filter(Boolean)
+  const lexicalTokens = words.filter((token) => (
+    token.length > 2 &&
+    !REDUNDANCY_STOP_WORDS.has(token)
+  ))
+  const transcriptSignals = scoreTranscriptSignals(normalized)
+  const openLoop = scoreHookOpenLoopSignal(normalized)
+  const unresolved = scoreHookEndingUnresolvedSignal(normalized)
+  const questionCount = (normalized.match(/\?/g) || []).length
+  const curiosityBlend = clamp01(0.62 * openLoop + 0.38 * unresolved)
+  const hasQuestion = questionCount > 0
+  const startsGenericBridge = /^(yeah|ok(?:ay)?|well|so|and|but)\b/.test(normalized)
+  const isGenericUtterance = (
+    words.length <= 4 &&
+    lexicalTokens.length <= 1 &&
+    !hasQuestion &&
+    transcriptSignals.keywordIntensity < 0.24 &&
+    transcriptSignals.curiosityTrigger < 0.22
+  ) || (
+    startsGenericBridge &&
+    words.length <= 6 &&
+    curiosityBlend < 0.2
+  )
+  const specificity = clamp01(
+    0.34 * clamp01(lexicalTokens.length / 6) +
+    0.2 * clamp01(words.length / 14) +
+    0.2 * transcriptSignals.keywordIntensity +
+    0.16 * curiosityBlend +
+    0.1 * (hasQuestion ? 1 : 0) -
+    0.2 * transcriptSignals.fillerDensity -
+    (isGenericUtterance ? 0.16 : 0)
+  )
+  return {
+    wordCount: words.length,
+    lexicalTokenCount: lexicalTokens.length,
+    questionCount,
+    curiosityBlend: Number(curiosityBlend.toFixed(4)),
+    specificity: Number(specificity.toFixed(4)),
+    isGenericUtterance
+  }
+}
+
 const computeHookInstantHoldScore = ({
   start,
   end,
@@ -12396,6 +12553,7 @@ const runHookAudit = ({
   const words = text ? text.split(/\s+/).filter(Boolean) : []
   const contextPenalty = evaluateHookContextDependency(start, end, transcriptCues)
   const transcriptSignals = scoreTranscriptSignals(text)
+  const textQualitySignals = analyzeHookTextQualitySignals(text)
   const curiositySignal = clamp01(
     averageWindowMetric(windows, start, end, (window) => (window.curiosityTrigger ?? 0)) * 0.55 +
     transcriptSignals.curiosityTrigger * 0.45
@@ -12415,6 +12573,14 @@ const runHookAudit = ({
     0.14 * averageWindowMetric(windows, start, end, (window) => window.visualImpact ?? 0)
   )
   const hasTranscriptSupport = words.length >= 3
+  const lowInformationTranscriptText = words.length > 0 && (
+    textQualitySignals.isGenericUtterance ||
+    (
+      textQualitySignals.wordCount <= 4 &&
+      textQualitySignals.specificity < 0.2 &&
+      textQualitySignals.curiosityBlend < 0.24
+    )
+  )
   const understandableByTranscript = words.length >= 5 && contextPenalty <= 0.34
   const understandableBySignal = nonVerbalClarity >= 0.52 && contextPenalty <= 0.55
   const understandable = hasTranscriptSupport
@@ -12442,7 +12608,7 @@ const runHookAudit = ({
     0.38 * spoilerRisk
   )
   const teaserThreshold = hasTranscriptSupport ? 0.29 : 0.24
-  const teaserPass = teaserStrength >= teaserThreshold
+  const teaserPass = teaserStrength >= teaserThreshold && !lowInformationTranscriptText
   const highIntensityTeaserBySignal = emotionalSignal >= 0.76 && curiositySignal >= 0.58
   const endingTensionPass = endingUnresolved >= (hasTranscriptSupport ? 0.24 : 0.18) || highIntensityTeaserBySignal
   const spoilerLimit = hasTranscriptSupport ? 0.52 : 0.62
@@ -12475,8 +12641,9 @@ const runHookAudit = ({
   if (!endingTensionPass) reasons.push('Ending resolves too cleanly; opener should end with stronger unresolved tension')
   if (!noOverReveal) reasons.push('Reveals too much too early; keep the opener as a curiosity teaser')
   if (contextPenalty > (hasTranscriptSupport ? 0.34 : 0.55)) reasons.push('Requires too much prior context')
+  if (lowInformationTranscriptText) reasons.push('Opener transcript is too generic; select a more specific curiosity line')
   return {
-    passed: understandable && curiosity && payoff && teaserPass && endingTensionPass && noOverReveal && auditScore >= passThreshold,
+    passed: understandable && curiosity && payoff && teaserPass && endingTensionPass && noOverReveal && !lowInformationTranscriptText && auditScore >= passThreshold,
     auditScore: Number(auditScore.toFixed(4)),
     understandable,
     curiosity,
@@ -14261,6 +14428,32 @@ const getMaximumRemovedSeconds = (
   }
   const ratio = aggressiveMode ? LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE : LONG_FORM_MAX_REMOVAL_RATIO
   return durationSeconds * ratio
+}
+
+const resolveLongFormMinimumEditedRuntimeRatio = ({
+  durationSeconds,
+  aggressiveMode,
+  contentFormat,
+  longFormAggression,
+  longFormClarityVsSpeed
+}: {
+  durationSeconds: number
+  aggressiveMode: boolean
+  contentFormat: RetentionContentFormat
+  longFormAggression?: number | null
+  longFormClarityVsSpeed?: number | null
+}) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) return 0
+  if (contentFormat === 'tiktok_short') return 0
+  const resolvedAggression = parseLongFormAggression(longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const resolvedClarity = parseLongFormClarityVsSpeed(longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  let ratio = durationSeconds >= 10 * 60 ? 0.5 : 0.48
+  if (durationSeconds >= 20 * 60) ratio -= 0.04
+  if (durationSeconds >= 35 * 60) ratio -= 0.04
+  if (aggressiveMode) ratio -= 0.03
+  ratio += clamp((resolvedClarity - 60) / 100 * 0.07, -0.03, 0.06)
+  ratio -= clamp((resolvedAggression - 60) / 100 * 0.05, -0.02, 0.04)
+  return Number(clamp(ratio, 0.42, 0.62).toFixed(4))
 }
 
 const capRemovedRangesByBudget = ({
@@ -25437,6 +25630,46 @@ const processJob = async (
           }
         }
       }
+      if (hasTranscriptSignals && hookSelectionModeForRender === 'auto') {
+        const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
+          candidates: hookCandidates,
+          durationSeconds,
+          minStartSeconds: 24,
+          maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
+        })
+        if (differentPartCandidate) {
+          const currentCandidate = resolvedHookDecision?.candidate || null
+          const currentSignals = currentCandidate
+            ? analyzeHookTextQualitySignals(String(currentCandidate.text || ''))
+            : null
+          const shouldSwapToDifferentPart = (
+            !currentCandidate ||
+            !currentCandidate.auditPassed ||
+            Boolean(currentSignals?.isGenericUtterance) ||
+            Number(currentSignals?.curiosityBlend ?? 0) < 0.3 ||
+            (
+              currentCandidate.start < 18 &&
+              getHookCandidateConfidence(currentCandidate) < 0.7
+            )
+          )
+          if (shouldSwapToDifferentPart) {
+            const differentPartThreshold = resolveHookScoreThreshold({
+              aggressionLevel,
+              hasTranscript: hasTranscriptSignals,
+              signalStrength: contentSignalStrength,
+              thresholdOffset: hookThresholdOffset
+            })
+            resolvedHookDecision = {
+              candidate: differentPartCandidate,
+              confidence: getHookCandidateConfidence(differentPartCandidate),
+              threshold: differentPartThreshold,
+              usedFallback: true,
+              reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.',
+              debug: resolvedHookDecision?.debug || null
+            }
+          }
+        }
+      }
       if (!resolvedHookDecision) {
         const fallbackThreshold = resolveHookScoreThreshold({
           aggressionLevel,
@@ -27112,6 +27345,58 @@ const processJob = async (
           optimizationNotes.push(
             `Edit impact rescue applied (${(impactBeforeRescue * 100).toFixed(1)}% -> ${(impactAfterRescue * 100).toFixed(1)}%).`
           )
+        }
+      }
+      const minEditedRuntimeRatio = resolveLongFormMinimumEditedRuntimeRatio({
+        durationSeconds,
+        aggressiveMode: Boolean(options.aggressiveMode),
+        contentFormat: selectedContentFormat,
+        longFormAggression: options.longFormAggression ?? null,
+        longFormClarityVsSpeed: options.longFormClarityVsSpeed ?? null
+      })
+      if (minEditedRuntimeRatio > 0) {
+        const currentEditedRuntimeSeconds = computeEditedRuntimeSeconds(finalSegments)
+        const minimumEditedRuntimeSeconds = durationSeconds * minEditedRuntimeRatio
+        if (currentEditedRuntimeSeconds + 0.25 < minimumEditedRuntimeSeconds) {
+          const runtimeHookCandidate = selectedHook || initialHook
+          const conservativeRuntimeBase = buildGuaranteedFallbackSegments(durationSeconds, {
+            ...options,
+            aggressiveMode: false,
+            onlyCuts: false
+          })
+          let runtimeRescueTimeline: Segment[] = conservativeRuntimeBase.map((segment) => ({ ...segment }))
+          if (runtimeHookCandidate && shouldMoveHookForRender) {
+            const hookRange: TimeRange = {
+              start: Number(runtimeHookCandidate.start || 0),
+              end: Number((Number(runtimeHookCandidate.start || 0) + Number(runtimeHookCandidate.duration || 0)).toFixed(3))
+            }
+            const hookSegment: Segment = {
+              start: Number(hookRange.start.toFixed(3)),
+              end: Number(hookRange.end.toFixed(3)),
+              speed: 1,
+              subtitleIntent: 'hook',
+              emphasize: true,
+              transitionStyle: 'smooth',
+              audioLeadInMs: 140,
+              audioTailMs: 180
+            }
+            runtimeRescueTimeline = [
+              hookSegment,
+              ...subtractRange(conservativeRuntimeBase.map((segment) => ({ ...segment })), hookRange)
+            ]
+          }
+          const runtimeRescueSegments = prepareSegmentsForRender(runtimeRescueTimeline, durationSeconds)
+          const rescuedEditedRuntimeSeconds = computeEditedRuntimeSeconds(runtimeRescueSegments)
+          if (
+            runtimeRescueSegments.length &&
+            rescuedEditedRuntimeSeconds >= minimumEditedRuntimeSeconds &&
+            rescuedEditedRuntimeSeconds > currentEditedRuntimeSeconds + 0.5
+          ) {
+            finalSegments = runtimeRescueSegments
+            optimizationNotes.push(
+              `Runtime floor rescue applied (${(currentEditedRuntimeSeconds / 60).toFixed(2)}m -> ${(rescuedEditedRuntimeSeconds / 60).toFixed(2)}m edited runtime; floor ${(minEditedRuntimeRatio * 100).toFixed(1)}%).`
+            )
+          }
         }
       }
       const resolvedHookForHardGate = selectedHook || initialHook
@@ -31952,6 +32237,35 @@ const buildEditPlanForTest = async ({
       resolvedHook = auditedOpeningFromPool
     }
   }
+  if (hasTranscriptSignals) {
+    const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
+      candidates: candidatePool,
+      durationSeconds,
+      minStartSeconds: 24,
+      maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
+    })
+    if (differentPartCandidate) {
+      const currentSignals = resolvedHook
+        ? analyzeHookTextQualitySignals(String(resolvedHook.text || ''))
+        : null
+      const shouldSwapToDifferentPart = (
+        !resolvedHook ||
+        !resolvedHook.auditPassed ||
+        Boolean(currentSignals?.isGenericUtterance) ||
+        Number(currentSignals?.curiosityBlend ?? 0) < 0.3 ||
+        (
+          resolvedHook.start < 18 &&
+          getHookCandidateConfidence(resolvedHook) < 0.7
+        )
+      )
+      if (shouldSwapToDifferentPart) {
+        resolvedHook = {
+          ...differentPartCandidate,
+          reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.'
+        } as HookCandidate
+      }
+    }
+  }
   if (!resolvedHook) {
     const fallbackThreshold = resolveHookScoreThreshold({
       aggressionLevel: normalizedAggression,
@@ -32161,6 +32475,42 @@ const buildEditPlanForTest = async ({
       ))
     ) {
       plan.hookCandidates = [plan.hook, ...plan.hookCandidates].slice(0, Math.max(8, HOOK_SELECTION_MAX_CANDIDATES))
+    }
+  }
+  const runtimeFloorRatioForTest = resolveLongFormMinimumEditedRuntimeRatio({
+    durationSeconds,
+    aggressiveMode: Boolean(options.aggressiveMode),
+    contentFormat: durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS ? 'youtube_long' : 'tiktok_short',
+    longFormAggression: options.longFormAggression ?? null,
+    longFormClarityVsSpeed: options.longFormClarityVsSpeed ?? null
+  })
+  if (runtimeFloorRatioForTest > 0 && Array.isArray(plan?.segments) && plan.segments.length) {
+    const currentEditedRuntimeSeconds = computeEditedRuntimeSeconds(plan.segments)
+    const minimumEditedRuntimeSeconds = durationSeconds * runtimeFloorRatioForTest
+    if (currentEditedRuntimeSeconds + 0.25 < minimumEditedRuntimeSeconds) {
+      const conservativeBase = buildGuaranteedFallbackSegments(durationSeconds, {
+        ...options,
+        aggressiveMode: false,
+        onlyCuts: false
+      })
+      const hookForRuntimeFloor = plan.hook || null
+      const timelineWithHook = hookForRuntimeFloor
+        ? buildTimelineWithHookAtStartForTest(conservativeBase.map((segment) => ({ ...segment })), hookForRuntimeFloor)
+        : conservativeBase.map((segment) => ({ ...segment }))
+      const rescuedSegments = prepareSegmentsForRender(timelineWithHook, durationSeconds)
+      const stabilizedRescue = stabilizeStoryPacingSegments({
+        segments: rescuedSegments,
+        windows: planWindows,
+        styleProfile: plan?.styleProfile ?? null
+      })
+      const rescuedEditedRuntimeSeconds = computeEditedRuntimeSeconds(stabilizedRescue)
+      if (
+        stabilizedRescue.length &&
+        rescuedEditedRuntimeSeconds >= minimumEditedRuntimeSeconds &&
+        rescuedEditedRuntimeSeconds > currentEditedRuntimeSeconds + 0.5
+      ) {
+        plan.segments = stabilizedRescue
+      }
     }
   }
   return plan
