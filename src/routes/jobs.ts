@@ -1934,6 +1934,7 @@ const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
 const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
 const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
 const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
+const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_balanced_defaults_2026_03_04'
 const MANDATORY_VARIANT_MIN = 3
 const MANDATORY_VARIANT_MAX = 5
 const PLAYER_TELEMETRY_MAX_EVENTS_PER_REQUEST = 240
@@ -3311,10 +3312,10 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   maxCutsRequested: null,
   editorMode: null,
   hookSelectionMode: 'auto',
-  longFormPreset: 'auto',
-  longFormAggression: 72,
-  longFormClarityVsSpeed: 46,
-  tangentKiller: true,
+  longFormPreset: 'balanced',
+  longFormAggression: 45,
+  longFormClarityVsSpeed: 82,
+  tangentKiller: false,
   coldStartAutopilot: false,
   continuityFirstMode: false,
   exploreX3Mode: false,
@@ -13881,7 +13882,11 @@ const buildRetentionMetadataSummary = ({
   strategyProfile,
   autoDetectProfile,
   outcomeMenuProfile,
-  outcomeMenuApply
+  outcomeMenuApply,
+  longFormPreset,
+  longFormAggression,
+  longFormClarityVsSpeed,
+  tangentKiller
 }: {
   durationSeconds: number
   segments: Segment[]
@@ -13914,6 +13919,10 @@ const buildRetentionMetadataSummary = ({
   autoDetectProfile?: VideoAutoDetectProfile | null
   outcomeMenuProfile?: OutcomeMenuProfile | null
   outcomeMenuApply?: OutcomeMenuApplyResult | null
+  longFormPreset?: LongFormPreset | null
+  longFormAggression?: number | null
+  longFormClarityVsSpeed?: number | null
+  tangentKiller?: boolean | null
 }) => {
   const segmentStats = buildSegmentStatsSummary(segments)
   const resolvedBoundaryPathologySummary = boundaryPathologySummary || summarizeBoundaryPathology({
@@ -13934,6 +13943,20 @@ const buildRetentionMetadataSummary = ({
     : 0
   const resolvedArchetypeBlend = styleArchetypeBlend || behaviorStyleProfile?.archetypeBlend || null
   const autoEscalationCount = Array.isArray(autoEscalationEvents) ? autoEscalationEvents.length : 0
+  const resolvedLongFormPreset = parseLongFormPreset(longFormPreset ?? DEFAULT_EDIT_OPTIONS.longFormPreset)
+  const resolvedLongFormAggression =
+    parseLongFormAggression(longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
+  const resolvedLongFormClarityVsSpeed =
+    parseLongFormClarityVsSpeed(longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+  const resolvedTangentKiller =
+    typeof tangentKiller === 'boolean' ? tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
+  const longFormDataMode =
+    resolvedLongFormPreset === 'balanced' &&
+    resolvedLongFormAggression === 45 &&
+    resolvedLongFormClarityVsSpeed === 82 &&
+    resolvedTangentKiller === false
+      ? LONG_FORM_DEFAULT_DATA_MODE
+      : 'custom'
   const improvements: string[] = []
   if (styleProfile?.style) {
     improvements.push(
@@ -14130,6 +14153,13 @@ const buildRetentionMetadataSummary = ({
       patternInterruptCount: Number(patternInterruptCount ?? 0),
       patternInterruptDensity: Number((patternInterruptDensity ?? 0).toFixed(4)),
       cutQualityScore: Number(clamp01(Number(cutQualityScore ?? 0)).toFixed(4)),
+      longFormDataMode,
+      longFormTuning: {
+        preset: resolvedLongFormPreset,
+        aggression: resolvedLongFormAggression,
+        clarityVsSpeed: resolvedLongFormClarityVsSpeed,
+        tangentKiller: resolvedTangentKiller
+      },
       boundaryPathologySummary: resolvedBoundaryPathologySummary,
       styleTimelineFeatures: styleFeatureSnapshot ?? null,
       whyKeepWatching: Array.isArray(judge?.why_keep_watching) ? judge!.why_keep_watching.slice(0, 3) : [],
@@ -23184,7 +23214,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       contentFormat: analyzeContentFormat,
       targetPlatform: resolvedTargetPlatform,
       strategyProfile,
-      autoDetectProfile: analyzeAutoDetectProfile
+      autoDetectProfile: analyzeAutoDetectProfile,
+      longFormPreset: options.longFormPreset,
+      longFormAggression: options.longFormAggression,
+      longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+      tangentKiller: options.tangentKiller
     })
     const analyzePreScan = buildLongFormPreScanSummary({
       durationSeconds: duration,
@@ -26896,7 +26930,11 @@ const processJob = async (
       strategyProfile,
       autoDetectProfile: processAutoDetectProfile,
       outcomeMenuProfile,
-      outcomeMenuApply
+      outcomeMenuApply,
+      longFormPreset: options.longFormPreset,
+      longFormAggression: options.longFormAggression,
+      longFormClarityVsSpeed: options.longFormClarityVsSpeed,
+      tangentKiller: options.tangentKiller
     })
     const processPreScan = buildLongFormPreScanSummary({
       durationSeconds,
