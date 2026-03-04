@@ -1934,7 +1934,7 @@ const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
 const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
 const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
 const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
-const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_balanced_defaults_2026_03_04'
+const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_aggressive_defaults_2026_03_04'
 const MANDATORY_VARIANT_MIN = 3
 const MANDATORY_VARIANT_MAX = 5
 const PLAYER_TELEMETRY_MAX_EVENTS_PER_REQUEST = 240
@@ -3312,10 +3312,10 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   maxCutsRequested: null,
   editorMode: null,
   hookSelectionMode: 'auto',
-  longFormPreset: 'balanced',
-  longFormAggression: 45,
-  longFormClarityVsSpeed: 82,
-  tangentKiller: false,
+  longFormPreset: 'aggressive',
+  longFormAggression: 72,
+  longFormClarityVsSpeed: 52,
+  tangentKiller: true,
   coldStartAutopilot: false,
   continuityFirstMode: false,
   exploreX3Mode: false,
@@ -13951,10 +13951,10 @@ const buildRetentionMetadataSummary = ({
   const resolvedTangentKiller =
     typeof tangentKiller === 'boolean' ? tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
   const longFormDataMode =
-    resolvedLongFormPreset === 'balanced' &&
-    resolvedLongFormAggression === 45 &&
-    resolvedLongFormClarityVsSpeed === 82 &&
-    resolvedTangentKiller === false
+    resolvedLongFormPreset === 'aggressive' &&
+    resolvedLongFormAggression === 72 &&
+    resolvedLongFormClarityVsSpeed === 52 &&
+    resolvedTangentKiller === true
       ? LONG_FORM_DEFAULT_DATA_MODE
       : 'custom'
   const improvements: string[] = []

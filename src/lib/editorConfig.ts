@@ -26,7 +26,7 @@ const parseBooleanEnv = (name: string, fallback: boolean) => {
 const hookMin = parseNumberEnv('EDITOR_HOOK_MIN', 5, { min: 3.5, max: 10 })
 const hookMax = Math.max(hookMin + 0.2, parseNumberEnv('EDITOR_HOOK_MAX', 8, { min: 4, max: 11 }))
 const cutMin = parseNumberEnv('EDITOR_CUT_MIN', 5, { min: 2.5, max: 10 })
-const cutMax = Math.max(cutMin + 0.2, parseNumberEnv('EDITOR_CUT_MAX', 8, { min: 3.5, max: 12 }))
+const cutMax = Math.max(cutMin + 0.2, parseNumberEnv('EDITOR_CUT_MAX', 10, { min: 3.5, max: 12 }))
 
 export const EDITOR_ENGINE_VERSION = String(process.env.EDITOR_ENGINE_VERSION || '2026.02.25').trim()
 export const EDITOR_CONFIG_VERSION = String(process.env.EDITOR_CONFIG_VERSION || 'retention-v3').trim()
