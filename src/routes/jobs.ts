@@ -1652,8 +1652,8 @@ const HOOK_MAX = EDITOR_RETENTION_CONFIG.hookMax
 const AUTO_HOOK_DURATION_MIN_SECONDS = 5
 const AUTO_HOOK_DURATION_MAX_SECONDS = 8
 const HOOK_OPENER_FIRST_SECONDS = 3
-const HOOK_STANDARD_INSTANT_HOLD_MIN = 0.58
-const HOOK_STANDARD_TEASER_TENSION_MIN = 0.48
+const HOOK_STANDARD_INSTANT_HOLD_MIN = 0.56
+const HOOK_STANDARD_TEASER_TENSION_MIN = 0.44
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -2579,10 +2579,8 @@ const resolveHookCandidateTarget = (durationSeconds: number) => {
   return 20
 }
 const resolveLongFormMinHookSourceStart = (durationSeconds: number) => {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 6
-  // Keep long-form hook sourcing early enough to preserve context while still
-  // avoiding dead-air intros.
-  return Number(clamp(durationSeconds * 0.03, 6, 12).toFixed(3))
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 8
+  return Number(clamp(durationSeconds * 0.08, 8, 24).toFixed(3))
 }
 const resolveClipCandidateTarget = ({
   durationSeconds,
@@ -2727,9 +2725,9 @@ const resolveInterruptIntervalRange = ({
     maxSec = 4.2
   }
   if (!editorMode || editorMode === 'auto') {
-    minSec = Math.max(2, minSec - 0.52)
-    maxSec = Math.max(minSec + 0.2, maxSec - 0.82)
-  } else if (editorMode === 'education' || editorMode === 'podcast') {
+    minSec = Math.max(2, minSec - 0.22)
+    maxSec = Math.max(minSec + 0.2, maxSec - 0.34)
+  } else if (editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary') {
     minSec = Math.max(2, minSec - 0.14)
     maxSec = Math.max(minSec + 0.2, maxSec - 0.28)
   } else {
@@ -2770,15 +2768,15 @@ const resolveV3PacingGovernorCaps = ({
   maxGapSeconds: number
   maxTalkingHeadShotSeconds: number
 }) => {
-  const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast'
+  const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary'
   const autoMode = !editorMode || editorMode === 'auto'
   const tightenedGap = clamp(
-    maxGapSeconds - (contextHeavyMode ? 0.22 : autoMode ? 0.68 : 0.48),
+    maxGapSeconds - (contextHeavyMode ? 0.22 : autoMode ? 0.36 : 0.48),
     1.9,
     5
   )
   const tightenedTalkingHead = clamp(
-    maxTalkingHeadShotSeconds - (contextHeavyMode ? 0.18 : autoMode ? 0.84 : 0.58),
+    maxTalkingHeadShotSeconds - (contextHeavyMode ? 0.18 : autoMode ? 0.42 : 0.58),
     2.2,
     6
   )
@@ -9890,7 +9888,10 @@ const selectRenderableHookCandidate = ({
     entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
     entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN
   ))
-  const strict = strictWithInstantHold
+  const strict = strictWithInstantHold || ranked.find((entry) => (
+    entry.candidate.auditPassed &&
+    entry.confidence >= threshold
+  ))
   if (strict) {
     const debug = buildHookSelectionDebugPayload({
       ranked,
@@ -12584,13 +12585,6 @@ type EditorModeCutProfile = {
   compressionBoost: number
 }
 
-const AUTO_V3_CUT_PROFILE: EditorModeCutProfile = {
-  // Auto mode should stay closest to legacy v3 binge cadence.
-  candidateThresholdDelta: -0.11,
-  hardCutThresholdDelta: -0.08,
-  compressionBoost: 1.24
-}
-
 const NON_AUTO_BASE_CUT_PROFILE: EditorModeCutProfile = {
   // Legacy v3 baseline cadence applied across all modes.
   candidateThresholdDelta: -0.07,
@@ -12614,7 +12608,6 @@ const EDITOR_MODE_CUT_PROFILES: Partial<Record<EditorModeSelection, EditorModeCu
 const resolveEditorModeCutProfile = (
   editorMode?: EditorModeSelection | null
 ): EditorModeCutProfile => {
-  if (!editorMode || editorMode === 'auto') return AUTO_V3_CUT_PROFILE
   const modeProfile = editorMode ? (EDITOR_MODE_CUT_PROFILES[editorMode] || null) : null
   if (!modeProfile) return NON_AUTO_BASE_CUT_PROFILE
   return {
@@ -15140,7 +15133,7 @@ const evaluateHardQualityBar = ({
   beatAnchors: number[]
 }): HardQualityGateAudit => {
   const isLongForm = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS && contentFormat !== 'tiktok_short'
-  const minHookSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
+  const minHookSourceStart = Number(Math.max(8, durationSeconds * 0.08).toFixed(3))
   const hookTimingScore = isLongForm
     ? clamp01(hookSourceStart / Math.max(0.1, minHookSourceStart))
     : 1
@@ -16360,15 +16353,7 @@ const buildEditPlan = async (
     clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
     enabled: longFormRuntimeTuning.isLongForm
   })
-  const earlyCadenceApplied = enforceEarlyCadenceFloor({
-    segments: pacingGoverned.segments,
-    durationSeconds,
-    hookRange,
-    enabled: longFormRuntimeTuning.isLongForm && (!options.editorMode || options.editorMode === 'auto'),
-    windowSeconds: 34,
-    targetRuntimeSeconds: 2.55
-  })
-  let finalTimelineSegments = earlyCadenceApplied.segments.map((segment) => ({ ...segment }))
+  let finalTimelineSegments = pacingGoverned.segments.map((segment) => ({ ...segment }))
   let plannerSummary: EditPlan['planner'] | undefined
   try {
     const videoProbe = probeVideoStream(filePath)
@@ -17120,92 +17105,6 @@ const applyPacingGovernor = ({
   return {
     segments: governed.filter((segment) => segment.end - segment.start > 0.12),
     adjustments
-  }
-}
-
-const enforceEarlyCadenceFloor = ({
-  segments,
-  durationSeconds,
-  hookRange,
-  enabled,
-  windowSeconds = 34,
-  targetRuntimeSeconds = 2.6
-}: {
-  segments: Segment[]
-  durationSeconds: number
-  hookRange: TimeRange | null
-  enabled: boolean
-  windowSeconds?: number
-  targetRuntimeSeconds?: number
-}) => {
-  if (!enabled || !Array.isArray(segments) || segments.length < 2 || durationSeconds <= 0) {
-    return { segments: segments.map((segment) => ({ ...segment })), applied: 0 }
-  }
-  const safeWindow = clamp(Number(windowSeconds || 34), 12, 60)
-  const safeTarget = clamp(Number(targetRuntimeSeconds || 2.6), 2.1, 4.2)
-  const earlyCutoff = Math.min(durationSeconds, safeWindow)
-  const protectedHookRange = hookRange
-    ? {
-        start: Number(Math.max(0, hookRange.start - 0.08).toFixed(3)),
-        end: Number(Math.min(durationSeconds, hookRange.end + 0.45).toFixed(3))
-      }
-    : null
-  const out: Segment[] = []
-  let applied = 0
-  const sorted = segments
-    .map((segment) => ({ ...segment }))
-    .sort((left, right) => left.start - right.start || left.end - right.end)
-  for (const segment of sorted) {
-    const span = Math.max(0, segment.end - segment.start)
-    if (span <= 0.2) continue
-    const speed = segment.speed && segment.speed > 0 ? segment.speed : 1
-    const runtime = span / speed
-    const inEarlyWindow = segment.start < earlyCutoff
-    const intersectsHook = Boolean(
-      protectedHookRange &&
-      overlapsRange(
-        { start: segment.start, end: segment.end },
-        protectedHookRange
-      )
-    )
-    if (
-      inEarlyWindow &&
-      !intersectsHook &&
-      runtime > safeTarget * 1.32 &&
-      span >= 0.68
-    ) {
-      const desiredPieces = clamp(Math.ceil(runtime / safeTarget), 2, 4)
-      const pieceSpan = span / desiredPieces
-      for (let index = 0; index < desiredPieces; index += 1) {
-        const start = Number((segment.start + pieceSpan * index).toFixed(3))
-        const end = Number(
-          (index === desiredPieces - 1 ? segment.end : segment.start + pieceSpan * (index + 1)).toFixed(3)
-        )
-        if (end - start < 0.2) continue
-        out.push({
-          ...segment,
-          start,
-          end,
-          emphasize: segment.emphasize || index > 0
-        })
-      }
-      applied += desiredPieces - 1
-    } else {
-      out.push(segment)
-    }
-  }
-  const normalized: Segment[] = []
-  for (const segment of out) {
-    const prev = normalized[normalized.length - 1]
-    let start = segment.start
-    const end = segment.end
-    if (prev && start < prev.end - 0.02) start = Number(prev.end.toFixed(3))
-    if (end - start <= 0.16) continue
-    normalized.push({ ...segment, start: Number(start.toFixed(3)), end: Number(end.toFixed(3)) })
-  }
-  return {
-    segments: normalized.length ? normalized : segments.map((segment) => ({ ...segment })),
-    applied
   }
 }
 
@@ -25292,16 +25191,8 @@ const processJob = async (
           clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
           enabled: longFormRuntimeTuning.isLongForm
         })
-        const earlyCadenceAttempt = enforceEarlyCadenceFloor({
-          segments: pacingGovernedAttempt.segments,
-          durationSeconds,
-          hookRange,
-          enabled: longFormRuntimeTuning.isLongForm && (!editorModeForRender || editorModeForRender === 'auto'),
-          windowSeconds: 34,
-          targetRuntimeSeconds: 2.55
-        })
         const microRehookResult = applyLongFormMicroRehooks({
-          segments: earlyCadenceAttempt.segments,
+          segments: pacingGovernedAttempt.segments,
           anchors: microRehookAnchorsForAnalysis,
           durationSeconds
         })
@@ -26231,7 +26122,7 @@ const processJob = async (
         const isLongFormRecovery = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS && selectedContentFormat !== 'tiktok_short'
 
         if (failedKeys.has('hook_source_timing') && isLongFormRecovery) {
-          const minHookSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
+          const minHookSourceStart = Number(Math.max(8, durationSeconds * 0.08).toFixed(3))
           const candidatePool = [
             ...hookVariantsForAnalysis,
             recoveredHook
