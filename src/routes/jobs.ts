@@ -17088,23 +17088,33 @@ const applyPacingGovernor = ({
       ))
       .map((cue) => Number(cue.start.toFixed(3)))
       .sort((a, b) => a - b)
-    const desiredPieces = Math.max(2, Math.ceil(runtime / maxSpan))
+    const boostedLowValueSplit = splitTemplate.emphasize === true && effectiveSpeed > baseSpeed + 0.01
+    const relaxedSpan = boostedLowValueSplit
+      ? maxSpan * (durationSeconds < 120 ? 1.55 : 1.35)
+      : maxSpan
+    let desiredPieces = Math.max(2, Math.ceil(runtime / relaxedSpan))
+    if (boostedLowValueSplit) {
+      const pieceCap = durationSeconds < 120 ? 2 : 3
+      desiredPieces = Math.min(desiredPieces, pieceCap)
+    }
     const forcedSpacing = spanSeconds / desiredPieces
+    const minPieceSeconds = durationSeconds < 120 ? 0.55 : 0.42
+    const dedupeGap = Math.max(0.22, minPieceSeconds * 0.78)
     const splitPoints: number[] = []
     for (let idx = 1; idx < desiredPieces; idx += 1) {
       const target = segment.start + forcedSpacing * idx
       const nearest = meaningfulBoundaries
-        .filter((point) => point > segment.start + 0.16 && point < segment.end - 0.16)
+        .filter((point) => point > segment.start + minPieceSeconds && point < segment.end - minPieceSeconds)
         .sort((a, b) => Math.abs(a - target) - Math.abs(b - target))[0]
-      const chosen = Number(clamp(nearest ?? target, segment.start + 0.16, segment.end - 0.16).toFixed(3))
-      if (splitPoints.some((point) => Math.abs(point - chosen) < 0.14)) continue
+      const chosen = Number(clamp(nearest ?? target, segment.start + minPieceSeconds, segment.end - minPieceSeconds).toFixed(3))
+      if (splitPoints.some((point) => Math.abs(point - chosen) < dedupeGap)) continue
       splitPoints.push(chosen)
     }
     const boundaries = [segment.start, ...splitPoints.sort((a, b) => a - b), segment.end]
     for (let idx = 0; idx < boundaries.length - 1; idx += 1) {
       const start = Number(boundaries[idx].toFixed(3))
       const end = Number(boundaries[idx + 1].toFixed(3))
-      if (end - start < 0.14) continue
+      if (end - start < minPieceSeconds) continue
       governed.push({
         ...splitTemplate,
         start,
