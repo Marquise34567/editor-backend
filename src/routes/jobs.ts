@@ -17044,7 +17044,10 @@ const applyPacingGovernor = ({
   const governed: Segment[] = []
   for (const segment of segments) {
     const baseSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
-    const runtime = Math.max(0.001, (segment.end - segment.start) / baseSpeed)
+    const spanSeconds = Math.max(0.001, segment.end - segment.start)
+    let splitTemplate: Segment = { ...segment }
+    let effectiveSpeed = baseSpeed
+    let runtime = Math.max(0.001, spanSeconds / effectiveSpeed)
     if (runtime <= maxSpan + 0.04) {
       governed.push({ ...segment })
       continue
@@ -17061,11 +17064,20 @@ const applyPacingGovernor = ({
       )
     ) > 0.58
     if (lowValue && baseSpeed < maxSpeedCap) {
-      const neededSpeed = (segment.end - segment.start) / maxSpan
+      const neededSpeed = spanSeconds / maxSpan
       const boosted = clamp(Math.max(baseSpeed, neededSpeed), 1, maxSpeedCap)
-      governed.push({ ...segment, speed: Number(boosted.toFixed(3)), emphasize: true })
-      adjustments += 1
-      continue
+      effectiveSpeed = Number(boosted.toFixed(3))
+      splitTemplate = {
+        ...segment,
+        speed: effectiveSpeed,
+        emphasize: true
+      }
+      runtime = Math.max(0.001, spanSeconds / effectiveSpeed)
+      if (runtime <= maxSpan + 0.04) {
+        governed.push({ ...splitTemplate })
+        adjustments += 1
+        continue
+      }
     }
     const meaningfulBoundaries = transcriptCues
       .filter((cue) => cue.start > segment.start + 0.2 && cue.end < segment.end - 0.2)
@@ -17077,7 +17089,7 @@ const applyPacingGovernor = ({
       .map((cue) => Number(cue.start.toFixed(3)))
       .sort((a, b) => a - b)
     const desiredPieces = Math.max(2, Math.ceil(runtime / maxSpan))
-    const forcedSpacing = (segment.end - segment.start) / desiredPieces
+    const forcedSpacing = spanSeconds / desiredPieces
     const splitPoints: number[] = []
     for (let idx = 1; idx < desiredPieces; idx += 1) {
       const target = segment.start + forcedSpacing * idx
@@ -17094,10 +17106,10 @@ const applyPacingGovernor = ({
       const end = Number(boundaries[idx + 1].toFixed(3))
       if (end - start < 0.14) continue
       governed.push({
-        ...segment,
+        ...splitTemplate,
         start,
         end,
-        emphasize: segment.emphasize || idx > 0
+        emphasize: splitTemplate.emphasize || idx > 0
       })
     }
     adjustments += 1
