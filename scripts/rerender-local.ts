@@ -1,4 +1,5 @@
 import fs from 'fs'
+import os from 'os'
 import path from 'path'
 import { spawnSync } from 'child_process'
 import { __retentionTestUtils } from '../src/routes/jobs'
@@ -8,6 +9,15 @@ const ffprobeBin = process.env.FFPROBE_PATH || 'ffprobe'
 const AUTO_HOOK_MIN_SECONDS = 5
 const AUTO_HOOK_MAX_SECONDS = 8
 const AUTO_HOOK_LOCK_SECONDS = 8
+const LOCAL_RERENDER_DEFAULTS = {
+  aggressionLevel: 'medium',
+  strategyProfile: 'balanced',
+  longFormPreset: 'balanced',
+  longFormAggression: 42,
+  longFormClarityVsSpeed: 72,
+  maxCuts: 22,
+  autoTranscribe: true
+} as const
 
 const clamp = (value: number, min: number, max: number) => {
   if (!Number.isFinite(value)) return min
@@ -60,7 +70,8 @@ const parseCli = (): CliOptions => {
   if (!positionals[0]) {
     throw new Error(
       'usage: ts-node scripts/rerender-local.ts "<input.mp4>" "<output.mp4>" ' +
-      '[--aggression medium] [--strategy balanced] [--longFormAggression 72] [--longFormClarity 52] ' +
+      '[--aggression medium] [--strategy balanced] [--longFormPreset balanced] ' +
+      '[--longFormAggression 42] [--longFormClarity 72] [--maxCuts 22] ' +
       '[--transcribe true] [--transcriptSrt "<captions.srt>"]'
     )
   }
@@ -69,18 +80,22 @@ const parseCli = (): CliOptions => {
   const longFormAggression = Number(options.longFormAggression ?? options.longformAggression ?? '')
   const longFormClarityVsSpeed = Number(options.longFormClarity ?? options.longformClarity ?? '')
   const maxCuts = Number(options.maxCuts ?? options.maxcuts ?? '')
-  const autoTranscribe = parseBooleanOption(options.transcribe, true)
+  const autoTranscribe = parseBooleanOption(options.transcribe, LOCAL_RERENDER_DEFAULTS.autoTranscribe)
   const transcriptSrtPathRaw = String(options.transcriptSrt ?? options.transcript_srt ?? '').trim()
   return {
     input,
     output,
-    aggressionLevel: options.aggression,
-    strategyProfile: options.strategy,
+    aggressionLevel: options.aggression || LOCAL_RERENDER_DEFAULTS.aggressionLevel,
+    strategyProfile: options.strategy || LOCAL_RERENDER_DEFAULTS.strategyProfile,
     editorMode: options.editorMode,
-    longFormPreset: options.longFormPreset,
-    longFormAggression: Number.isFinite(longFormAggression) ? longFormAggression : undefined,
-    longFormClarityVsSpeed: Number.isFinite(longFormClarityVsSpeed) ? longFormClarityVsSpeed : undefined,
-    maxCuts: Number.isFinite(maxCuts) ? maxCuts : undefined,
+    longFormPreset: options.longFormPreset || LOCAL_RERENDER_DEFAULTS.longFormPreset,
+    longFormAggression: Number.isFinite(longFormAggression)
+      ? longFormAggression
+      : LOCAL_RERENDER_DEFAULTS.longFormAggression,
+    longFormClarityVsSpeed: Number.isFinite(longFormClarityVsSpeed)
+      ? longFormClarityVsSpeed
+      : LOCAL_RERENDER_DEFAULTS.longFormClarityVsSpeed,
+    maxCuts: Number.isFinite(maxCuts) ? maxCuts : LOCAL_RERENDER_DEFAULTS.maxCuts,
     autoTranscribe,
     transcriptSrtPath: transcriptSrtPathRaw ? path.resolve(transcriptSrtPathRaw) : undefined
   }
@@ -205,6 +220,45 @@ const capNarrativeSegmentCount = (
   return out
 }
 
+const capSegmentsToMaxCuts = (
+  segments: Array<{ start: number; end: number; speed: number }>,
+  maxCuts: number | undefined
+) => {
+  if (!Array.isArray(segments) || !segments.length) return [] as Array<{ start: number; end: number; speed: number }>
+  const parsedMaxCuts = Number(maxCuts)
+  if (!Number.isFinite(parsedMaxCuts) || parsedMaxCuts < 1) return segments
+  const maxSegments = Math.max(2, Math.round(parsedMaxCuts) + 1)
+  if (segments.length <= maxSegments) return segments
+  const out = segments
+    .map((segment) => ({ ...segment }))
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  while (out.length > maxSegments) {
+    let bestIndex = -1
+    let bestCost = Number.POSITIVE_INFINITY
+    for (let index = 0; index < out.length - 1; index += 1) {
+      const left = out[index]
+      const right = out[index + 1]
+      const gap = Math.max(0, right.start - left.end)
+      const mergedDuration = Math.max(0.1, right.end - left.start)
+      const speedDelta = Math.abs((left.speed || 1) - (right.speed || 1))
+      const cost = gap * 1.2 + speedDelta * 0.6 + mergedDuration * 0.05
+      if (cost < bestCost) {
+        bestCost = cost
+        bestIndex = index
+      }
+    }
+    if (bestIndex < 0) break
+    const left = out[bestIndex]
+    const right = out[bestIndex + 1]
+    out.splice(bestIndex, 2, {
+      start: Number(left.start.toFixed(3)),
+      end: Number(Math.max(left.end, right.end).toFixed(3)),
+      speed: Number(clamp(((left.speed || 1) + (right.speed || 1)) / 2, 1, 1.2).toFixed(3))
+    })
+  }
+  return out
+}
+
 const main = async () => {
   const cli = parseCli()
   if (!fs.existsSync(cli.input)) throw new Error(`input_missing:${cli.input}`)
@@ -278,12 +332,13 @@ const main = async () => {
     sourceDuration,
     String(plan?.styleProfile?.style || '')
   )
+  const densityCappedSegments = capSegmentsToMaxCuts(cappedSegments, cli.maxCuts)
 
-  if (!cappedSegments.length) throw new Error('plan_has_no_segments')
+  if (!densityCappedSegments.length) throw new Error('plan_has_no_segments')
 
   const filterParts: string[] = []
-  for (let idx = 0; idx < cappedSegments.length; idx += 1) {
-    const segment = cappedSegments[idx]
+  for (let idx = 0; idx < densityCappedSegments.length; idx += 1) {
+    const segment = densityCappedSegments[idx]
     const start = segment.start.toFixed(3)
     const end = segment.end.toFixed(3)
     const speed = Number(segment.speed || 1)
@@ -314,31 +369,43 @@ const main = async () => {
     filterParts.push(`[0:a]${audioFilters.join(',')}[a${idx}]`)
   }
 
-  const concatInputs = cappedSegments
+  const concatInputs = densityCappedSegments
     .map((_, idx) => `[v${idx}][a${idx}]`)
     .join('')
-  filterParts.push(`${concatInputs}concat=n=${cappedSegments.length}:v=1:a=1[outv][outa]`)
+  filterParts.push(`${concatInputs}concat=n=${densityCappedSegments.length}:v=1:a=1[outv][outa]`)
   const filterComplex = filterParts.join(';')
-
-  run(ffmpegBin, [
-    '-y',
-    '-hide_banner',
-    '-loglevel', 'error',
-    '-i', cli.input,
-    '-filter_complex', filterComplex,
-    '-map', '[outv]',
-    '-map', '[outa]',
-    '-movflags', '+faststart',
-    '-c:v', 'libx264',
-    '-preset', 'superfast',
-    '-crf', '22',
-    '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac',
-    '-b:a', '192k',
-    '-ar', '48000',
-    '-ac', '2',
-    cli.output
-  ])
+  const filterScriptPath = path.join(
+    os.tmpdir(),
+    `rerender-local-filter-${Date.now()}-${Math.random().toString(36).slice(2, 9)}.txt`
+  )
+  fs.writeFileSync(filterScriptPath, filterComplex, 'utf8')
+  try {
+    run(ffmpegBin, [
+      '-y',
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-i', cli.input,
+      '-filter_complex_script', filterScriptPath,
+      '-map', '[outv]',
+      '-map', '[outa]',
+      '-movflags', '+faststart',
+      '-c:v', 'libx264',
+      '-preset', 'superfast',
+      '-crf', '22',
+      '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac',
+      '-b:a', '192k',
+      '-ar', '48000',
+      '-ac', '2',
+      cli.output
+    ])
+  } finally {
+    try {
+      fs.unlinkSync(filterScriptPath)
+    } catch {
+      // ignore
+    }
+  }
 
   const outputDuration = probeDurationSeconds(cli.output)
   const outputPlanPath = `${cli.output}.plan.json`
@@ -348,7 +415,7 @@ const main = async () => {
     output: cli.output,
     sourceDurationSeconds: Number(sourceDuration.toFixed(3)),
     outputDurationSeconds: Number(outputDuration.toFixed(3)),
-    segmentCount: cappedSegments.length,
+    segmentCount: densityCappedSegments.length,
     hook: plan?.hook || null,
     transcriptSignals: plan?.transcriptSignals || null,
     buildOptions: {
@@ -368,7 +435,7 @@ const main = async () => {
   console.log(`OUTPUT: ${cli.output}`)
   console.log(`SOURCE_SECONDS: ${sourceDuration.toFixed(3)}`)
   console.log(`OUTPUT_SECONDS: ${outputDuration.toFixed(3)}`)
-  console.log(`SEGMENTS: ${cappedSegments.length}`)
+  console.log(`SEGMENTS: ${densityCappedSegments.length}`)
   console.log(`TRANSCRIPT_CUES: ${Number(plan?.transcriptSignals?.cueCount || 0)}`)
   console.log(`HOOK: ${JSON.stringify(plan?.hook || null)}`)
   console.log(`PLAN_JSON: ${outputPlanPath}`)

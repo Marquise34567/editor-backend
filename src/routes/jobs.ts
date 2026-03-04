@@ -1934,6 +1934,9 @@ const LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE = 0.36
 const LONG_FORM_SPEED_CAP_MIN = 1.08
 const LONG_FORM_SPEED_CAP_MAX = 1.18
 const LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS = 6 * 60
+const isVerticalRuntimeShortForm = (renderMode: RenderMode, runtimeSeconds: number) => (
+  renderMode === 'vertical' && Math.max(0, Number(runtimeSeconds || 0)) < LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS
+)
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
 const HARD_GATE_MIN_EDIT_DELTA_SHORT = 0.08
@@ -9973,8 +9976,29 @@ const selectRenderableHookCandidate = ({
   const passesNonVerbalSafety = (entry: HookSelectionRankedEntry) => {
     const hasHookText = String(entry.candidate.text || '').trim().length > 0
     if (hasTranscript || hasHookText) return true
+    const lowSignalNoTranscript = signalStrength < 0.48
+    const relaxedNonVerbalAuditFloor = clamp(
+      Math.max(HOOK_NON_VERBAL_MIN_AUDIT_SCORE - 0.1, relaxedTranscriptAuditFloor - 0.04),
+      0.36,
+      HOOK_NON_VERBAL_MIN_AUDIT_SCORE
+    )
+    const relaxedNonVerbalSelectionFloor = clamp(
+      HOOK_NON_VERBAL_MIN_SELECTION_SCORE - 0.1 - (signalStrength < 0.42 ? 0.04 : 0),
+      0.42,
+      HOOK_NON_VERBAL_MIN_SELECTION_SCORE
+    )
+    if (!entry.candidate.auditPassed) {
+      if (!lowSignalNoTranscript) return false
+      return (
+        entry.confidence >= Math.max(HOOK_NON_VERBAL_MIN_CONFIDENCE - 0.1, relaxedThreshold - 0.05) &&
+        entry.candidate.auditScore >= relaxedNonVerbalAuditFloor &&
+        entry.selectionScore >= relaxedNonVerbalSelectionFloor &&
+        entry.instantHold >= relaxedInstantHoldFloor &&
+        entry.teaserTension >= relaxedTeaserFloor &&
+        entry.curiosityPressure >= relaxedCuriosityFloor
+      )
+    }
     return (
-      entry.candidate.auditPassed &&
       entry.confidence >= HOOK_NON_VERBAL_MIN_CONFIDENCE &&
       entry.candidate.auditScore >= HOOK_NON_VERBAL_MIN_AUDIT_SCORE &&
       entry.selectionScore >= HOOK_NON_VERBAL_MIN_SELECTION_SCORE &&
@@ -14444,16 +14468,21 @@ const resolveLongFormMinimumEditedRuntimeRatio = ({
   longFormClarityVsSpeed?: number | null
 }) => {
   if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) return 0
-  if (contentFormat === 'tiktok_short') return 0
+  const shortFormTarget = contentFormat === 'tiktok_short'
+  const longRuntime = durationSeconds >= 10 * 60
   const resolvedAggression = parseLongFormAggression(longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   const resolvedClarity = parseLongFormClarityVsSpeed(longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   let ratio = durationSeconds >= 10 * 60 ? 0.5 : 0.48
   if (durationSeconds >= 20 * 60) ratio -= 0.04
   if (durationSeconds >= 35 * 60) ratio -= 0.04
   if (aggressiveMode) ratio -= 0.03
+  if (shortFormTarget && !longRuntime) ratio -= 0.03
   ratio += clamp((resolvedClarity - 60) / 100 * 0.07, -0.03, 0.06)
   ratio -= clamp((resolvedAggression - 60) / 100 * 0.05, -0.02, 0.04)
-  return Number(clamp(ratio, 0.42, 0.62).toFixed(4))
+  const minFloor = shortFormTarget
+    ? (longRuntime ? 0.5 : 0.4)
+    : 0.42
+  return Number(clamp(ratio, minFloor, 0.62).toFixed(4))
 }
 
 const capRemovedRangesByBudget = ({
@@ -17799,7 +17828,7 @@ const enforceLongFormComprehensionFloor = ({
   renderMode: RenderMode
   contentFormat: RetentionContentFormat
 }) => {
-  if (renderMode === 'vertical') return segments
+  if (isVerticalRuntimeShortForm(renderMode, durationSeconds)) return segments
   if (contentFormat === 'tiktok_short') return segments
   if (durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return segments
   const contextStart = Number(clamp(hookRange.end, 0, Math.max(0, durationSeconds - 0.8)).toFixed(3))
@@ -22413,7 +22442,7 @@ const resolveRuntimeRetentionProfile = ({
   targetPlatform: RetentionTargetPlatform
 }) => {
   const runtime = Math.max(1, Number(runtimeSeconds || 0))
-  const isVerticalShortForm = renderMode === 'vertical'
+  const isVerticalShortForm = isVerticalRuntimeShortForm(renderMode, runtime)
   const isLongForm = !isVerticalShortForm && runtime >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
   let strategy = parseRetentionStrategyProfile(requestedStrategy)
   let aggression = parseRetentionAggressionLevel(requestedAggression)
@@ -22639,7 +22668,8 @@ const resolveAutoDetectedPreset = ({
   qualityScore: number
 }): LongFormPreset => {
   const runtime = Math.max(1, Number(runtimeSeconds || 0))
-  if (renderMode === 'vertical' || contentFormat === 'tiktok_short') {
+  const verticalShortForm = isVerticalRuntimeShortForm(renderMode, runtime)
+  if (verticalShortForm || contentFormat === 'tiktok_short') {
     return qualityScore >= 78 ? 'aggressive' : 'ultra'
   }
   if (runtime >= 45 * 60 && qualityScore >= 74) return 'balanced'
@@ -22976,7 +23006,8 @@ const inferRetentionContentFormat = ({
   const safeWindows = Array.isArray(windows) ? windows : []
   const normalizedPlatform = parseRetentionTargetPlatform(targetPlatform)
   const shortFormPlatform = normalizedPlatform === 'tiktok' || normalizedPlatform === 'instagram_reels'
-  if (renderMode === 'vertical') return 'tiktok_short'
+  const normalizedRenderMode: RenderMode = renderMode === 'vertical' ? 'vertical' : 'horizontal'
+  if (isVerticalRuntimeShortForm(normalizedRenderMode, runtime)) return 'tiktok_short'
   const speechAvg = safeWindows.length
     ? safeWindows.reduce((sum, window) => sum + window.speechIntensity, 0) / safeWindows.length
     : 0
@@ -24714,10 +24745,21 @@ const processJob = async (
   const failedOutputUploads: string[] = []
   try {
     const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
-    const durationSeconds = storedDuration ?? getDurationSeconds(tmpIn) ?? 0
+    const probedDuration = getDurationSeconds(tmpIn) ?? 0
+    const durationSeconds = probedDuration > 0 ? probedDuration : (storedDuration ?? 0)
     if (!durationSeconds || durationSeconds <= 0) {
       await updateJob(jobId, { status: 'failed', error: 'duration_unavailable' })
       throw new Error('duration_unavailable')
+    }
+    if (
+      storedDuration &&
+      probedDuration > 0 &&
+      Math.abs(probedDuration - storedDuration) >= 3
+    ) {
+      console.warn(`[${requestId || 'noid'}] duration mismatch detected, preferring probe`, {
+        storedDuration,
+        probedDuration
+      })
     }
     const durationMinutes = toMinutes(durationSeconds)
     await updateJob(jobId, { inputDurationSeconds: Math.round(durationSeconds) })
@@ -32151,7 +32193,7 @@ const buildEditPlanForTest = async ({
     ...(normalizedLongFormPreset ? { longFormPreset: normalizedLongFormPreset } : {}),
     ...(normalizedLongFormAggression === null ? {} : { longFormAggression: normalizedLongFormAggression }),
     ...(normalizedLongFormClarity === null ? {} : { longFormClarityVsSpeed: normalizedLongFormClarity }),
-    ...(normalizedMaxCuts === null ? {} : { maxCuts: normalizedMaxCuts }),
+    ...(normalizedMaxCuts === null ? {} : { maxCutsRequested: normalizedMaxCuts }),
     ...(typeof tangentKiller === 'boolean' ? { tangentKiller } : {})
   }
   let normalizedTranscriptCues: TranscriptCue[] = Array.isArray(transcriptCues)
