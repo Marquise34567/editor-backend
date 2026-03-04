@@ -2727,7 +2727,7 @@ const resolveInterruptIntervalRange = ({
   if (!editorMode || editorMode === 'auto') {
     minSec = Math.max(2, minSec - 0.22)
     maxSec = Math.max(minSec + 0.2, maxSec - 0.34)
-  } else if (editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary') {
+  } else if (editorMode === 'education' || editorMode === 'podcast') {
     minSec = Math.max(2, minSec - 0.14)
     maxSec = Math.max(minSec + 0.2, maxSec - 0.28)
   } else {
@@ -2768,7 +2768,7 @@ const resolveV3PacingGovernorCaps = ({
   maxGapSeconds: number
   maxTalkingHeadShotSeconds: number
 }) => {
-  const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary'
+  const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast'
   const autoMode = !editorMode || editorMode === 'auto'
   const tightenedGap = clamp(
     maxGapSeconds - (contextHeavyMode ? 0.22 : autoMode ? 0.36 : 0.48),
@@ -8931,7 +8931,7 @@ const applyEditorModeAggressionFloor = (
 ): RetentionAggressionLevel => {
   const resolvedMode = editorMode && editorMode !== 'auto' ? editorMode : 'auto'
   const floor: RetentionAggressionLevel =
-    resolvedMode === 'education' || resolvedMode === 'podcast' || resolvedMode === 'commentary' || resolvedMode === 'auto'
+    resolvedMode === 'education' || resolvedMode === 'podcast'
       ? 'medium'
       : 'high'
   const ranking: RetentionAggressionLevel[] = ['low', 'medium', 'high', 'viral']
@@ -21410,24 +21410,22 @@ const resolveRuntimeRetentionProfile = ({
       notes.push('Vertical mode uses short-form viral pacing to maximize retention.')
     }
   } else {
-    if (strategy === 'viral') {
-      strategy = 'balanced'
-      notes.push('Horizontal mode caps strategy at balanced to preserve narrative clarity.')
-    }
-    if (aggression === 'high' || aggression === 'viral') {
-      aggression = 'medium'
-      notes.push('Horizontal mode caps aggression at medium to avoid overcutting context.')
-    }
-    if (strategy === 'safe') {
-      aggression = 'low'
-    } else if (aggression === 'low') {
+    if (strategy === 'safe' || aggression === 'low') {
       strategy = 'safe'
+      aggression = 'low'
+    } else if (strategy === 'viral' || aggression === 'high' || aggression === 'viral') {
+      strategy = 'viral'
+      aggression = aggression === 'viral' ? 'viral' : 'high'
     } else {
       strategy = 'balanced'
       aggression = 'medium'
     }
     if (isLongForm) {
       notes.push('Long-form runtime detected; applied long-form pacing safeguards.')
+      if (aggression === 'viral') {
+        aggression = 'high'
+        notes.push('Long-form runtime softened viral aggression to high for stability.')
+      }
     }
   }
   const referencePreset = RETENTION_STYLE_REFERENCE_PRESETS[strategy]
