@@ -1934,7 +1934,7 @@ const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
 const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
 const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
 const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
-const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_aggressive_defaults_2026_03_04'
+const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_auto_defaults_2026_03_04'
 const MANDATORY_VARIANT_MIN = 3
 const MANDATORY_VARIANT_MAX = 5
 const PLAYER_TELEMETRY_MAX_EVENTS_PER_REQUEST = 240
@@ -3312,7 +3312,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   maxCutsRequested: null,
   editorMode: null,
   hookSelectionMode: 'auto',
-  longFormPreset: 'aggressive',
+  longFormPreset: 'auto',
   longFormAggression: 72,
   longFormClarityVsSpeed: 52,
   tangentKiller: true,
@@ -13951,7 +13951,7 @@ const buildRetentionMetadataSummary = ({
   const resolvedTangentKiller =
     typeof tangentKiller === 'boolean' ? tangentKiller : DEFAULT_EDIT_OPTIONS.tangentKiller
   const longFormDataMode =
-    resolvedLongFormPreset === 'aggressive' &&
+    resolvedLongFormPreset === 'auto' &&
     resolvedLongFormAggression === 72 &&
     resolvedLongFormClarityVsSpeed === 52 &&
     resolvedTangentKiller === true
@@ -22755,6 +22755,10 @@ const getEditOptionsForUser = async (
   let requestedAggression = parseRetentionAggressionLevel(
     overrides?.retentionAggressionLevel ?? STRATEGY_TO_AGGRESSION[requestedStrategy]
   )
+  if (longFormPreset === 'auto' && requestedAggression === 'medium') {
+    // Keep Auto long-form aligned with the B baseline profile.
+    requestedAggression = 'high'
+  }
   let resolvedFastMode = fastModeOverride ?? false
   if (coldStartAutopilot) {
     if (requestedStrategy === 'viral') requestedStrategy = 'balanced'
