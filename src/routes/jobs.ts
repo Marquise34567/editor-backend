@@ -26902,7 +26902,7 @@ const processJob = async (
             return 'with reduced overlays'
           }
 
-          const runWithChain = async (videoChain: string, enableFades: boolean) => {
+          const runWithChain = async (videoChain: string, enableFades: boolean, enableAudioPolish: boolean) => {
             const concatFilter = buildConcatFilter(finalSegments, {
               withAudio,
               hasAudioStream: hasAudio,
@@ -26915,12 +26915,12 @@ const processJob = async (
             if (videoChain) {
               filterParts.push(`[outv]${videoChain}[vout]`)
             }
-            if (withAudio && audioFilters.length > 0) {
+            if (withAudio && audioFilters.length > 0 && enableAudioPolish) {
               filterParts.push(`[outa]${audioFilters.join(',')}[aout]`)
             }
             const filter = filterParts.join(';')
             const videoMap = videoChain ? '[vout]' : '[outv]'
-            const audioMap = withAudio ? (audioFilters.length > 0 ? '[aout]' : '[outa]') : null
+            const audioMap = withAudio ? ((audioFilters.length > 0 && enableAudioPolish) ? '[aout]' : '[outa]') : null
             const mapArgs = ['-map', videoMap]
             if (audioMap) mapArgs.push('-map', audioMap)
             await runFfmpegWithFilter(argsWithWatermark, filter, mapArgs, tmpOut, 'concat')
@@ -26931,20 +26931,30 @@ const processJob = async (
           for (const chain of videoChains) {
             const fadeVariants = options.transitions ? [true, false] : [false]
             for (const enableFades of fadeVariants) {
-              try {
-                await runWithChain(chain, enableFades)
-                ran = true
-                if (chain !== fullVideoChain) {
-                  const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                  optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
+              const audioPolishVariants = withAudio && audioFilters.length > 0 ? [true, false] : [false]
+              for (const enableAudioPolish of audioPolishVariants) {
+                try {
+                  await runWithChain(chain, enableFades, enableAudioPolish)
+                  ran = true
+                  if (chain !== fullVideoChain) {
+                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
+                    optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
+                  }
+                  if (options.transitions && !enableFades) {
+                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
+                    optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
+                  }
+                  if (withAudio && audioFilters.length > 0 && !enableAudioPolish) {
+                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'audio_filter_failed'
+                    optimizationNotes.push(`Render fallback: audio polish disabled (${reason}).`)
+                  }
+                  break
+                } catch (err) {
+                  lastErr = err
                 }
-                if (options.transitions && !enableFades) {
-                  const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
-                  optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
-                }
+              }
+              if (ran) {
                 break
-              } catch (err) {
-                lastErr = err
               }
             }
             if (ran) break
