@@ -1091,6 +1091,7 @@ type HookSelectionDebugCandidate = {
   instantHold: number
   introClarity: number
   teaserTension: number
+  curiosityPressure: number
   visualNovelty: number
   openerQuality: number
   selectionScore: number
@@ -1101,10 +1102,12 @@ type HookSelectionDebugCandidate = {
     strictConfidence: boolean
     strictInstantHold: boolean
     strictTeaserTension: boolean
+    strictCuriosity: boolean
     relaxedAuditOrLowSignal: boolean
     relaxedConfidence: boolean
     relaxedInstantHold: boolean
     relaxedTeaserTension: boolean
+    relaxedCuriosity: boolean
   }
 }
 type HookSelectionDebugPayload = {
@@ -1112,6 +1115,7 @@ type HookSelectionDebugPayload = {
   relaxedThreshold: number
   relaxedInstantHoldFloor: number
   relaxedTeaserFloor: number
+  relaxedCuriosityFloor: number
   selectionMode: 'strict' | 'relaxed' | 'fallback'
   selected: {
     start: number
@@ -1124,6 +1128,7 @@ type HookSelectionDebugPayload = {
     instantHold: number
     introClarity: number
     teaserTension: number
+    curiosityPressure: number
     visualNovelty: number
     openerQuality: number
     selectionScore: number
@@ -1654,6 +1659,16 @@ const AUTO_HOOK_DURATION_MAX_SECONDS = 8
 const HOOK_OPENER_FIRST_SECONDS = 3
 const HOOK_STANDARD_INSTANT_HOLD_MIN = 0.56
 const HOOK_STANDARD_TEASER_TENSION_MIN = 0.44
+const HOOK_STANDARD_INTRO_CLARITY_MIN = 0.34
+const HOOK_STANDARD_CURIOSITY_MIN = 0.48
+const HOOK_NON_VERBAL_MIN_CONFIDENCE = 0.62
+const HOOK_NON_VERBAL_MIN_AUDIT_SCORE = 0.52
+const HOOK_NON_VERBAL_MIN_SELECTION_SCORE = 0.58
+const HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE = 0.56
+const HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE = 0.54
+const HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE = 0.56
+const HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY = 0.34
+const HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER = 0.3
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -1914,6 +1929,10 @@ const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
 const LONG_FORM_MIN_EDIT_SECONDS = 20
 const LONG_FORM_MAX_EDIT_SECONDS = 140
+const LONG_FORM_MAX_REMOVAL_RATIO = 0.28
+const LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE = 0.36
+const LONG_FORM_SPEED_CAP_MIN = 1.08
+const LONG_FORM_SPEED_CAP_MAX = 1.18
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
 const HARD_GATE_MIN_EDIT_DELTA_SHORT = 0.08
@@ -3268,12 +3287,12 @@ const resolveLongFormRuntimeTuning = ({
   const compressionMin = clamp(
     presetConfig.compressionSpeed.min + 0.05 * aggressionBias - 0.03 * (safeClarity / 100),
     1,
-    1.3
+    1.14
   )
   const compressionMax = clamp(
     presetConfig.compressionSpeed.max + 0.06 * aggressionBias - 0.02 * (safeClarity / 100),
     Math.max(compressionMin + 0.01, 1.02),
-    1.34
+    LONG_FORM_SPEED_CAP_MAX
   )
   return {
     ...presetConfig,
@@ -9584,6 +9603,7 @@ type HookSelectionRankedEntry = {
   instantHold: number
   introClarity: number
   teaserTension: number
+  curiosityPressure: number
   visualNovelty: number
   openerQuality: number
   selectionScore: number
@@ -9622,6 +9642,25 @@ const scoreRenderableHookCandidateSignals = ({
       0.44 * scoreHookEndingUnresolvedSignal(introText)
     )
     : clamp01(0.9 * candidate.auditScore + 0.06)
+  const curiosityWindow = windows.length
+    ? clamp01(averageWindowMetric(windows, candidate.start, candidate.start + candidate.duration, (window) => (
+      0.62 * (window.curiosityTrigger ?? 0) +
+      0.18 * window.emotionIntensity +
+      0.12 * (window.actionSpike ?? 0) +
+      0.08 * window.vocalExcitement
+    )))
+    : 0.5
+  const curiosityPressure = introText
+    ? clamp01(
+      0.52 * scoreHookOpenLoopSignal(introText) +
+      0.32 * scoreHookEndingUnresolvedSignal(introText) +
+      0.16 * curiosityWindow
+    )
+    : clamp01(
+      0.58 * curiosityWindow +
+      0.28 * teaserTension +
+      0.14 * instantHold
+    )
   const visualNovelty = windows.length
     ? clamp01(averageWindowMetric(windows, candidate.start, candidate.start + candidate.duration, (window) => (
       0.4 * window.sceneChangeRate +
@@ -9636,12 +9675,17 @@ const scoreRenderableHookCandidateSignals = ({
     0.15 * teaserTension +
     0.12 * visualNovelty
   )
-  const selectionScore = clamp01(0.58 * confidence + 0.42 * openerQuality)
+  const selectionScore = clamp01(
+    0.46 * confidence +
+    0.3 * openerQuality +
+    0.24 * curiosityPressure
+  )
   return {
     confidence: Number(confidence.toFixed(4)),
     instantHold: Number(instantHold.toFixed(4)),
     introClarity: Number(introClarity.toFixed(4)),
     teaserTension: Number(teaserTension.toFixed(4)),
+    curiosityPressure: Number(curiosityPressure.toFixed(4)),
     visualNovelty: Number(visualNovelty.toFixed(4)),
     openerQuality: Number(openerQuality.toFixed(4)),
     selectionScore: Number(selectionScore.toFixed(4))
@@ -9655,6 +9699,8 @@ const buildHookSelectionDebugPayload = ({
   relaxedThreshold,
   relaxedInstantHoldFloor,
   relaxedTeaserFloor,
+  relaxedCuriosityFloor,
+  relaxedTranscriptAuditFloor = 0,
   selectionMode,
   hasTranscript,
   signalStrength,
@@ -9667,6 +9713,8 @@ const buildHookSelectionDebugPayload = ({
   relaxedThreshold: number
   relaxedInstantHoldFloor: number
   relaxedTeaserFloor: number
+  relaxedCuriosityFloor: number
+  relaxedTranscriptAuditFloor?: number
   selectionMode: 'strict' | 'relaxed' | 'fallback'
   hasTranscript: boolean
   signalStrength: number
@@ -9696,6 +9744,7 @@ const buildHookSelectionDebugPayload = ({
       instantHold: Number(entry.instantHold.toFixed(4)),
       introClarity: Number(entry.introClarity.toFixed(4)),
       teaserTension: Number(entry.teaserTension.toFixed(4)),
+      curiosityPressure: Number(entry.curiosityPressure.toFixed(4)),
       visualNovelty: Number(entry.visualNovelty.toFixed(4)),
       openerQuality: Number(entry.openerQuality.toFixed(4)),
       selectionScore: Number(entry.selectionScore.toFixed(4)),
@@ -9706,10 +9755,19 @@ const buildHookSelectionDebugPayload = ({
         strictConfidence: entry.confidence >= threshold,
         strictInstantHold: entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN,
         strictTeaserTension: entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN,
-        relaxedAuditOrLowSignal: Boolean(entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48),
+        strictCuriosity: entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN,
+        relaxedAuditOrLowSignal: Boolean(
+          entry.candidate.auditPassed ||
+          !hasTranscript ||
+          (
+            signalStrength < 0.48 &&
+            entry.candidate.auditScore >= relaxedTranscriptAuditFloor
+          )
+        ),
         relaxedConfidence: entry.confidence >= relaxedThreshold,
         relaxedInstantHold: entry.openerQuality >= relaxedInstantHoldFloor,
-        relaxedTeaserTension: entry.teaserTension >= relaxedTeaserFloor
+        relaxedTeaserTension: entry.teaserTension >= relaxedTeaserFloor,
+        relaxedCuriosity: entry.curiosityPressure >= relaxedCuriosityFloor
       }
     }))
   return {
@@ -9717,6 +9775,7 @@ const buildHookSelectionDebugPayload = ({
     relaxedThreshold: Number(relaxedThreshold.toFixed(4)),
     relaxedInstantHoldFloor: Number(relaxedInstantHoldFloor.toFixed(4)),
     relaxedTeaserFloor: Number(relaxedTeaserFloor.toFixed(4)),
+    relaxedCuriosityFloor: Number(relaxedCuriosityFloor.toFixed(4)),
     selectionMode,
     selected: {
       start: Number(selected.candidate.start.toFixed(3)),
@@ -9729,6 +9788,7 @@ const buildHookSelectionDebugPayload = ({
       instantHold: Number(selected.instantHold.toFixed(4)),
       introClarity: Number(selected.introClarity.toFixed(4)),
       teaserTension: Number(selected.teaserTension.toFixed(4)),
+      curiosityPressure: Number(selected.curiosityPressure.toFixed(4)),
       visualNovelty: Number(selected.visualNovelty.toFixed(4)),
       openerQuality: Number(selected.openerQuality.toFixed(4)),
       selectionScore: Number(selected.selectionScore.toFixed(4))
@@ -9771,6 +9831,7 @@ const selectLongFormDisplacedHookCandidate = ({
         instantHold: scored.instantHold,
         introClarity: scored.introClarity,
         teaserTension: scored.teaserTension,
+        curiosityPressure: scored.curiosityPressure,
         visualNovelty: scored.visualNovelty,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
@@ -9794,11 +9855,16 @@ const selectLongFormDisplacedHookCandidate = ({
     nonVerbalPrimary ? 0.42 : 0.36,
     primaryEntry.teaserTension + (nonVerbalPrimary ? 0.06 : 0.04)
   )
+  const minCuriosityFloor = Math.max(
+    HOOK_STANDARD_CURIOSITY_MIN - 0.04,
+    primaryEntry.curiosityPressure + (nonVerbalPrimary ? 0.05 : 0.03)
+  )
   const minConfidenceFloor = Math.max(0.52, primaryEntry.confidence - 0.02)
   const displaced = ranked.find((entry) => (
     entry.candidate.start >= minSourceStart &&
     entry.selectionScore >= minSelectionFloor &&
     entry.teaserTension >= minTeaserFloor &&
+    entry.curiosityPressure >= minCuriosityFloor &&
     entry.confidence >= minConfidenceFloor &&
     entry.candidate.auditPassed
   ))
@@ -9850,6 +9916,7 @@ const selectRenderableHookCandidate = ({
         instantHold: scored.instantHold,
         introClarity: scored.introClarity,
         teaserTension: scored.teaserTension,
+        curiosityPressure: scored.curiosityPressure,
         visualNovelty: scored.visualNovelty,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
@@ -9882,27 +9949,71 @@ const selectRenderableHookCandidate = ({
     0.26,
     HOOK_STANDARD_TEASER_TENSION_MIN
   )
+  const relaxedCuriosityFloor = clamp(
+    HOOK_STANDARD_CURIOSITY_MIN - (hasTranscript ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.26,
+    HOOK_STANDARD_CURIOSITY_MIN
+  )
+  const relaxedTranscriptAuditFloor = clamp(
+    Math.max(HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE, relaxedThreshold - 0.02),
+    0.5,
+    0.72
+  )
+  const passesRelaxedAuditGate = (entry: HookSelectionRankedEntry) => {
+    if (entry.candidate.auditPassed) return true
+    if (!hasTranscript) return signalStrength < 0.48
+    if (signalStrength >= 0.48) return false
+    return (
+      entry.candidate.auditScore >= relaxedTranscriptAuditFloor &&
+      entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER) &&
+      entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY)
+    )
+  }
+  const passesNonVerbalSafety = (entry: HookSelectionRankedEntry) => {
+    const hasHookText = String(entry.candidate.text || '').trim().length > 0
+    if (hasTranscript || hasHookText) return true
+    return (
+      entry.candidate.auditPassed &&
+      entry.confidence >= HOOK_NON_VERBAL_MIN_CONFIDENCE &&
+      entry.candidate.auditScore >= HOOK_NON_VERBAL_MIN_AUDIT_SCORE &&
+      entry.selectionScore >= HOOK_NON_VERBAL_MIN_SELECTION_SCORE &&
+      entry.instantHold >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
+      entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN &&
+      entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN
+    )
+  }
   const strictWithInstantHold = ranked.find((entry) => (
     entry.candidate.auditPassed &&
     entry.confidence >= threshold &&
     entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
-    entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN
+    entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN &&
+    entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN &&
+    entry.introClarity >= HOOK_STANDARD_INTRO_CLARITY_MIN &&
+    passesNonVerbalSafety(entry)
   ))
   const strictFallbackInstantFloor = clamp(
-    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.03 : 0.05) - (signalStrength < 0.5 ? 0.02 : 0),
+    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.015 : 0.03) - (signalStrength < 0.5 ? 0.01 : 0),
     relaxedInstantHoldFloor,
     HOOK_STANDARD_INSTANT_HOLD_MIN
   )
   const strictFallbackTeaserFloor = clamp(
-    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.02 : 0.04) - (signalStrength < 0.5 ? 0.02 : 0),
+    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.01 : 0.02) - (signalStrength < 0.5 ? 0.01 : 0),
     relaxedTeaserFloor,
     HOOK_STANDARD_TEASER_TENSION_MIN
+  )
+  const strictFallbackCuriosityFloor = clamp(
+    HOOK_STANDARD_CURIOSITY_MIN - (hasTranscript ? 0.01 : 0.02) - (signalStrength < 0.5 ? 0.01 : 0),
+    relaxedCuriosityFloor,
+    HOOK_STANDARD_CURIOSITY_MIN
   )
   const strictWithQualityFloor = ranked.find((entry) => (
     entry.candidate.auditPassed &&
     entry.confidence >= threshold &&
     entry.openerQuality >= strictFallbackInstantFloor &&
-    entry.teaserTension >= strictFallbackTeaserFloor
+    entry.teaserTension >= strictFallbackTeaserFloor &&
+    entry.curiosityPressure >= strictFallbackCuriosityFloor &&
+    entry.introClarity >= HOOK_STANDARD_INTRO_CLARITY_MIN &&
+    passesNonVerbalSafety(entry)
   ))
   const strict = strictWithInstantHold || strictWithQualityFloor
   if (strict) {
@@ -9913,6 +10024,8 @@ const selectRenderableHookCandidate = ({
       relaxedThreshold,
       relaxedInstantHoldFloor,
       relaxedTeaserFloor,
+      relaxedCuriosityFloor,
+      relaxedTranscriptAuditFloor,
       selectionMode: 'strict',
       hasTranscript,
       signalStrength,
@@ -9932,11 +10045,15 @@ const selectRenderableHookCandidate = ({
     entry.confidence >= relaxedThreshold &&
     entry.openerQuality >= relaxedInstantHoldFloor &&
     entry.teaserTension >= relaxedTeaserFloor &&
-    (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
+    entry.curiosityPressure >= relaxedCuriosityFloor &&
+    passesRelaxedAuditGate(entry) &&
+    passesNonVerbalSafety(entry)
   )) || ranked.find((entry) => (
     entry.confidence >= relaxedThreshold &&
     entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.06, 0.24) &&
-    (entry.candidate.auditPassed || !hasTranscript || signalStrength < 0.48)
+    entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.06, 0.24) &&
+    passesRelaxedAuditGate(entry) &&
+    passesNonVerbalSafety(entry)
   ))
   if (relaxed) {
     const fallbackReason = hasTranscript
@@ -9949,6 +10066,8 @@ const selectRenderableHookCandidate = ({
       relaxedThreshold,
       relaxedInstantHoldFloor,
       relaxedTeaserFloor,
+      relaxedCuriosityFloor,
+      relaxedTranscriptAuditFloor,
       selectionMode: 'relaxed',
       hasTranscript,
       signalStrength,
@@ -9965,6 +10084,35 @@ const selectRenderableHookCandidate = ({
     }
   }
   return null
+}
+
+const pickAuditedOpeningCandidateFromPool = ({
+  candidates,
+  durationSeconds,
+  maxStartSeconds = 45
+}: {
+  candidates: HookCandidate[]
+  durationSeconds: number
+  maxStartSeconds?: number
+}): HookCandidate | null => {
+  if (!Array.isArray(candidates) || !candidates.length) return null
+  const maxStart = Math.max(0, Math.min(Number(maxStartSeconds || 45), Math.max(0, durationSeconds - HOOK_MIN)))
+  const ranked = candidates
+    .filter((candidate) => (
+      candidate &&
+      Number.isFinite(candidate.start) &&
+      Number.isFinite(candidate.duration) &&
+      candidate.duration >= HOOK_MIN - 0.01 &&
+      candidate.start >= 0 &&
+      candidate.start <= maxStart &&
+      Boolean(candidate.auditPassed)
+    ))
+    .sort((a, b) => (
+      b.auditScore - a.auditScore ||
+      b.score - a.score ||
+      a.start - b.start
+    ))
+  return ranked[0] || null
 }
 
 const averageWindowMetric = (
@@ -10123,6 +10271,12 @@ const buildFallbackHookCandidateFromStorySegments = ({
         end: hookEnd,
         windows
       })
+      const earlyWindowSeconds = Math.max(26, Math.min(96, durationSeconds * 0.4))
+      const earlyStartScore = clamp01(1 - Math.max(0, hookStart - 1.2) / earlyWindowSeconds)
+      const latePenalty = clamp01(
+        (hookStart - earlyWindowSeconds) /
+        Math.max(14, durationSeconds - earlyWindowSeconds)
+      )
       const peakImpact = peakWindow?.impact ?? clamp01(
         0.36 * hookSignal +
         0.24 * energy +
@@ -10144,7 +10298,9 @@ const buildFallbackHookCandidateFromStorySegments = ({
         0.09 * spikeDensity +
         0.08 * dynamicLift.score +
         0.05 * dynamicLift.peakDensity +
-        0.15 * instantHold -
+        0.15 * instantHold +
+        0.08 * earlyStartScore -
+        0.07 * latePenalty -
         0.06 * silenceRatio
       )
       return {
@@ -10174,6 +10330,265 @@ const buildFallbackHookCandidateFromStorySegments = ({
     auditPassed: false,
     text: '',
     reason: 'Fallback hook selected from this video\'s highest-impact energy peak with strongest first-3-second hold after weak candidate pool (no fixed timestamp).',
+    synthetic: true
+  } as HookCandidate
+}
+
+const buildCuriosityFallbackHookCandidateFromTranscript = ({
+  transcriptCues,
+  windows,
+  durationSeconds,
+  segments
+}: {
+  transcriptCues: TranscriptCue[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  segments?: TimeRange[]
+}) => {
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return null
+  }
+  const candidateDurations = [8, 7.5, 7, 6.5, 6].map((value) => Number(clamp(value, HOOK_MIN, HOOK_MAX).toFixed(3)))
+  const hasCoverageMap = Array.isArray(segments) && segments.length > 0
+  const candidateRows: Array<{
+    start: number
+    end: number
+    text: string
+    score: number
+    auditScore: number
+    auditPassed: boolean
+    openLoop: number
+    unresolved: number
+    teaserStrength: number
+    spoilerRisk: number
+    contextPenalty: number
+  }> = []
+  const seen = new Set<string>()
+  for (const cue of transcriptCues) {
+    const cueStart = Number(cue.start)
+    const cueEnd = Number(cue.end)
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart + 0.01) continue
+    for (const duration of candidateDurations) {
+      const maxStart = Math.max(0, durationSeconds - duration)
+      const tentativeStart = Number(clamp(cueStart - Math.min(1.6, duration * 0.32), 0, maxStart).toFixed(3))
+      const aligned = alignHookToSentenceBoundaries(
+        tentativeStart,
+        tentativeStart + duration,
+        transcriptCues,
+        durationSeconds
+      )
+      if (hasCoverageMap && !isRangeCoveredBySegments(aligned.start, aligned.end, segments as TimeRange[])) continue
+      const key = `${aligned.start.toFixed(3)}:${aligned.end.toFixed(3)}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const text = getTranscriptTextInRange(transcriptCues, aligned.start, aligned.end).replace(/\s+/g, ' ').trim()
+      if (!text || text.length < 10) continue
+      const transcriptSignals = scoreTranscriptSignals(text.toLowerCase())
+      const openLoop = scoreHookOpenLoopSignal(text)
+      const unresolved = scoreHookEndingUnresolvedSignal(text)
+      const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
+      const curiosityWindow = clamp01(averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
+        0.62 * (window.curiosityTrigger ?? 0) +
+        0.18 * window.emotionIntensity +
+        0.12 * (window.actionSpike ?? 0) +
+        0.08 * window.vocalExcitement
+      )))
+      const instantHold = clamp01(computeHookInstantHoldScore({
+        start: aligned.start,
+        end: aligned.end,
+        windows
+      }))
+      const earlyScore = clamp01(1 - aligned.start / Math.max(30, Math.min(96, durationSeconds * 0.44)))
+      const audit = runHookAudit({
+        start: aligned.start,
+        end: aligned.end,
+        transcriptCues,
+        windows
+      })
+      const score = clamp01(
+        0.34 * audit.auditScore +
+        0.18 * openLoop +
+        0.12 * unresolved +
+        0.12 * transcriptSignals.curiosityTrigger +
+        0.1 * curiosityWindow +
+        0.08 * instantHold +
+        0.06 * earlyScore -
+        0.08 * audit.spoilerRisk -
+        0.08 * contextPenalty -
+        0.04 * transcriptSignals.fillerDensity
+      )
+      candidateRows.push({
+        start: Number(aligned.start.toFixed(3)),
+        end: Number(aligned.end.toFixed(3)),
+        text,
+        score: Number(score.toFixed(4)),
+        auditScore: Number(audit.auditScore.toFixed(4)),
+        auditPassed: Boolean(audit.passed),
+        openLoop: Number(openLoop.toFixed(4)),
+        unresolved: Number(unresolved.toFixed(4)),
+        teaserStrength: Number(audit.teaserStrength.toFixed(4)),
+        spoilerRisk: Number(audit.spoilerRisk.toFixed(4)),
+        contextPenalty: Number(contextPenalty.toFixed(4))
+      })
+    }
+  }
+  const rankedRows = candidateRows.sort((a, b) => (
+    Number(b.auditPassed) - Number(a.auditPassed) ||
+    b.auditScore - a.auditScore ||
+    b.score - a.score ||
+    b.teaserStrength - a.teaserStrength ||
+    a.start - b.start
+  ))
+  const best = rankedRows.find((row) => (
+    row.auditPassed &&
+    row.auditScore >= 0.64 &&
+    row.openLoop >= 0.34 &&
+    row.unresolved >= 0.28 &&
+    row.teaserStrength >= 0.3
+  )) || rankedRows.find((row) => (
+    row.auditScore >= 0.58 &&
+    row.openLoop >= 0.3 &&
+    row.unresolved >= 0.24 &&
+    row.teaserStrength >= 0.27 &&
+    row.spoilerRisk <= 0.58
+  )) || rankedRows.find((row) => (
+    row.auditScore >= HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE &&
+    row.openLoop >= 0.26 &&
+    row.unresolved >= 0.2 &&
+    row.teaserStrength >= HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER &&
+    row.contextPenalty <= 0.64 &&
+    row.spoilerRisk <= 0.64
+  ))
+  if (!best || best.score < 0.4) return null
+  const duration = Number((best.end - best.start).toFixed(3))
+  return {
+    start: Number(best.start.toFixed(3)),
+    duration,
+    score: Number(best.score.toFixed(4)),
+    auditScore: Number(best.auditScore.toFixed(4)),
+    auditPassed: Boolean(best.auditPassed),
+    text: best.text,
+    reason: 'Curiosity-first fallback hook selected from transcript open-loop signals with unresolved payoff framing.',
+    synthetic: true
+  } as HookCandidate
+}
+
+const buildAuditedOpeningHookCandidateFromTranscript = ({
+  transcriptCues,
+  windows,
+  durationSeconds,
+  segments,
+  searchWindowSeconds = 45,
+  targetDurationSeconds = AUTO_HOOK_DURATION_MAX_SECONDS
+}: {
+  transcriptCues: TranscriptCue[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  segments?: TimeRange[]
+  searchWindowSeconds?: number
+  targetDurationSeconds?: number
+}): HookCandidate | null => {
+  if (!Array.isArray(transcriptCues) || transcriptCues.length < 2 || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return null
+  }
+  const targetDuration = Number(clamp(
+    Number(targetDurationSeconds || AUTO_HOOK_DURATION_MAX_SECONDS),
+    HOOK_MIN,
+    Math.min(HOOK_MAX, durationSeconds)
+  ).toFixed(3))
+  if (!Number.isFinite(targetDuration) || targetDuration < Math.max(0.2, HOOK_MIN - 0.01)) return null
+  const searchEnd = Number(clamp(
+    Number(searchWindowSeconds || 45),
+    targetDuration + 0.2,
+    durationSeconds
+  ).toFixed(3))
+  const maxStart = Math.max(0, searchEnd - targetDuration)
+  const hasCoverageMap = Array.isArray(segments) && segments.length > 0
+  const startCandidates: number[] = [0]
+  const offsets = [-1.6, -0.9, -0.4, 0]
+  for (const cue of transcriptCues) {
+    const cueStart = Number(cue?.start)
+    if (!Number.isFinite(cueStart) || cueStart > searchEnd + 0.05) continue
+    for (const offset of offsets) {
+      startCandidates.push(Number(clamp(cueStart + offset, 0, maxStart).toFixed(3)))
+    }
+  }
+  const dedupedStarts = startCandidates
+    .sort((a, b) => a - b)
+    .filter((start, index, arr) => index === 0 || Math.abs(start - arr[index - 1]) >= 0.08)
+  const rows: Array<{
+    start: number
+    end: number
+    text: string
+    score: number
+    auditScore: number
+  }> = []
+  for (const startCandidate of dedupedStarts) {
+    const aligned = alignHookToSentenceBoundaries(
+      startCandidate,
+      startCandidate + targetDuration,
+      transcriptCues,
+      durationSeconds
+    )
+    const start = Number(clamp(aligned.start, 0, maxStart).toFixed(3))
+    const end = Number(clamp(start + targetDuration, start + Math.min(0.2, targetDuration), searchEnd).toFixed(3))
+    if (end - start < Math.max(0.2, HOOK_MIN - 0.01)) continue
+    if (hasCoverageMap && !isRangeCoveredBySegments(start, end, segments as TimeRange[])) continue
+    const text = getTranscriptTextInRange(transcriptCues, start, end).replace(/\s+/g, ' ').trim()
+    if (!text || text.length < 4) continue
+    const audit = runHookAudit({
+      start,
+      end,
+      transcriptCues,
+      windows
+    })
+    if (!audit.passed) continue
+    const openLoop = scoreHookOpenLoopSignal(text)
+    const unresolved = scoreHookEndingUnresolvedSignal(text)
+    const contextPenalty = evaluateHookContextDependency(start, end, transcriptCues)
+    const instantHold = clamp01(computeHookInstantHoldScore({
+      start,
+      end,
+      windows
+    }))
+    const curiosityWindow = clamp01(averageWindowMetric(windows, start, end, (window) => (
+      0.62 * (window.curiosityTrigger ?? 0) +
+      0.2 * window.emotionIntensity +
+      0.1 * (window.actionSpike ?? 0) +
+      0.08 * window.vocalExcitement
+    )))
+    const score = clamp01(
+      0.54 * audit.auditScore +
+      0.16 * openLoop +
+      0.14 * unresolved +
+      0.08 * instantHold +
+      0.08 * curiosityWindow -
+      0.08 * audit.spoilerRisk -
+      0.06 * contextPenalty
+    )
+    rows.push({
+      start,
+      end,
+      text,
+      score: Number(score.toFixed(4)),
+      auditScore: Number(audit.auditScore.toFixed(4))
+    })
+  }
+  const best = rows
+    .sort((a, b) => (
+      b.score - a.score ||
+      b.auditScore - a.auditScore ||
+      a.start - b.start
+    ))[0]
+  if (!best) return null
+  return {
+    start: Number(best.start.toFixed(3)),
+    duration: Number((best.end - best.start).toFixed(3)),
+    score: Number(best.score.toFixed(4)),
+    auditScore: Number(best.auditScore.toFixed(4)),
+    auditPassed: true,
+    text: best.text,
+    reason: 'Audited opener selected from first 45s transcript search (curiosity + payoff + unresolved tension).',
     synthetic: true
   } as HookCandidate
 }
@@ -10323,6 +10738,87 @@ const refineSegmentsForRetention = (
     .filter((segment) => segment.end - segment.start > 0.25)
 
   return enforceSegmentLengths(refined, minLen, maxLen, windows)
+}
+
+const stabilizeStoryPacingSegments = ({
+  segments,
+  windows,
+  styleProfile
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  styleProfile?: ContentStyleProfile | null
+}): Segment[] => {
+  if (!Array.isArray(segments) || !segments.length) return [] as Segment[]
+  const style = styleProfile?.style || null
+  if (style !== 'story' && style !== 'vlog') {
+    return segments.map((segment) => ({ ...segment }))
+  }
+  const speedCap = style === 'vlog' ? 1.2 : 1.18
+  const normalized = segments
+    .map((segment) => ({
+      ...segment,
+      speed: Number(clamp(Number(segment.speed || 1), 1, speedCap).toFixed(3))
+    }))
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  const merged: Segment[] = []
+  for (const segment of normalized) {
+    const len = segment.end - segment.start
+    if (len <= 0.08) continue
+    const prev = merged[merged.length - 1]
+    if (!prev) {
+      merged.push({ ...segment })
+      continue
+    }
+    const gap = segment.start - prev.end
+    const prevLen = prev.end - prev.start
+    const continuitySignal = gap <= 0.32
+      ? averageWindowMetric(
+          windows,
+          Math.max(prev.start, prev.end - 0.65),
+          Math.min(segment.end, segment.start + 0.65),
+          (window) => (
+            0.56 * window.speechIntensity +
+            0.24 * (window.hookScore ?? window.score) +
+            0.2 * (window.narrativeProgress ?? 0.45)
+          )
+        )
+      : 0
+    if (
+      gap >= 0 &&
+      gap <= 0.26 &&
+      (
+        prevLen < 1.05 ||
+        len < 1.05 ||
+        continuitySignal >= 0.53
+      )
+    ) {
+      prev.end = Number(Math.max(prev.end, segment.end).toFixed(3))
+      prev.speed = Number(clamp(((prev.speed ?? 1) + (segment.speed ?? 1)) / 2, 1, speedCap).toFixed(3))
+      prev.zoom = Math.max(prev.zoom ?? 0, segment.zoom ?? 0)
+      prev.brightness = Number((((prev.brightness ?? 0) + (segment.brightness ?? 0)) / 2).toFixed(3))
+      prev.audioGain = Number(clamp(((prev.audioGain ?? 1) + (segment.audioGain ?? 1)) / 2, 0.88, 1.18).toFixed(3))
+      continue
+    }
+    merged.push({ ...segment })
+  }
+  const filtered = merged.filter((segment) => {
+    const len = segment.end - segment.start
+    if (len >= 0.55) return true
+    const signal = averageWindowMetric(
+      windows,
+      segment.start,
+      segment.end,
+      (window) => 0.68 * window.speechIntensity + 0.32 * (window.hookScore ?? window.score)
+    )
+    return signal >= 0.46
+  })
+  const stabilized = enforceSegmentLengths(filtered, 1.05, 10.5, windows)
+    .map((segment) => ({
+      ...segment,
+      speed: Number(clamp(Number(segment.speed || 1), 1, speedCap).toFixed(3))
+    }))
+  return stabilized.length ? stabilized : normalized
 }
 
 const buildEngagementWindows = (
@@ -12565,7 +13061,7 @@ const buildMicroCutRangesFromSilences = ({
   windows: EngagementWindow[]
 }): { ranges: TimeRange[]; actions: BoredomEditAction[] } => {
   if (!silences.length || durationSeconds <= 0) return { ranges: [], actions: [] }
-  const safeMaxSilence = clamp(maxSilenceSeconds, 0.08, 0.45)
+  const safeMaxSilence = clamp(maxSilenceSeconds, 1, 2.2)
   const ranges: TimeRange[] = []
   const actions: BoredomEditAction[] = []
   for (const silence of silences) {
@@ -12600,9 +13096,9 @@ type EditorModeCutProfile = {
 
 const NON_AUTO_BASE_CUT_PROFILE: EditorModeCutProfile = {
   // Legacy v3 baseline cadence applied across all modes.
-  candidateThresholdDelta: -0.07,
-  hardCutThresholdDelta: -0.05,
-  compressionBoost: 1.18
+  candidateThresholdDelta: -0.04,
+  hardCutThresholdDelta: -0.03,
+  compressionBoost: 1.08
 }
 
 const EDITOR_MODE_CUT_PROFILES: Partial<Record<EditorModeSelection, EditorModeCutProfile>> = {
@@ -13754,6 +14250,72 @@ const getRangesDurationSeconds = (ranges: TimeRange[]) => {
   return ranges.reduce((sum, range) => sum + Math.max(0, range.end - range.start), 0)
 }
 
+const getMaximumRemovedSeconds = (
+  durationSeconds: number,
+  aggressiveMode = false,
+  isLongForm = false
+) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 0
+  if (!isLongForm) {
+    return durationSeconds * (aggressiveMode ? 0.62 : 0.55)
+  }
+  const ratio = aggressiveMode ? LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE : LONG_FORM_MAX_REMOVAL_RATIO
+  return durationSeconds * ratio
+}
+
+const capRemovedRangesByBudget = ({
+  priorityRanges,
+  secondaryRanges,
+  maxRemovedSeconds
+}: {
+  priorityRanges: TimeRange[]
+  secondaryRanges: TimeRange[]
+  maxRemovedSeconds: number
+}) => {
+  const budget = Number(maxRemovedSeconds || 0)
+  if (!Number.isFinite(budget) || budget <= 0) return [] as TimeRange[]
+  const minCutSeconds = 0.16
+  const selected: TimeRange[] = []
+  let used = 0
+
+  const appendRange = (range: TimeRange, allowPartial: boolean) => {
+    if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) return
+    if (used >= budget - 0.001) return
+    const normalizedStart = Number(range.start)
+    const normalizedEnd = Number(range.end)
+    if (normalizedEnd - normalizedStart < minCutSeconds) return
+    const availableParts = subtractRanges(
+      [{ start: normalizedStart, end: normalizedEnd, speed: 1 }],
+      selected
+    ).map((part) => ({
+      start: Number(part.start.toFixed(3)),
+      end: Number(part.end.toFixed(3))
+    }))
+    for (const part of availableParts) {
+      if (used >= budget - 0.001) break
+      const partDuration = Math.max(0, part.end - part.start)
+      if (partDuration < minCutSeconds) continue
+      const remaining = budget - used
+      if (partDuration <= remaining + 0.001) {
+        selected.push(part)
+        used += partDuration
+        continue
+      }
+      if (!allowPartial || remaining < minCutSeconds) continue
+      const start = Number((part.start + (partDuration - remaining) / 2).toFixed(3))
+      const end = Number((start + remaining).toFixed(3))
+      if (end - start < minCutSeconds) continue
+      selected.push({ start, end })
+      used = budget
+      break
+    }
+  }
+
+  for (const range of mergeRanges(priorityRanges)) appendRange(range, true)
+  for (const range of mergeRanges(secondaryRanges)) appendRange(range, false)
+  return mergeRanges(selected)
+}
+
 const getMinimumRemovedSeconds = (durationSeconds: number, aggressiveMode = false) => {
   if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RESCUE_MIN_DURATION) return 0
   const ratio = aggressiveMode ? LONG_FORM_MIN_EDIT_RATIO + 0.01 : LONG_FORM_MIN_EDIT_RATIO
@@ -13847,6 +14409,30 @@ const computeEditedRuntimeSeconds = (segments: Segment[]) => {
     const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
     return sum + Math.max(0, (seg.end - seg.start) / speed)
   }, 0)
+}
+
+const applyLongFormSpeedGovernor = (
+  segments: Segment[],
+  tuning: LongFormRuntimeTuning
+) => {
+  if (!segments.length || !tuning.isLongForm) {
+    return segments.map((segment) => ({ ...segment }))
+  }
+  const aggressionBias = clamp01(tuning.aggression / 100)
+  const speedBias = clamp01(1 - tuning.clarityVsSpeed / 100)
+  const speedCap = clamp(
+    LONG_FORM_SPEED_CAP_MIN + 0.06 * aggressionBias + 0.04 * speedBias,
+    LONG_FORM_SPEED_CAP_MIN,
+    LONG_FORM_SPEED_CAP_MAX
+  )
+  return segments.map((segment) => {
+    const currentSpeed = segment.speed && segment.speed > 0 ? segment.speed : 1
+    if (currentSpeed <= speedCap + 0.001) return { ...segment }
+    return {
+      ...segment,
+      speed: Number(clamp(currentSpeed, 1, speedCap).toFixed(3))
+    }
+  })
 }
 
 const computeKeptTimelineSeconds = (segments: Segment[]) => {
@@ -15555,9 +16141,9 @@ const buildSilenceTrimCuts = (
   const maxSilenceSeconds = clamp(
     Number.isFinite(Number(opts?.maxSilenceSeconds))
       ? Number(opts?.maxSilenceSeconds)
-      : (aggressiveMode ? 0.18 : 0.28),
-    0.08,
-    0.45
+      : (aggressiveMode ? 1 : 1.2),
+    1,
+    2.2
   )
   const minTrim = clamp((aggressiveMode ? 0.08 : 0.12) + 0.08 * (1 - clarityWeight), 0.06, 0.26)
   const edgePadding = aggressiveMode ? 0.14 : 0.18
@@ -16040,7 +16626,7 @@ const buildEditPlan = async (
     tangentKiller
   })
   const silenceDetectionMinimum = longFormRuntimeTuning.isLongForm
-    ? clamp(longFormRuntimeTuning.maxSilenceSeconds * 0.85, 0.08, 0.45)
+    ? clamp(Math.max(1, longFormRuntimeTuning.maxSilenceSeconds), 1, 2.4)
     : clamp(
         options.onlyCuts
           ? 0.16
@@ -16139,7 +16725,7 @@ const buildEditPlan = async (
     : []
   const silenceTrimCuts = options.removeBoring
     ? applyContinuityGuardsToCuts(rawSilenceTrimCuts, windows, options.aggressiveMode, {
-        minCutSeconds: 0.12
+        minCutSeconds: 0.35
       })
     : []
 
@@ -16172,9 +16758,12 @@ const buildEditPlan = async (
     ...contentRemovedCandidates,
     ...silenceTrimCuts
   ])
+  let guardedContentRemovedSegments = options.removeBoring
+    ? applyContinuityGuardsToCuts(contentRemovedCandidates, windows, options.aggressiveMode)
+    : []
   let removedSegments = options.removeBoring
     ? mergeRanges([
-        ...applyContinuityGuardsToCuts(contentRemovedCandidates, windows, options.aggressiveMode),
+        ...guardedContentRemovedSegments,
         ...silenceTrimCuts
       ])
     : []
@@ -16192,14 +16781,30 @@ const buildEditPlan = async (
       if (rescueCuts.length) {
         contentRemovedCandidates = mergeRanges([...contentRemovedCandidates, ...rescueCuts])
         candidateRemovedSegments = mergeRanges([...contentRemovedCandidates, ...silenceTrimCuts])
+        guardedContentRemovedSegments = applyContinuityGuardsToCuts(contentRemovedCandidates, windows, true)
         const guardedWithSilence = mergeRanges([
-          ...applyContinuityGuardsToCuts(contentRemovedCandidates, windows, true),
+          ...guardedContentRemovedSegments,
           ...silenceTrimCuts
         ])
         const guardedRemovedSeconds = getRangesDurationSeconds(guardedWithSilence)
         if (guardedRemovedSeconds >= removedSeconds + 0.15) {
           removedSegments = guardedWithSilence
         }
+      }
+    }
+    const maxRemovedSeconds = getMaximumRemovedSeconds(
+      durationSeconds,
+      options.aggressiveMode,
+      longFormRuntimeTuning.isLongForm
+    )
+    if (maxRemovedSeconds > 0) {
+      const cappedRemovedSegments = capRemovedRangesByBudget({
+        priorityRanges: silenceTrimCuts,
+        secondaryRanges: guardedContentRemovedSegments,
+        maxRemovedSeconds
+      })
+      if (cappedRemovedSegments.length) {
+        removedSegments = cappedRemovedSegments
       }
     }
   }
@@ -16510,6 +17115,7 @@ const buildEditPlan = async (
   } catch (error) {
     console.warn('retention planner integration failed, continuing with base timeline', error)
   }
+  finalTimelineSegments = applyLongFormSpeedGovernor(finalTimelineSegments, longFormRuntimeTuning)
   const storyBeatGraph = buildStoryBeatGraph({
     durationSeconds,
     windows,
@@ -17080,10 +17686,10 @@ const applyPacingGovernor = ({
     const avgSpeech = averageWindowMetric(windows, segment.start, segment.end, (window) => window.speechIntensity)
     const avgCuriosity = averageWindowMetric(windows, segment.start, segment.end, (window) => (window.curiosityTrigger ?? 0))
     const deadAirHardCutEligible = (
-      lowValueScore >= 0.66 &&
-      avgSpeech <= 0.42 &&
-      avgCuriosity <= 0.38 &&
-      runtime >= 4.2 &&
+      lowValueScore >= 0.72 &&
+      avgSpeech <= 0.34 &&
+      avgCuriosity <= 0.32 &&
+      runtime >= 5.6 &&
       segment.start >= 2.2
     )
     if (deadAirHardCutEligible) {
@@ -17725,8 +18331,135 @@ const applyEliteCutRefinement = ({
   }
 }
 
-const prepareSegmentsForRender = (segments: Segment[], durationSeconds: number) => {
-  const normalized = segments
+const collectTranscriptBoundaryTimesForRender = (
+  transcriptCues: TranscriptCue[],
+  durationSeconds: number
+) => {
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length) return [] as number[]
+  const safeDuration = Number.isFinite(durationSeconds) && durationSeconds > 0
+    ? durationSeconds
+    : Number.MAX_SAFE_INTEGER
+  const boundaries: number[] = []
+  for (const cue of transcriptCues.slice(0, 2200)) {
+    const cueStart = Number(cue?.start)
+    const cueEnd = Number(cue?.end)
+    if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart + 0.01) continue
+    boundaries.push(roundForFilter(clamp(cueStart, 0, safeDuration)))
+    boundaries.push(roundForFilter(clamp(cueEnd, 0, safeDuration)))
+    if (Array.isArray(cue?.words) && cue.words.length) {
+      const stride = cue.words.length > 30 ? 2 : 1
+      for (let index = 0; index < cue.words.length; index += stride) {
+        const word = cue.words[index]
+        const wordStart = Number(word?.start)
+        const wordEnd = Number(word?.end)
+        if (Number.isFinite(wordStart)) boundaries.push(roundForFilter(clamp(wordStart, cueStart, cueEnd)))
+        if (Number.isFinite(wordEnd)) boundaries.push(roundForFilter(clamp(wordEnd, cueStart, cueEnd)))
+      }
+    } else {
+      // Approximate intra-cue boundaries when word timestamps are unavailable.
+      const cueText = String(cue?.text || '').trim()
+      if (cueText) {
+        const tokens = cueText.split(/\s+/).filter(Boolean)
+        if (tokens.length > 1) {
+          const stride = tokens.length > 24 ? 2 : 1
+          const cueSpan = cueEnd - cueStart
+          for (let index = stride; index < tokens.length; index += stride) {
+            const tokenBoundary = cueStart + cueSpan * (index / tokens.length)
+            boundaries.push(roundForFilter(clamp(tokenBoundary, cueStart, cueEnd)))
+          }
+        }
+      }
+    }
+  }
+  const sorted = boundaries
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right)
+  const deduped: number[] = []
+  for (const boundary of sorted) {
+    const previous = deduped[deduped.length - 1]
+    if (previous !== undefined && Math.abs(previous - boundary) < 0.03) continue
+    deduped.push(boundary)
+  }
+  return deduped
+}
+
+const snapTimeToNearestTranscriptBoundary = (
+  value: number,
+  boundaries: number[],
+  maxShift: number
+) => {
+  if (!boundaries.length || !Number.isFinite(value) || maxShift <= 0) return value
+  let left = 0
+  let right = boundaries.length - 1
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2)
+    if (boundaries[mid] < value) left = mid + 1
+    else right = mid
+  }
+  const candidates = [boundaries[left]]
+  if (left > 0) candidates.push(boundaries[left - 1])
+  if (left + 1 < boundaries.length) candidates.push(boundaries[left + 1])
+  let nearest = value
+  let bestDistance = Number.POSITIVE_INFINITY
+  for (const candidate of candidates) {
+    const distance = Math.abs(candidate - value)
+    if (distance < bestDistance) {
+      bestDistance = distance
+      nearest = candidate
+    }
+  }
+  return bestDistance <= maxShift ? nearest : value
+}
+
+const alignSegmentsToTranscriptBoundariesForRender = (
+  segments: Segment[],
+  transcriptCues: TranscriptCue[],
+  durationSeconds: number
+) => {
+  if (!segments.length || !Array.isArray(transcriptCues) || !transcriptCues.length) {
+    return segments.map((segment) => ({ ...segment }))
+  }
+  const boundaries = collectTranscriptBoundaryTimesForRender(transcriptCues, durationSeconds)
+  if (!boundaries.length) return segments.map((segment) => ({ ...segment }))
+  const sorted = segments
+    .map((segment) => ({ ...segment }))
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  const aligned: Segment[] = []
+  for (const segment of sorted) {
+    const normalized = normalizeSegmentForRender(segment, durationSeconds)
+    if (!normalized) continue
+    const span = Math.max(MIN_RENDER_SEGMENT_SECONDS, normalized.end - normalized.start)
+    const maxShift = clamp(span * 0.2, 0.04, 0.2)
+    const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, boundaries, maxShift)
+    const snappedEndCandidate = snapTimeToNearestTranscriptBoundary(normalized.end, boundaries, maxShift)
+    let start = roundForFilter(clamp(Math.min(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
+    let end = roundForFilter(clamp(Math.max(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
+    const previous = aligned[aligned.length - 1]
+    if (previous && start < previous.end + 0.01) {
+      start = roundForFilter(clamp(previous.end + 0.01, 0, durationSeconds))
+    }
+    if (end - start < MIN_RENDER_SEGMENT_SECONDS) {
+      start = normalized.start
+      end = normalized.end
+      if (previous && start < previous.end + 0.01) {
+        start = roundForFilter(clamp(previous.end + 0.01, 0, durationSeconds))
+      }
+    }
+    if (end - start < MIN_RENDER_SEGMENT_SECONDS) continue
+    aligned.push({ ...normalized, start, end })
+  }
+  return aligned.length ? aligned : segments.map((segment) => ({ ...segment }))
+}
+
+const prepareSegmentsForRender = (
+  segments: Segment[],
+  durationSeconds: number,
+  transcriptCues?: TranscriptCue[]
+) => {
+  const alignedInput = Array.isArray(transcriptCues) && transcriptCues.length
+    ? alignSegmentsToTranscriptBoundariesForRender(segments, transcriptCues, durationSeconds)
+    : segments
+  const normalized = alignedInput
     .map((segment) => normalizeSegmentForRender(segment, durationSeconds))
     .filter((segment): segment is Segment => Boolean(segment))
   if (!normalized.length) return normalized
@@ -24678,6 +25411,32 @@ const processJob = async (
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
+      if (
+        hasTranscriptSignals &&
+        (!resolvedHookDecision || !resolvedHookDecision.candidate.auditPassed)
+      ) {
+        const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
+          candidates: hookCandidates,
+          durationSeconds,
+          maxStartSeconds: 45
+        })
+        if (auditedOpeningFromPool) {
+          const auditedThreshold = resolveHookScoreThreshold({
+            aggressionLevel,
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength,
+            thresholdOffset: hookThresholdOffset
+          })
+          resolvedHookDecision = {
+            candidate: auditedOpeningFromPool,
+            confidence: getHookCandidateConfidence(auditedOpeningFromPool),
+            threshold: auditedThreshold,
+            usedFallback: true,
+            reason: 'Hook retry: selected audited opening candidate from first 45s candidate pool.',
+            debug: resolvedHookDecision?.debug || null
+          }
+        }
+      }
       if (!resolvedHookDecision) {
         const fallbackThreshold = resolveHookScoreThreshold({
           aggressionLevel,
@@ -24700,12 +25459,44 @@ const processJob = async (
           0.26,
           HOOK_STANDARD_TEASER_TENSION_MIN
         )
-        const fallbackHook = buildFallbackHookCandidateFromStorySegments({
+        const fallbackRelaxedCuriosityFloor = clamp(
+          HOOK_STANDARD_CURIOSITY_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (contentSignalStrength < 0.5 ? 0.04 : 0),
+          0.26,
+          HOOK_STANDARD_CURIOSITY_MIN
+        )
+        const transcriptCuriosityFallback = hasTranscriptSignals
+          ? buildCuriosityFallbackHookCandidateFromTranscript({
+            transcriptCues: processTranscriptCues,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+            durationSeconds,
+            segments: storySegments
+          })
+          : null
+        const transcriptAuditedOpeningFallback = hasTranscriptSignals
+          ? buildAuditedOpeningHookCandidateFromTranscript({
+            transcriptCues: processTranscriptCues,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+            durationSeconds,
+            segments: storySegments,
+            searchWindowSeconds: 45,
+            targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+          })
+          : null
+        const transcriptSyntheticFallback = hasTranscriptSignals
+          ? buildSyntheticHookCandidate({
+            durationSeconds,
+            segments: storySegments,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+            transcriptCues: processTranscriptCues
+          })
+          : null
+        const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
           segments: storySegments,
           windows: editPlan?.engagementWindows ?? [],
           silences: editPlan?.silences ?? [],
           durationSeconds
-        }) || {
+        })
+        const defaultFallbackHook: HookCandidate = {
           start: Number((storySegments[0]?.start ?? 0).toFixed(3)),
           duration: Number(
             clamp(
@@ -24721,9 +25512,157 @@ const processJob = async (
           reason: 'Fallback hook generated from this video\'s strongest high-energy moment with best available first-3-second hold due weak candidate pool (no fixed timestamp).',
           synthetic: true
         }
+        const fallbackPool = [
+          transcriptAuditedOpeningFallback,
+          transcriptCuriosityFallback,
+          transcriptSyntheticFallback,
+          storyFallbackHook,
+          ...hookCandidates,
+          defaultFallbackHook
+        ].filter((candidate): candidate is HookCandidate => Boolean(candidate))
+        const dedupedFallbackPool = fallbackPool.filter((candidate, index) => (
+          fallbackPool.findIndex((entry) => (
+            Math.abs(entry.start - candidate.start) < 0.01 &&
+            Math.abs(entry.duration - candidate.duration) < 0.01
+          )) === index
+        ))
+        const fallbackPoolRanked: HookSelectionRankedEntry[] = dedupedFallbackPool
+          .map((candidate) => {
+            const scored = scoreRenderableHookCandidateSignals({
+              candidate,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            return {
+              candidate,
+              confidence: scored.confidence,
+              instantHold: scored.instantHold,
+              introClarity: scored.introClarity,
+              teaserTension: scored.teaserTension,
+              curiosityPressure: scored.curiosityPressure,
+              visualNovelty: scored.visualNovelty,
+              openerQuality: scored.openerQuality,
+              selectionScore: scored.selectionScore
+            }
+          })
+          .sort((a, b) => (
+            Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+            b.candidate.auditScore - a.candidate.auditScore ||
+            b.selectionScore - a.selectionScore ||
+            b.confidence - a.confidence ||
+            b.candidate.score - a.candidate.score ||
+            a.candidate.start - b.candidate.start
+          ))
+        const transcriptFallbackAuditFloor = clamp(
+          Math.max(HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE, fallbackRelaxedThreshold - 0.03),
+          0.5,
+          0.72
+        )
+        const transcriptFallbackSelectionFloor = Math.max(
+          HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE,
+          fallbackRelaxedThreshold
+        )
+        const transcriptFallbackCuriosityFloor = Math.max(
+          HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY,
+          fallbackRelaxedCuriosityFloor - 0.02
+        )
+        const transcriptFallbackTeaserFloor = Math.max(
+          HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER,
+          fallbackRelaxedTeaserFloor - 0.02
+        )
+        const transcriptFallbackSafe = (entry: HookSelectionRankedEntry) => (
+          entry.candidate.auditScore >= transcriptFallbackAuditFloor &&
+          entry.selectionScore >= transcriptFallbackSelectionFloor &&
+          entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
+          entry.teaserTension >= transcriptFallbackTeaserFloor
+        )
+        const transcriptAuditedOpeningEntry = transcriptAuditedOpeningFallback
+          ? fallbackPoolRanked.find((entry) => (
+              Math.abs(entry.candidate.start - transcriptAuditedOpeningFallback.start) < 0.01 &&
+              Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
+            )) || null
+          : null
+        const transcriptFallbackPick = hasTranscriptSignals
+          ? (
+              transcriptAuditedOpeningEntry ||
+              fallbackPoolRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
+              fallbackPoolRanked.find((entry) => transcriptFallbackSafe(entry))
+            )
+          : null
+        let fallbackHook = (
+          transcriptFallbackPick?.candidate ||
+          fallbackPoolRanked[0]?.candidate ||
+          defaultFallbackHook
+        )
+        let fallbackSignals = scoreRenderableHookCandidateSignals({
+          candidate: fallbackHook,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+        })
+        const fallbackTranscriptUnsafe = hasTranscriptSignals && (
+          fallbackHook.auditScore < transcriptFallbackAuditFloor ||
+          fallbackSignals.selectionScore < transcriptFallbackSelectionFloor ||
+          fallbackSignals.curiosityPressure < transcriptFallbackCuriosityFloor ||
+          fallbackSignals.teaserTension < transcriptFallbackTeaserFloor
+        )
+        if (fallbackTranscriptUnsafe) {
+          const openingSegment = storySegments[0]
+          const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
+          const openingDuration = Number(clamp(
+            openingSegment ? (openingSegment.end - openingSegment.start) : AUTO_HOOK_DURATION_MAX_SECONDS,
+            HOOK_MIN,
+            HOOK_MAX
+          ).toFixed(3))
+          const alignedOpening = alignHookToSentenceBoundaries(
+            openingStart,
+            openingStart + openingDuration,
+            processTranscriptCues,
+            durationSeconds
+          )
+          const openingAudit = runHookAudit({
+            start: alignedOpening.start,
+            end: alignedOpening.end,
+            transcriptCues: processTranscriptCues,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          fallbackHook = {
+            ...fallbackHook,
+            start: Number(alignedOpening.start.toFixed(3)),
+            duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
+            score: Number(clamp01(Math.max(fallbackHook.score, openingAudit.auditScore * 0.92)).toFixed(4)),
+            auditScore: Number(openingAudit.auditScore.toFixed(4)),
+            auditPassed: Boolean(openingAudit.passed),
+            text: extractHookText(alignedOpening.start, alignedOpening.end, processTranscriptCues),
+            reason: 'Transcript fallback candidates missed quality floor; using coherent opening tease from the start aligned to transcript boundaries.'
+          }
+          fallbackSignals = scoreRenderableHookCandidateSignals({
+            candidate: fallbackHook,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+        }
+        const fallbackNoTranscriptUnsafe = !hasTranscriptSignals && (
+          !fallbackHook.auditPassed ||
+          fallbackHook.auditScore < HOOK_NON_VERBAL_MIN_AUDIT_SCORE ||
+          fallbackSignals.confidence < HOOK_NON_VERBAL_MIN_CONFIDENCE ||
+          fallbackSignals.selectionScore < HOOK_NON_VERBAL_MIN_SELECTION_SCORE ||
+          fallbackSignals.curiosityPressure < HOOK_STANDARD_CURIOSITY_MIN
+        )
+        if (fallbackNoTranscriptUnsafe) {
+          const openingSegment = storySegments[0]
+          const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
+          const openingDuration = Number(clamp(
+            openingSegment ? (openingSegment.end - openingSegment.start) : 6,
+            HOOK_MIN,
+            HOOK_MAX
+          ).toFixed(3))
+          fallbackHook = {
+            ...fallbackHook,
+            start: openingStart,
+            duration: openingDuration,
+            reason: 'Fallback hook quality floor not met without transcript support; preserving coherent opener from the beginning of this video.'
+          }
+        }
         const fallbackCandidatesForDebug = [
           fallbackHook,
-          ...hookCandidates.filter((candidate) => (
+          ...dedupedFallbackPool.filter((candidate) => (
             Math.abs(candidate.start - fallbackHook.start) > 0.01 ||
             Math.abs(candidate.duration - fallbackHook.duration) > 0.01
           ))
@@ -24740,6 +25679,7 @@ const processJob = async (
               instantHold: scored.instantHold,
               introClarity: scored.introClarity,
               teaserTension: scored.teaserTension,
+              curiosityPressure: scored.curiosityPressure,
               visualNovelty: scored.visualNovelty,
               openerQuality: scored.openerQuality,
               selectionScore: scored.selectionScore
@@ -24763,6 +25703,8 @@ const processJob = async (
             relaxedThreshold: fallbackRelaxedThreshold,
             relaxedInstantHoldFloor: fallbackRelaxedInstantHoldFloor,
             relaxedTeaserFloor: fallbackRelaxedTeaserFloor,
+            relaxedCuriosityFloor: fallbackRelaxedCuriosityFloor,
+            relaxedTranscriptAuditFloor: hasTranscriptSignals ? transcriptFallbackAuditFloor : 0,
             selectionMode: 'fallback',
             hasTranscript: hasTranscriptSignals,
             signalStrength: contentSignalStrength,
@@ -24838,6 +25780,36 @@ const processJob = async (
         : resolvedHookDecision.usedFallback
           ? 'fallback'
           : 'auto'
+      if (
+        !preferredHookCandidate &&
+        hasTranscriptSignals &&
+        !initialHook.auditPassed
+      ) {
+        const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
+          transcriptCues: processTranscriptCues,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+          durationSeconds,
+          segments: storySegments,
+          searchWindowSeconds: 45,
+          targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+        })
+        if (auditedOpeningRetry) {
+          initialHook = enforceAutoHookDurationRange({
+            candidate: auditedOpeningRetry,
+            durationSeconds
+          })
+          resolvedHookDecision = {
+            candidate: initialHook,
+            confidence: getHookCandidateConfidence(initialHook),
+            threshold: resolvedHookDecision.threshold,
+            usedFallback: true,
+            reason: 'Hook retry: first-45s transcript search found an audited opener with stronger curiosity/payoff framing.',
+            debug: resolvedHookDecision.debug
+          }
+          selectedHookSelectionSource = 'fallback'
+          optimizationNotes.push('Hook retry upgraded opener using first-45s transcript audited search.')
+        }
+      }
       const relocationCandidates = [
         initialHook,
         ...hookCandidates.filter((candidate) => (
@@ -24911,11 +25883,22 @@ const processJob = async (
       }
       // User-selected hooks must always be stitched to the opening so the
       // chosen intro is guaranteed to lead the final edit.
+      const fallbackHookUnsafe = selectedHookSelectionSource === 'fallback' && (
+        !initialHook.auditPassed ||
+        initialHook.auditScore < HOOK_NON_VERBAL_MIN_AUDIT_SCORE ||
+        initialHookSignals.confidence < HOOK_NON_VERBAL_MIN_CONFIDENCE ||
+        initialHookSignals.selectionScore < HOOK_NON_VERBAL_MIN_SELECTION_SCORE
+      )
+      if (fallbackHookUnsafe) {
+        optimizationNotes.push('Fallback hook failed non-verbal quality floor; preserving chronological opener instead of forced relocation.')
+      }
       const forceLongFormHookMove =
         durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
-        selectedHookSelectionSource !== 'user_selected'
+        selectedHookSelectionSource !== 'user_selected' &&
+        !fallbackHookUnsafe
       const shouldMoveHookForRender =
         !options.onlyCuts &&
+        !fallbackHookUnsafe &&
         (options.autoHookMove || selectedHookSelectionSource === 'user_selected' || forceLongFormHookMove)
       if (preferredHookCandidate) {
         optimizationNotes.push(
@@ -26107,7 +27090,7 @@ const processJob = async (
       await updateJob(jobId, { status: 'retention', progress: 72 })
 
       const plannedSegmentCount = finalSegments.length
-      finalSegments = prepareSegmentsForRender(finalSegments, durationSeconds)
+      finalSegments = prepareSegmentsForRender(finalSegments, durationSeconds, processTranscriptCues)
       if (finalSegments.length !== plannedSegmentCount) {
         optimizationNotes.push(
           `Render stabilization adjusted segments (${plannedSegmentCount} -> ${finalSegments.length}) for long-form reliability.`
@@ -26120,7 +27103,8 @@ const processJob = async (
       if (impactBeforeRescue < minImpact) {
         const rescuedSegments = prepareSegmentsForRender(
           buildGuaranteedFallbackSegments(durationSeconds, options),
-          durationSeconds
+          durationSeconds,
+          processTranscriptCues
         )
         if (rescuedSegments.length) {
           finalSegments = rescuedSegments
@@ -26351,7 +27335,7 @@ const processJob = async (
         }
 
         if (recoveryMutated) {
-          recoveredSegments = prepareSegmentsForRender(recoveredSegments, durationSeconds)
+          recoveredSegments = prepareSegmentsForRender(recoveredSegments, durationSeconds, processTranscriptCues)
           recoveredStoryReorderMap = recoveredSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -26994,7 +27978,8 @@ const processJob = async (
         if (hasSegments && finalSegments.length) {
           const emergencySegments = prepareSegmentsForRender(
             finalSegments.map((segment) => ({ ...segment, speed: 1, zoom: 0, brightness: 0 })),
-            durationSeconds
+            durationSeconds,
+            processTranscriptCues
           )
           if (emergencySegments.length) {
             const emergencyFilter = buildConcatFilter(emergencySegments, {
@@ -30824,11 +31809,29 @@ const buildUniquenessSignatureForTest = ({
 const buildEditPlanForTest = async ({
   filePath,
   aggressionLevel,
-  strategyProfile
+  strategyProfile,
+  editorMode,
+  longFormPreset,
+  longFormAggression,
+  longFormClarityVsSpeed,
+  maxCuts,
+  tangentKiller,
+  autoTranscribe,
+  transcriptSrtPath,
+  transcriptCues
 }: {
   filePath: string
   aggressionLevel?: RetentionAggressionLevel | string
   strategyProfile?: RetentionStrategyProfile | string
+  editorMode?: EditorModeSelection | string | null
+  longFormPreset?: LongFormPreset | string | null
+  longFormAggression?: number | string | null
+  longFormClarityVsSpeed?: number | string | null
+  maxCuts?: number | string | null
+  tangentKiller?: boolean | null
+  autoTranscribe?: boolean | null
+  transcriptSrtPath?: string | null
+  transcriptCues?: TranscriptCue[] | null
 }) => {
   const absolutePath = path.resolve(String(filePath || ''))
   if (!absolutePath || !fs.existsSync(absolutePath)) {
@@ -30842,15 +31845,325 @@ const buildEditPlanForTest = async ({
   const normalizedStrategy = parseRetentionStrategyProfile(
     strategyProfile || strategyFromAggressionLevel(normalizedAggression)
   )
+  const normalizedEditorMode = parseEditorModeSelection(editorMode)
+  const normalizedLongFormPreset = (
+    longFormPreset === undefined || longFormPreset === null || longFormPreset === ''
+      ? null
+      : parseLongFormPreset(longFormPreset)
+  )
+  const maxCutsRaw = Number(maxCuts)
+  const normalizedMaxCuts = Number.isFinite(maxCutsRaw)
+    ? Math.round(clamp(maxCutsRaw, USER_MAX_CUTS_MIN, USER_MAX_CUTS_MAX))
+    : null
+  const normalizedLongFormAggression = parseLongFormAggression(longFormAggression)
+  const normalizedLongFormClarity = parseLongFormClarityVsSpeed(longFormClarityVsSpeed)
   const options: EditOptions = {
     ...DEFAULT_EDIT_OPTIONS,
     retentionAggressionLevel: normalizedAggression,
     retentionStrategyProfile: normalizedStrategy,
-    aggressiveMode: isAggressiveRetentionLevel(normalizedAggression)
+    aggressiveMode: isAggressiveRetentionLevel(normalizedAggression),
+    ...(normalizedEditorMode === null ? {} : { editorMode: normalizedEditorMode }),
+    ...(normalizedLongFormPreset ? { longFormPreset: normalizedLongFormPreset } : {}),
+    ...(normalizedLongFormAggression === null ? {} : { longFormAggression: normalizedLongFormAggression }),
+    ...(normalizedLongFormClarity === null ? {} : { longFormClarityVsSpeed: normalizedLongFormClarity }),
+    ...(normalizedMaxCuts === null ? {} : { maxCuts: normalizedMaxCuts }),
+    ...(typeof tangentKiller === 'boolean' ? { tangentKiller } : {})
   }
-  return buildEditPlan(absolutePath, durationSeconds, options, undefined, {
-    aggressionLevel: normalizedAggression
+  let normalizedTranscriptCues: TranscriptCue[] = Array.isArray(transcriptCues)
+    ? transcriptCues
+        .map((cue) => ({
+          start: Number(cue?.start),
+          end: Number(cue?.end),
+          text: String(cue?.text || ''),
+          keywordIntensity: Number(clamp01(Number(cue?.keywordIntensity ?? 0))),
+          curiosityTrigger: Number(clamp01(Number(cue?.curiosityTrigger ?? 0))),
+          fillerDensity: Number(clamp01(Number(cue?.fillerDensity ?? 0))),
+          words: Array.isArray(cue?.words) ? cue.words : undefined,
+          speaker: typeof cue?.speaker === 'string' ? cue.speaker : null,
+          language: typeof cue?.language === 'string' ? cue.language : null
+        }))
+        .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.01)
+    : []
+  if (!normalizedTranscriptCues.length && transcriptSrtPath) {
+    const absoluteSrt = path.resolve(String(transcriptSrtPath))
+    normalizedTranscriptCues = parseTranscriptCues(absoluteSrt)
+  }
+  const shouldAutoTranscribe = autoTranscribe === true
+  if (!normalizedTranscriptCues.length && shouldAutoTranscribe) {
+    const transcriptWorkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retention-test-transcribe-'))
+    try {
+      const generatedSrt = await generateSubtitles(absolutePath, transcriptWorkDir)
+      if (generatedSrt) {
+        normalizedTranscriptCues = parseTranscriptCues(generatedSrt)
+      }
+    } catch {
+      normalizedTranscriptCues = []
+    } finally {
+      try {
+        fs.rmSync(transcriptWorkDir, { recursive: true, force: true })
+      } catch {
+        // ignore cleanup failures in test path
+      }
+    }
+  }
+  const plan = await buildEditPlan(absolutePath, durationSeconds, options, undefined, {
+    aggressionLevel: normalizedAggression,
+    transcriptCues: normalizedTranscriptCues
   })
+  if (Array.isArray(plan?.segments) && plan.segments.length) {
+    plan.segments = stabilizeStoryPacingSegments({
+      segments: plan.segments,
+      windows: Array.isArray(plan?.engagementWindows) ? plan.engagementWindows : [],
+      styleProfile: plan?.styleProfile ?? null
+    })
+  }
+  const candidatePool: HookCandidate[] = (
+    Array.isArray(plan?.hookCandidates) && plan.hookCandidates.length
+      ? plan.hookCandidates
+      : plan?.hook
+        ? [plan.hook]
+        : []
+  ).filter((candidate): candidate is HookCandidate => Boolean(candidate))
+  const planWindows = Array.isArray(plan?.engagementWindows) ? plan.engagementWindows : []
+  const planSegments = Array.isArray(plan?.segments) ? plan.segments : []
+  const planSilences = Array.isArray(plan?.silences) ? plan.silences : []
+  const hasTranscriptSignals = normalizedTranscriptCues.length > 0
+  const signalStrength = computeContentSignalStrength(planWindows)
+  const hookDecision = candidatePool.length
+    ? selectRenderableHookCandidate({
+      candidates: candidatePool,
+      aggressionLevel: normalizedAggression,
+      hasTranscript: hasTranscriptSignals,
+      signalStrength,
+      windows: planWindows
+    })
+    : null
+  let resolvedHook = hookDecision?.candidate || null
+  if (
+    hasTranscriptSignals &&
+    (!resolvedHook || !resolvedHook.auditPassed)
+  ) {
+    const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
+      candidates: candidatePool,
+      durationSeconds,
+      maxStartSeconds: 45
+    })
+    if (auditedOpeningFromPool) {
+      resolvedHook = auditedOpeningFromPool
+    }
+  }
+  if (!resolvedHook) {
+    const fallbackThreshold = resolveHookScoreThreshold({
+      aggressionLevel: normalizedAggression,
+      hasTranscript: hasTranscriptSignals,
+      signalStrength
+    })
+    const fallbackRelaxedThreshold = clamp(
+      fallbackThreshold - (hasTranscriptSignals ? 0.08 : 0.16) - (signalStrength < 0.5 ? 0.04 : 0),
+      0.4,
+      fallbackThreshold
+    )
+    const fallbackRelaxedTeaserFloor = clamp(
+      HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+      0.26,
+      HOOK_STANDARD_TEASER_TENSION_MIN
+    )
+    const fallbackRelaxedCuriosityFloor = clamp(
+      HOOK_STANDARD_CURIOSITY_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+      0.26,
+      HOOK_STANDARD_CURIOSITY_MIN
+    )
+    const transcriptCuriosityFallback = hasTranscriptSignals
+      ? buildCuriosityFallbackHookCandidateFromTranscript({
+        transcriptCues: normalizedTranscriptCues,
+        windows: planWindows,
+        durationSeconds,
+        segments: planSegments
+      })
+      : null
+    const transcriptAuditedOpeningFallback = hasTranscriptSignals
+      ? buildAuditedOpeningHookCandidateFromTranscript({
+        transcriptCues: normalizedTranscriptCues,
+        windows: planWindows,
+        durationSeconds,
+        segments: planSegments,
+        searchWindowSeconds: 45,
+        targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+      })
+      : null
+    const transcriptSyntheticFallback = hasTranscriptSignals
+      ? buildSyntheticHookCandidate({
+        durationSeconds,
+        segments: planSegments,
+        windows: planWindows,
+        transcriptCues: normalizedTranscriptCues
+      })
+      : null
+    const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
+      segments: planSegments,
+      windows: planWindows,
+      silences: planSilences,
+      durationSeconds,
+    })
+    const fallbackPool = [
+      transcriptAuditedOpeningFallback,
+      transcriptCuriosityFallback,
+      transcriptSyntheticFallback,
+      storyFallbackHook,
+      ...candidatePool
+    ].filter((candidate): candidate is HookCandidate => Boolean(candidate))
+    const dedupedFallbackPool = fallbackPool.filter((candidate, index) => (
+      fallbackPool.findIndex((entry) => (
+        Math.abs(entry.start - candidate.start) < 0.01 &&
+        Math.abs(entry.duration - candidate.duration) < 0.01
+      )) === index
+    ))
+    const fallbackRanked: HookSelectionRankedEntry[] = dedupedFallbackPool
+      .map((candidate) => {
+        const scored = scoreRenderableHookCandidateSignals({
+          candidate,
+          windows: planWindows
+        })
+        return {
+          candidate,
+          confidence: scored.confidence,
+          instantHold: scored.instantHold,
+          introClarity: scored.introClarity,
+          teaserTension: scored.teaserTension,
+          curiosityPressure: scored.curiosityPressure,
+          visualNovelty: scored.visualNovelty,
+          openerQuality: scored.openerQuality,
+          selectionScore: scored.selectionScore
+        }
+      })
+      .sort((a, b) => (
+        Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+        b.candidate.auditScore - a.candidate.auditScore ||
+        b.selectionScore - a.selectionScore ||
+        b.confidence - a.confidence ||
+        b.candidate.score - a.candidate.score ||
+        a.candidate.start - b.candidate.start
+      ))
+    const transcriptFallbackAuditFloor = clamp(
+      Math.max(HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE, fallbackRelaxedThreshold - 0.03),
+      0.5,
+      0.72
+    )
+    const transcriptFallbackSelectionFloor = Math.max(
+      HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE,
+      fallbackRelaxedThreshold
+    )
+    const transcriptFallbackCuriosityFloor = Math.max(
+      HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY,
+      fallbackRelaxedCuriosityFloor - 0.02
+    )
+    const transcriptFallbackTeaserFloor = Math.max(
+      HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER,
+      fallbackRelaxedTeaserFloor - 0.02
+    )
+    const transcriptFallbackSafe = (entry: HookSelectionRankedEntry) => (
+      entry.candidate.auditScore >= transcriptFallbackAuditFloor &&
+      entry.selectionScore >= transcriptFallbackSelectionFloor &&
+      entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
+      entry.teaserTension >= transcriptFallbackTeaserFloor
+    )
+    const transcriptAuditedOpeningEntry = transcriptAuditedOpeningFallback
+      ? fallbackRanked.find((entry) => (
+          Math.abs(entry.candidate.start - transcriptAuditedOpeningFallback.start) < 0.01 &&
+          Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
+        )) || null
+      : null
+    const transcriptFallbackPick = hasTranscriptSignals
+      ? (
+          transcriptAuditedOpeningEntry ||
+          fallbackRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
+          fallbackRanked.find((entry) => transcriptFallbackSafe(entry))
+        )
+      : null
+    if (transcriptFallbackPick) {
+      resolvedHook = transcriptFallbackPick.candidate
+    } else if (hasTranscriptSignals) {
+      const openingSegment = planSegments[0]
+      const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
+      const openingDuration = Number(clamp(
+        openingSegment ? (openingSegment.end - openingSegment.start) : AUTO_HOOK_DURATION_MAX_SECONDS,
+        HOOK_MIN,
+        HOOK_MAX
+      ).toFixed(3))
+      const alignedOpening = alignHookToSentenceBoundaries(
+        openingStart,
+        openingStart + openingDuration,
+        normalizedTranscriptCues,
+        durationSeconds
+      )
+      const openingAudit = runHookAudit({
+        start: alignedOpening.start,
+        end: alignedOpening.end,
+        transcriptCues: normalizedTranscriptCues,
+        windows: planWindows
+      })
+      resolvedHook = {
+        start: Number(alignedOpening.start.toFixed(3)),
+        duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
+        score: Number(clamp01(openingAudit.auditScore * 0.92 + 0.08).toFixed(4)),
+        auditScore: Number(openingAudit.auditScore.toFixed(4)),
+        auditPassed: Boolean(openingAudit.passed),
+        text: extractHookText(alignedOpening.start, alignedOpening.end, normalizedTranscriptCues),
+        reason: 'Fallback candidates missed transcript quality floor; using coherent opening tease aligned to transcript boundaries.',
+        synthetic: true
+      } as HookCandidate
+    } else {
+      resolvedHook = fallbackRanked[0]?.candidate || storyFallbackHook || null
+    }
+  }
+  if (resolvedHook && !resolvedHook.auditPassed && hasTranscriptSignals) {
+    const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
+      transcriptCues: normalizedTranscriptCues,
+      windows: planWindows,
+      durationSeconds,
+      segments: planSegments,
+      searchWindowSeconds: 45,
+      targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+    })
+    if (auditedOpeningRetry) {
+      resolvedHook = auditedOpeningRetry
+    }
+  }
+  if (!resolvedHook) {
+    resolvedHook = buildFallbackHookCandidateFromStorySegments({
+      segments: planSegments,
+      windows: planWindows,
+      silences: planSilences,
+      durationSeconds
+    })
+  }
+  if (resolvedHook) {
+    const enforcedHook = enforceAutoHookDurationRange({
+      candidate: resolvedHook,
+      durationSeconds
+    })
+    const lockedDuration = Number(clamp(
+      AUTO_HOOK_DURATION_MAX_SECONDS,
+      HOOK_MIN,
+      Math.min(HOOK_MAX, durationSeconds)
+    ).toFixed(3))
+    const maxHookStart = Math.max(0, durationSeconds - lockedDuration)
+    plan.hook = {
+      ...enforcedHook,
+      start: Number(clamp(enforcedHook.start, 0, maxHookStart).toFixed(3)),
+      duration: Number(lockedDuration.toFixed(3))
+    }
+    if (
+      Array.isArray(plan.hookCandidates) &&
+      !plan.hookCandidates.some((candidate) => (
+        Math.abs(candidate.start - plan.hook.start) < 0.01 &&
+        Math.abs(candidate.duration - plan.hook.duration) < 0.01
+      ))
+    ) {
+      plan.hookCandidates = [plan.hook, ...plan.hookCandidates].slice(0, Math.max(8, HOOK_SELECTION_MAX_CANDIDATES))
+    }
+  }
+  return plan
 }
 
 export const __retentionTestUtils = {

@@ -66,6 +66,21 @@ const canRunRawSql = () =>
 
 const nowIso = () => new Date().toISOString()
 
+const toBase64Url = (value: Buffer) =>
+  value
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '')
+
+const fromBase64Url = (value: string) => {
+  const normalized = String(value || '').trim().replace(/-/g, '+').replace(/_/g, '/')
+  if (!normalized) return Buffer.alloc(0)
+  const padding = normalized.length % 4
+  const padded = padding === 0 ? normalized : `${normalized}${'='.repeat(4 - padding)}`
+  return Buffer.from(padded, 'base64')
+}
+
 const parseDateIso = (value: unknown): string | null => {
   if (!value) return null
   const parsed = new Date(String(value))
@@ -175,7 +190,7 @@ const encryptToken = (value: string): string => {
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv)
   const encrypted = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()])
   const tag = cipher.getAuthTag()
-  return `enc:v1:${iv.toString('base64url')}:${tag.toString('base64url')}:${encrypted.toString('base64url')}`
+  return `enc:v1:${toBase64Url(iv)}:${toBase64Url(tag)}:${toBase64Url(encrypted)}`
 }
 
 const decryptToken = (value: string): string => {
@@ -185,9 +200,9 @@ const decryptToken = (value: string): string => {
   const chunks = value.split(':')
   if (chunks.length !== 5) return ''
   try {
-    const iv = Buffer.from(chunks[2], 'base64url')
-    const tag = Buffer.from(chunks[3], 'base64url')
-    const payload = Buffer.from(chunks[4], 'base64url')
+    const iv = fromBase64Url(chunks[2])
+    const tag = fromBase64Url(chunks[3])
+    const payload = fromBase64Url(chunks[4])
     const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv)
     decipher.setAuthTag(tag)
     const decrypted = Buffer.concat([decipher.update(payload), decipher.final()])
@@ -544,7 +559,7 @@ export const buildYouTubeOAuthAuthorizeUrl = async (userId: string) => {
     throw error
   }
   await cleanupExpiredStates()
-  const state = crypto.randomBytes(24).toString('base64url')
+  const state = toBase64Url(crypto.randomBytes(24))
   const expiresAt = new Date(Date.now() + OAUTH_STATE_TTL_MS).toISOString()
   await saveState({
     state,

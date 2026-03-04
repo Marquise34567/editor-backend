@@ -25,7 +25,8 @@
     "test:algorithm-control-room": "ts-node scripts/test-algorithm-control-room.ts",
     "test:uniqueness-benchmark": "ts-node scripts/test-uniqueness-benchmark.ts",
     "test:pre-push": "npm run test:algorithm-control-room && npm run test:retention-enforcer && npm run test:uniqueness-benchmark",
-    "tune:emotional-real-clips": "ts-node scripts/tune-emotional-real-clips.ts"
+    "tune:emotional-real-clips": "ts-node scripts/tune-emotional-real-clips.ts",
+    "rerender:local": "ts-node scripts/rerender-local.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.995.0",
