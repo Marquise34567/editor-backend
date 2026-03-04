@@ -12560,7 +12560,7 @@ const buildMicroCutRangesFromSilences = ({
     const end = clamp(silence.end, 0, durationSeconds)
     const len = Math.max(0, end - start)
     if (len <= safeMaxSilence + 0.015) continue
-    const removeDuration = len - safeMaxSilence
+    const removeDuration = Math.min(len - safeMaxSilence, 4)
     const trimStart = Number((start + (len - removeDuration) / 2).toFixed(3))
     const trimEnd = Number((trimStart + removeDuration).toFixed(3))
     const candidate = { start: trimStart, end: trimEnd }
@@ -15554,7 +15554,7 @@ const buildSilenceTrimCuts = (
     const rawEnd = clamp(silence.end, 0, durationSeconds)
     const silenceDuration = rawEnd - rawStart
     if (silenceDuration <= maxSilenceSeconds + 0.01) continue
-    const removeDuration = silenceDuration - maxSilenceSeconds
+    const removeDuration = Math.min(silenceDuration - maxSilenceSeconds, 4)
     let start = rawStart + (silenceDuration - removeDuration) / 2
     let end = start + removeDuration
     start += keepPadding * 0.25
@@ -17052,7 +17052,7 @@ const applyPacingGovernor = ({
       governed.push({ ...segment })
       continue
     }
-    const lowValue = averageWindowMetric(
+    const lowValueScore = averageWindowMetric(
       windows,
       segment.start,
       segment.end,
@@ -17062,7 +17062,47 @@ const applyPacingGovernor = ({
         0.16 * (1 - (window.curiosityTrigger ?? 0)) +
         0.12 * (1 - window.motionScore)
       )
-    ) > 0.58
+    )
+    const lowValue = lowValueScore > 0.58
+    const avgSpeech = averageWindowMetric(windows, segment.start, segment.end, (window) => window.speechIntensity)
+    const avgCuriosity = averageWindowMetric(windows, segment.start, segment.end, (window) => (window.curiosityTrigger ?? 0))
+    const deadAirHardCutEligible = (
+      lowValueScore >= 0.66 &&
+      avgSpeech <= 0.42 &&
+      avgCuriosity <= 0.38 &&
+      runtime >= 4.2 &&
+      segment.start >= 2.2
+    )
+    if (deadAirHardCutEligible) {
+      const edgeKeepSeconds = durationSeconds < 120 ? 0.38 : 0.3
+      const maxCutRuntime = Math.max(0, runtime - edgeKeepSeconds * 2)
+      const requestedCutRuntime = Math.min(4, maxCutRuntime)
+      const cutSourceSpan = requestedCutRuntime * baseSpeed
+      if (cutSourceSpan >= 0.55 && cutSourceSpan <= spanSeconds - edgeKeepSeconds * 2) {
+        const cutStart = Number((segment.start + (spanSeconds - cutSourceSpan) / 2).toFixed(3))
+        const cutEnd = Number((cutStart + cutSourceSpan).toFixed(3))
+        const leadingEnd = cutStart
+        const trailingStart = cutEnd
+        if (leadingEnd - segment.start >= 0.14) {
+          governed.push({
+            ...segment,
+            start: Number(segment.start.toFixed(3)),
+            end: Number(leadingEnd.toFixed(3)),
+            emphasize: true
+          })
+        }
+        if (segment.end - trailingStart >= 0.14) {
+          governed.push({
+            ...segment,
+            start: Number(trailingStart.toFixed(3)),
+            end: Number(segment.end.toFixed(3)),
+            emphasize: true
+          })
+        }
+        adjustments += 1
+        continue
+      }
+    }
     if (lowValue && baseSpeed < maxSpeedCap) {
       const neededSpeed = spanSeconds / maxSpan
       const boosted = clamp(Math.max(baseSpeed, neededSpeed), 1, maxSpeedCap)
