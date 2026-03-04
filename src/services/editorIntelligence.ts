@@ -2880,6 +2880,10 @@ export const registerPolicyOutcomeForJob = async ({
     return { ok: false, reason: 'assignment_not_found' }
   }
   const outcomeScore = deriveFeedbackOutcomeScore(feedback)
+  const assignedAtValue = assignment.assignedAt
+  const assignedAtIso = assignedAtValue instanceof Date
+    ? assignedAtValue.toISOString()
+    : String(assignedAtValue || nowIso())
   const record = {
     userId,
     jobId,
@@ -2889,7 +2893,7 @@ export const registerPolicyOutcomeForJob = async ({
     outcomeSource: source ? String(source) : null,
     isPlatform: Boolean(isPlatform),
     metadata: metadata && typeof metadata === 'object' ? metadata : {},
-    assignedAt: String(assignment.assignedAt || nowIso()),
+    assignedAt: assignedAtIso,
     outcomeAt: nowIso()
   }
   inMemoryPolicyOutcomes.push(record)
@@ -2900,7 +2904,7 @@ export const registerPolicyOutcomeForJob = async ({
         `
           INSERT INTO policy_ab_outcomes
             (user_id, job_id, policy_id, variant_id, outcome_score, outcome_source, is_platform, metadata, assigned_at, outcome_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW())
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::timestamptz, NOW())
         `,
         record.userId,
         record.jobId,
