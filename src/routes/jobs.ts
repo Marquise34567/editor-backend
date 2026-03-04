@@ -2579,8 +2579,10 @@ const resolveHookCandidateTarget = (durationSeconds: number) => {
   return 20
 }
 const resolveLongFormMinHookSourceStart = (durationSeconds: number) => {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 8
-  return Number(clamp(durationSeconds * 0.08, 8, 24).toFixed(3))
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 6
+  // Keep long-form hook sourcing early enough to preserve context while still
+  // avoiding dead-air intros.
+  return Number(clamp(durationSeconds * 0.03, 6, 12).toFixed(3))
 }
 const resolveClipCandidateTarget = ({
   durationSeconds,
@@ -3358,6 +3360,15 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   exploreX3Mode: false,
   topHumanGuardMode: false,
   creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4))
+}
+
+const AUTO_MODE_V3_DEFAULTS = {
+  strategy: 'viral' as RetentionStrategyProfile,
+  aggression: 'high' as RetentionAggressionLevel,
+  longFormPreset: 'aggressive' as LongFormPreset,
+  longFormAggression: 88,
+  longFormClarityVsSpeed: 44,
+  tangentKiller: true
 }
 
 const applyRetentionStyleReferencePreset = ({
@@ -9778,14 +9789,20 @@ const selectLongFormDisplacedHookCandidate = ({
     Math.abs(entry.candidate.duration - primary.duration) < 0.01
   )) || ranked[0]
   if (!primaryEntry) return null
-  const minSelectionFloor = Math.max(0.42, primaryEntry.selectionScore - 0.08)
+  const nonVerbalPrimary = String(primaryEntry.candidate.text || '').trim().length === 0
+  const minSelectionLift = nonVerbalPrimary ? 0.08 : 0.05
+  const minSelectionFloor = Math.max(0.42, primaryEntry.selectionScore + minSelectionLift)
+  const minTeaserFloor = Math.max(
+    nonVerbalPrimary ? 0.42 : 0.36,
+    primaryEntry.teaserTension + (nonVerbalPrimary ? 0.06 : 0.04)
+  )
+  const minConfidenceFloor = Math.max(0.52, primaryEntry.confidence - 0.02)
   const displaced = ranked.find((entry) => (
     entry.candidate.start >= minSourceStart &&
     entry.selectionScore >= minSelectionFloor &&
-    (entry.candidate.auditPassed || !primary.auditPassed)
-  )) || ranked.find((entry) => (
-    entry.candidate.start >= minSourceStart &&
-    entry.selectionScore >= Math.max(0.38, primaryEntry.selectionScore - 0.12)
+    entry.teaserTension >= minTeaserFloor &&
+    entry.confidence >= minConfidenceFloor &&
+    entry.candidate.auditPassed
   ))
   if (!displaced) return null
   const displacementSeconds = displaced.candidate.start - primary.start
@@ -9795,7 +9812,7 @@ const selectLongFormDisplacedHookCandidate = ({
     minSourceStart: Number(minSourceStart.toFixed(3)),
     fromStart: Number(primary.start.toFixed(3)),
     toStart: Number(displaced.candidate.start.toFixed(3)),
-    reason: `Long-form hook relocation applied: moved source hook from ${primary.start.toFixed(1)}s to ${displaced.candidate.start.toFixed(1)}s to avoid generic intro and increase opener novelty.`
+    reason: `Long-form hook relocation applied: moved source hook from ${primary.start.toFixed(1)}s to ${displaced.candidate.start.toFixed(1)}s after clear opener quality gain.`
   }
 }
 
@@ -12272,13 +12289,16 @@ const pickTopHookCandidates = ({
         : 0
       const midpoint = aligned.start + (durationSecondsActual / 2)
       const timelinePosition = clamp01(midpoint / Math.max(1, durationSeconds))
-      const beatRoleScore = timelinePosition < 0.18
-        ? -0.28
+      const beatRoleScore = timelinePosition < 0.2
+        ? 0.2
         : timelinePosition < 0.52
-          ? 0.18
+          ? 0.16
           : timelinePosition < 0.84
-            ? 0.3
-            : -0.12
+            ? 0.08
+            : -0.1
+      const nonVerbalEarlyBoost = !hookText
+        ? clamp01(1 - (timelinePosition / 0.45)) * 0.04
+        : 0
       const earlyResolutionPenalty = timelinePosition < 0.34
         ? clamp01(
           0.62 * audit.spoilerRisk +
@@ -12305,10 +12325,11 @@ const pickTopHookCandidates = ({
         0.11 * audit.auditScore * modeHookProfile.auditMultiplier +
         0.06 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
         0.04 * dynamicLift.peakDensity -
-        0.1 * longFormStartPenalty -
+        0.06 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier +
+        nonVerbalEarlyBoost +
         modeHookProfile.baseBias
       )
       evaluated.push({
@@ -15118,7 +15139,7 @@ const evaluateHardQualityBar = ({
   beatAnchors: number[]
 }): HardQualityGateAudit => {
   const isLongForm = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS && contentFormat !== 'tiktok_short'
-  const minHookSourceStart = Number(Math.max(8, durationSeconds * 0.08).toFixed(3))
+  const minHookSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
   const hookTimingScore = isLongForm
     ? clamp01(hookSourceStart / Math.max(0.1, minHookSourceStart))
     : 1
@@ -26107,7 +26128,7 @@ const processJob = async (
         const isLongFormRecovery = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS && selectedContentFormat !== 'tiktok_short'
 
         if (failedKeys.has('hook_source_timing') && isLongFormRecovery) {
-          const minHookSourceStart = Number(Math.max(8, durationSeconds * 0.08).toFixed(3))
+          const minHookSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
           const candidatePool = [
             ...hookVariantsForAnalysis,
             recoveredHook
@@ -27792,6 +27813,50 @@ const handleCreateJob = async (req: any, res: any) => {
     if (topHumanGuardMode) {
       requestedFastMode = false
       if (tangentKillerOverride === null) tangentKillerOverride = true
+    }
+    const autoModeRequested = editorModeOverride === null || editorModeOverride === 'auto'
+    const legacyAutoBaselineRequested = (
+      autoModeRequested &&
+      retentionStrategyProfile === 'balanced' &&
+      (retentionAggressionLevel === 'medium' || retentionAggressionLevel === 'high') &&
+      (longFormPresetOverride === null || longFormPresetOverride === 'auto') &&
+      (
+        longFormAggressionOverride === null ||
+        longFormAggressionOverride === DEFAULT_EDIT_OPTIONS.longFormAggression
+      ) &&
+      (
+        longFormClarityVsSpeedOverride === null ||
+        longFormClarityVsSpeedOverride === DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
+      ) &&
+      (maxCutsOverride === null || maxCutsOverride <= 15)
+    )
+    if (
+      legacyAutoBaselineRequested &&
+      !fullAutoYoutubePreset &&
+      !coldStartAutopilot &&
+      !continuityFirstMode
+    ) {
+      if (!retentionTuning.hasStrategyOverride || retentionStrategyProfile === 'balanced') {
+        retentionStrategyProfile = AUTO_MODE_V3_DEFAULTS.strategy
+      }
+      if (
+        !retentionTuning.hasAggressionOverride ||
+        retentionAggressionLevel === 'medium' ||
+        retentionAggressionLevel === 'high'
+      ) {
+        retentionAggressionLevel = AUTO_MODE_V3_DEFAULTS.aggression
+      }
+      if (maxCutsOverride === null || maxCutsOverride <= 15) maxCutsOverride = null
+      if (longFormPresetOverride === null || longFormPresetOverride === 'auto') {
+        longFormPresetOverride = AUTO_MODE_V3_DEFAULTS.longFormPreset
+      }
+      longFormAggressionOverride = longFormAggressionOverride === null
+        ? AUTO_MODE_V3_DEFAULTS.longFormAggression
+        : Math.max(longFormAggressionOverride, AUTO_MODE_V3_DEFAULTS.longFormAggression)
+      longFormClarityVsSpeedOverride = longFormClarityVsSpeedOverride === null
+        ? AUTO_MODE_V3_DEFAULTS.longFormClarityVsSpeed
+        : Math.min(longFormClarityVsSpeedOverride, AUTO_MODE_V3_DEFAULTS.longFormClarityVsSpeed)
+      if (tangentKillerOverride === null) tangentKillerOverride = AUTO_MODE_V3_DEFAULTS.tangentKiller
     }
     const fullAutoYoutubeProfile = fullAutoYoutubePreset
       ? {
