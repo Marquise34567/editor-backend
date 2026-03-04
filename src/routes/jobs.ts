@@ -9888,10 +9888,23 @@ const selectRenderableHookCandidate = ({
     entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
     entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN
   ))
-  const strict = strictWithInstantHold || ranked.find((entry) => (
+  const strictFallbackInstantFloor = clamp(
+    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.03 : 0.05) - (signalStrength < 0.5 ? 0.02 : 0),
+    relaxedInstantHoldFloor,
+    HOOK_STANDARD_INSTANT_HOLD_MIN
+  )
+  const strictFallbackTeaserFloor = clamp(
+    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.02 : 0.04) - (signalStrength < 0.5 ? 0.02 : 0),
+    relaxedTeaserFloor,
+    HOOK_STANDARD_TEASER_TENSION_MIN
+  )
+  const strictWithQualityFloor = ranked.find((entry) => (
     entry.candidate.auditPassed &&
-    entry.confidence >= threshold
+    entry.confidence >= threshold &&
+    entry.openerQuality >= strictFallbackInstantFloor &&
+    entry.teaserTension >= strictFallbackTeaserFloor
   ))
+  const strict = strictWithInstantHold || strictWithQualityFloor
   if (strict) {
     const debug = buildHookSelectionDebugPayload({
       ranked,
