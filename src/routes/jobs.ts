@@ -25242,6 +25242,7 @@ const processJob = async (
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), `${jobId}-`))
   const tmpIn = path.join(workDir, 'input')
   const tmpOut = path.join(workDir, 'output.mp4')
+  const renderArtifactTag = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`
   const absTmpIn = path.resolve(tmpIn)
   const absTmpOut = path.resolve(tmpOut)
   try {
@@ -25743,7 +25744,7 @@ const processJob = async (
         }
       }
       if (stitchedVerticalOutputReady) {
-        const stitchedOutputKey = `${job.userId}/${jobId}/output.mp4`
+        const stitchedOutputKey = `${job.userId}/${jobId}/renders/${renderArtifactTag}/output.mp4`
         try {
           await uploadFileToOutput({ key: stitchedOutputKey, filePath: stitchedVerticalOutputPath, contentType: 'video/mp4' })
         } catch (error) {
@@ -25759,7 +25760,7 @@ const processJob = async (
 
       for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
         const clipPath = renderedClipPaths[idx]
-        const key = `${job.userId}/${jobId}/vertical/clip-${idx + 1}.mp4`
+        const key = `${job.userId}/${jobId}/renders/${renderArtifactTag}/vertical/clip-${idx + 1}.mp4`
         try {
           await uploadFileToOutput({ key, filePath: clipPath, contentType: 'video/mp4' })
         } catch (error) {
@@ -29171,7 +29172,7 @@ const processJob = async (
     const outputPaths: string[] = []
     const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
     fs.mkdirSync(localOutDir, { recursive: true })
-    const outPath = `${job.userId}/${jobId}/output.mp4`
+    const outPath = `${job.userId}/${jobId}/renders/${renderArtifactTag}/output.mp4`
     const localOutPath = path.join(localOutDir, 'output.mp4')
     fs.copyFileSync(tmpOut, localOutPath)
     console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
@@ -31936,6 +31937,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       renderSettings: (job as any)?.renderSettings,
       payload: req.body
     })
+    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
     const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
     const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
@@ -32003,6 +32005,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platform_profile: requestedPlatformProfile,
       hookSelectionMode: requestedHookSelectionMode,
       hook_selection_mode: requestedHookSelectionMode,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
       ...(requestedSmartZoom === null ? {} : { smartZoom: requestedSmartZoom }),
@@ -32066,6 +32069,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       platform_profile: requestedPlatformProfile,
       hookSelectionMode: requestedHookSelectionMode,
       hook_selection_mode: requestedHookSelectionMode,
+      ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       style_archetype_blend_override: styleBlendOverride,
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
