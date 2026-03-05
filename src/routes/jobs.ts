@@ -9835,22 +9835,37 @@ const scoreRenderableHookCandidateSignals = ({
     ? textSignals.authenticity
     : clamp01(0.58 * curiosityWindow + 0.42 * instantHold)
   const openerQuality = clamp01(
-    0.34 * instantHold +
-    0.14 * introClarity +
-    0.12 * teaserTension +
-    0.1 * visualNovelty +
-    0.14 * visualImpact +
-    0.08 * overlayReadiness +
-    0.08 * urgency
+    0.29 * instantHold +
+    0.12 * introClarity +
+    0.15 * teaserTension +
+    0.12 * curiosityPressure +
+    0.09 * visualNovelty +
+    0.13 * visualImpact +
+    0.06 * overlayReadiness +
+    0.04 * urgency
   )
+  const totalTimelineSeconds = windows.length
+    ? Math.max(1, Number((windows[windows.length - 1]?.time ?? hookEnd) + 1))
+    : Math.max(1, hookEnd + 1)
+  const curiosityWindowSeconds = Math.max(26, Math.min(120, totalTimelineSeconds * 0.42))
+  const openerTimingScore = clamp01(1 - Math.max(0, hookStart - 1.2) / curiosityWindowSeconds)
+  const lateSourcePenalty = hookStart > curiosityWindowSeconds
+    ? clamp01(
+      (hookStart - curiosityWindowSeconds) /
+      Math.max(22, totalTimelineSeconds - curiosityWindowSeconds)
+    )
+    : 0
   const selectionScore = clamp01(
-    0.3 * confidence +
-    0.24 * openerQuality +
-    0.16 * curiosityPressure +
-    0.1 * valuePromise +
-    0.08 * urgency +
-    0.07 * contrarianTrigger +
-    0.05 * authenticity
+    0.24 * confidence +
+    0.21 * openerQuality +
+    0.22 * curiosityPressure +
+    0.12 * teaserTension +
+    0.08 * valuePromise +
+    0.05 * urgency +
+    0.05 * openerTimingScore +
+    0.02 * contrarianTrigger +
+    0.01 * authenticity -
+    0.06 * lateSourcePenalty
   )
   return {
     confidence: Number(confidence.toFixed(4)),
@@ -10474,19 +10489,106 @@ const evaluateTranscriptHookQuality = ({
   })
   const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
   const qualityScore = clamp01(
-    0.28 * clamp01(Number(candidate.auditScore || 0)) +
-    0.26 * scored.selectionScore +
-    0.16 * scored.curiosityPressure +
-    0.12 * scored.teaserTension +
+    0.22 * clamp01(Number(candidate.auditScore || 0)) +
+    0.22 * scored.selectionScore +
+    0.22 * scored.curiosityPressure +
+    0.16 * scored.teaserTension +
     0.08 * scored.introClarity +
-    0.06 * scored.visualImpact +
-    0.04 * textSignals.specificity
+    0.05 * scored.visualImpact +
+    0.05 * textSignals.specificity
   )
   return {
     scored,
     textSignals,
     qualityScore: Number(qualityScore.toFixed(4))
   }
+}
+
+const pickNonVerbalCuriosityCandidateFromRanked = ({
+  ranked,
+  durationSeconds,
+  current
+}: {
+  ranked: HookSelectionRankedEntry[]
+  durationSeconds: number
+  current?: HookCandidate | null
+}): HookCandidate | null => {
+  if (!Array.isArray(ranked) || !ranked.length) return null
+  const safeDuration = Math.max(1, Number(durationSeconds || 0))
+  const earlyWindow = Math.max(26, Math.min(120, safeDuration * 0.42))
+  const currentEntry = current
+    ? ranked.find((entry) => (
+      Math.abs(entry.candidate.start - current.start) < 0.01 &&
+      Math.abs(entry.candidate.duration - current.duration) < 0.01
+    )) || null
+    : null
+  const currentPriority = currentEntry
+    ? clamp01(
+      0.3 * currentEntry.curiosityPressure +
+      0.2 * currentEntry.teaserTension +
+      0.2 * currentEntry.visualImpact +
+      0.1 * currentEntry.instantHold +
+      0.1 * currentEntry.selectionScore +
+      0.1 * currentEntry.openerQuality
+    )
+    : 0
+  const enriched = ranked
+    .map((entry) => {
+      const start = Number(entry.candidate.start || 0)
+      const earlyBias = clamp01(1 - Math.max(0, start - 1.2) / earlyWindow)
+      const latePenalty = start > earlyWindow
+        ? clamp01((start - earlyWindow) / Math.max(24, safeDuration - earlyWindow))
+        : 0
+      const curiosityCore = clamp01(
+        0.28 * entry.curiosityPressure +
+        0.22 * entry.teaserTension +
+        0.2 * entry.visualImpact +
+        0.12 * entry.instantHold +
+        0.1 * entry.selectionScore +
+        0.08 * entry.openerQuality
+      )
+      const priority = clamp01(
+        0.68 * curiosityCore +
+        0.18 * earlyBias +
+        0.08 * clamp01(Number(entry.candidate.auditScore || 0)) +
+        0.06 * Number(Boolean(entry.candidate.auditPassed)) -
+        0.12 * latePenalty
+      )
+      return {
+        entry,
+        curiosityCore,
+        priority
+      }
+    })
+    .sort((a, b) => (
+      b.priority - a.priority ||
+      b.curiosityCore - a.curiosityCore ||
+      b.entry.selectionScore - a.entry.selectionScore ||
+      b.entry.candidate.auditScore - a.entry.candidate.auditScore ||
+      a.entry.candidate.start - b.entry.candidate.start
+    ))
+  if (!enriched.length) return null
+  const qualityPick = enriched.find((row) => (
+    row.entry.selectionScore >= 0.5 &&
+    row.entry.curiosityPressure >= 0.34 &&
+    row.entry.teaserTension >= 0.3 &&
+    row.entry.visualImpact >= 0.3
+  ))
+  const pick = qualityPick || enriched[0]
+  if (!pick) return null
+  const clearlyBetterThanCurrent = (
+    !currentEntry ||
+    pick.priority >= currentPriority + 0.03 ||
+    pick.entry.curiosityPressure >= currentEntry.curiosityPressure + 0.05 ||
+    pick.entry.teaserTension >= currentEntry.teaserTension + 0.05 ||
+    pick.entry.visualImpact >= currentEntry.visualImpact + 0.05 ||
+    pick.entry.selectionScore >= currentEntry.selectionScore + 0.03
+  )
+  if (!clearlyBetterThanCurrent) return null
+  return {
+    ...pick.entry.candidate,
+    reason: 'Non-verbal curiosity rescue: selected the strongest visual/tension moment for opener instead of generic fallback.'
+  } as HookCandidate
 }
 
 const pickTranscriptHookQualityRescueCandidate = ({
@@ -26297,6 +26399,62 @@ const processJob = async (
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
+      if (!hasTranscriptSignals && hookSelectionModeForRender === 'auto' && hookCandidates.length > 0) {
+        const nonVerbalRanked: HookSelectionRankedEntry[] = hookCandidates
+          .map((candidate) => {
+            const scored = scoreRenderableHookCandidateSignals({
+              candidate,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            return {
+              candidate,
+              confidence: scored.confidence,
+              instantHold: scored.instantHold,
+              introClarity: scored.introClarity,
+              teaserTension: scored.teaserTension,
+              curiosityPressure: scored.curiosityPressure,
+              visualNovelty: scored.visualNovelty,
+              visualImpact: scored.visualImpact,
+              valuePromise: scored.valuePromise,
+              urgency: scored.urgency,
+              contrarianTrigger: scored.contrarianTrigger,
+              overlayReadiness: scored.overlayReadiness,
+              authenticity: scored.authenticity,
+              openerQuality: scored.openerQuality,
+              selectionScore: scored.selectionScore
+            }
+          })
+          .sort((a, b) => (
+            b.selectionScore - a.selectionScore ||
+            b.curiosityPressure - a.curiosityPressure ||
+            b.teaserTension - a.teaserTension ||
+            b.visualImpact - a.visualImpact ||
+            b.confidence - a.confidence ||
+            a.candidate.start - b.candidate.start
+          ))
+        const upgradedNonVerbalHook = pickNonVerbalCuriosityCandidateFromRanked({
+          ranked: nonVerbalRanked,
+          durationSeconds,
+          current: resolvedHookDecision?.candidate || null
+        })
+        if (upgradedNonVerbalHook) {
+          const upgradeThreshold = resolveHookScoreThreshold({
+            aggressionLevel,
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength,
+            thresholdOffset: hookThresholdOffset
+          })
+          resolvedHookDecision = {
+            candidate: upgradedNonVerbalHook,
+            confidence: getHookCandidateConfidence(upgradedNonVerbalHook),
+            threshold: upgradeThreshold,
+            usedFallback: true,
+            reason: upgradedNonVerbalHook.reason,
+            debug: resolvedHookDecision?.debug || null
+          }
+          optimizationNotes.push('Hook upgrade: prioritized strongest non-verbal curiosity moment for opener.')
+        }
+      }
       if (
         hasTranscriptSignals &&
         (!resolvedHookDecision || !resolvedHookDecision.candidate.auditPassed)
@@ -26649,18 +26807,32 @@ const processJob = async (
           fallbackSignals.curiosityPressure < HOOK_STANDARD_CURIOSITY_MIN
         )
         if (fallbackNoTranscriptUnsafe) {
-          const openingSegment = storySegments[0]
-          const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
-          const openingDuration = Number(clamp(
-            openingSegment ? (openingSegment.end - openingSegment.start) : 6,
-            HOOK_MIN,
-            HOOK_MAX
-          ).toFixed(3))
-          fallbackHook = {
-            ...fallbackHook,
-            start: openingStart,
-            duration: openingDuration,
-            reason: 'Fallback hook quality floor not met without transcript support; preserving coherent opener from the beginning of this video.'
+          const nonVerbalCuriosityFallback = pickNonVerbalCuriosityCandidateFromRanked({
+            ranked: fallbackPoolRanked,
+            durationSeconds,
+            current: fallbackHook
+          })
+          if (nonVerbalCuriosityFallback) {
+            fallbackHook = nonVerbalCuriosityFallback
+            fallbackSignals = scoreRenderableHookCandidateSignals({
+              candidate: fallbackHook,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            optimizationNotes.push('Hook fallback rescue: replaced weak non-verbal opener with higher-curiosity visual/tension candidate.')
+          } else {
+            const openingSegment = storySegments[0]
+            const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
+            const openingDuration = Number(clamp(
+              openingSegment ? (openingSegment.end - openingSegment.start) : 6,
+              HOOK_MIN,
+              HOOK_MAX
+            ).toFixed(3))
+            fallbackHook = {
+              ...fallbackHook,
+              start: openingStart,
+              duration: openingDuration,
+              reason: 'Fallback hook quality floor not met without transcript support; preserving coherent opener from the beginning of this video.'
+            }
           }
         }
         if (
@@ -33159,6 +33331,48 @@ const buildEditPlanForTest = async ({
     })
     : null
   let resolvedHook = hookDecision?.candidate || null
+  if (!hasTranscriptSignals && candidatePool.length > 0) {
+    const nonVerbalRanked: HookSelectionRankedEntry[] = candidatePool
+      .map((candidate) => {
+        const scored = scoreRenderableHookCandidateSignals({
+          candidate,
+          windows: planWindows
+        })
+        return {
+          candidate,
+          confidence: scored.confidence,
+          instantHold: scored.instantHold,
+          introClarity: scored.introClarity,
+          teaserTension: scored.teaserTension,
+          curiosityPressure: scored.curiosityPressure,
+          visualNovelty: scored.visualNovelty,
+          visualImpact: scored.visualImpact,
+          valuePromise: scored.valuePromise,
+          urgency: scored.urgency,
+          contrarianTrigger: scored.contrarianTrigger,
+          overlayReadiness: scored.overlayReadiness,
+          authenticity: scored.authenticity,
+          openerQuality: scored.openerQuality,
+          selectionScore: scored.selectionScore
+        }
+      })
+      .sort((a, b) => (
+        b.selectionScore - a.selectionScore ||
+        b.curiosityPressure - a.curiosityPressure ||
+        b.teaserTension - a.teaserTension ||
+        b.visualImpact - a.visualImpact ||
+        b.confidence - a.confidence ||
+        a.candidate.start - b.candidate.start
+      ))
+    const upgradedNonVerbalHook = pickNonVerbalCuriosityCandidateFromRanked({
+      ranked: nonVerbalRanked,
+      durationSeconds,
+      current: resolvedHook
+    })
+    if (upgradedNonVerbalHook) {
+      resolvedHook = upgradedNonVerbalHook
+    }
+  }
   if (
     hasTranscriptSignals &&
     (!resolvedHook || !resolvedHook.auditPassed)
@@ -33428,7 +33642,12 @@ const buildEditPlanForTest = async ({
         resolvedHook = shouldUseOpeningFallback ? openingCandidate : looseTranscriptCandidate
       }
     } else {
-      resolvedHook = fallbackRanked[0]?.candidate || storyFallbackHook || null
+      const nonVerbalFallback = pickNonVerbalCuriosityCandidateFromRanked({
+        ranked: fallbackRanked,
+        durationSeconds,
+        current: fallbackRanked[0]?.candidate || null
+      })
+      resolvedHook = nonVerbalFallback || fallbackRanked[0]?.candidate || storyFallbackHook || null
     }
   }
   if (resolvedHook && !resolvedHook.auditPassed && hasTranscriptSignals) {
