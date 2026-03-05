@@ -29568,7 +29568,7 @@ const MAX_PIPELINES = (() => {
 const QUEUE_RECOVERY_INTERVAL_MS = (() => {
   const envVal = Number(process.env.JOB_QUEUE_RECOVERY_INTERVAL_MS || 0)
   if (Number.isFinite(envVal) && envVal >= 5000) return envVal
-  return 30_000
+  return 10_000
 })()
 const STALE_PIPELINE_MS = (() => {
   const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
@@ -29731,8 +29731,8 @@ const recoverQueuedJobs = async () => {
           in: [...STARTABLE_QUEUE_STATUSES, ...STALE_RECOVERABLE_STATUSES] as any
         }
       },
-      orderBy: { createdAt: 'asc' },
-      take: 200
+      orderBy: { updatedAt: 'asc' },
+      take: 1000
     })
     const jobs = Array.isArray(candidates) ? candidates : []
     const nowMs = Date.now()

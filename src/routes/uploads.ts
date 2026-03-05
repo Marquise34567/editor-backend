@@ -127,15 +127,14 @@ router.post('/complete', async (req: any, res) => {
       }
     }
 
-    await updateJob(resolvedJobId, { inputPath: key, status: 'queued', progress: 1 })
-    // trigger processing asynchronously
-    setImmediate(() => {
-      try {
-        enqueuePipeline({ jobId: resolvedJobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
-      } catch (e) {
-        console.error('enqueuePipeline failed', e)
-      }
-    })
+    // Mark as analyzing immediately and enqueue in-process for reliability.
+    // Avoid setImmediate here because short-lived workers can drop deferred queue kicks.
+    await updateJob(resolvedJobId, { inputPath: key, status: 'analyzing', progress: 10 })
+    try {
+      enqueuePipeline({ jobId: resolvedJobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
+    } catch (e) {
+      console.error('enqueuePipeline failed', e)
+    }
     return res.json({ ok: true, jobId: resolvedJobId })
   } catch (err: any) {
     console.error('uploads.complete error', err)
@@ -310,8 +309,12 @@ router.post('/proxy', bodyParser.raw({ type: '*/*', limit: '3gb' }), async (req:
         return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(error.message || error) })
       }
     }
-    await updateJob(jobId, { inputPath: key, status: 'queued', progress: 1 })
-    setImmediate(() => enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 }))
+    await updateJob(jobId, { inputPath: key, status: 'analyzing', progress: 10 })
+    try {
+      enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
+    } catch (e) {
+      console.error('enqueuePipeline failed', e)
+    }
     return res.json({ ok: true, key })
   } catch (err: any) {
     console.error('uploads.proxy error', err)
