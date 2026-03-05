@@ -684,9 +684,8 @@ const buildScoredCandidates = ({
     const fillerPenalty = clamp(avg(overlappingSignals.map((segment) => segment.fillerDensity), 0) * 0.45, 0, 0.25)
     const sentimentScore = candidate.scores.sentiment || computeLexiconSentiment(candidate.transcript)
     const faceCenterBoost = clamp(frameScan.centeredFaceVerticalSignal, 0, 1) * 0.08
-    const openerBias = candidate.start <= 2.5
-      ? (candidate.source === 'intro_fallback' ? 0.01 : 0.04)
-      : 0
+    // Do not force the start of the video; let strongest curiosity/motion win.
+    const openerBias = 0
     const heuristicScore = clamp(
       motionScore * 0.36 +
         audioScore * 0.28 +
@@ -2000,68 +1999,44 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
         llm: Number(clamp(1 - index * 0.08, 0.2, 1).toFixed(4))
       }
     }))
-  const strongest = candidates[0] || null
-  const strongestEarlyCandidate =
-    candidates
-      .filter((candidate) => candidate.start <= 3.2)
-      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
-  const introAnchorCandidate =
-    candidates
-      .filter((candidate) => candidate.start <= 1.2)
-      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
-  const introAnchorLooksStrong = Boolean(
-    strongest &&
-    introAnchorCandidate &&
-    introAnchorCandidate.scores.combined >= Math.max(0.62, strongest.scores.combined - 0.015) &&
-    (
-      introAnchorCandidate.source !== 'intro_fallback' ||
-      introAnchorCandidate.scores.combined >= Math.max(0.7, strongest.scores.combined - 0.005)
-    ) &&
-    String(introAnchorCandidate.transcript || '').trim().length >= 18
-  )
-  const earlyCandidateLooksStrong = Boolean(
-    strongest &&
-    strongestEarlyCandidate &&
-    strongest.start > 3.5 &&
-    strongestEarlyCandidate.scores.combined >= Math.max(0.6, strongest.scores.combined - 0.03)
-  )
-  const provisionalSelectedCandidate = introAnchorLooksStrong
-    ? introAnchorCandidate
-    : earlyCandidateLooksStrong
-      ? strongestEarlyCandidate
-      : strongest
-  const earlyWindowLimitSeconds = Number(clamp(duration * 0.24, 48, 120).toFixed(1))
-  const strongestWithinEarlyWindow =
-    candidates
-      .filter((candidate) => candidate.start <= earlyWindowLimitSeconds)
-      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
   const transcriptSignalCount = Array.isArray(input.transcriptSegments) ? input.transcriptSegments.length : 0
   const hasTranscriptSignals = transcriptSignalCount > 0
-  const selectedCandidate = (
-    provisionalSelectedCandidate &&
-    strongestWithinEarlyWindow &&
-    provisionalSelectedCandidate.start > earlyWindowLimitSeconds &&
-    strongestWithinEarlyWindow.scores.combined >= Math.max(0.56, provisionalSelectedCandidate.scores.combined - 0.06)
-  )
-    ? strongestWithinEarlyWindow
-    : provisionalSelectedCandidate
-  const lateHookWindowSeconds = Number(clamp(duration * 0.42, 90, Math.max(90, duration - 8)).toFixed(1))
-  const strongestLateSafeEarlyCandidate =
-    candidates
-      .filter((candidate) => candidate.start <= lateHookWindowSeconds)
-      .sort((left, right) => (
-        right.scores.combined - left.scores.combined ||
-        left.start - right.start
-      ))[0] || null
-  const finalSelectedCandidate = (
-    selectedCandidate &&
-    !hasTranscriptSignals &&
-    strongestLateSafeEarlyCandidate &&
-    selectedCandidate.start > lateHookWindowSeconds &&
-    strongestLateSafeEarlyCandidate.scores.combined >= Math.max(0.46, selectedCandidate.scores.combined - 0.18)
-  )
-    ? strongestLateSafeEarlyCandidate
-    : selectedCandidate
+  const rankedWithoutIntroFallback = candidates.filter((candidate) => candidate.source !== 'intro_fallback')
+  const baseRankingPool = rankedWithoutIntroFallback.length ? rankedWithoutIntroFallback : candidates
+  const strongest = baseRankingPool[0] || null
+  const curiosityRanked = baseRankingPool
+    .map((candidate) => {
+      const timelinePosition = clamp(candidate.start / Math.max(1, duration), 0, 1)
+      const extremeTailPenalty = timelinePosition > 0.92 ? clamp((timelinePosition - 0.92) * 1.4, 0, 0.12) : 0
+      const curiosityScore = clamp(
+        0.5 * candidate.scores.combined +
+        0.26 * candidate.scores.motion +
+        0.24 * candidate.scores.sentiment -
+        extremeTailPenalty,
+        0,
+        1
+      )
+      return { candidate, curiosityScore }
+    })
+    .sort((left, right) => (
+      right.curiosityScore - left.curiosityScore ||
+      right.candidate.scores.combined - left.candidate.scores.combined ||
+      left.candidate.start - right.candidate.start
+    ))
+  const strongestCuriosity = curiosityRanked[0] || null
+  let finalSelectedCandidate = strongestCuriosity?.candidate || strongest
+  if (!hasTranscriptSignals && finalSelectedCandidate) {
+    const finalCuriosityScore = strongestCuriosity?.curiosityScore ?? finalSelectedCandidate.scores.combined
+    const lateStartFloor = Math.max(4.5, duration * 0.04)
+    const nonEarlyAlternative = curiosityRanked.find((entry) => entry.candidate.start >= lateStartFloor) || null
+    if (
+      finalSelectedCandidate.start <= 3.2 &&
+      nonEarlyAlternative &&
+      nonEarlyAlternative.curiosityScore >= finalCuriosityScore - 0.015
+    ) {
+      finalSelectedCandidate = nonEarlyAlternative.candidate
+    }
+  }
   const selected = finalSelectedCandidate ? toAIDurationHook(finalSelectedCandidate, duration, 8) : null
   const selectedPeakMoment = buildSelectedPeakMoment(selected)
   const hookBlueprint = buildHookBlueprint({
@@ -2110,15 +2085,9 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     selectedHook: selected
       ? {
           ...selected,
-          reason:
-            finalSelectedCandidate?.id === introAnchorCandidate?.id && introAnchorCandidate?.id !== strongest?.id
-              ? `Selected this 8-second opener over alternatives because it anchors at timeline start while preserving comparable retention strength (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : finalSelectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
-              ? `Selected this 8-second opener over alternatives because its early-timeline placement preserves first-3s hold while matching top retention score (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : finalSelectedCandidate?.id === strongestLateSafeEarlyCandidate?.id &&
-                strongestLateSafeEarlyCandidate?.id !== strongest?.id
-              ? `Selected this 8-second opener over alternatives because no transcript was available and this early candidate stayed close to top retention score while improving opener positioning (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : `Selected this 8-second opener over alternatives because it delivers the strongest retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
+          reason: hasTranscriptSignals
+            ? `Selected this 8-second opener over alternatives because it delivers the strongest retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
+            : `Selected this 8-second opener over alternatives because it scored highest on full-timeline curiosity + motion pressure without transcript cues (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s), instead of defaulting to the beginning.`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),
