@@ -15,7 +15,6 @@ const LOCAL_RERENDER_DEFAULTS = {
   longFormPreset: 'balanced',
   longFormAggression: 42,
   longFormClarityVsSpeed: 72,
-  maxCuts: 22,
   autoTranscribe: true
 } as const
 
@@ -47,6 +46,14 @@ const parseBooleanOption = (value: string | undefined, fallback: boolean) => {
   return fallback
 }
 
+const parseOptionalNumber = (value: string | undefined): number => {
+  if (value === undefined || value === null) return Number.NaN
+  const trimmed = String(value).trim()
+  if (!trimmed) return Number.NaN
+  const parsed = Number(trimmed)
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
+
 const parseCli = (): CliOptions => {
   const args = process.argv.slice(2)
   const positionals: string[] = []
@@ -71,15 +78,15 @@ const parseCli = (): CliOptions => {
     throw new Error(
       'usage: ts-node scripts/rerender-local.ts "<input.mp4>" "<output.mp4>" ' +
       '[--aggression medium] [--strategy balanced] [--longFormPreset balanced] ' +
-      '[--longFormAggression 42] [--longFormClarity 72] [--maxCuts 22] ' +
+      '[--longFormAggression 42] [--longFormClarity 72] [--maxCuts <optional>] ' +
       '[--transcribe true] [--transcriptSrt "<captions.srt>"]'
     )
   }
   const input = path.resolve(positionals[0])
   const output = path.resolve(positionals[1] || `${input.replace(/\.[^/.]+$/, '')}_rerender.mp4`)
-  const longFormAggression = Number(options.longFormAggression ?? options.longformAggression ?? '')
-  const longFormClarityVsSpeed = Number(options.longFormClarity ?? options.longformClarity ?? '')
-  const maxCuts = Number(options.maxCuts ?? options.maxcuts ?? '')
+  const longFormAggression = parseOptionalNumber(options.longFormAggression ?? options.longformAggression)
+  const longFormClarityVsSpeed = parseOptionalNumber(options.longFormClarity ?? options.longformClarity)
+  const maxCuts = parseOptionalNumber(options.maxCuts ?? options.maxcuts)
   const autoTranscribe = parseBooleanOption(options.transcribe, LOCAL_RERENDER_DEFAULTS.autoTranscribe)
   const transcriptSrtPathRaw = String(options.transcriptSrt ?? options.transcript_srt ?? '').trim()
   return {
@@ -95,7 +102,7 @@ const parseCli = (): CliOptions => {
     longFormClarityVsSpeed: Number.isFinite(longFormClarityVsSpeed)
       ? longFormClarityVsSpeed
       : LOCAL_RERENDER_DEFAULTS.longFormClarityVsSpeed,
-    maxCuts: Number.isFinite(maxCuts) ? maxCuts : LOCAL_RERENDER_DEFAULTS.maxCuts,
+    maxCuts: Number.isFinite(maxCuts) ? maxCuts : undefined,
     autoTranscribe,
     transcriptSrtPath: transcriptSrtPathRaw ? path.resolve(transcriptSrtPathRaw) : undefined
   }
@@ -229,34 +236,64 @@ const capSegmentsToMaxCuts = (
   if (!Number.isFinite(parsedMaxCuts) || parsedMaxCuts < 1) return segments
   const maxSegments = Math.max(2, Math.round(parsedMaxCuts) + 1)
   if (segments.length <= maxSegments) return segments
+  const softTarget = maxSegments + Math.max(4, Math.min(14, Math.round(maxSegments * 0.28)))
   const out = segments
     .map((segment) => ({ ...segment }))
     .sort((a, b) => a.start - b.start || a.end - b.end)
-  while (out.length > maxSegments) {
+  const findMergeIndex = (maxGap: number, maxMergedSpan: number) => {
     let bestIndex = -1
     let bestCost = Number.POSITIVE_INFINITY
     for (let index = 0; index < out.length - 1; index += 1) {
       const left = out[index]
       const right = out[index + 1]
       const gap = Math.max(0, right.start - left.end)
+      if (gap > maxGap) continue
       const mergedDuration = Math.max(0.1, right.end - left.start)
+      if (mergedDuration > maxMergedSpan) continue
       const speedDelta = Math.abs((left.speed || 1) - (right.speed || 1))
-      const cost = gap * 1.2 + speedDelta * 0.6 + mergedDuration * 0.05
+      const cost = gap * 2.2 + speedDelta * 0.7 + mergedDuration * 0.08
       if (cost < bestCost) {
         bestCost = cost
         bestIndex = index
       }
     }
-    if (bestIndex < 0) break
-    const left = out[bestIndex]
-    const right = out[bestIndex + 1]
-    out.splice(bestIndex, 2, {
+    return bestIndex
+  }
+  const applyMergeAt = (mergeIdx: number) => {
+    const left = out[mergeIdx]
+    const right = out[mergeIdx + 1]
+    out.splice(mergeIdx, 2, {
       start: Number(left.start.toFixed(3)),
       end: Number(Math.max(left.end, right.end).toFixed(3)),
-      speed: Number(clamp(((left.speed || 1) + (right.speed || 1)) / 2, 1, 1.2).toFixed(3))
+      speed: Number(clamp(((left.speed || 1) + (right.speed || 1)) / 2, 1, 1.24).toFixed(3))
     })
   }
+  while (out.length > softTarget) {
+    let bestIndex = findMergeIndex(0.55, 12.5)
+    if (bestIndex < 0) bestIndex = findMergeIndex(1.2, 15)
+    if (bestIndex < 0) break
+    applyMergeAt(bestIndex)
+  }
+  while (out.length > maxSegments) {
+    const bestIndex = findMergeIndex(0.45, 10)
+    if (bestIndex < 0) break
+    applyMergeAt(bestIndex)
+  }
   return out
+}
+
+const resolveAdaptiveMaxCuts = (sourceDurationSeconds: number, requestedMaxCuts?: number) => {
+  const requested = Number(requestedMaxCuts)
+  if (Number.isFinite(requested) && requested >= 1) {
+    return Math.max(1, Math.round(requested))
+  }
+  if (sourceDurationSeconds >= 720) return 44
+  if (sourceDurationSeconds >= 540) return 40
+  if (sourceDurationSeconds >= 420) return 36
+  if (sourceDurationSeconds >= 300) return 32
+  if (sourceDurationSeconds >= 180) return 26
+  if (sourceDurationSeconds >= 120) return 22
+  return 16
 }
 
 const main = async () => {
@@ -264,6 +301,7 @@ const main = async () => {
   if (!fs.existsSync(cli.input)) throw new Error(`input_missing:${cli.input}`)
   fs.mkdirSync(path.dirname(cli.output), { recursive: true })
   const sourceDuration = probeDurationSeconds(cli.input)
+  const effectiveMaxCuts = resolveAdaptiveMaxCuts(sourceDuration, cli.maxCuts)
 
   const planner = (__retentionTestUtils as any).buildEditPlanForTest as (args: any) => Promise<any>
   const plan = await planner({
@@ -274,7 +312,7 @@ const main = async () => {
     longFormPreset: cli.longFormPreset,
     longFormAggression: cli.longFormAggression,
     longFormClarityVsSpeed: cli.longFormClarityVsSpeed,
-    maxCuts: cli.maxCuts,
+    maxCuts: effectiveMaxCuts,
     autoTranscribe: cli.autoTranscribe,
     transcriptSrtPath: cli.transcriptSrtPath
   })
@@ -310,7 +348,7 @@ const main = async () => {
   )
     ? moveHookToStart(baseSegments, normalizedHook)
     : baseSegments
-  const preppedSegments = timelineWithHookAtStart
+  const timelineSegments = timelineWithHookAtStart
     .map((segment: any) => ({
       start: Number(segment?.start),
       end: Number(segment?.end),
@@ -322,9 +360,26 @@ const main = async () => {
       Number.isFinite(segment.speed) &&
       segment.end - segment.start > 0.12
     ))
-    .sort((a: any, b: any) => a.start - b.start || a.end - b.end)
+  const hasPinnedHookIntro = Boolean(
+    normalizedHook &&
+    timelineSegments.length &&
+    Math.abs(timelineSegments[0].start - normalizedHook.start) <= 0.06 &&
+    Math.abs((timelineSegments[0].end - timelineSegments[0].start) - normalizedHook.duration) <= 0.08
+  )
+  const pinnedHookSegment = hasPinnedHookIntro
+    ? {
+      ...timelineSegments[0],
+      speed: 1
+    }
+    : null
+  const bodySegments = hasPinnedHookIntro
+    ? timelineSegments.slice(1)
+    : timelineSegments.slice()
+  const orderedBodySegments = bodySegments
+    .map((segment) => ({ ...segment }))
+    .sort((a, b) => a.start - b.start || a.end - b.end)
   const segments = stabilizeSegmentsForStoryRender(
-    preppedSegments,
+    orderedBodySegments,
     String(plan?.styleProfile?.style || '')
   )
   const cappedSegments = capNarrativeSegmentCount(
@@ -332,7 +387,11 @@ const main = async () => {
     sourceDuration,
     String(plan?.styleProfile?.style || '')
   )
-  const densityCappedSegments = capSegmentsToMaxCuts(cappedSegments, cli.maxCuts)
+  const maxCutsBudget = Math.max(1, Math.round(effectiveMaxCuts) - (hasPinnedHookIntro ? 1 : 0))
+  const densityCappedBody = capSegmentsToMaxCuts(cappedSegments, maxCutsBudget)
+  const densityCappedSegments = pinnedHookSegment
+    ? [pinnedHookSegment, ...densityCappedBody]
+    : densityCappedBody
 
   if (!densityCappedSegments.length) throw new Error('plan_has_no_segments')
 
@@ -425,7 +484,7 @@ const main = async () => {
       longFormPreset: cli.longFormPreset || null,
       longFormAggression: cli.longFormAggression ?? null,
       longFormClarityVsSpeed: cli.longFormClarityVsSpeed ?? null,
-      maxCuts: cli.maxCuts ?? null,
+      maxCuts: effectiveMaxCuts,
       autoTranscribe: cli.autoTranscribe,
       transcriptSrtPath: cli.transcriptSrtPath || null
     }

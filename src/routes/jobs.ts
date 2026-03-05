@@ -1093,6 +1093,12 @@ type HookSelectionDebugCandidate = {
   teaserTension: number
   curiosityPressure: number
   visualNovelty: number
+  visualImpact: number
+  valuePromise: number
+  urgency: number
+  contrarianTrigger: number
+  overlayReadiness: number
+  authenticity: number
   openerQuality: number
   selectionScore: number
   text: string
@@ -1103,11 +1109,13 @@ type HookSelectionDebugCandidate = {
     strictInstantHold: boolean
     strictTeaserTension: boolean
     strictCuriosity: boolean
+    strictVisualImpact: boolean
     relaxedAuditOrLowSignal: boolean
     relaxedConfidence: boolean
     relaxedInstantHold: boolean
     relaxedTeaserTension: boolean
     relaxedCuriosity: boolean
+    relaxedVisualImpact: boolean
   }
 }
 type HookSelectionDebugPayload = {
@@ -1130,6 +1138,12 @@ type HookSelectionDebugPayload = {
     teaserTension: number
     curiosityPressure: number
     visualNovelty: number
+    visualImpact: number
+    valuePromise: number
+    urgency: number
+    contrarianTrigger: number
+    overlayReadiness: number
+    authenticity: number
     openerQuality: number
     selectionScore: number
   }
@@ -1669,6 +1683,8 @@ const HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE = 0.54
 const HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE = 0.56
 const HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY = 0.34
 const HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER = 0.3
+const HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE = 0.62
+const HOOK_TRANSCRIPT_RESCUE_MIN_SELECTION_SCORE = 0.58
 const HOOK_RELOCATE_MIN_START = 6
 const HOOK_RELOCATE_SCORE_TOLERANCE = 0.06
 const HOOK_SELECTION_MATCH_START_TOLERANCE_SEC = EDITOR_RETENTION_CONFIG.hookSelectionMatchStartToleranceSec
@@ -1902,7 +1918,7 @@ const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MIN_VERTICAL_CLIPS = 3
-const MAX_VERTICAL_CLIPS = 4
+const MAX_VERTICAL_CLIPS = 12
 const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 30
 const VERTICAL_CLIP_DURATION_LONG_SECONDS = 60
 const DEFAULT_VERTICAL_CLIP_DURATION_SECONDS = VERTICAL_CLIP_DURATION_SHORT_SECONDS
@@ -2076,11 +2092,13 @@ const UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT = `You are an expert video editor spec
 Mission: create a cliffhanger/teaser opener built around the single most surprising, intriguing, funniest, or craziest moment without fully revealing the payoff.
 
 Core hook rules:
-1) Select the #1 peak moment and rate it 1-10 for surprise/intrigue/funny/crazy with a short reason.
-2) Tease at least 8 seconds from or immediately leading into that moment.
-3) End on maximum curiosity using freeze-frame/cut-to-black/music sting/"Wait for it..." style.
-4) Add subtle enhancements: text overlays, voiceover hints, elevated audio/SFX, and contrast-driven grading.
-5) Optimize retention psychology: short-form for completion/loops; long-form for first 30-60s survival.
+1) First 1-3 seconds must be a scroll-stopper: motion/surprise/contrast/pattern-break in frame one.
+2) Select the #1 peak moment and rate it 1-10 for surprise/intrigue/funny/crazy with a short reason.
+3) Tease at least 8 seconds from or immediately leading into that moment; never reveal payoff too early.
+4) Create unresolved tension + curiosity gap (question, contradiction, specific detail, or "what happens next" pull).
+5) Overlay large bold mute-proof text in first 1-2 seconds with a clear value promise.
+6) Keep authenticity: creator-style/UGC energy beats polished ad tone; retain relatable human voice.
+7) Optimize retention psychology: short-form for completion/loops; long-form for first 30-60s survival.
 
 Format adaptation:
 - Short-form: 3-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
@@ -9609,6 +9627,12 @@ type HookSelectionRankedEntry = {
   teaserTension: number
   curiosityPressure: number
   visualNovelty: number
+  visualImpact: number
+  valuePromise: number
+  urgency: number
+  contrarianTrigger: number
+  overlayReadiness: number
+  authenticity: number
   openerQuality: number
   selectionScore: number
 }
@@ -9621,14 +9645,17 @@ const scoreRenderableHookCandidateSignals = ({
   windows: EngagementWindow[]
 }) => {
   const confidence = getHookCandidateConfidence(candidate)
+  const hookStart = Number(candidate.start || 0)
+  const hookEnd = Number(candidate.start + candidate.duration || 0)
   const instantHold = windows.length
     ? computeHookInstantHoldScore({
-      start: candidate.start,
-      end: candidate.start + candidate.duration,
+      start: hookStart,
+      end: hookEnd,
       windows
     })
     : clamp01(0.64 * candidate.score + 0.36 * candidate.auditScore)
   const introText = String(candidate.text || '').trim()
+  const textSignals = analyzeHookTextQualitySignals(introText)
   const introSignals = introText
     ? scoreTranscriptSignals(introText.toLowerCase())
     : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0 }
@@ -9647,7 +9674,7 @@ const scoreRenderableHookCandidateSignals = ({
     )
     : clamp01(0.9 * candidate.auditScore + 0.06)
   const curiosityWindow = windows.length
-    ? clamp01(averageWindowMetric(windows, candidate.start, candidate.start + candidate.duration, (window) => (
+    ? clamp01(averageWindowMetric(windows, hookStart, hookEnd, (window) => (
       0.62 * (window.curiosityTrigger ?? 0) +
       0.18 * window.emotionIntensity +
       0.12 * (window.actionSpike ?? 0) +
@@ -9666,23 +9693,77 @@ const scoreRenderableHookCandidateSignals = ({
       0.14 * instantHold
     )
   const visualNovelty = windows.length
-    ? clamp01(averageWindowMetric(windows, candidate.start, candidate.start + candidate.duration, (window) => (
+    ? clamp01(averageWindowMetric(windows, hookStart, hookEnd, (window) => (
       0.4 * window.sceneChangeRate +
       0.34 * window.motionScore +
       0.18 * window.textDensity +
       0.08 * (window.actionSpike ?? 0)
     )))
     : 0.5
+  const firstVisualWindowEnd = Math.min(hookEnd, hookStart + Math.min(1.4, Math.max(0.5, candidate.duration * 0.24)))
+  const firstFrameImpact = windows.length
+    ? clamp01(averageWindowMetric(windows, hookStart, firstVisualWindowEnd, (window) => (
+      0.34 * (window.actionSpike ?? 0) +
+      0.3 * window.motionScore +
+      0.22 * window.sceneChangeRate +
+      0.14 * (window.visualImpact ?? window.score)
+    )))
+    : clamp01(0.58 * candidate.score + 0.42 * candidate.auditScore)
+  const visualChaos = windows.length
+    ? clamp01(averageWindowMetric(windows, hookStart, hookEnd, (window) => (
+      0.34 * (window.actionSpike ?? 0) +
+      0.28 * window.sceneChangeRate +
+      0.22 * window.motionScore +
+      0.16 * Math.abs((window.visualImpact ?? window.score) - (window.hookScore ?? window.score))
+    )))
+    : clamp01(0.54 * candidate.score + 0.46 * candidate.auditScore)
+  const secondWindowStart = Math.min(hookEnd, hookStart + Math.max(0.55, Math.min(1.15, candidate.duration * 0.42)))
+  const secondWindowImpact = windows.length && secondWindowStart < hookEnd
+    ? clamp01(averageWindowMetric(windows, secondWindowStart, hookEnd, (window) => (
+      0.32 * (window.actionSpike ?? 0) +
+      0.28 * window.motionScore +
+      0.24 * window.sceneChangeRate +
+      0.16 * (window.visualImpact ?? window.score)
+    )))
+    : firstFrameImpact
+  const patternBreak = clamp01(Math.abs(secondWindowImpact - firstFrameImpact) * 1.45 + 0.22 * Math.max(firstFrameImpact, secondWindowImpact))
+  const visualImpact = clamp01(
+    0.42 * visualChaos +
+    0.34 * firstFrameImpact +
+    0.24 * patternBreak
+  )
+  const valuePromise = introText
+    ? textSignals.valuePromise
+    : clamp01(0.42 * curiosityPressure + 0.32 * teaserTension + 0.26 * visualImpact)
+  const urgency = introText
+    ? textSignals.urgency
+    : clamp01(0.38 * teaserTension + 0.34 * firstFrameImpact + 0.28 * curiosityPressure)
+  const contrarianTrigger = introText
+    ? textSignals.contradiction
+    : clamp01(0.56 * patternBreak + 0.44 * teaserTension)
+  const overlayReadiness = introText
+    ? textSignals.overlayReadiness
+    : clamp01(0.46 * visualImpact + 0.3 * instantHold + 0.24 * teaserTension)
+  const authenticity = introText
+    ? textSignals.authenticity
+    : clamp01(0.58 * curiosityWindow + 0.42 * instantHold)
   const openerQuality = clamp01(
-    0.52 * instantHold +
-    0.21 * introClarity +
-    0.15 * teaserTension +
-    0.12 * visualNovelty
+    0.34 * instantHold +
+    0.14 * introClarity +
+    0.12 * teaserTension +
+    0.1 * visualNovelty +
+    0.14 * visualImpact +
+    0.08 * overlayReadiness +
+    0.08 * urgency
   )
   const selectionScore = clamp01(
-    0.46 * confidence +
-    0.3 * openerQuality +
-    0.24 * curiosityPressure
+    0.3 * confidence +
+    0.24 * openerQuality +
+    0.16 * curiosityPressure +
+    0.1 * valuePromise +
+    0.08 * urgency +
+    0.07 * contrarianTrigger +
+    0.05 * authenticity
   )
   return {
     confidence: Number(confidence.toFixed(4)),
@@ -9691,6 +9772,12 @@ const scoreRenderableHookCandidateSignals = ({
     teaserTension: Number(teaserTension.toFixed(4)),
     curiosityPressure: Number(curiosityPressure.toFixed(4)),
     visualNovelty: Number(visualNovelty.toFixed(4)),
+    visualImpact: Number(visualImpact.toFixed(4)),
+    valuePromise: Number(valuePromise.toFixed(4)),
+    urgency: Number(urgency.toFixed(4)),
+    contrarianTrigger: Number(contrarianTrigger.toFixed(4)),
+    overlayReadiness: Number(overlayReadiness.toFixed(4)),
+    authenticity: Number(authenticity.toFixed(4)),
     openerQuality: Number(openerQuality.toFixed(4)),
     selectionScore: Number(selectionScore.toFixed(4))
   }
@@ -9750,6 +9837,12 @@ const buildHookSelectionDebugPayload = ({
       teaserTension: Number(entry.teaserTension.toFixed(4)),
       curiosityPressure: Number(entry.curiosityPressure.toFixed(4)),
       visualNovelty: Number(entry.visualNovelty.toFixed(4)),
+      visualImpact: Number(entry.visualImpact.toFixed(4)),
+      valuePromise: Number(entry.valuePromise.toFixed(4)),
+      urgency: Number(entry.urgency.toFixed(4)),
+      contrarianTrigger: Number(entry.contrarianTrigger.toFixed(4)),
+      overlayReadiness: Number(entry.overlayReadiness.toFixed(4)),
+      authenticity: Number(entry.authenticity.toFixed(4)),
       openerQuality: Number(entry.openerQuality.toFixed(4)),
       selectionScore: Number(entry.selectionScore.toFixed(4)),
       text: String(entry.candidate.text || ''),
@@ -9760,6 +9853,7 @@ const buildHookSelectionDebugPayload = ({
         strictInstantHold: entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN,
         strictTeaserTension: entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN,
         strictCuriosity: entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN,
+        strictVisualImpact: entry.visualImpact >= 0.34,
         relaxedAuditOrLowSignal: Boolean(
           entry.candidate.auditPassed ||
           !hasTranscript ||
@@ -9771,7 +9865,8 @@ const buildHookSelectionDebugPayload = ({
         relaxedConfidence: entry.confidence >= relaxedThreshold,
         relaxedInstantHold: entry.openerQuality >= relaxedInstantHoldFloor,
         relaxedTeaserTension: entry.teaserTension >= relaxedTeaserFloor,
-        relaxedCuriosity: entry.curiosityPressure >= relaxedCuriosityFloor
+        relaxedCuriosity: entry.curiosityPressure >= relaxedCuriosityFloor,
+        relaxedVisualImpact: entry.visualImpact >= 0.28
       }
     }))
   return {
@@ -9794,6 +9889,12 @@ const buildHookSelectionDebugPayload = ({
       teaserTension: Number(selected.teaserTension.toFixed(4)),
       curiosityPressure: Number(selected.curiosityPressure.toFixed(4)),
       visualNovelty: Number(selected.visualNovelty.toFixed(4)),
+      visualImpact: Number(selected.visualImpact.toFixed(4)),
+      valuePromise: Number(selected.valuePromise.toFixed(4)),
+      urgency: Number(selected.urgency.toFixed(4)),
+      contrarianTrigger: Number(selected.contrarianTrigger.toFixed(4)),
+      overlayReadiness: Number(selected.overlayReadiness.toFixed(4)),
+      authenticity: Number(selected.authenticity.toFixed(4)),
       openerQuality: Number(selected.openerQuality.toFixed(4)),
       selectionScore: Number(selected.selectionScore.toFixed(4))
     },
@@ -9837,6 +9938,12 @@ const selectLongFormDisplacedHookCandidate = ({
         teaserTension: scored.teaserTension,
         curiosityPressure: scored.curiosityPressure,
         visualNovelty: scored.visualNovelty,
+        visualImpact: scored.visualImpact,
+        valuePromise: scored.valuePromise,
+        urgency: scored.urgency,
+        contrarianTrigger: scored.contrarianTrigger,
+        overlayReadiness: scored.overlayReadiness,
+        authenticity: scored.authenticity,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
@@ -9922,6 +10029,12 @@ const selectRenderableHookCandidate = ({
         teaserTension: scored.teaserTension,
         curiosityPressure: scored.curiosityPressure,
         visualNovelty: scored.visualNovelty,
+        visualImpact: scored.visualImpact,
+        valuePromise: scored.valuePromise,
+        urgency: scored.urgency,
+        contrarianTrigger: scored.contrarianTrigger,
+        overlayReadiness: scored.overlayReadiness,
+        authenticity: scored.authenticity,
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
@@ -9957,6 +10070,16 @@ const selectRenderableHookCandidate = ({
     HOOK_STANDARD_CURIOSITY_MIN - (hasTranscript ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
     0.26,
     HOOK_STANDARD_CURIOSITY_MIN
+  )
+  const strictVisualImpactFloor = clamp(
+    0.46 - (hasTranscript ? 0.02 : 0) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.34,
+    0.5
+  )
+  const relaxedVisualImpactFloor = clamp(
+    strictVisualImpactFloor - 0.08,
+    0.28,
+    strictVisualImpactFloor
   )
   const relaxedTranscriptAuditFloor = clamp(
     Math.max(HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE, relaxedThreshold - 0.02),
@@ -10013,6 +10136,7 @@ const selectRenderableHookCandidate = ({
     entry.openerQuality >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
     entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN &&
     entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN &&
+    entry.visualImpact >= strictVisualImpactFloor &&
     entry.introClarity >= HOOK_STANDARD_INTRO_CLARITY_MIN &&
     passesNonVerbalSafety(entry)
   ))
@@ -10037,6 +10161,7 @@ const selectRenderableHookCandidate = ({
     entry.openerQuality >= strictFallbackInstantFloor &&
     entry.teaserTension >= strictFallbackTeaserFloor &&
     entry.curiosityPressure >= strictFallbackCuriosityFloor &&
+    entry.visualImpact >= strictVisualImpactFloor &&
     entry.introClarity >= HOOK_STANDARD_INTRO_CLARITY_MIN &&
     passesNonVerbalSafety(entry)
   ))
@@ -10071,12 +10196,14 @@ const selectRenderableHookCandidate = ({
     entry.openerQuality >= relaxedInstantHoldFloor &&
     entry.teaserTension >= relaxedTeaserFloor &&
     entry.curiosityPressure >= relaxedCuriosityFloor &&
+    entry.visualImpact >= relaxedVisualImpactFloor &&
     passesRelaxedAuditGate(entry) &&
     passesNonVerbalSafety(entry)
   )) || ranked.find((entry) => (
     entry.confidence >= relaxedThreshold &&
     entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.06, 0.24) &&
     entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.06, 0.24) &&
+    entry.visualImpact >= Math.max(relaxedVisualImpactFloor - 0.06, 0.22) &&
     passesRelaxedAuditGate(entry) &&
     passesNonVerbalSafety(entry)
   ))
@@ -10230,8 +10357,13 @@ const pickCuriosityDifferentPartCandidateFromPool = ({
     .filter((entry) => (
       !entry.textSignals.isGenericUtterance &&
       entry.textSignals.curiosityBlend >= 0.3 &&
-      entry.textSignals.specificity >= 0.22 &&
-      clamp01(Number(entry.candidate.auditScore || 0)) >= 0.56
+      entry.textSignals.specificity >= 0.26 &&
+      (
+        entry.textSignals.valuePromise >= 0.12 ||
+        entry.textSignals.overlayReadiness >= 0.42 ||
+        entry.textSignals.questionCount >= 1
+      ) &&
+      clamp01(Number(entry.candidate.auditScore || 0)) >= 0.6
     ))
     .sort((a, b) => (
       b.curiosityScore - a.curiosityScore ||
@@ -10240,6 +10372,168 @@ const pickCuriosityDifferentPartCandidateFromPool = ({
       a.candidate.start - b.candidate.start
     ))
   return ranked[0]?.candidate || null
+}
+
+const evaluateTranscriptHookQuality = ({
+  candidate,
+  windows
+}: {
+  candidate: HookCandidate
+  windows: EngagementWindow[]
+}) => {
+  const scored = scoreRenderableHookCandidateSignals({
+    candidate,
+    windows
+  })
+  const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
+  const qualityScore = clamp01(
+    0.28 * clamp01(Number(candidate.auditScore || 0)) +
+    0.26 * scored.selectionScore +
+    0.16 * scored.curiosityPressure +
+    0.12 * scored.teaserTension +
+    0.08 * scored.introClarity +
+    0.06 * scored.visualImpact +
+    0.04 * textSignals.specificity
+  )
+  return {
+    scored,
+    textSignals,
+    qualityScore: Number(qualityScore.toFixed(4))
+  }
+}
+
+const pickTranscriptHookQualityRescueCandidate = ({
+  current,
+  candidates,
+  transcriptCues,
+  windows,
+  durationSeconds,
+  segments
+}: {
+  current: HookCandidate
+  candidates: HookCandidate[]
+  transcriptCues: TranscriptCue[]
+  windows: EngagementWindow[]
+  durationSeconds: number
+  segments: TimeRange[]
+}) => {
+  if (!current || !Array.isArray(transcriptCues) || transcriptCues.length < 2) return null
+  const currentEval = evaluateTranscriptHookQuality({
+    candidate: current,
+    windows
+  })
+  const currentWeak = (
+    !current.auditPassed &&
+    (
+      current.auditScore < HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE ||
+      currentEval.scored.selectionScore < HOOK_TRANSCRIPT_RESCUE_MIN_SELECTION_SCORE ||
+      currentEval.scored.curiosityPressure < 0.34 ||
+      currentEval.scored.teaserTension < 0.3 ||
+      currentEval.scored.introClarity < 0.24 ||
+      currentEval.textSignals.isGenericUtterance ||
+      currentEval.textSignals.specificity < 0.24
+    )
+  )
+  if (!currentWeak) return null
+  const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
+    candidates,
+    durationSeconds,
+    maxStartSeconds: 60
+  })
+  const transcriptAuditedOpeningFallback = buildAuditedOpeningHookCandidateFromTranscript({
+    transcriptCues,
+    windows,
+    durationSeconds,
+    segments,
+    searchWindowSeconds: 60,
+    targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+  })
+  const transcriptCuriosityFallback = buildCuriosityFallbackHookCandidateFromTranscript({
+    transcriptCues,
+    windows,
+    durationSeconds,
+    segments
+  })
+  const strongPoolCandidate = candidates
+    .map((candidate) => {
+      const evaluated = evaluateTranscriptHookQuality({
+        candidate,
+        windows
+      })
+      return {
+        candidate,
+        evaluated
+      }
+    })
+    .filter((entry) => (
+      !entry.evaluated.textSignals.isGenericUtterance &&
+      entry.evaluated.scored.curiosityPressure >= 0.34 &&
+      entry.evaluated.scored.teaserTension >= 0.3 &&
+      (
+        entry.candidate.auditPassed ||
+        entry.candidate.auditScore >= HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE
+      )
+    ))
+    .sort((a, b) => (
+      Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+      b.evaluated.qualityScore - a.evaluated.qualityScore ||
+      b.candidate.auditScore - a.candidate.auditScore ||
+      a.candidate.start - b.candidate.start
+    ))[0]?.candidate || null
+  const rescuePool = [
+    transcriptAuditedOpeningFallback,
+    auditedOpeningFromPool,
+    strongPoolCandidate,
+    transcriptCuriosityFallback
+  ].filter((candidate): candidate is HookCandidate => Boolean(candidate))
+  if (!rescuePool.length) return null
+  const dedupedRescuePool = rescuePool.filter((candidate, index) => (
+    rescuePool.findIndex((entry) => (
+      Math.abs(entry.start - candidate.start) < 0.01 &&
+      Math.abs(entry.duration - candidate.duration) < 0.01
+    )) === index
+  ))
+  const rankedRescue = dedupedRescuePool
+    .map((candidate) => {
+      const evaluated = evaluateTranscriptHookQuality({
+        candidate,
+        windows
+      })
+      return {
+        candidate,
+        evaluated
+      }
+    })
+    .filter((entry) => (
+      !entry.evaluated.textSignals.isGenericUtterance &&
+      entry.evaluated.scored.curiosityPressure >= 0.32 &&
+      entry.evaluated.scored.teaserTension >= 0.28 &&
+      entry.evaluated.scored.selectionScore >= HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE &&
+      (
+        entry.candidate.auditPassed ||
+        entry.candidate.auditScore >= HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE
+      )
+    ))
+    .sort((a, b) => (
+      Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+      b.evaluated.qualityScore - a.evaluated.qualityScore ||
+      b.candidate.auditScore - a.candidate.auditScore ||
+      a.candidate.start - b.candidate.start
+    ))
+  const bestRescue = rankedRescue[0]
+  if (!bestRescue) return null
+  const rescueBeatsCurrent = (
+    (bestRescue.candidate.auditPassed && !current.auditPassed) ||
+    bestRescue.evaluated.qualityScore >= currentEval.qualityScore + 0.05 ||
+    bestRescue.candidate.auditScore >= current.auditScore + 0.05
+  )
+  if (!rescueBeatsCurrent) return null
+  return {
+    ...bestRescue.candidate,
+    reason: bestRescue.candidate.auditPassed
+      ? 'Hook rescue: upgraded to higher-confidence audited transcript opener with stronger curiosity flow.'
+      : 'Hook rescue: upgraded to stronger transcript-backed open-loop candidate with better tease quality.'
+  } as HookCandidate
 }
 
 const averageWindowMetric = (
@@ -10649,6 +10943,11 @@ const buildAuditedOpeningHookCandidateFromTranscript = ({
     text: string
     score: number
     auditScore: number
+    auditPassed: boolean
+    openLoop: number
+    unresolved: number
+    teaserStrength: number
+    spoilerRisk: number
   }> = []
   for (const startCandidate of dedupedStarts) {
     const aligned = alignHookToSentenceBoundaries(
@@ -10669,7 +10968,6 @@ const buildAuditedOpeningHookCandidateFromTranscript = ({
       transcriptCues,
       windows
     })
-    if (!audit.passed) continue
     const openLoop = scoreHookOpenLoopSignal(text)
     const unresolved = scoreHookEndingUnresolvedSignal(text)
     const contextPenalty = evaluateHookContextDependency(start, end, transcriptCues)
@@ -10698,24 +10996,41 @@ const buildAuditedOpeningHookCandidateFromTranscript = ({
       end,
       text,
       score: Number(score.toFixed(4)),
-      auditScore: Number(audit.auditScore.toFixed(4))
+      auditScore: Number(audit.auditScore.toFixed(4)),
+      auditPassed: Boolean(audit.passed),
+      openLoop: Number(openLoop.toFixed(4)),
+      unresolved: Number(unresolved.toFixed(4)),
+      teaserStrength: Number(audit.teaserStrength.toFixed(4)),
+      spoilerRisk: Number(audit.spoilerRisk.toFixed(4))
     })
   }
-  const best = rows
+  const ranked = rows
     .sort((a, b) => (
-      b.score - a.score ||
+      Number(b.auditPassed) - Number(a.auditPassed) ||
       b.auditScore - a.auditScore ||
+      b.score - a.score ||
       a.start - b.start
-    ))[0]
+    ))
+  const bestPass = ranked.find((row) => row.auditPassed)
+  const bestNearPass = ranked.find((row) => (
+    row.auditScore >= HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE &&
+    row.openLoop >= 0.32 &&
+    row.unresolved >= 0.22 &&
+    row.teaserStrength >= 0.28 &&
+    row.spoilerRisk <= 0.62
+  ))
+  const best = bestPass || bestNearPass || null
   if (!best) return null
   return {
     start: Number(best.start.toFixed(3)),
     duration: Number((best.end - best.start).toFixed(3)),
     score: Number(best.score.toFixed(4)),
     auditScore: Number(best.auditScore.toFixed(4)),
-    auditPassed: true,
+    auditPassed: Boolean(best.auditPassed),
     text: best.text,
-    reason: 'Audited opener selected from first 45s transcript search (curiosity + payoff + unresolved tension).',
+    reason: best.auditPassed
+      ? 'Audited opener selected from first 45s transcript search (curiosity + payoff + unresolved tension).'
+      : 'Near-pass opener selected from first 45s transcript search with strongest curiosity/teaser quality available.',
     synthetic: true
   } as HookCandidate
 }
@@ -12436,6 +12751,11 @@ const analyzeHookTextQualitySignals = (text: string) => {
       questionCount: 0,
       curiosityBlend: 0,
       specificity: 0,
+      valuePromise: 0,
+      urgency: 0,
+      contradiction: 0,
+      overlayReadiness: 0,
+      authenticity: 0,
       isGenericUtterance: true
     }
   }
@@ -12471,12 +12791,57 @@ const analyzeHookTextQualitySignals = (text: string) => {
     0.2 * transcriptSignals.fillerDensity -
     (isGenericUtterance ? 0.16 : 0)
   )
+  const hasNumericSpecificity = /\b\d+([.,]\d+)?\b/.test(normalized)
+  const valueKeywordHit = /\b(fix|solve|secret|trick|mistake|avoid|save|faster|grow|improve|result|proof|strategy|framework|step|tutorial|how to)\b/.test(normalized)
+  const urgencyKeywordHit = /\b(now|today|before|deadline|limited|don'?t|stop|immediately|right now|this month|2026)\b/.test(normalized)
+  const contradictionKeywordHit = /\b(but|however|until|wrong|vs|versus|instead|even though|terrified|worth it)\b/.test(normalized)
+  const punchyOverlayHit = /\b(wait|stop|secret|wrong|never|this|now|how|why|fix|don'?t|before)\b/.test(normalized)
+  const firstPersonHit = /\b(i|my|me|we|our)\b/.test(normalized)
+  const secondPersonHit = /\b(you|your)\b/.test(normalized)
+  const adLikePhraseHit = /\b(our product|subscribe for more|link in bio|official|sponsored)\b/.test(normalized)
+  const valuePromise = clamp01(
+    0.34 * Number(valueKeywordHit) +
+    0.24 * Number(hasNumericSpecificity) +
+    0.18 * transcriptSignals.keywordIntensity +
+    0.16 * curiosityBlend +
+    0.08 * Number(hasQuestion)
+  )
+  const urgency = clamp01(
+    0.46 * Number(urgencyKeywordHit) +
+    0.26 * Number(hasQuestion) +
+    0.18 * scoreHookEndingUnresolvedSignal(normalized) +
+    0.1 * Number(/\b(stop|before)\b/.test(normalized))
+  )
+  const contradiction = clamp01(
+    0.58 * Number(contradictionKeywordHit) +
+    0.22 * curiosityBlend +
+    0.2 * Number(/\bnot\b/.test(normalized))
+  )
+  const compactOverlayBand = words.length >= 3 && words.length <= 11
+    ? 1
+    : clamp01(1 - Math.abs(words.length - 7) / 10)
+  const overlayReadiness = clamp01(
+    0.5 * compactOverlayBand +
+    0.28 * Number(punchyOverlayHit) +
+    0.22 * Number(hasNumericSpecificity)
+  )
+  const authenticity = clamp01(
+    0.42 * Number(firstPersonHit) +
+    0.24 * Number(secondPersonHit) +
+    0.18 * clamp01(1 - transcriptSignals.fillerDensity) -
+    0.26 * Number(adLikePhraseHit)
+  )
   return {
     wordCount: words.length,
     lexicalTokenCount: lexicalTokens.length,
     questionCount,
     curiosityBlend: Number(curiosityBlend.toFixed(4)),
     specificity: Number(specificity.toFixed(4)),
+    valuePromise: Number(valuePromise.toFixed(4)),
+    urgency: Number(urgency.toFixed(4)),
+    contradiction: Number(contradiction.toFixed(4)),
+    overlayReadiness: Number(overlayReadiness.toFixed(4)),
+    authenticity: Number(authenticity.toFixed(4)),
     isGenericUtterance
   }
 }
@@ -17752,29 +18117,68 @@ const normalizeSegmentForRender = (segment: Segment, durationSeconds: number): S
   return { ...segment, start, end, speed, zoom, brightness }
 }
 
-const mergeSegmentsToLimitCount = (segments: Segment[], maxSegments: number) => {
+const mergeSegmentsToLimitCount = (
+  segments: Segment[],
+  maxSegments: number,
+  opts?: {
+    hardLimit?: boolean
+  }
+) => {
   if (segments.length <= maxSegments) return segments
+  const hardLimit = opts?.hardLimit === true
   const merged = segments.map((seg) => ({ ...seg }))
-  while (merged.length > maxSegments && merged.length > 1) {
-    let mergeIdx = 0
-    let bestGap = Number.POSITIVE_INFINITY
+  const overflowAllowance = Math.max(4, Math.min(14, Math.round(maxSegments * 0.28)))
+  const softTarget = hardLimit ? maxSegments : maxSegments + overflowAllowance
+  const findMergeIndex = (maxGapSeconds: number, maxMergedSpanSeconds: number) => {
+    let mergeIdx = -1
+    let bestCost = Number.POSITIVE_INFINITY
     for (let i = 0; i < merged.length - 1; i += 1) {
-      const gap = Math.max(0, merged[i + 1].start - merged[i].end)
-      if (gap < bestGap) {
-        bestGap = gap
+      const left = merged[i]
+      const right = merged[i + 1]
+      const gap = Math.max(0, right.start - left.end)
+      if (gap > maxGapSeconds) continue
+      const mergedSpan = Math.max(0.001, right.end - left.start)
+      if (mergedSpan > maxMergedSpanSeconds) continue
+      const speedDelta = Math.abs((left.speed ?? 1) - (right.speed ?? 1))
+      const emphasizePenalty = left.emphasize || right.emphasize ? 0.2 : 0
+      const cost = gap * 2.2 + mergedSpan * 0.08 + speedDelta * 0.7 + emphasizePenalty
+      if (cost < bestCost) {
+        bestCost = cost
         mergeIdx = i
       }
     }
+    return mergeIdx
+  }
+  const applyMergeAt = (mergeIdx: number) => {
     const left = merged[mergeIdx]
     const right = merged[mergeIdx + 1]
+    const blendedSpeed = Number(clamp(((left.speed ?? 1) + (right.speed ?? 1)) / 2, 0.85, 1.36).toFixed(3))
+    const blendedZoom = Number(clamp(Math.max(left.zoom ?? 0, right.zoom ?? 0) * 0.55, 0, ZOOM_HARD_MAX - 1).toFixed(3))
+    const blendedBrightness = Number(clamp(((left.brightness ?? 0) + (right.brightness ?? 0)) / 2, -0.35, 0.35).toFixed(3))
     merged.splice(mergeIdx, 2, {
-      start: left.start,
+      ...left,
       end: right.end,
-      speed: 1,
-      zoom: 0,
-      brightness: 0,
-      audioGain: Number(clamp(((left.audioGain ?? 1) + (right.audioGain ?? 1)) / 2, 0.8, 1.24).toFixed(3))
+      speed: blendedSpeed,
+      zoom: blendedZoom,
+      brightness: blendedBrightness,
+      audioGain: Number(clamp(((left.audioGain ?? 1) + (right.audioGain ?? 1)) / 2, 0.8, 1.24).toFixed(3)),
+      emphasize: Boolean(left.emphasize || right.emphasize)
     })
+  }
+  while (merged.length > softTarget && merged.length > 1) {
+    let mergeIdx = findMergeIndex(0.55, 12.5)
+    if (mergeIdx < 0) mergeIdx = findMergeIndex(1.2, 15)
+    if (mergeIdx < 0) break
+    applyMergeAt(mergeIdx)
+  }
+  while (merged.length > maxSegments && merged.length > 1) {
+    let mergeIdx = findMergeIndex(0.45, 10.2)
+    if (mergeIdx < 0) {
+      if (!hardLimit) break
+      mergeIdx = findMergeIndex(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY)
+    }
+    if (mergeIdx < 0) break
+    applyMergeAt(mergeIdx)
   }
   return merged
 }
@@ -17812,7 +18216,7 @@ const enforceCutDensityLimit = ({
     ? platformMaxCuts
     : Math.max(1, userRequestedMaxCuts)
   const maxSegments = Math.max(2, maxCuts + 1)
-  return mergeSegmentsToLimitCount(segments, maxSegments)
+  return mergeSegmentsToLimitCount(segments, maxSegments, { hardLimit: false })
 }
 
 const enforceLongFormComprehensionFloor = ({
@@ -18700,7 +19104,7 @@ const prepareSegmentsForRender = (
     }
     compacted.push({ ...next })
   }
-  return mergeSegmentsToLimitCount(compacted, MAX_RENDER_SEGMENTS)
+  return mergeSegmentsToLimitCount(compacted, MAX_RENDER_SEGMENTS, { hardLimit: true })
 }
 
 const buildAtempoChain = (speed: number) => {
@@ -24929,9 +25333,33 @@ const processJob = async (
         editorMode: editorModeForRender
       })
       await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: watermarkEnabled })
+      const verticalContentFormatForRuntime = inferRetentionContentFormat({
+        runtimeSeconds: durationSeconds,
+        windows: verticalWindows,
+        renderMode: renderConfig.mode,
+        nicheProfile: verticalNicheProfile,
+        targetPlatform: retentionTargetPlatform
+      })
+      let verticalRequestedClipCount = renderConfig.verticalClipCount
+      if (durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) {
+        const minVerticalEditedRuntimeRatio = resolveLongFormMinimumEditedRuntimeRatio({
+          durationSeconds,
+          aggressiveMode: Boolean(options.aggressiveMode),
+          contentFormat: verticalContentFormatForRuntime,
+          longFormAggression: options.longFormAggression ?? null,
+          longFormClarityVsSpeed: options.longFormClarityVsSpeed ?? null
+        })
+        const minVerticalEditedRuntimeSeconds = durationSeconds * (minVerticalEditedRuntimeRatio > 0 ? minVerticalEditedRuntimeRatio : 0.5)
+        const clipDurationBudget = Math.max(15, Number(renderConfig.verticalClipDurationSeconds || DEFAULT_VERTICAL_CLIP_DURATION_SECONDS))
+        const requiredClipCount = Math.ceil(minVerticalEditedRuntimeSeconds / clipDurationBudget)
+        const adjustedClipCount = Math.round(clamp(requiredClipCount, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS))
+        if (adjustedClipCount > verticalRequestedClipCount) {
+          verticalRequestedClipCount = adjustedClipCount
+        }
+      }
       const verticalSelection = buildVerticalRetentionCandidates({
         durationSeconds: durationSeconds || 0,
-        requestedCount: renderConfig.verticalClipCount,
+        requestedCount: verticalRequestedClipCount,
         clipDurationMaxSeconds: renderConfig.verticalClipDurationSeconds,
         windows: verticalWindows,
         platformProfile: platformProfileId,
@@ -25115,6 +25543,97 @@ const processJob = async (
         jobId,
         requestId
       })
+      const stitchedVerticalOutputPath = path.join(localOutDir, 'output.mp4')
+      let stitchedVerticalOutputReady = false
+      if (renderedClipPaths.length === 1) {
+        try {
+          fs.copyFileSync(renderedClipPaths[0], stitchedVerticalOutputPath)
+          const stitchedStats = fs.statSync(stitchedVerticalOutputPath)
+          stitchedVerticalOutputReady = stitchedStats.isFile() && stitchedStats.size > 0
+        } catch (error) {
+          console.warn(`[${requestId || 'noid'}] vertical stitched output copy failed`, error)
+        }
+      } else if (renderedClipPaths.length > 1) {
+        const concatListPath = path.join(workDir, `vertical-stitched-list-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.txt`)
+        try {
+          const concatLines = renderedClipPaths
+            .map((filePath) => `file '${filePath.replace(/'/g, "'\\''")}'`)
+            .join('\n')
+          fs.writeFileSync(concatListPath, concatLines, 'utf8')
+          const concatCopyArgs = [
+            '-y',
+            '-nostdin',
+            '-hide_banner',
+            '-loglevel',
+            'error',
+            '-f',
+            'concat',
+            '-safe',
+            '0',
+            '-i',
+            concatListPath,
+            '-c',
+            'copy',
+            '-movflags',
+            '+faststart',
+            stitchedVerticalOutputPath
+          ]
+          try {
+            await runFfmpeg(concatCopyArgs)
+          } catch {
+            const concatEncodeArgs = [
+              '-y',
+              '-nostdin',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              '-f',
+              'concat',
+              '-safe',
+              '0',
+              '-i',
+              concatListPath,
+              '-movflags',
+              '+faststart',
+              '-c:v',
+              'libx264',
+              '-preset',
+              ffPreset,
+              '-crf',
+              ffCrf,
+              '-threads',
+              '0',
+              '-pix_fmt',
+              'yuv420p'
+            ]
+            if (hasInputAudio) {
+              concatEncodeArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            }
+            concatEncodeArgs.push(stitchedVerticalOutputPath)
+            await runFfmpeg(concatEncodeArgs)
+          }
+          const stitchedStats = fs.statSync(stitchedVerticalOutputPath)
+          stitchedVerticalOutputReady = stitchedStats.isFile() && stitchedStats.size > 0
+        } catch (error) {
+          console.warn(`[${requestId || 'noid'}] vertical stitched output generation failed`, error)
+        } finally {
+          safeUnlink(concatListPath)
+        }
+      }
+      if (stitchedVerticalOutputReady) {
+        const stitchedOutputKey = `${job.userId}/${jobId}/output.mp4`
+        try {
+          await uploadFileToOutput({ key: stitchedOutputKey, filePath: stitchedVerticalOutputPath, contentType: 'video/mp4' })
+        } catch (error) {
+          outputUploadFallbackUsed = true
+          failedOutputUploads.push(stitchedOutputKey)
+          console.warn(`[${requestId || 'noid'}] stitched vertical output upload failed, serving local fallback`, {
+            key: stitchedOutputKey,
+            error: (error as any)?.message || error
+          })
+        }
+        outputPaths.push(stitchedOutputKey)
+      }
 
       for (let idx = 0; idx < renderedClipPaths.length; idx += 1) {
         const clipPath = renderedClipPaths[idx]
@@ -25684,6 +26203,19 @@ const processJob = async (
           const currentSignals = currentCandidate
             ? analyzeHookTextQualitySignals(String(currentCandidate.text || ''))
             : null
+          const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
+          const differentPartEligible = (
+            differentPartCandidate.auditPassed ||
+            (
+              differentPartCandidate.auditScore >= Math.max(
+                HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE,
+                Number(currentCandidate?.auditScore ?? 0) + 0.03
+              ) &&
+              differentPartSignals.curiosityBlend >= 0.34 &&
+              differentPartSignals.specificity >= 0.28 &&
+              !differentPartSignals.isGenericUtterance
+            )
+          )
           const shouldSwapToDifferentPart = (
             !currentCandidate ||
             !currentCandidate.auditPassed ||
@@ -25694,7 +26226,7 @@ const processJob = async (
               getHookCandidateConfidence(currentCandidate) < 0.7
             )
           )
-          if (shouldSwapToDifferentPart) {
+          if (shouldSwapToDifferentPart && differentPartEligible) {
             const differentPartThreshold = resolveHookScoreThreshold({
               aggressionLevel,
               hasTranscript: hasTranscriptSignals,
@@ -25709,6 +26241,36 @@ const processJob = async (
               reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.',
               debug: resolvedHookDecision?.debug || null
             }
+          }
+        }
+      }
+      if (
+        hasTranscriptSignals &&
+        resolvedHookDecision?.candidate &&
+        hookSelectionModeForRender === 'auto'
+      ) {
+        const rescuedHookCandidate = pickTranscriptHookQualityRescueCandidate({
+          current: resolvedHookDecision.candidate,
+          candidates: hookCandidates,
+          transcriptCues: processTranscriptCues,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+          durationSeconds,
+          segments: storySegments
+        })
+        if (rescuedHookCandidate) {
+          const rescueThreshold = resolveHookScoreThreshold({
+            aggressionLevel,
+            hasTranscript: hasTranscriptSignals,
+            signalStrength: contentSignalStrength,
+            thresholdOffset: hookThresholdOffset
+          })
+          resolvedHookDecision = {
+            candidate: rescuedHookCandidate,
+            confidence: getHookCandidateConfidence(rescuedHookCandidate),
+            threshold: rescueThreshold,
+            usedFallback: true,
+            reason: rescuedHookCandidate.reason,
+            debug: resolvedHookDecision?.debug || null
           }
         }
       }
@@ -25753,7 +26315,7 @@ const processJob = async (
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
             durationSeconds,
             segments: storySegments,
-            searchWindowSeconds: 45,
+            searchWindowSeconds: 90,
             targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
           })
           : null
@@ -25815,6 +26377,12 @@ const processJob = async (
               teaserTension: scored.teaserTension,
               curiosityPressure: scored.curiosityPressure,
               visualNovelty: scored.visualNovelty,
+              visualImpact: scored.visualImpact,
+              valuePromise: scored.valuePromise,
+              urgency: scored.urgency,
+              contrarianTrigger: scored.contrarianTrigger,
+              overlayReadiness: scored.overlayReadiness,
+              authenticity: scored.authenticity,
               openerQuality: scored.openerQuality,
               selectionScore: scored.selectionScore
             }
@@ -25898,7 +26466,7 @@ const processJob = async (
             transcriptCues: processTranscriptCues,
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
           })
-          fallbackHook = {
+          const openingCandidate: HookCandidate = {
             ...fallbackHook,
             start: Number(alignedOpening.start.toFixed(3)),
             duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
@@ -25908,10 +26476,26 @@ const processJob = async (
             text: extractHookText(alignedOpening.start, alignedOpening.end, processTranscriptCues),
             reason: 'Transcript fallback candidates missed quality floor; using coherent opening tease from the start aligned to transcript boundaries.'
           }
-          fallbackSignals = scoreRenderableHookCandidateSignals({
+          const currentEval = evaluateTranscriptHookQuality({
             candidate: fallbackHook,
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
           })
+          const openingEval = evaluateTranscriptHookQuality({
+            candidate: openingCandidate,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          const shouldUseOpeningFallback = (
+            openingCandidate.auditPassed ||
+            openingEval.qualityScore >= currentEval.qualityScore + 0.04 ||
+            (
+              openingCandidate.auditScore >= fallbackHook.auditScore + 0.05 &&
+              openingEval.scored.curiosityPressure >= currentEval.scored.curiosityPressure - 0.02
+            )
+          )
+          if (shouldUseOpeningFallback) {
+            fallbackHook = openingCandidate
+            fallbackSignals = openingEval.scored
+          }
         }
         const fallbackNoTranscriptUnsafe = !hasTranscriptSignals && (
           !fallbackHook.auditPassed ||
@@ -25956,6 +26540,12 @@ const processJob = async (
               teaserTension: scored.teaserTension,
               curiosityPressure: scored.curiosityPressure,
               visualNovelty: scored.visualNovelty,
+              visualImpact: scored.visualImpact,
+              valuePromise: scored.valuePromise,
+              urgency: scored.urgency,
+              contrarianTrigger: scored.contrarianTrigger,
+              overlayReadiness: scored.overlayReadiness,
+              authenticity: scored.authenticity,
               openerQuality: scored.openerQuality,
               selectionScore: scored.selectionScore
             }
@@ -26065,24 +26655,45 @@ const processJob = async (
           windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
           durationSeconds,
           segments: storySegments,
-          searchWindowSeconds: 45,
+          searchWindowSeconds: 90,
           targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
         })
         if (auditedOpeningRetry) {
-          initialHook = enforceAutoHookDurationRange({
-            candidate: auditedOpeningRetry,
-            durationSeconds
+          const currentHookEval = evaluateTranscriptHookQuality({
+            candidate: initialHook,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
           })
+          const retryHookEval = evaluateTranscriptHookQuality({
+            candidate: auditedOpeningRetry,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          const shouldApplyRetry = (
+            auditedOpeningRetry.auditPassed ||
+            retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.04 ||
+            auditedOpeningRetry.auditScore >= initialHook.auditScore + 0.05
+          )
+          if (shouldApplyRetry) {
+            initialHook = enforceAutoHookDurationRange({
+              candidate: auditedOpeningRetry,
+              durationSeconds
+            })
+          }
+        }
+        if (
+          auditedOpeningRetry &&
+          Math.abs(initialHook.start - auditedOpeningRetry.start) < 0.01 &&
+          Math.abs(initialHook.duration - auditedOpeningRetry.duration) < 0.01
+        ) {
           resolvedHookDecision = {
             candidate: initialHook,
             confidence: getHookCandidateConfidence(initialHook),
             threshold: resolvedHookDecision.threshold,
             usedFallback: true,
-            reason: 'Hook retry: first-45s transcript search found an audited opener with stronger curiosity/payoff framing.',
+            reason: 'Hook retry: early transcript search found an audited opener with stronger curiosity/payoff framing.',
             debug: resolvedHookDecision.debug
           }
           selectedHookSelectionSource = 'fallback'
-          optimizationNotes.push('Hook retry upgraded opener using first-45s transcript audited search.')
+          optimizationNotes.push('Hook retry upgraded opener using early transcript audited search.')
         }
       }
       const relocationCandidates = [
@@ -28330,6 +28941,52 @@ const processJob = async (
         }
         if (!processed) throw err
       }
+      if (
+        processed &&
+        durationSeconds >= LONG_FORM_RESCUE_MIN_DURATION &&
+        fs.existsSync(tmpOut)
+      ) {
+        const renderedDurationBeforeGuard = Number(getDurationSeconds(tmpOut) || 0)
+        const resolvedRuntimeFloorRatio = resolveLongFormMinimumEditedRuntimeRatio({
+          durationSeconds,
+          aggressiveMode: Boolean(options.aggressiveMode),
+          contentFormat: selectedContentFormat,
+          longFormAggression: options.longFormAggression ?? null,
+          longFormClarityVsSpeed: options.longFormClarityVsSpeed ?? null
+        })
+        const runtimeFloorRatio = resolvedRuntimeFloorRatio > 0
+          ? resolvedRuntimeFloorRatio
+          : (durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS ? 0.5 : 0.4)
+        const minimumRenderedDuration = durationSeconds * runtimeFloorRatio
+        if (
+          renderedDurationBeforeGuard > 0 &&
+          renderedDurationBeforeGuard + 1 < minimumRenderedDuration
+        ) {
+          const conservativeRuntimeSegments = prepareSegmentsForRender(
+            buildGuaranteedFallbackSegments(durationSeconds, {
+              ...options,
+              aggressiveMode: false,
+              onlyCuts: false
+            }),
+            durationSeconds,
+            processTranscriptCues
+          )
+          if (conservativeRuntimeSegments.length) {
+            try {
+              await runSegmentFileFallback(conservativeRuntimeSegments)
+              const renderedDurationAfterGuard = Number(getDurationSeconds(tmpOut) || 0)
+              if (renderedDurationAfterGuard > renderedDurationBeforeGuard + 0.5) {
+                finalSegments = conservativeRuntimeSegments
+                optimizationNotes.push(
+                  `Horizontal runtime floor rescue applied (${(renderedDurationBeforeGuard / 60).toFixed(2)}m -> ${(renderedDurationAfterGuard / 60).toFixed(2)}m; floor ${(runtimeFloorRatio * 100).toFixed(1)}%).`
+                )
+              }
+            } catch (runtimeGuardError) {
+              console.warn(`[${requestId || 'noid'}] horizontal runtime floor rescue failed`, runtimeGuardError)
+            }
+          }
+        }
+      }
     }
 
     if (!processed) {
@@ -28463,7 +29120,14 @@ const processJob = async (
           instantHold: Number(finalHookSignals.instantHold.toFixed(4)),
           introClarity: Number(finalHookSignals.introClarity.toFixed(4)),
           teaserTension: Number(finalHookSignals.teaserTension.toFixed(4)),
+          curiosityPressure: Number(finalHookSignals.curiosityPressure.toFixed(4)),
           visualNovelty: Number(finalHookSignals.visualNovelty.toFixed(4)),
+          visualImpact: Number(finalHookSignals.visualImpact.toFixed(4)),
+          valuePromise: Number(finalHookSignals.valuePromise.toFixed(4)),
+          urgency: Number(finalHookSignals.urgency.toFixed(4)),
+          contrarianTrigger: Number(finalHookSignals.contrarianTrigger.toFixed(4)),
+          overlayReadiness: Number(finalHookSignals.overlayReadiness.toFixed(4)),
+          authenticity: Number(finalHookSignals.authenticity.toFixed(4)),
           openerQuality: Number(finalHookSignals.openerQuality.toFixed(4)),
           selectionScore: Number(finalHookSignals.selectionScore.toFixed(4))
         },
@@ -32290,6 +32954,19 @@ const buildEditPlanForTest = async ({
       const currentSignals = resolvedHook
         ? analyzeHookTextQualitySignals(String(resolvedHook.text || ''))
         : null
+      const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
+      const differentPartEligible = (
+        differentPartCandidate.auditPassed ||
+        (
+          differentPartCandidate.auditScore >= Math.max(
+            HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE,
+            Number(resolvedHook?.auditScore ?? 0) + 0.03
+          ) &&
+          differentPartSignals.curiosityBlend >= 0.34 &&
+          differentPartSignals.specificity >= 0.28 &&
+          !differentPartSignals.isGenericUtterance
+        )
+      )
       const shouldSwapToDifferentPart = (
         !resolvedHook ||
         !resolvedHook.auditPassed ||
@@ -32300,12 +32977,25 @@ const buildEditPlanForTest = async ({
           getHookCandidateConfidence(resolvedHook) < 0.7
         )
       )
-      if (shouldSwapToDifferentPart) {
+      if (shouldSwapToDifferentPart && differentPartEligible) {
         resolvedHook = {
           ...differentPartCandidate,
           reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.'
         } as HookCandidate
       }
+    }
+  }
+  if (hasTranscriptSignals && resolvedHook) {
+    const rescuedHookCandidate = pickTranscriptHookQualityRescueCandidate({
+      current: resolvedHook,
+      candidates: candidatePool,
+      transcriptCues: normalizedTranscriptCues,
+      windows: planWindows,
+      durationSeconds,
+      segments: planSegments
+    })
+    if (rescuedHookCandidate) {
+      resolvedHook = rescuedHookCandidate
     }
   }
   if (!resolvedHook) {
@@ -32343,7 +33033,7 @@ const buildEditPlanForTest = async ({
         windows: planWindows,
         durationSeconds,
         segments: planSegments,
-        searchWindowSeconds: 45,
+        searchWindowSeconds: 90,
         targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
       })
       : null
@@ -32388,6 +33078,12 @@ const buildEditPlanForTest = async ({
           teaserTension: scored.teaserTension,
           curiosityPressure: scored.curiosityPressure,
           visualNovelty: scored.visualNovelty,
+          visualImpact: scored.visualImpact,
+          valuePromise: scored.valuePromise,
+          urgency: scored.urgency,
+          contrarianTrigger: scored.contrarianTrigger,
+          overlayReadiness: scored.overlayReadiness,
+          authenticity: scored.authenticity,
           openerQuality: scored.openerQuality,
           selectionScore: scored.selectionScore
         }
@@ -32439,6 +33135,7 @@ const buildEditPlanForTest = async ({
     if (transcriptFallbackPick) {
       resolvedHook = transcriptFallbackPick.candidate
     } else if (hasTranscriptSignals) {
+      const looseTranscriptCandidate = fallbackRanked[0]?.candidate || null
       const openingSegment = planSegments[0]
       const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
       const openingDuration = Number(clamp(
@@ -32458,7 +33155,7 @@ const buildEditPlanForTest = async ({
         transcriptCues: normalizedTranscriptCues,
         windows: planWindows
       })
-      resolvedHook = {
+      const openingCandidate: HookCandidate = {
         start: Number(alignedOpening.start.toFixed(3)),
         duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
         score: Number(clamp01(openingAudit.auditScore * 0.92 + 0.08).toFixed(4)),
@@ -32468,6 +33165,27 @@ const buildEditPlanForTest = async ({
         reason: 'Fallback candidates missed transcript quality floor; using coherent opening tease aligned to transcript boundaries.',
         synthetic: true
       } as HookCandidate
+      if (!looseTranscriptCandidate) {
+        resolvedHook = openingCandidate
+      } else {
+        const looseEval = evaluateTranscriptHookQuality({
+          candidate: looseTranscriptCandidate,
+          windows: planWindows
+        })
+        const openingEval = evaluateTranscriptHookQuality({
+          candidate: openingCandidate,
+          windows: planWindows
+        })
+        const shouldUseOpeningFallback = (
+          openingCandidate.auditPassed ||
+          openingEval.qualityScore >= looseEval.qualityScore + 0.04 ||
+          (
+            openingCandidate.auditScore >= looseTranscriptCandidate.auditScore + 0.05 &&
+            openingEval.scored.curiosityPressure >= looseEval.scored.curiosityPressure - 0.02
+          )
+        )
+        resolvedHook = shouldUseOpeningFallback ? openingCandidate : looseTranscriptCandidate
+      }
     } else {
       resolvedHook = fallbackRanked[0]?.candidate || storyFallbackHook || null
     }
@@ -32478,7 +33196,7 @@ const buildEditPlanForTest = async ({
       windows: planWindows,
       durationSeconds,
       segments: planSegments,
-      searchWindowSeconds: 45,
+      searchWindowSeconds: 90,
       targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
     })
     if (auditedOpeningRetry) {
