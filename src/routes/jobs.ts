@@ -1903,6 +1903,12 @@ const HOOK_ANALYZE_MAX = (() => {
   return Number.isFinite(envValue) && envValue >= 45 ? Math.round(envValue) : 1800
 })()
 const ANALYSIS_SKIP_PROXY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_SKIP_PROXY || '').trim())
+const ANALYSIS_SKIP_PROXY_ABOVE_BYTES = (() => {
+  const envValue = Number(process.env.ANALYSIS_SKIP_PROXY_ABOVE_BYTES || 300 * 1024 * 1024)
+  return Number.isFinite(envValue) && envValue >= 50 * 1024 * 1024
+    ? Math.round(envValue)
+    : 300 * 1024 * 1024
+})()
 const ANALYSIS_PROXY_WIDTH = (() => {
   const envValue = Number(process.env.ANALYSIS_PROXY_WIDTH || 960)
   return Number.isFinite(envValue) && envValue >= 320 ? Math.round(envValue) : 960
@@ -20351,6 +20357,12 @@ const runWhisperTranscribe = async ({
 
 const generateSubtitles = async (inputPath: string, workingDir: string) => {
   const captionEngine = getCaptionEngineStatus()
+  if (!captionEngine.available && !ALLOW_OPENAI_TRANSCRIPTION_FALLBACK) {
+    const embeddedOutput = await extractEmbeddedSubtitlesAsSrt(inputPath, workingDir)
+    if (embeddedOutput) return embeddedOutput
+    console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
+    return null
+  }
   const fasterWhisperOutput = await generateSubtitlesViaFasterWhisper(inputPath, workingDir)
   if (fasterWhisperOutput) return fasterWhisperOutput
 
@@ -20411,7 +20423,7 @@ const generateProxy = async (inputPath: string, outPath: string, opts?: { width?
   const width = opts?.width ?? ANALYSIS_PROXY_WIDTH
   const height = opts?.height ?? ANALYSIS_PROXY_HEIGHT
   const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
-  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', '-c:a', 'copy', outPath]
+  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-an', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', outPath]
   await runFfmpeg(args)
 }
 
@@ -24468,9 +24480,16 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
 
     // Generate a low-res proxy and analyze the proxy to save CPU/time.
     const tmpProxy = path.join(os.tmpdir(), `${jobId}-proxy.mp4`)
-    if (!ANALYSIS_SKIP_PROXY) {
+    const shouldSkipProxyForSize = inStats.size >= ANALYSIS_SKIP_PROXY_ABOVE_BYTES
+    if (!ANALYSIS_SKIP_PROXY && !shouldSkipProxyForSize) {
       try {
+        console.log(`[${requestId || 'noid'}] proxy generation start`, {
+          inputBytes: inStats.size,
+          width: ANALYSIS_PROXY_WIDTH,
+          height: ANALYSIS_PROXY_HEIGHT
+        })
         await generateProxy(tmpIn, tmpProxy)
+        console.log(`[${requestId || 'noid'}] proxy generation complete`)
         // upload proxy for client preview
         const proxyBucketPath = `${job.userId}/${jobId}/proxy.mp4`
         try {
@@ -24489,7 +24508,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         console.warn('proxy generation failed, falling back to original for analysis', e)
       }
     } else {
-      console.log(`[${requestId || 'noid'}] proxy generation skipped for analysis`)
+      console.log(`[${requestId || 'noid'}] proxy generation skipped for analysis`, {
+        skipProxyFlag: ANALYSIS_SKIP_PROXY,
+        skipProxyForSize: shouldSkipProxyForSize,
+        inputBytes: inStats.size,
+        thresholdBytes: ANALYSIS_SKIP_PROXY_ABOVE_BYTES
+      })
     }
 
     const initialRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
@@ -25113,7 +25137,7 @@ const processJob = async (
       const requiredPlan = getRequiredPlanForAutoZoom(autoZoomMax)
       throw new PlanLimitError('Upgrade to unlock higher auto zoom limits.', 'autoZoomMax', requiredPlan)
     }
-    const wantsAdvanced = Boolean(options.emotionalBoost) || Boolean(options.aggressiveMode)
+    const wantsAdvanced = Boolean(options.emotionalBoost)
     const premiumModeBypassesAdvancedEffects = editorModeForRender === 'ultra' || editorModeForRender === 'retention-king'
     if (wantsAdvanced && !features.advancedEffects && !premiumModeBypassesAdvancedEffects) {
       const requiredPlan = getRequiredPlanForAdvancedEffects()
@@ -29471,15 +29495,26 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       await processJob(jobId, user, requestedQuality, processOptions, requestId)
     } catch (err: any) {
       if (err instanceof PlanLimitError) {
-        const planLimitMessage = err.code === 'MINUTES_LIMIT_REACHED'
-          ? 'Upgrade for more minutes'
-          : err.code
+        const planLimitDetails = [
+          err.code || 'PLAN_LIMIT_EXCEEDED',
+          err.message || '',
+          err.feature ? `feature=${err.feature}` : '',
+          err.requiredPlan ? `requiredPlan=${err.requiredPlan}` : ''
+        ]
+          .map((part) => String(part).trim())
+          .filter(Boolean)
+        const planLimitMessage = planLimitDetails.join(' | ')
         await updateJob(jobId, { status: 'failed', error: planLimitMessage })
         try {
           await updatePipelineStepState(jobId, 'RENDER_FINAL', {
             status: 'failed',
             completedAt: toIsoNow(),
-            lastError: truncateErrorText(err.code) || 'plan_limit'
+            lastError: truncateErrorText(planLimitMessage) || 'plan_limit',
+            meta: {
+              code: err.code || 'PLAN_LIMIT_EXCEEDED',
+              feature: err.feature || null,
+              requiredPlan: err.requiredPlan || null
+            }
           })
         } catch (e) {
           // ignore
