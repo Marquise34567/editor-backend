@@ -3930,6 +3930,19 @@ const parseEditorModeSelection = (value: any): EditorModeSelection | null => {
     : null
 }
 
+const isPremiumEditorMode = (mode: EditorModeSelection | null | undefined): mode is 'ultra' | 'retention-king' => {
+  return mode === 'ultra' || mode === 'retention-king'
+}
+
+const resolveEditorModeForTier = (
+  mode: EditorModeSelection | null,
+  tier: PlanTier
+): EditorModeSelection | null => {
+  if (!isPremiumEditorMode(mode)) return mode
+  if (isPaidTier(tier)) return mode
+  return 'auto'
+}
+
 const resolveModeRetentionTargets = (
   value?: EditorModeSelection | string | null
 ): { mode: EditorModeSelection; target: number; floor: number } => {
@@ -24301,21 +24314,15 @@ const getEditOptionsForUser = async (
     (settings as any)?.max_cuts ??
     (settings as any)?.maxCutsRequested
   )
-  const editorMode = parseEditorModeSelection(
+  const requestedEditorMode = parseEditorModeSelection(
     overrides?.editorMode ??
     (settings as any)?.editorMode ??
     (settings as any)?.editor_mode ??
     (settings as any)?.contentMode
   )
+  const editorMode = resolveEditorModeForTier(requestedEditorMode, effectiveTier)
   const ultraModeRequested = editorMode === 'ultra'
   const retentionKingModeRequested = editorMode === 'retention-king'
-  if ((ultraModeRequested || retentionKingModeRequested) && !isPaidTier(effectiveTier)) {
-    throw new PlanLimitError(
-      'Upgrade to unlock Ultra Mode and Retention King.',
-      'premiumModes',
-      'starter'
-    )
-  }
   const hookSelectionMode = parseHookSelectionMode(
     overrides?.hookSelectionMode ??
     (settings as any)?.hookSelectionMode ??
@@ -30128,15 +30135,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const devBypass = isDevAccount(userId, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
     const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
-    const premiumModeRequested = editorModeOverride === 'ultra' || editorModeOverride === 'retention-king'
-    if (premiumModeRequested && !isPaidTier(effectiveTier)) {
-      return res.status(403).json({
-        error: 'PLAN_LIMIT_EXCEEDED',
-        feature: 'premiumModes',
-        requiredPlan: 'starter',
-        message: 'Upgrade to unlock Ultra Mode and Retention King.'
-      })
-    }
+    editorModeOverride = resolveEditorModeForTier(editorModeOverride, effectiveTier)
     if (editorModeOverride === 'ultra') {
       retentionAggressionLevel = 'viral'
       retentionStrategyProfile = 'viral'
@@ -30872,7 +30871,11 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
-    const resolvedEditorMode = editorModeOverride ?? getEditorModeFromJob(job)
+    const resolvedEditorModeRaw = editorModeOverride ?? getEditorModeFromJob(job)
+    const { plan, tier } = await getUserPlan(req.user.id)
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+    const resolvedEditorMode = resolveEditorModeForTier(resolvedEditorModeRaw, effectiveTier)
     const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'auto'
     let resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
     const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
@@ -31009,7 +31012,6 @@ const handleCompleteUpload = async (req: any, res: any) => {
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {})
     }
 
-    const { plan, tier } = await getUserPlan(req.user.id)
     const renderMode = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
     const renderLimitViolation = await getRenderLimitViolation({
       userId: req.user.id,
@@ -31086,18 +31088,11 @@ router.post('/:id/analyze', async (req: any, res) => {
     })
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
-    const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
-    if ((requestedEditorMode === 'ultra' || requestedEditorMode === 'retention-king') && !isPaidTier(effectiveTier)) {
-      return res.status(403).json({
-        error: 'PLAN_LIMIT_EXCEEDED',
-        feature: 'premiumModes',
-        requiredPlan: 'starter',
-        message: 'Upgrade to unlock Ultra Mode and Retention King.'
-      })
-    }
+    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
@@ -31295,7 +31290,11 @@ router.post('/:id/process', async (req: any, res) => {
     })
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
-    const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const { tier } = await getUserPlan(req.user.id)
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
@@ -31582,7 +31581,11 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
     const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
-    const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const { tier } = await getUserPlan(req.user.id)
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
+    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
     const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
@@ -31861,6 +31864,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
 
     const user = await getOrCreateUser(req.user.id, req.user?.email)
     const { tier, plan } = await getUserPlan(req.user.id)
+    const devBypass = isDevAccount(req.user.id, req.user?.email)
+    const effectiveTier: PlanTier = devBypass ? 'studio' : tier
     const rerenderLimitViolation = await getRerenderLimitViolation({
       userId: req.user.id,
       email: req.user?.email,
@@ -31935,7 +31940,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
     const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
-    const requestedEditorMode = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
