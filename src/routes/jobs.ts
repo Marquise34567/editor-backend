@@ -1934,6 +1934,26 @@ const RENDER_FILTER_THREADS = (() => {
   const envValue = Number(process.env.FFMPEG_FILTER_THREADS || 1)
   return Number.isFinite(envValue) && envValue >= 1 ? Math.round(envValue) : 1
 })()
+const RENDER_CODEC_THREADS = (() => {
+  const envValue = Number(process.env.FFMPEG_THREADS || process.env.FFMPEG_CODEC_THREADS || 1)
+  if (!Number.isFinite(envValue) || envValue < 1) return 1
+  return Math.min(8, Math.round(envValue))
+})()
+const SEGMENT_FILE_FALLBACK_MIN_SEGMENTS = (() => {
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 20)
+  if (!Number.isFinite(envValue) || envValue < 6) return 20
+  return Math.round(envValue)
+})()
+const SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS = (() => {
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS || 9 * 60)
+  if (!Number.isFinite(envValue) || envValue < 120) return 9 * 60
+  return Math.round(envValue)
+})()
+const SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES = (() => {
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES || 300 * 1024 * 1024)
+  if (!Number.isFinite(envValue) || envValue < 100 * 1024 * 1024) return 300 * 1024 * 1024
+  return Math.round(envValue)
+})()
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
@@ -20423,7 +20443,7 @@ const generateProxy = async (inputPath: string, outPath: string, opts?: { width?
   const width = opts?.width ?? ANALYSIS_PROXY_WIDTH
   const height = opts?.height ?? ANALYSIS_PROXY_HEIGHT
   const scale = `scale='min(${width},iw)':'min(${height},ih)':force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1`
-  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-an', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', '0', '-pix_fmt', 'yuv420p', '-movflags', '+faststart', outPath]
+  const args = ['-hide_banner', '-nostdin', '-y', '-i', inputPath, '-vf', scale, '-an', '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28', '-threads', String(RENDER_CODEC_THREADS), '-pix_fmt', 'yuv420p', '-movflags', '+faststart', outPath]
   await runFfmpeg(args)
 }
 
@@ -22696,7 +22716,7 @@ const renderVerticalClip = async ({
     '-crf',
     videoCrf,
     '-threads',
-    '0',
+    String(RENDER_CODEC_THREADS),
     '-pix_fmt',
     'yuv420p',
     '-filter_complex',
@@ -25646,7 +25666,7 @@ const processJob = async (
               '-crf',
               ffCrf,
               '-threads',
-              '0',
+              String(RENDER_CODEC_THREADS),
               '-pix_fmt',
               'yuv420p'
             ]
@@ -28525,7 +28545,7 @@ const processJob = async (
         '-crf',
         ffCrf,
         '-threads',
-        '0',
+        String(RENDER_CODEC_THREADS),
         '-pix_fmt',
         'yuv420p'
       ]
@@ -28782,7 +28802,7 @@ const processJob = async (
               '-crf',
               ffCrf,
               '-threads',
-              '0',
+              String(RENDER_CODEC_THREADS),
               '-pix_fmt',
               'yuv420p'
             ]
@@ -28816,7 +28836,7 @@ const processJob = async (
                 '-crf',
                 ffCrf,
                 '-threads',
-                '0',
+                String(RENDER_CODEC_THREADS),
                 '-pix_fmt',
                 'yuv420p',
                 '-vf',
@@ -28864,6 +28884,13 @@ const processJob = async (
 
       try {
         if (hasSegments) {
+          const preferSegmentFileFallback = (
+            finalSegments.length >= SEGMENT_FILE_FALLBACK_MIN_SEGMENTS &&
+            (
+              durationSeconds >= SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS ||
+              inStats.size >= SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES
+            )
+          )
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
           // If using an image watermark we must add the watermark file as a second input
           // so ffmpeg can reference it as input index 1 in the overlay filter.
@@ -28908,36 +28935,55 @@ const processJob = async (
 
           let lastErr: any = null
           let ran = false
-          for (const chain of videoChains) {
-            const fadeVariants = options.transitions ? [true, false] : [false]
-            for (const enableFades of fadeVariants) {
-              const audioPolishVariants = withAudio && audioFilters.length > 0 ? [true, false] : [false]
-              for (const enableAudioPolish of audioPolishVariants) {
-                try {
-                  await runWithChain(chain, enableFades, enableAudioPolish)
-                  ran = true
-                  if (chain !== fullVideoChain) {
-                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
-                    optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
+          if (preferSegmentFileFallback) {
+            try {
+              await runSegmentFileFallback(finalSegments)
+              ran = true
+              optimizationNotes.push(
+                'Render strategy: segment-file stitch selected for long/heavy source to reduce memory pressure.'
+              )
+            } catch (segmentFirstErr) {
+              lastErr = segmentFirstErr
+              console.warn(
+                `[${requestId || 'noid'}] segment-file preferred strategy failed, retrying concat pipeline`,
+                {
+                  reason: summarizeFfmpegError(segmentFirstErr)
+                }
+              )
+            }
+          }
+          if (!ran) {
+            for (const chain of videoChains) {
+              const fadeVariants = options.transitions ? [true, false] : [false]
+              for (const enableFades of fadeVariants) {
+                const audioPolishVariants = withAudio && audioFilters.length > 0 ? [true, false] : [false]
+                for (const enableAudioPolish of audioPolishVariants) {
+                  try {
+                    await runWithChain(chain, enableFades, enableAudioPolish)
+                    ran = true
+                    if (chain !== fullVideoChain) {
+                      const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
+                      optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
+                    }
+                    if (options.transitions && !enableFades) {
+                      const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
+                      optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
+                    }
+                    if (withAudio && audioFilters.length > 0 && !enableAudioPolish) {
+                      const reason = lastErr ? summarizeFfmpegError(lastErr) : 'audio_filter_failed'
+                      optimizationNotes.push(`Render fallback: audio polish disabled (${reason}).`)
+                    }
+                    break
+                  } catch (err) {
+                    lastErr = err
                   }
-                  if (options.transitions && !enableFades) {
-                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
-                    optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
-                  }
-                  if (withAudio && audioFilters.length > 0 && !enableAudioPolish) {
-                    const reason = lastErr ? summarizeFfmpegError(lastErr) : 'audio_filter_failed'
-                    optimizationNotes.push(`Render fallback: audio polish disabled (${reason}).`)
-                  }
+                }
+                if (ran) {
                   break
-                } catch (err) {
-                  lastErr = err
                 }
               }
-              if (ran) {
-                break
-              }
+              if (ran) break
             }
-            if (ran) break
           }
           if (!ran) {
             const reason = summarizeFfmpegError(lastErr)
