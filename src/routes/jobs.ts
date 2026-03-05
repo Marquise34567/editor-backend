@@ -1923,9 +1923,29 @@ const ANALYSIS_FRAME_FPS = (() => {
     ? Number(envValue.toFixed(2))
     : 2
 })()
+const ANALYSIS_FAST_PATH_MIN_DURATION_SECONDS = (() => {
+  const envValue = Number(process.env.ANALYSIS_FAST_PATH_MIN_DURATION_SECONDS || 8 * 60)
+  return Number.isFinite(envValue) && envValue >= 120 ? Math.round(envValue) : 8 * 60
+})()
+const ANALYSIS_FAST_PATH_MIN_INPUT_BYTES = (() => {
+  const envValue = Number(process.env.ANALYSIS_FAST_PATH_MIN_INPUT_BYTES || 250 * 1024 * 1024)
+  return Number.isFinite(envValue) && envValue >= 100 * 1024 * 1024
+    ? Math.round(envValue)
+    : 250 * 1024 * 1024
+})()
+const ANALYSIS_FAST_PATH_FRAME_FPS = (() => {
+  const envValue = Number(process.env.ANALYSIS_FAST_PATH_FRAME_FPS || 1.1)
+  return Number.isFinite(envValue) && envValue >= 0.25 && envValue <= 4
+    ? Number(envValue.toFixed(2))
+    : 1.1
+})()
 const ANALYSIS_FRAME_SCALE_WIDTH = (() => {
   const envValue = Number(process.env.ANALYSIS_FRAME_SCALE_WIDTH || 360)
   return Number.isFinite(envValue) && envValue >= 160 ? Math.round(envValue) : 360
+})()
+const ANALYSIS_FAST_PATH_SCALE_WIDTH = (() => {
+  const envValue = Number(process.env.ANALYSIS_FAST_PATH_SCALE_WIDTH || 300)
+  return Number.isFinite(envValue) && envValue >= 160 ? Math.round(envValue) : 300
 })()
 const ANALYSIS_DISABLE_FACE_DETECTION = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_FACE_DETECTION || '').trim())
 const ANALYSIS_DISABLE_TEXT_DENSITY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_TEXT_DENSITY || '').trim())
@@ -8736,12 +8756,26 @@ const detectSceneChanges = async (filePath: string, durationSeconds: number) => 
   return Array.from(times.values()).sort((a, b) => a - b)
 }
 
-const extractFramesEveryHalfSecond = async (filePath: string, outDir: string, durationSeconds: number) => {
+const extractFramesEveryHalfSecond = async (
+  filePath: string,
+  outDir: string,
+  durationSeconds: number,
+  opts?: {
+    fpsOverride?: number | null
+    scaleWidthOverride?: number | null
+  }
+) => {
   if (!hasFfmpeg()) return [] as string[]
   const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
   fs.mkdirSync(outDir, { recursive: true })
   const framePattern = path.join(outDir, 'frame-%06d.jpg')
-  const frameFilter = `fps=${ANALYSIS_FRAME_FPS},scale=${ANALYSIS_FRAME_SCALE_WIDTH}:-1:flags=lanczos`
+  const fps = Number.isFinite(Number(opts?.fpsOverride))
+    ? Math.max(0.25, Number(opts?.fpsOverride))
+    : ANALYSIS_FRAME_FPS
+  const scaleWidth = Number.isFinite(Number(opts?.scaleWidthOverride))
+    ? Math.max(160, Math.round(Number(opts?.scaleWidthOverride)))
+    : ANALYSIS_FRAME_SCALE_WIDTH
+  const frameFilter = `fps=${fps},scale=${scaleWidth}:-1:flags=lanczos`
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -24553,6 +24587,18 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       requestedStrategy: requestedStrategyProfile,
       targetPlatform: requestedTargetPlatform
     })
+    const useFastFrameAnalysis = (
+      duration >= ANALYSIS_FAST_PATH_MIN_DURATION_SECONDS ||
+      inStats.size >= ANALYSIS_FAST_PATH_MIN_INPUT_BYTES
+    )
+    if (useFastFrameAnalysis) {
+      console.log(`[${requestId || 'noid'}] fast frame-analysis mode enabled`, {
+        durationSeconds: duration,
+        inputBytes: inStats.size,
+        fps: ANALYSIS_FAST_PATH_FRAME_FPS,
+        scaleWidth: Math.min(ANALYSIS_FRAME_SCALE_WIDTH, ANALYSIS_FAST_PATH_SCALE_WIDTH)
+      })
+    }
     const strategyProfile = runtimeRetentionProfile.strategy
     const aggressionLevel = runtimeRetentionProfile.aggression
     const editorModePlaybook = resolveEditorModePlaybook(options.editorMode ?? null)
@@ -24584,7 +24630,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
           statusUpdate: { status: 'cutting', progress: 24 },
           run: async () => {
             const frameDir = path.join(analysisWorkDir, 'frames')
-            const frames = await extractFramesEveryHalfSecond(analyzePath, frameDir, duration)
+            const frames = await extractFramesEveryHalfSecond(analyzePath, frameDir, duration, {
+              fpsOverride: useFastFrameAnalysis ? ANALYSIS_FAST_PATH_FRAME_FPS : null,
+              scaleWidthOverride: useFastFrameAnalysis
+                ? Math.min(ANALYSIS_FRAME_SCALE_WIDTH, ANALYSIS_FAST_PATH_SCALE_WIDTH)
+                : null
+            })
             extractedFrameCount = frames.length
             const plan = await buildEditPlan(
               analyzePath,
