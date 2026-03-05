@@ -20005,9 +20005,14 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
 const FASTER_WHISPER_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/faster_whisper_transcribe.py')
 const VERTICAL_CLIP_PREVIEW_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/vertical_clip_preview.py')
 const FASTER_WHISPER_TIMEOUT_MS = (() => {
-  const raw = Number(process.env.FASTER_WHISPER_TIMEOUT_MS || 300_000)
-  if (!Number.isFinite(raw)) return 300_000
-  return Math.max(20_000, Math.min(900_000, Math.round(raw)))
+  const raw = Number(process.env.FASTER_WHISPER_TIMEOUT_MS || 120_000)
+  if (!Number.isFinite(raw)) return 120_000
+  return Math.max(15_000, Math.min(300_000, Math.round(raw)))
+})()
+const FASTER_WHISPER_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.FASTER_WHISPER_MAX_ATTEMPTS || 2)
+  if (!Number.isFinite(raw)) return 2
+  return Math.max(1, Math.min(5, Math.round(raw)))
 })()
 const ENABLE_VERTICAL_DESKTOP_PREVIEW = /^(1|true|yes|on)$/i.test(
   String(process.env.VERTICAL_DESKTOP_PREVIEW || '').trim()
@@ -20117,16 +20122,17 @@ const parseFasterWhisperResult = (stdout: string): { srtPath?: string | null } =
 
 const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: string) => {
   if (!fs.existsSync(FASTER_WHISPER_SCRIPT_PATH)) return null
-  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'small').trim() || 'small'
+  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'base').trim() || 'base'
   const language = String(process.env.FASTER_WHISPER_LANGUAGE || process.env.CAPTION_LANGUAGE || process.env.WHISPER_LANGUAGE || '').trim()
   const device = String(process.env.FASTER_WHISPER_DEVICE || '').trim()
   const computeType = String(process.env.FASTER_WHISPER_COMPUTE_TYPE || 'int8').trim() || 'int8'
-  const beamSizeRaw = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 5)
-  const beamSize = Number.isFinite(beamSizeRaw) ? Math.max(1, Math.min(10, Math.round(beamSizeRaw))) : 5
+  const beamSizeRaw = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 2)
+  const beamSize = Number.isFinite(beamSizeRaw) ? Math.max(1, Math.min(5, Math.round(beamSizeRaw))) : 2
   const extraArgs = splitWhisperArgs(process.env.FASTER_WHISPER_ARGS)
   const baseName = path.basename(inputPath, path.extname(inputPath))
 
-  for (const attempt of buildFasterWhisperAttempts()) {
+  const attempts = buildFasterWhisperAttempts().slice(0, FASTER_WHISPER_MAX_ATTEMPTS)
+  for (const attempt of attempts) {
     const args = [
       '--input',
       inputPath,
@@ -27958,7 +27964,21 @@ const processJob = async (
 
       if (options.autoCaptions) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })
-        subtitlePath = await generateSubtitles(tmpIn, workDir)
+        // Fast path: reuse already-parsed transcript cues from analysis when available.
+        if (Array.isArray(processTranscriptCues) && processTranscriptCues.length > 0) {
+          const sourceCueSrtPath = path.join(
+            workDir,
+            `${path.basename(tmpIn, path.extname(tmpIn))}.analysis-cues.srt`
+          )
+          const reusedCueSrt = writeTranscriptCuesToSrt(processTranscriptCues, sourceCueSrtPath)
+          if (reusedCueSrt) {
+            subtitlePath = reusedCueSrt
+            optimizationNotes.push('Auto subtitles reused analyzed transcript cues (fast path).')
+          }
+        }
+        if (!subtitlePath) {
+          subtitlePath = await generateSubtitles(tmpIn, workDir)
+        }
         if (!subtitlePath) {
           const captionEngine = getCaptionEngineStatus()
           optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
