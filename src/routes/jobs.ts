@@ -29572,8 +29572,8 @@ const QUEUE_RECOVERY_INTERVAL_MS = (() => {
 })()
 const STALE_PIPELINE_MS = (() => {
   const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 60_000) return envVal
-  return 90 * 60_000
+  if (Number.isFinite(envVal) && envVal >= 120_000) return envVal
+  return 8 * 60_000
 })()
 const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
 const STALE_RECOVERABLE_STATUSES = new Set([
