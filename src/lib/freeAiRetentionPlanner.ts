@@ -2035,6 +2035,8 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     candidates
       .filter((candidate) => candidate.start <= earlyWindowLimitSeconds)
       .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
+  const transcriptSignalCount = Array.isArray(input.transcriptSegments) ? input.transcriptSegments.length : 0
+  const hasTranscriptSignals = transcriptSignalCount > 0
   const selectedCandidate = (
     provisionalSelectedCandidate &&
     strongestWithinEarlyWindow &&
@@ -2043,7 +2045,24 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   )
     ? strongestWithinEarlyWindow
     : provisionalSelectedCandidate
-  const selected = selectedCandidate ? toAIDurationHook(selectedCandidate, duration, 8) : null
+  const lateHookWindowSeconds = Number(clamp(duration * 0.42, 90, Math.max(90, duration - 8)).toFixed(1))
+  const strongestLateSafeEarlyCandidate =
+    candidates
+      .filter((candidate) => candidate.start <= lateHookWindowSeconds)
+      .sort((left, right) => (
+        right.scores.combined - left.scores.combined ||
+        left.start - right.start
+      ))[0] || null
+  const finalSelectedCandidate = (
+    selectedCandidate &&
+    !hasTranscriptSignals &&
+    strongestLateSafeEarlyCandidate &&
+    selectedCandidate.start > lateHookWindowSeconds &&
+    strongestLateSafeEarlyCandidate.scores.combined >= Math.max(0.46, selectedCandidate.scores.combined - 0.18)
+  )
+    ? strongestLateSafeEarlyCandidate
+    : selectedCandidate
+  const selected = finalSelectedCandidate ? toAIDurationHook(finalSelectedCandidate, duration, 8) : null
   const selectedPeakMoment = buildSelectedPeakMoment(selected)
   const hookBlueprint = buildHookBlueprint({
     format,
@@ -2066,7 +2085,7 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
   })
   const predictionConfidenceLevel = deriveConfidenceLevel(fallbackRetention.predictionConfidence)
   const hookComparison = candidates
-    .filter((candidate) => candidate.id !== selectedCandidate?.id)
+    .filter((candidate) => candidate.id !== finalSelectedCandidate?.id)
     .slice(0, 3)
     .map((candidate) => ({
       id: candidate.id,
@@ -2092,10 +2111,13 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       ? {
           ...selected,
           reason:
-            selectedCandidate?.id === introAnchorCandidate?.id && introAnchorCandidate?.id !== strongest?.id
+            finalSelectedCandidate?.id === introAnchorCandidate?.id && introAnchorCandidate?.id !== strongest?.id
               ? `Selected this 8-second opener over alternatives because it anchors at timeline start while preserving comparable retention strength (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : selectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
+              : finalSelectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
               ? `Selected this 8-second opener over alternatives because its early-timeline placement preserves first-3s hold while matching top retention score (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
+              : finalSelectedCandidate?.id === strongestLateSafeEarlyCandidate?.id &&
+                strongestLateSafeEarlyCandidate?.id !== strongest?.id
+              ? `Selected this 8-second opener over alternatives because no transcript was available and this early candidate stayed close to top retention score while improving opener positioning (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
               : `Selected this 8-second opener over alternatives because it delivers the strongest retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
         }
       : null,
