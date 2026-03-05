@@ -84,6 +84,20 @@ const router = express.Router()
 const INPUT_BUCKET = process.env.SUPABASE_BUCKET_INPUT || process.env.SUPABASE_BUCKET_UPLOADS || 'uploads'
 const OUTPUT_BUCKET = process.env.SUPABASE_BUCKET_OUTPUT || process.env.SUPABASE_BUCKET_OUTPUTS || 'outputs'
 const FFMPEG_LOG_LIMIT = 10_000_000
+const SCRIPT_STDIO_LIMIT = (() => {
+  const raw = Number(process.env.JOB_SCRIPT_STDIO_LIMIT || 1_000_000)
+  if (!Number.isFinite(raw)) return 1_000_000
+  return Math.max(32_000, Math.min(5_000_000, Math.round(raw)))
+})()
+
+const appendBoundedOutput = (current: string, chunk: Buffer | string, maxChars: number) => {
+  const text = String(chunk || '')
+  if (!text) return current
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return ''
+  const merged = current + text
+  if (merged.length <= maxChars) return merged
+  return merged.slice(merged.length - maxChars)
+}
 
 type FfmpegRunResult = {
   exitCode: number | null
@@ -14142,7 +14156,7 @@ const detectEmotionModelSignals = async (filePath: string, durationSeconds: numb
     let stdout = ''
     const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.stdout.on('data', (chunk) => {
-      stdout += chunk.toString()
+      stdout = appendBoundedOutput(stdout, chunk, SCRIPT_STDIO_LIMIT)
     })
     proc.on('error', () => resolve([]))
     proc.on('close', () => {
@@ -14280,7 +14294,7 @@ const detectTextDensity = async (filePath: string, durationSeconds: number) => {
     let stdout = ''
     const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
     proc.stdout.on('data', (chunk) => {
-      stdout += chunk.toString()
+      stdout = appendBoundedOutput(stdout, chunk, SCRIPT_STDIO_LIMIT)
     })
     proc.on('error', () => resolve([]))
     proc.on('close', () => {
@@ -20103,10 +20117,10 @@ const parseFasterWhisperResult = (stdout: string): { srtPath?: string | null } =
 
 const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: string) => {
   if (!fs.existsSync(FASTER_WHISPER_SCRIPT_PATH)) return null
-  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'medium').trim() || 'medium'
+  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'small').trim() || 'small'
   const language = String(process.env.FASTER_WHISPER_LANGUAGE || process.env.CAPTION_LANGUAGE || process.env.WHISPER_LANGUAGE || '').trim()
   const device = String(process.env.FASTER_WHISPER_DEVICE || '').trim()
-  const computeType = String(process.env.FASTER_WHISPER_COMPUTE_TYPE || '').trim()
+  const computeType = String(process.env.FASTER_WHISPER_COMPUTE_TYPE || 'int8').trim() || 'int8'
   const beamSizeRaw = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 5)
   const beamSize = Number.isFinite(beamSizeRaw) ? Math.max(1, Math.min(10, Math.round(beamSizeRaw))) : 5
   const extraArgs = splitWhisperArgs(process.env.FASTER_WHISPER_ARGS)
@@ -20156,10 +20170,10 @@ const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: 
         }
       }, FASTER_WHISPER_TIMEOUT_MS)
       proc.stdout.on('data', (chunk) => {
-        stdout += String(chunk || '')
+        stdout = appendBoundedOutput(stdout, String(chunk || ''), SCRIPT_STDIO_LIMIT)
       })
       proc.stderr.on('data', (chunk) => {
-        stderr += String(chunk || '')
+        stderr = appendBoundedOutput(stderr, String(chunk || ''), SCRIPT_STDIO_LIMIT)
       })
       proc.on('error', () => {
         clearTimeout(timeout)

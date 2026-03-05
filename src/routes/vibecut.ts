@@ -334,6 +334,16 @@ const VIBECUT_BOUNDARY_REANCHOR_CANDIDATES = [0, 0.08, 0.16, 0.24, 0.32] as cons
 const frameScanRatioRaw = Number(process.env.VIBECUT_FRAME_SCAN_RATIO || 1)
 const FRAME_SCAN_SAMPLE_RATIO = Number.isFinite(frameScanRatioRaw) ? clamp(frameScanRatioRaw, 0.05, 1) : 1
 const UPLOAD_RUTHLESS_TIMEOUT_MS = clamp(Number(process.env.VIBECUT_UPLOAD_RUTHLESS_TIMEOUT_MS || 3500), 1500, 10_000)
+const VIBECUT_PROCESS_STDIO_LIMIT = clamp(Number(process.env.VIBECUT_PROCESS_STDIO_LIMIT || 700_000), 32_000, 5_000_000)
+
+const appendBoundedOutput = (current: string, chunk: Buffer | string, maxChars: number) => {
+  const text = String(chunk || '')
+  if (!text) return current
+  if (!Number.isFinite(maxChars) || maxChars <= 0) return ''
+  const merged = current + text
+  if (merged.length <= maxChars) return merged
+  return merged.slice(merged.length - maxChars)
+}
 
 const RUTHLESS_UPLOAD_PROMPT = `You are AutoEditor's ruthless retention-maximizing AI brain.
 Mission: maximize retention and completion rate, not runtime.
@@ -914,7 +924,7 @@ const runProcess = async (
             if (settled) return
             timedOut = true
             settled = true
-            stderr += `\nProcess timeout after ${Math.round(safeTimeoutMs)}ms`
+            stderr = appendBoundedOutput(stderr, `\nProcess timeout after ${Math.round(safeTimeoutMs)}ms`, VIBECUT_PROCESS_STDIO_LIMIT)
             try {
               child.kill('SIGKILL')
             } catch {
@@ -932,13 +942,13 @@ const runProcess = async (
     }
 
     child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString()
+      stdout = appendBoundedOutput(stdout, chunk, VIBECUT_PROCESS_STDIO_LIMIT)
     })
     child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString()
+      stderr = appendBoundedOutput(stderr, chunk, VIBECUT_PROCESS_STDIO_LIMIT)
     })
     child.on('error', (error) => {
-      stderr += `${error?.message || error}`
+      stderr = appendBoundedOutput(stderr, `${error?.message || error}`, VIBECUT_PROCESS_STDIO_LIMIT)
       finalize({ code: 1, stdout, stderr })
     })
     child.on('close', (code) => {
