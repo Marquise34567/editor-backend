@@ -29872,6 +29872,9 @@ const recoverQueuedJobs = async () => {
       const jobId = String(job?.id || '')
       const userId = String(job?.userId || '')
       if (!jobId || !userId) continue
+      // Never recover jobs currently executing in this process.
+      // Long renders can legitimately exceed stale thresholds.
+      if (runningPipelineJobIds.has(jobId)) continue
 
       const status = String(job?.status || '').toLowerCase()
       const progress = Number(job?.progress ?? 0)
