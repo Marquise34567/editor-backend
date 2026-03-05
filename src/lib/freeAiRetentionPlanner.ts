@@ -684,7 +684,9 @@ const buildScoredCandidates = ({
     const fillerPenalty = clamp(avg(overlappingSignals.map((segment) => segment.fillerDensity), 0) * 0.45, 0, 0.25)
     const sentimentScore = candidate.scores.sentiment || computeLexiconSentiment(candidate.transcript)
     const faceCenterBoost = clamp(frameScan.centeredFaceVerticalSignal, 0, 1) * 0.08
-    const openerBias = candidate.start <= 2.5 ? 0.08 : 0
+    const openerBias = candidate.start <= 2.5
+      ? (candidate.source === 'intro_fallback' ? 0.01 : 0.04)
+      : 0
     const heuristicScore = clamp(
       motionScore * 0.36 +
         audioScore * 0.28 +
@@ -2007,20 +2009,40 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     candidates
       .filter((candidate) => candidate.start <= 1.2)
       .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
-  const selectedCandidate = (
+  const introAnchorLooksStrong = Boolean(
     strongest &&
     introAnchorCandidate &&
-    introAnchorCandidate.scores.combined >= strongest.scores.combined * 0.84
+    introAnchorCandidate.scores.combined >= Math.max(0.62, strongest.scores.combined - 0.015) &&
+    (
+      introAnchorCandidate.source !== 'intro_fallback' ||
+      introAnchorCandidate.scores.combined >= Math.max(0.7, strongest.scores.combined - 0.005)
+    ) &&
+    String(introAnchorCandidate.transcript || '').trim().length >= 18
   )
+  const earlyCandidateLooksStrong = Boolean(
+    strongest &&
+    strongestEarlyCandidate &&
+    strongest.start > 3.5 &&
+    strongestEarlyCandidate.scores.combined >= Math.max(0.6, strongest.scores.combined - 0.03)
+  )
+  const provisionalSelectedCandidate = introAnchorLooksStrong
     ? introAnchorCandidate
-    : (
-        strongest &&
-        strongestEarlyCandidate &&
-        strongest.start > 3.5 &&
-        strongestEarlyCandidate.scores.combined >= strongest.scores.combined * 0.9
-      )
+    : earlyCandidateLooksStrong
       ? strongestEarlyCandidate
       : strongest
+  const earlyWindowLimitSeconds = Number(clamp(duration * 0.24, 48, 120).toFixed(1))
+  const strongestWithinEarlyWindow =
+    candidates
+      .filter((candidate) => candidate.start <= earlyWindowLimitSeconds)
+      .sort((left, right) => right.scores.combined - left.scores.combined)[0] || null
+  const selectedCandidate = (
+    provisionalSelectedCandidate &&
+    strongestWithinEarlyWindow &&
+    provisionalSelectedCandidate.start > earlyWindowLimitSeconds &&
+    strongestWithinEarlyWindow.scores.combined >= Math.max(0.56, provisionalSelectedCandidate.scores.combined - 0.06)
+  )
+    ? strongestWithinEarlyWindow
+    : provisionalSelectedCandidate
   const selected = selectedCandidate ? toAIDurationHook(selectedCandidate, duration, 8) : null
   const selectedPeakMoment = buildSelectedPeakMoment(selected)
   const hookBlueprint = buildHookBlueprint({
@@ -2074,7 +2096,7 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
               ? `Selected this 8-second opener over alternatives because it anchors at timeline start while preserving comparable retention strength (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
               : selectedCandidate?.id === strongestEarlyCandidate?.id && strongestEarlyCandidate?.id !== strongest?.id
               ? `Selected this 8-second opener over alternatives because its early-timeline placement preserves first-3s hold while matching top retention score (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
-              : `Selected this 8-second opener over alternatives because it delivers the strongest early retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
+              : `Selected this 8-second opener over alternatives because it delivers the strongest retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),

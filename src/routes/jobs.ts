@@ -10712,6 +10712,7 @@ const buildFallbackHookCandidateFromStorySegments = ({
   silences: TimeRange[]
   durationSeconds: number
 }) => {
+  const hasWindowSignals = Array.isArray(windows) && windows.length > 0
   const dynamicBaseline = computeHookDynamicBaseline(windows)
   const scored = segments
     .map((segment) => {
@@ -10750,6 +10751,10 @@ const buildFallbackHookCandidateFromStorySegments = ({
       const hookEnd = clamp(hookStart + targetDuration, hookStart + Math.min(0.2, maxDuration), segmentEnd)
       const duration = hookEnd - hookStart
       if (duration < Math.max(2.8, minDuration - 0.4)) return null
+      if (!hasWindowSignals) {
+        const blindStartFloor = Math.min(Math.max(2.2, durationSeconds * 0.035), 14)
+        if (hookStart < blindStartFloor) return null
+      }
 
       const hookSignal = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.hookScore ?? window.score)
       const energy = averageWindowMetric(windows, hookStart, hookEnd, (window) => window.audioEnergy)
@@ -10780,11 +10785,15 @@ const buildFallbackHookCandidateFromStorySegments = ({
         windows
       })
       const earlyWindowSeconds = Math.max(26, Math.min(96, durationSeconds * 0.4))
-      const earlyStartScore = clamp01(1 - Math.max(0, hookStart - 1.2) / earlyWindowSeconds)
-      const latePenalty = clamp01(
-        (hookStart - earlyWindowSeconds) /
-        Math.max(14, durationSeconds - earlyWindowSeconds)
-      )
+      const earlyStartScore = hasWindowSignals
+        ? clamp01(1 - Math.max(0, hookStart - 1.2) / earlyWindowSeconds)
+        : 0.45
+      const latePenalty = hasWindowSignals
+        ? clamp01(
+          (hookStart - earlyWindowSeconds) /
+          Math.max(14, durationSeconds - earlyWindowSeconds)
+        )
+        : 0
       const peakImpact = peakWindow?.impact ?? clamp01(
         0.36 * hookSignal +
         0.24 * energy +
@@ -26516,6 +26525,7 @@ const processJob = async (
             b.selectionScore - a.selectionScore ||
             b.confidence - a.confidence ||
             b.candidate.score - a.candidate.score ||
+            Number(Boolean(a.candidate.synthetic)) - Number(Boolean(b.candidate.synthetic)) ||
             a.candidate.start - b.candidate.start
           ))
         const transcriptFallbackAuditFloor = clamp(
@@ -26547,9 +26557,20 @@ const processJob = async (
               Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
             )) || null
           : null
+        const transcriptAuditedOpeningSafeEntry = transcriptAuditedOpeningEntry && (
+          transcriptFallbackSafe(transcriptAuditedOpeningEntry) ||
+          (
+            transcriptAuditedOpeningEntry.candidate.auditPassed &&
+            transcriptAuditedOpeningEntry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
+            transcriptAuditedOpeningEntry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
+            transcriptAuditedOpeningEntry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
+          )
+        )
+          ? transcriptAuditedOpeningEntry
+          : null
         const transcriptFallbackPick = hasTranscriptSignals
           ? (
-              transcriptAuditedOpeningEntry ||
+              transcriptAuditedOpeningSafeEntry ||
               fallbackPoolRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
               fallbackPoolRanked.find((entry) => transcriptFallbackSafe(entry))
             )
@@ -26640,6 +26661,35 @@ const processJob = async (
             start: openingStart,
             duration: openingDuration,
             reason: 'Fallback hook quality floor not met without transcript support; preserving coherent opener from the beginning of this video.'
+          }
+        }
+        if (
+          hasTranscriptSignals &&
+          fallbackHook.synthetic &&
+          fallbackHook.start <= 2.2 &&
+          (
+            fallbackHook.auditScore < Math.max(0.62, transcriptFallbackAuditFloor - 0.02) ||
+            fallbackSignals.selectionScore < Math.max(0.6, transcriptFallbackSelectionFloor - 0.02) ||
+            fallbackSignals.curiosityPressure < Math.max(0.46, transcriptFallbackCuriosityFloor - 0.02)
+          )
+        ) {
+          const replacement = fallbackPoolRanked.find((entry) => (
+            entry.candidate.start >= 2.2 &&
+            !entry.candidate.synthetic &&
+            entry.selectionScore >= Math.max(0.58, transcriptFallbackSelectionFloor - 0.05) &&
+            entry.curiosityPressure >= Math.max(0.44, transcriptFallbackCuriosityFloor - 0.04) &&
+            entry.teaserTension >= Math.max(0.44, transcriptFallbackTeaserFloor - 0.04)
+          )) || fallbackPoolRanked.find((entry) => (
+            entry.candidate.start >= 2.2 &&
+            entry.selectionScore >= Math.max(0.6, fallbackSignals.selectionScore + 0.03)
+          ))
+          if (replacement) {
+            fallbackHook = replacement.candidate
+            fallbackSignals = scoreRenderableHookCandidateSignals({
+              candidate: fallbackHook,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            optimizationNotes.push('Hook fallback guard replaced weak synthetic opening with stronger candidate.')
           }
         }
         const fallbackCandidatesForDebug = [
@@ -33273,6 +33323,7 @@ const buildEditPlanForTest = async ({
         b.selectionScore - a.selectionScore ||
         b.confidence - a.confidence ||
         b.candidate.score - a.candidate.score ||
+        Number(Boolean(a.candidate.synthetic)) - Number(Boolean(b.candidate.synthetic)) ||
         a.candidate.start - b.candidate.start
       ))
     const transcriptFallbackAuditFloor = clamp(
@@ -33304,9 +33355,20 @@ const buildEditPlanForTest = async ({
           Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
         )) || null
       : null
+    const transcriptAuditedOpeningSafeEntry = transcriptAuditedOpeningEntry && (
+      transcriptFallbackSafe(transcriptAuditedOpeningEntry) ||
+      (
+        transcriptAuditedOpeningEntry.candidate.auditPassed &&
+        transcriptAuditedOpeningEntry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
+        transcriptAuditedOpeningEntry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
+        transcriptAuditedOpeningEntry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
+      )
+    )
+      ? transcriptAuditedOpeningEntry
+      : null
     const transcriptFallbackPick = hasTranscriptSignals
       ? (
-          transcriptAuditedOpeningEntry ||
+          transcriptAuditedOpeningSafeEntry ||
           fallbackRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
           fallbackRanked.find((entry) => transcriptFallbackSafe(entry))
         )
