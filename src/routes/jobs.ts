@@ -108,6 +108,14 @@ type FfmpegRunResult = {
 
 const bucketChecks: Record<string, Promise<void> | null> = {}
 const RETRY_BASE_DELAY_MS = 350
+const AUTO_DELETE_DOWNLOAD_OUTPUTS = /^(1|true|yes)$/i.test(
+  String(process.env.AUTO_DELETE_DOWNLOAD_OUTPUTS || '').trim()
+)
+const AUTO_DELETE_DOWNLOAD_OUTPUT_DELAY_MS = (() => {
+  const envValue = Number(process.env.AUTO_DELETE_DOWNLOAD_OUTPUT_DELAY_MS || 60_000)
+  if (!Number.isFinite(envValue) || envValue < 10_000) return 60_000
+  return Math.round(envValue)
+})()
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -7041,6 +7049,38 @@ const resolveOutputUrlWithLocalFallback = async ({
     }
     throw error
   }
+}
+
+const scheduleOutputAutoDeleteIfEnabled = ({
+  requestId,
+  jobId,
+  outputPaths,
+  selectedOutputPath,
+  source
+}: {
+  requestId?: string | null
+  jobId: string
+  outputPaths: string[]
+  selectedOutputPath: string
+  source: 'remote' | 'local'
+}) => {
+  if (!AUTO_DELETE_DOWNLOAD_OUTPUTS) return
+  if (source !== 'remote') return
+  const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
+  if (!keyToDelete) return
+  setTimeout(async () => {
+    try {
+      await deleteOutputObject(keyToDelete)
+      try {
+        await updateJob(jobId, { outputPath: null })
+      } catch {
+        // ignore DB update failures
+      }
+      console.log(`[${requestId || 'noid'}] auto-deleted R2 object ${keyToDelete} for job ${jobId}`)
+    } catch (err) {
+      console.error('auto-delete failed', err)
+    }
+  }, AUTO_DELETE_DOWNLOAD_OUTPUT_DELAY_MS)
 }
 
 const normalizePercentMetric = (value: any) => {
@@ -31314,29 +31354,13 @@ router.post('/:id/download-url', async (req: any, res) => {
         forceDownload: true
       })
 
-      // schedule auto-delete 1 minute after user requests download
-      if (resolved.source === 'remote') {
-        try {
-          const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
-          if (keyToDelete) {
-            setTimeout(async () => {
-              try {
-                await deleteOutputObject(keyToDelete)
-                try {
-                  await updateJob(id, { outputPath: null })
-                } catch (e) {
-                  // ignore DB update failures
-                }
-                console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
-              } catch (err) {
-                console.error('auto-delete failed', err)
-              }
-            }, 60_000)
-          }
-        } catch (e) {
-          // scheduling failure shouldn't block download
-        }
-      }
+      scheduleOutputAutoDeleteIfEnabled({
+        requestId: req.requestId,
+        jobId: id,
+        outputPaths,
+        selectedOutputPath,
+        source: resolved.source
+      })
 
       return res.json({ url: resolved.url, source: resolved.source })
     } catch (err) {
@@ -33329,29 +33353,13 @@ router.get('/:id/output-url', async (req: any, res) => {
         clipIndex
       })
 
-      // schedule auto-delete 1 minute after user requests download
-      if (resolved.source === 'remote') {
-        try {
-          const keyToDelete = outputPaths.length === 1 ? selectedOutputPath : null
-          if (keyToDelete) {
-            setTimeout(async () => {
-              try {
-                await deleteOutputObject(keyToDelete)
-                try {
-                  await updateJob(id, { outputPath: null })
-                } catch (e) {
-                  // ignore DB update failures
-                }
-                console.log(`[${req.requestId}] auto-deleted R2 object ${keyToDelete} for job ${id}`)
-              } catch (err) {
-                console.error('auto-delete failed', err)
-              }
-            }, 60_000)
-          }
-        } catch (e) {
-          // scheduling failure shouldn't block download
-        }
-      }
+      scheduleOutputAutoDeleteIfEnabled({
+        requestId: req.requestId,
+        jobId: id,
+        outputPaths,
+        selectedOutputPath,
+        source: resolved.source
+      })
 
       res.json({ url: resolved.url, source: resolved.source })
     } catch (err) {
