@@ -2010,6 +2010,12 @@ const SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS = (() => {
   if (!Number.isFinite(envValue) || envValue < 6) return 34
   return Math.round(envValue)
 })()
+const RENDER_FORCE_FAST_HORIZONTAL = /^(1|true|yes)$/i.test(
+  String(process.env.RENDER_FORCE_FAST_HORIZONTAL || '').trim()
+)
+const RENDER_PREFER_SEGMENT_FILE_FALLBACK = /^(1|true|yes)$/i.test(
+  String(process.env.RENDER_PREFER_SEGMENT_FILE_FALLBACK || '').trim()
+)
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
@@ -25466,10 +25472,14 @@ const processJob = async (
   const normalizedSubtitle = normalizeSubtitlePreset(subtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
   const baseCrf = getDefaultCrfForQuality(finalQuality)
   const adjustedCrf = Math.round(clamp(baseCrf + platformProfile.crfDelta, 16, 30))
-  const ffPreset = options.fastMode
+  const renderFastMode = Boolean(
+    options.fastMode ||
+    (renderConfig.mode === 'horizontal' && RENDER_FORCE_FAST_HORIZONTAL)
+  )
+  const ffPreset = renderFastMode
     ? FAST_MODE_FFMPEG_PRESET
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
-  const ffCrf = options.fastMode
+  const ffCrf = renderFastMode
     ? String(FAST_MODE_FFMPEG_CRF)
     : (process.env.FFMPEG_CRF || String(adjustedCrf))
   const ffAudioBitrate = resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
@@ -28492,15 +28502,15 @@ const processJob = async (
           musicDuck: options.musicDuck
         })
       }
-      const audioFilters = withAudio && !options.fastMode
+      const audioFilters = withAudio && !renderFastMode
         ? buildAudioFilters({
             aggressionLevel,
             styleProfile: styleProfileForAnalysis,
             audioProfile: audioProfileForAnalysis
           })
         : []
-      if (options.fastMode && withAudio) {
-        optimizationNotes.push('Fast mode: audio polish filters skipped for quicker render.')
+      if (renderFastMode && withAudio) {
+        optimizationNotes.push('Render speed mode: audio polish filters skipped for quicker render.')
       }
       audioFiltersForAnalysis = audioFilters.slice()
       await updateJob(jobId, { status: 'retention', progress: 72 })
@@ -29032,7 +29042,7 @@ const processJob = async (
         : watermarkEnabled
         ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
         : ''
-      const transitionsEnabledForRender = Boolean(options.transitions && !options.fastMode)
+      const transitionsEnabledForRender = Boolean(options.transitions && !renderFastMode)
       const subtitleFilter = subtitlePath
         ? (
           subtitleIsAss
@@ -29397,7 +29407,10 @@ const processJob = async (
           )
           const preferSegmentFileFallback = (
             segmentFileFallbackEligible &&
-            finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
+            (
+              RENDER_PREFER_SEGMENT_FILE_FALLBACK ||
+              finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
+            )
           )
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
           // If using an image watermark we must add the watermark file as a second input
