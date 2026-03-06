@@ -2027,6 +2027,11 @@ const isVerticalRuntimeShortForm = (renderMode: RenderMode, runtimeSeconds: numb
 )
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
+const NO_OP_EDIT_MIN_DURATION_SECONDS = 45
+const NO_OP_EDIT_MIN_CUT_COUNT = 2
+const NO_OP_EDIT_MIN_SEGMENT_COUNT = 3
+const NO_OP_EDIT_MIN_IMPACT = 0.055
+const NO_OP_EDIT_RUNTIME_DELTA_TOLERANCE_SECONDS = 1.25
 const HARD_GATE_MIN_EDIT_DELTA_SHORT = 0.08
 const HARD_GATE_MIN_EDIT_DELTA_LONG_BASE = 0.12
 const HARD_GATE_MIN_EDIT_DELTA_LONG_CAP = 0.15
@@ -15825,6 +15830,55 @@ const computeEditImpactRatio = (segments: Segment[], durationSeconds: number) =>
   return Math.max(0, cutImpact + paceImpact)
 }
 
+const auditNoOpEditRisk = ({
+  segments,
+  durationSeconds,
+  renderedDurationSeconds
+}: {
+  segments: Segment[]
+  durationSeconds: number
+  renderedDurationSeconds: number
+}) => {
+  const safeDuration = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
+  const safeRenderedDuration = Number.isFinite(renderedDurationSeconds)
+    ? Math.max(0, renderedDurationSeconds)
+    : 0
+  const impact = computeEditImpactRatio(segments, safeDuration)
+  const stats = buildSegmentStatsSummary(segments)
+  const reasons: string[] = []
+  if (safeDuration < NO_OP_EDIT_MIN_DURATION_SECONDS) {
+    return {
+      noOp: false,
+      reasons,
+      impact,
+      stats
+    }
+  }
+  if (stats.segmentCount < NO_OP_EDIT_MIN_SEGMENT_COUNT) {
+    reasons.push('low_segment_count')
+  }
+  if (stats.cutCount < NO_OP_EDIT_MIN_CUT_COUNT && impact < NO_OP_EDIT_MIN_IMPACT) {
+    reasons.push('low_cut_density')
+  }
+  if (
+    safeRenderedDuration > 0 &&
+    Math.abs(safeRenderedDuration - safeDuration) <= NO_OP_EDIT_RUNTIME_DELTA_TOLERANCE_SECONDS &&
+    impact < NO_OP_EDIT_MIN_IMPACT
+  ) {
+    reasons.push('runtime_near_source')
+  }
+  const runtimeDeltaRatio = safeDuration > 0 ? Math.max(0, safeDuration - safeRenderedDuration) / safeDuration : 0
+  if (runtimeDeltaRatio < 0.025 && impact < NO_OP_EDIT_MIN_IMPACT) {
+    reasons.push('near_passthrough_runtime')
+  }
+  return {
+    noOp: reasons.length > 0,
+    reasons,
+    impact,
+    stats
+  }
+}
+
 const classifyShotType = (window: EngagementWindow): { shotType: VisualShotType; confidence: number } => {
   const faceSignal = Number(window.faceIntensity ?? window.facePresence ?? 0)
   const motion = Number(window.motionScore ?? 0)
@@ -29389,6 +29443,76 @@ const processJob = async (
               }
             } catch (runtimeGuardError) {
               console.warn(`[${requestId || 'noid'}] horizontal runtime floor rescue failed`, runtimeGuardError)
+            }
+          }
+        }
+      }
+      if (processed && hasSegments && fs.existsSync(tmpOut)) {
+        const renderedDurationAfterFloorGuard = Number(getDurationSeconds(tmpOut) || 0)
+        const noOpAudit = auditNoOpEditRisk({
+          segments: finalSegments,
+          durationSeconds,
+          renderedDurationSeconds: renderedDurationAfterFloorGuard
+        })
+        if (noOpAudit.noOp) {
+          const forcedFallbackBase = buildGuaranteedFallbackSegments(durationSeconds, {
+            ...options,
+            aggressiveMode: true,
+            onlyCuts: false
+          })
+          let noOpRescueTimeline: Segment[] = forcedFallbackBase.map((segment) => ({ ...segment }))
+          const noOpHookCandidate = selectedHook || initialHook
+          if (noOpHookCandidate && shouldMoveHookForRender) {
+            const boundedHook = enforceAutoHookDurationRange({
+              candidate: {
+                ...noOpHookCandidate,
+                start: Number(clamp(Number(noOpHookCandidate.start || 0), 0, Math.max(0, durationSeconds - HOOK_MIN)).toFixed(3))
+              },
+              durationSeconds
+            })
+            const hookRange: TimeRange = {
+              start: Number(clamp(Number(boundedHook.start || 0), 0, Math.max(0, durationSeconds - MIN_RENDER_SEGMENT_SECONDS)).toFixed(3)),
+              end: Number(clamp(Number((Number(boundedHook.start || 0) + Number(boundedHook.duration || 0)).toFixed(3)), 0, durationSeconds).toFixed(3))
+            }
+            if (hookRange.end - hookRange.start >= MIN_RENDER_SEGMENT_SECONDS) {
+              const hookSegment: Segment = {
+                start: hookRange.start,
+                end: hookRange.end,
+                speed: 1,
+                subtitleIntent: 'hook',
+                emphasize: true,
+                transitionStyle: 'smooth',
+                audioLeadInMs: 140,
+                audioTailMs: 180
+              }
+              noOpRescueTimeline = [
+                hookSegment,
+                ...subtractRange(forcedFallbackBase.map((segment) => ({ ...segment })), hookRange)
+              ]
+            }
+          }
+          const noOpRescueSegments = prepareSegmentsForRender(
+            noOpRescueTimeline,
+            durationSeconds,
+            processTranscriptCues
+          )
+          if (noOpRescueSegments.length) {
+            try {
+              await runSegmentFileFallback(noOpRescueSegments)
+              const rescueRenderedDuration = Number(getDurationSeconds(tmpOut) || 0)
+              const rescueAudit = auditNoOpEditRisk({
+                segments: noOpRescueSegments,
+                durationSeconds,
+                renderedDurationSeconds: rescueRenderedDuration
+              })
+              if (!rescueAudit.noOp || rescueRenderedDuration + 0.5 < renderedDurationAfterFloorGuard) {
+                finalSegments = noOpRescueSegments
+                optimizationNotes.push(
+                  `No-op rescue applied (${noOpAudit.reasons.join(', ')}; impact ${(noOpAudit.impact * 100).toFixed(1)}% -> ${(rescueAudit.impact * 100).toFixed(1)}%).`
+                )
+              }
+            } catch (noOpRescueError) {
+              console.warn(`[${requestId || 'noid'}] no-op rescue render failed`, noOpRescueError)
             }
           }
         }
