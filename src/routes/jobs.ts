@@ -2043,6 +2043,9 @@ const isVerticalRuntimeShortForm = (renderMode: RenderMode, runtimeSeconds: numb
 )
 const MIN_EDIT_IMPACT_RATIO_SHORT = 0.035
 const MIN_EDIT_IMPACT_RATIO_LONG = 0.06
+const MIN_EDIT_IMPACT_RATIO_HORIZONTAL_MEDIUM = 0.14
+const MIN_EDIT_IMPACT_RATIO_HORIZONTAL_LONG = 0.2
+const MIN_EDIT_IMPACT_RATIO_HORIZONTAL_LONG_AGGRESSIVE = 0.24
 const NO_OP_EDIT_MIN_DURATION_SECONDS = 45
 const NO_OP_EDIT_MIN_CUT_COUNT = 2
 const NO_OP_EDIT_MIN_SEGMENT_COUNT = 3
@@ -15900,6 +15903,30 @@ const auditNoOpEditRisk = ({
   }
 }
 
+const resolveMinimumEditImpactRatio = ({
+  durationSeconds,
+  renderMode,
+  aggressiveMode
+}: {
+  durationSeconds: number
+  renderMode: RenderMode
+  aggressiveMode: boolean
+}) => {
+  const base = durationSeconds >= LONG_FORM_RESCUE_MIN_DURATION
+    ? MIN_EDIT_IMPACT_RATIO_LONG
+    : MIN_EDIT_IMPACT_RATIO_SHORT
+  if (renderMode !== 'horizontal') return base
+  if (durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) {
+    return aggressiveMode
+      ? Math.max(base, MIN_EDIT_IMPACT_RATIO_HORIZONTAL_LONG_AGGRESSIVE)
+      : Math.max(base, MIN_EDIT_IMPACT_RATIO_HORIZONTAL_LONG)
+  }
+  if (durationSeconds >= 3 * 60) {
+    return Math.max(base, MIN_EDIT_IMPACT_RATIO_HORIZONTAL_MEDIUM)
+  }
+  return base
+}
+
 const classifyShotType = (window: EngagementWindow): { shotType: VisualShotType; confidence: number } => {
   const faceSignal = Number(window.faceIntensity ?? window.facePresence ?? 0)
   const motion = Number(window.motionScore ?? 0)
@@ -16865,8 +16892,10 @@ const buildGuaranteedFallbackSegments = (durationSeconds: number, options: EditO
   const introLen = clamp(normalizedTotal * 0.06, 4, 10)
   const outroLen = clamp(normalizedTotal * 0.04, 3, 8)
   const workingEnd = Math.max(introLen + MIN_RENDER_SEGMENT_SECONDS, normalizedTotal - outroLen)
-  const keepBase = options.aggressiveMode ? 6.2 : 7.4
-  const cutGap = options.aggressiveMode ? 2.2 : 1.6
+  // Stronger rescue pattern for horizontal jobs so fallback never looks like
+  // a near pass-through export.
+  const keepBase = options.aggressiveMode ? 4.6 : 5.2
+  const cutGap = options.aggressiveMode ? 3.1 : 2.8
   const speedPattern = options.onlyCuts ? [1] : [1.18, 1.24, 1.12, 1.2]
   const segments: Segment[] = [
     { start: 0, end: roundForFilter(introLen), speed: 1 }
@@ -28444,9 +28473,11 @@ const processJob = async (
         )
       }
       const impactBeforeRescue = computeEditImpactRatio(finalSegments, durationSeconds)
-      const minImpact = durationSeconds >= LONG_FORM_RESCUE_MIN_DURATION
-        ? MIN_EDIT_IMPACT_RATIO_LONG
-        : MIN_EDIT_IMPACT_RATIO_SHORT
+      const minImpact = resolveMinimumEditImpactRatio({
+        durationSeconds,
+        renderMode: renderConfig.mode,
+        aggressiveMode: Boolean(options.aggressiveMode)
+      })
       if (impactBeforeRescue < minImpact) {
         const rescuedSegments = prepareSegmentsForRender(
           buildGuaranteedFallbackSegments(durationSeconds, options),
@@ -28457,7 +28488,7 @@ const processJob = async (
           finalSegments = rescuedSegments
           const impactAfterRescue = computeEditImpactRatio(finalSegments, durationSeconds)
           optimizationNotes.push(
-            `Edit impact rescue applied (${(impactBeforeRescue * 100).toFixed(1)}% -> ${(impactAfterRescue * 100).toFixed(1)}%).`
+            `Edit impact rescue applied (${(impactBeforeRescue * 100).toFixed(1)}% -> ${(impactAfterRescue * 100).toFixed(1)}%, floor ${(minImpact * 100).toFixed(1)}%).`
           )
         }
       }
