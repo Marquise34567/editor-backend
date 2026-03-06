@@ -1971,6 +1971,12 @@ const RENDER_CODEC_THREADS = (() => {
   if (!Number.isFinite(envValue) || envValue < 1) return 1
   return Math.min(8, Math.round(envValue))
 })()
+const FAST_MODE_FFMPEG_PRESET = String(process.env.FAST_MODE_FFMPEG_PRESET || 'ultrafast').trim() || 'ultrafast'
+const FAST_MODE_FFMPEG_CRF = (() => {
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_CRF || 29)
+  if (!Number.isFinite(envValue)) return 29
+  return Math.round(Math.min(35, Math.max(22, envValue)))
+})()
 const SEGMENT_FILE_FALLBACK_MIN_SEGMENTS = (() => {
   const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 20)
   if (!Number.isFinite(envValue) || envValue < 6) return 20
@@ -2135,6 +2141,11 @@ const CREATOR_FEEDBACK_SIGNAL_MAP: Record<CreatorFeedbackCategory, {
   }
 }
 const MAX_QUALITY_GATE_RETRIES = 3
+const FAST_MODE_QUALITY_GATE_RETRIES = (() => {
+  const envValue = Number(process.env.FAST_MODE_QUALITY_GATE_RETRIES || 1)
+  if (!Number.isFinite(envValue)) return 1
+  return Math.round(Math.min(MAX_QUALITY_GATE_RETRIES, Math.max(0, envValue)))
+})()
 const QUALITY_GATE_THRESHOLDS: QualityGateThresholds = {
   hook_strength: 80,
   emotional_pull: 70,
@@ -25377,10 +25388,10 @@ const processJob = async (
   const baseCrf = getDefaultCrfForQuality(finalQuality)
   const adjustedCrf = Math.round(clamp(baseCrf + platformProfile.crfDelta, 16, 30))
   const ffPreset = options.fastMode
-    ? 'superfast'
+    ? FAST_MODE_FFMPEG_PRESET
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
   const ffCrf = options.fastMode
-    ? '28'
+    ? String(FAST_MODE_FFMPEG_CRF)
     : (process.env.FFMPEG_CRF || String(adjustedCrf))
   const ffAudioBitrate = resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
   const ffAudioSampleRate = String(
@@ -27609,7 +27620,10 @@ const processJob = async (
       }
 
       let finalSegments: Segment[] = []
-      const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, MAX_QUALITY_GATE_RETRIES + 1))
+      const qualityGateRetryCount = options.fastMode
+        ? FAST_MODE_QUALITY_GATE_RETRIES
+        : MAX_QUALITY_GATE_RETRIES
+      const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
         MANDATORY_VARIANT_MIN +
         (durationSeconds >= 45 * 60 ? 2 : durationSeconds >= 18 * 60 ? 1 : 0),
@@ -28399,13 +28413,16 @@ const processJob = async (
           musicDuck: options.musicDuck
         })
       }
-      const audioFilters = withAudio
+      const audioFilters = withAudio && !options.fastMode
         ? buildAudioFilters({
             aggressionLevel,
             styleProfile: styleProfileForAnalysis,
             audioProfile: audioProfileForAnalysis
           })
         : []
+      if (options.fastMode && withAudio) {
+        optimizationNotes.push('Fast mode: audio polish filters skipped for quicker render.')
+      }
       audioFiltersForAnalysis = audioFilters.slice()
       await updateJob(jobId, { status: 'retention', progress: 72 })
 
@@ -28934,6 +28951,7 @@ const processJob = async (
         : watermarkEnabled
         ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
         : ''
+      const transitionsEnabledForRender = Boolean(options.transitions && !options.fastMode)
       const subtitleFilter = subtitlePath
         ? (
           subtitleIsAss
@@ -29310,7 +29328,7 @@ const processJob = async (
           }
           if (!ran) {
             for (const chain of videoChains) {
-              const fadeVariants = options.transitions ? [true, false] : [false]
+              const fadeVariants = transitionsEnabledForRender ? [true, false] : [false]
               for (const enableFades of fadeVariants) {
                 const audioPolishVariants = withAudio && audioFilters.length > 0 ? [true, false] : [false]
                 for (const enableAudioPolish of audioPolishVariants) {
@@ -29321,7 +29339,7 @@ const processJob = async (
                       const reason = lastErr ? summarizeFfmpegError(lastErr) : 'ffmpeg_failed'
                       optimizationNotes.push(`Render fallback: ${describeVideoChainFallback(chain)} (${reason}).`)
                     }
-                    if (options.transitions && !enableFades) {
+                    if (transitionsEnabledForRender && !enableFades) {
                       const reason = lastErr ? summarizeFfmpegError(lastErr) : 'stitch_filter_failed'
                       optimizationNotes.push(`Render fallback: stitch transitions disabled (${reason}).`)
                     }
