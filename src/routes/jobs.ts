@@ -659,12 +659,24 @@ export const updateJob = async (
         EDITOR_RETENTION_CONFIG.enforceStatusTransitions &&
         !isJobStatusTransitionAllowed(currentStatus, normalizedStatus)
       ) {
-        if (isLikelyStaleJobStatusUpdate(currentStatus, normalizedStatus)) {
+        const allowRecoveredCompletion =
+          normalizedStatus === 'completed' &&
+          (currentStatus === 'queued' || currentStatus === 'uploading') &&
+          Number(nextData.progress ?? 0) >= 90 &&
+          typeof nextData.outputPath === 'string' &&
+          String(nextData.outputPath || '').trim().length > 0
+        if (allowRecoveredCompletion) {
+          console.warn(`[queue] allowing recovered completion transition ${currentStatus}->${normalizedStatus}`, {
+            jobId,
+            progress: Number(nextData.progress ?? 0)
+          })
+        } else if (isLikelyStaleJobStatusUpdate(currentStatus, normalizedStatus)) {
           const current = await prisma.job.findUnique({ where: { id: jobId } })
           if (!current) throw new Error('job_not_found')
           return current
+        } else {
+          throw new Error(`invalid_status_transition:${currentStatus}->${normalizedStatus}`)
         }
-        throw new Error(`invalid_status_transition:${currentStatus}->${normalizedStatus}`)
       }
 
       const statusWhere: Record<string, any> = { id: jobId, status: currentStatus }
@@ -6907,6 +6919,12 @@ const getOutputPathsForJob = (job: any) => {
   return [] as string[]
 }
 
+const buildLocalOutputVersionToken = (outputPath: string) => {
+  const value = String(outputPath || '').trim()
+  if (!value) return null
+  return crypto.createHash('sha1').update(value).digest('hex').slice(0, 12)
+}
+
 const resolveLocalOutputPathForJob = (job: any, clipIndex = 0) => {
   const localOutDir = path.join(process.cwd(), 'outputs', job.userId, job.id)
   const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
@@ -6945,12 +6963,14 @@ const buildLocalOutputFallbackUrl = (
   req: any,
   jobId: string,
   clipIndex: number,
-  forceDownload = false
+  forceDownload = false,
+  versionToken?: string | null
 ) => {
   const clip = Math.max(1, clipIndex + 1)
   const params = new URLSearchParams()
   if (clip > 1) params.set('clip', String(clip))
   if (forceDownload) params.set('download', '1')
+  if (versionToken) params.set('v', String(versionToken))
   const query = params.toString()
   return buildAbsoluteApiUrl(req, `/api/jobs/${jobId}/local-output${query ? `?${query}` : ''}`)
 }
@@ -6984,8 +7004,9 @@ const resolveOutputUrlWithLocalFallback = async ({
   } catch (error) {
     const local = getLocalOutputFileInfo(job, clipIndex)
     if (local) {
+      const versionToken = buildLocalOutputVersionToken(outputPath)
       return {
-        url: buildLocalOutputFallbackUrl(req, job.id, clipIndex, forceDownload),
+        url: buildLocalOutputFallbackUrl(req, job.id, clipIndex, forceDownload, versionToken),
         source: 'local' as const
       }
     }
@@ -29746,6 +29767,30 @@ const processJob = async (
 
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
   await pipelineJobContext.run({ jobId }, async () => {
+    const pipelineWorkerId = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`
+    let heartbeatTimer: NodeJS.Timeout | null = null
+    const stopHeartbeat = () => {
+      if (!heartbeatTimer) return
+      clearInterval(heartbeatTimer)
+      heartbeatTimer = null
+    }
+    const touchLease = async (
+      state: PipelineRuntimeLeaseState,
+      opts?: { markStarted?: boolean; markFinished?: boolean; markRecovered?: boolean }
+    ) => {
+      try {
+        await updatePipelineRuntimeLease({
+          jobId,
+          workerId: pipelineWorkerId,
+          state,
+          markStarted: Boolean(opts?.markStarted),
+          markFinished: Boolean(opts?.markFinished),
+          markRecovered: Boolean(opts?.markRecovered)
+        })
+      } catch (error) {
+        console.warn(`[queue] pipeline lease update failed for ${jobId}`, error)
+      }
+    }
     try {
       const existing = await prisma.job.findUnique({ where: { id: jobId } })
       if (!existing) return
@@ -29756,6 +29801,13 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
         console.log(`[${requestId || 'noid'}] skip pipeline ${jobId} (upload not completed yet)`)
         return
+      }
+      await touchLease('running', { markStarted: true })
+      heartbeatTimer = setInterval(() => {
+        void touchLease('running')
+      }, PIPELINE_HEARTBEAT_INTERVAL_MS)
+      if (typeof (heartbeatTimer as any).unref === 'function') {
+        ;(heartbeatTimer as any).unref()
       }
       if (!hasFfmpeg()) {
         await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
@@ -29907,6 +29959,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       }
       await updateJob(jobId, { status: 'failed', error: formatFfmpegFailure(err) })
     } finally {
+      stopHeartbeat()
+      await touchLease('idle', { markFinished: true })
       killJobFfmpegProcesses(jobId)
       clearPipelineCanceled(jobId)
     }
@@ -29935,7 +29989,17 @@ const QUEUE_RECOVERY_INTERVAL_MS = (() => {
 const STALE_PIPELINE_MS = (() => {
   const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
   if (Number.isFinite(envVal) && envVal >= 120_000) return envVal
-  return 8 * 60_000
+  return 30 * 60_000
+})()
+const PIPELINE_HEARTBEAT_INTERVAL_MS = (() => {
+  const envVal = Number(process.env.PIPELINE_HEARTBEAT_INTERVAL_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 10_000) return Math.round(envVal)
+  return 25_000
+})()
+const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
+  const envVal = Number(process.env.PIPELINE_HEARTBEAT_GRACE_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
+  return Math.max(90_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
 })()
 const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
 const STALE_RECOVERABLE_STATUSES = new Set([
@@ -30048,6 +30112,104 @@ const toTimeMs = (value: unknown) => {
   return Number.isFinite(parsed) ? parsed : 0
 }
 
+type PipelineRuntimeLeaseState = 'running' | 'idle' | 'recovered'
+
+type PipelineRuntimeLease = {
+  state?: string | null
+  workerId?: string | null
+  startedAt?: string | null
+  heartbeatAt?: string | null
+  finishedAt?: string | null
+  recoveredAt?: string | null
+}
+
+const getAnalysisRecord = (value: unknown): Record<string, any> => {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, any>
+  }
+  return {}
+}
+
+const getPipelineRuntimeLease = (analysis: unknown): PipelineRuntimeLease | null => {
+  const record = getAnalysisRecord(analysis)
+  const raw = record.pipeline_runtime ?? record.pipelineRuntime
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  return raw as PipelineRuntimeLease
+}
+
+const isPipelineLeaseFresh = (lease: PipelineRuntimeLease | null, nowMs: number) => {
+  if (!lease) return false
+  const state = String(lease.state || '').toLowerCase()
+  if (state !== 'running') return false
+  const heartbeatMs = toTimeMs(lease.heartbeatAt)
+  if (heartbeatMs <= 0) return false
+  return nowMs - heartbeatMs <= PIPELINE_HEARTBEAT_GRACE_MS
+}
+
+const updatePipelineRuntimeLease = async ({
+  jobId,
+  workerId,
+  state,
+  markStarted = false,
+  markFinished = false,
+  markRecovered = false
+}: {
+  jobId: string
+  workerId?: string | null
+  state: PipelineRuntimeLeaseState
+  markStarted?: boolean
+  markFinished?: boolean
+  markRecovered?: boolean
+}) => {
+  const snapshot = await prisma.job.findUnique({
+    where: { id: jobId },
+    select: { status: true, analysis: true, updatedAt: true }
+  })
+  if (!snapshot) return false
+  const status = String(snapshot.status || '').toLowerCase()
+  if (status === 'completed' || status === 'failed') return false
+  const nowIso = toIsoNow()
+  const analysis = getAnalysisRecord(snapshot.analysis)
+  const previousLease = getPipelineRuntimeLease(analysis) || {}
+  const nextLease: PipelineRuntimeLease = {
+    ...previousLease,
+    state,
+    workerId: workerId || previousLease.workerId || null,
+    heartbeatAt: nowIso
+  }
+  if (markStarted) {
+    nextLease.startedAt = previousLease.startedAt || nowIso
+    nextLease.finishedAt = null
+    nextLease.recoveredAt = null
+  }
+  if (markFinished) {
+    nextLease.finishedAt = nowIso
+  }
+  if (markRecovered) {
+    nextLease.recoveredAt = nowIso
+  }
+  const nextAnalysis = {
+    ...analysis,
+    pipeline_runtime: nextLease,
+    pipelineRuntime: nextLease
+  }
+  try {
+    await updateJob(
+      jobId,
+      { analysis: nextAnalysis },
+      { expectedUpdatedAt: snapshot.updatedAt }
+    )
+    return true
+  } catch (err: any) {
+    const code = String(err?.code || '').toLowerCase()
+    const message = String(err?.message || '')
+    if (code === 'job_update_conflict' || message.includes('job_update_conflict')) {
+      return false
+    }
+    throw err
+  }
+}
+
 const processQueue = () => {
   while (activePipelines < MAX_PIPELINES && pipelineQueue.length > 0) {
     const next = pipelineQueue.shift()
@@ -30110,6 +30272,10 @@ const recoverQueuedJobs = async () => {
       const progress = Number(job?.progress ?? 0)
       const inputPath = typeof job?.inputPath === 'string' ? job.inputPath.trim() : ''
       const uploadReady = Number.isFinite(progress) && progress >= 1 && inputPath.length > 0
+      const analysis = getAnalysisRecord((job as any)?.analysis)
+      const runtimeLease = getPipelineRuntimeLease(analysis)
+      const hasFreshLease = isPipelineLeaseFresh(runtimeLease, nowMs)
+      if (hasFreshLease) continue
       const startable = STARTABLE_QUEUE_STATUSES.has(status)
       const staleRecoverable =
         STALE_RECOVERABLE_STATUSES.has(status) &&
@@ -30121,7 +30287,23 @@ const recoverQueuedJobs = async () => {
       if (staleRecoverable) {
         const boundedProgress = Math.max(1, Math.min(90, Number(job?.progress || 1)))
         try {
-          await updateJob(jobId, { status: 'queued', progress: boundedProgress, error: null })
+          const recoveredLease: PipelineRuntimeLease = {
+            ...(runtimeLease || {}),
+            state: 'recovered',
+            workerId: null,
+            recoveredAt: toIsoNow(),
+            heartbeatAt: toIsoNow()
+          }
+          await updateJob(jobId, {
+            status: 'queued',
+            progress: boundedProgress,
+            error: null,
+            analysis: {
+              ...analysis,
+              pipeline_runtime: recoveredLease,
+              pipelineRuntime: recoveredLease
+            }
+          })
           console.warn(`[queue] recovered stale job ${jobId} from ${status}`)
         } catch (err) {
           console.error('[queue] stale recovery update failed', { jobId, status, err })
@@ -32963,6 +33145,10 @@ router.get('/:id/local-output', async (req: any, res) => {
     const rangeMatch = /^bytes=(\d*)-(\d*)$/i.exec(rangeHeader)
     const fileName = path.basename(outputPaths[clipIndex] || localOutput.filePath)
     const wantsDownload = String(req.query?.download || '').toLowerCase() === '1' || String(req.query?.download || '').toLowerCase() === 'true'
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0')
+    res.setHeader('Pragma', 'no-cache')
+    res.setHeader('Expires', '0')
+    res.setHeader('Surrogate-Control', 'no-store')
     res.setHeader('Content-Type', 'video/mp4')
     res.setHeader('Accept-Ranges', 'bytes')
     if (wantsDownload) {
