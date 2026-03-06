@@ -1603,6 +1603,7 @@ type EditPlan = {
     retentionRationale?: string | null
   }
 }
+type PipelinePowerModeSelection = 'standard' | 'ultra' | 'retention_king'
 type EditOptions = {
   autoHookMove: boolean
   removeBoring: boolean
@@ -1621,6 +1622,7 @@ type EditOptions = {
   retentionStrategyProfile: RetentionStrategyProfile
   maxCutsRequested?: number | null
   editorMode?: EditorModeSelection | null
+  pipelinePowerMode?: PipelinePowerModeSelection | null
   hookSelectionMode?: HookSelectionMode | null
   preferredHookCandidate?: HookCandidate | null
   styleArchetypeBlend?: Partial<StyleArchetypeBlend> | null
@@ -2301,6 +2303,44 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       'Standard mode playbook active: universal high-retention hook framework enabled.'
     ]
   }
+}
+
+const resolvePipelinePowerModePlaybook = (
+  mode?: PipelinePowerModeSelection | null
+): EditorModePlaybook => {
+  if (mode === 'ultra') {
+    return {
+      id: 'ultra',
+      label: 'Fast',
+      prompt: ULTRA_MODE_PLAYBOOK_PROMPT,
+      notes: [
+        'Fast mode playbook active: aggressive binge-cut profile enabled.',
+        'Fast mode skips long-form transcript analysis to reduce turnaround time.',
+        'Fast mode keeps hook pressure high while prioritizing speed-first output.'
+      ]
+    }
+  }
+  if (mode === 'retention_king') {
+    return {
+      id: 'retention_king',
+      label: 'Quality',
+      prompt: ULTRA_MODE_PLAYBOOK_PROMPT,
+      notes: [
+        'Quality mode playbook active: aggressive binge-cut profile enabled.',
+        'Quality mode keeps transcript-assisted hook and cut analysis enabled for stronger opener selection.',
+        'Quality mode favors better edit decisions over the absolute fastest turnaround.'
+      ]
+    }
+  }
+  return resolveEditorModePlaybook('auto')
+}
+
+const shouldAutoTranscribeDuringAnalyze = (
+  pipelinePowerMode: PipelinePowerModeSelection,
+  renderMode: RenderMode
+) => {
+  if (renderMode !== 'horizontal') return true
+  return pipelinePowerMode !== 'ultra'
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
   low: 0.62,
@@ -3521,6 +3561,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   retentionStrategyProfile: 'balanced',
   maxCutsRequested: null,
   editorMode: null,
+  pipelinePowerMode: 'standard',
   hookSelectionMode: 'auto',
   longFormPreset: 'auto',
   longFormAggression: 72,
@@ -4002,6 +4043,38 @@ const parseEditorModeSelection = (value: any): EditorModeSelection | null => {
     : null
 }
 
+const parsePipelinePowerModeSelection = (value: any): PipelinePowerModeSelection | null => {
+  if (value === null || value === undefined) return null
+  const normalized = String(value).trim().toLowerCase().replace(/-/g, '_')
+  if (!normalized) return null
+  return normalized === 'standard' || normalized === 'ultra' || normalized === 'retention_king'
+    ? (normalized as PipelinePowerModeSelection)
+    : null
+}
+
+const inferPipelinePowerModeFromEditorMode = (
+  mode?: EditorModeSelection | null
+): PipelinePowerModeSelection => {
+  if (mode === 'ultra') return 'ultra'
+  if (mode === 'retention-king') return 'retention_king'
+  return 'standard'
+}
+
+const resolvePipelinePowerMode = (
+  mode?: PipelinePowerModeSelection | null,
+  editorMode?: EditorModeSelection | null
+): PipelinePowerModeSelection => {
+  return mode ?? inferPipelinePowerModeFromEditorMode(editorMode)
+}
+
+const resolveInternalEditorModeForPipelinePowerMode = (
+  editorMode?: EditorModeSelection | null,
+  pipelinePowerMode?: PipelinePowerModeSelection | null
+): EditorModeSelection | null => {
+  if (pipelinePowerMode === 'ultra' || pipelinePowerMode === 'retention_king') return 'ultra'
+  return editorMode ?? null
+}
+
 const isPremiumEditorMode = (mode: EditorModeSelection | null | undefined): mode is 'ultra' | 'retention-king' => {
   return mode === 'ultra' || mode === 'retention-king'
 }
@@ -4373,6 +4446,15 @@ const getEditorModeFromPayload = (payload?: any): EditorModeSelection | null => 
     parseEditorModeSelection((payload as any).editor_mode) ??
     parseEditorModeSelection((payload as any).contentMode) ??
     parseEditorModeSelection((payload as any).content_mode) ??
+    null
+  )
+}
+
+const getPipelinePowerModeFromPayload = (payload?: any): PipelinePowerModeSelection | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parsePipelinePowerModeSelection((payload as any).pipelinePowerMode) ??
+    parsePipelinePowerModeSelection((payload as any).pipeline_power_mode) ??
     null
   )
 }
@@ -6082,6 +6164,18 @@ const getFastModeFromJob = (job?: any): boolean => {
   )
 }
 
+const getPipelinePowerModeFromJob = (job?: any): PipelinePowerModeSelection => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  const explicit = (
+    parsePipelinePowerModeSelection(settings?.pipelinePowerMode) ??
+    parsePipelinePowerModeSelection(settings?.pipeline_power_mode) ??
+    parsePipelinePowerModeSelection(analysis?.pipelinePowerMode) ??
+    parsePipelinePowerModeSelection(analysis?.pipeline_power_mode)
+  )
+  return resolvePipelinePowerMode(explicit, getEditorModeFromJob(job))
+}
+
 const getColdStartAutopilotFromJob = (job?: any): boolean => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -6409,6 +6503,7 @@ const buildPersistedRenderSettings = (
     soundFx?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
+    pipelinePowerMode?: PipelinePowerModeSelection | null
     hookSelectionMode?: HookSelectionMode | null
     longFormPreset?: LongFormPreset | null
     longFormAggression?: number | null
@@ -6438,6 +6533,10 @@ const buildPersistedRenderSettings = (
   const soundFx = typeof opts?.soundFx === 'boolean' ? opts.soundFx : null
   const maxCuts = parseMaxCutsPreference(opts?.maxCuts)
   const editorMode = parseEditorModeSelection(opts?.editorMode)
+  const pipelinePowerMode = resolvePipelinePowerMode(
+    parsePipelinePowerModeSelection(opts?.pipelinePowerMode),
+    editorMode
+  )
   const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'auto') || 'auto'
   const longFormAggression = parseLongFormAggression(opts?.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
@@ -6479,6 +6578,8 @@ const buildPersistedRenderSettings = (
     targetPlatform: retentionTargetPlatform,
     platformProfile,
     platform_profile: platformProfile,
+    pipelinePowerMode,
+    pipeline_power_mode: pipelinePowerMode,
     hookSelectionMode,
     hook_selection_mode: hookSelectionMode,
     longFormPreset,
@@ -6524,6 +6625,7 @@ const buildPersistedRenderAnalysis = ({
   soundFx,
   maxCuts,
   editorMode,
+  pipelinePowerMode,
   hookSelectionMode,
   longFormPreset,
   longFormAggression,
@@ -6549,6 +6651,7 @@ const buildPersistedRenderAnalysis = ({
   soundFx?: boolean | null
   maxCuts?: number | null
   editorMode?: EditorModeSelection | null
+  pipelinePowerMode?: PipelinePowerModeSelection | null
   hookSelectionMode?: HookSelectionMode | null
   longFormPreset?: LongFormPreset | null
   longFormAggression?: number | null
@@ -6607,6 +6710,14 @@ const buildPersistedRenderAnalysis = ({
     (existing as any)?.editorMode ??
     (existing as any)?.editor_mode ??
     (existing as any)?.contentMode
+  )
+  const resolvedPipelinePowerMode = resolvePipelinePowerMode(
+    parsePipelinePowerModeSelection(
+      pipelinePowerMode ??
+      (existing as any)?.pipelinePowerMode ??
+      (existing as any)?.pipeline_power_mode
+    ),
+    resolvedEditorMode
   )
   const resolvedHookSelectionMode = parseHookSelectionMode(
     hookSelectionMode ??
@@ -6772,6 +6883,8 @@ const buildPersistedRenderAnalysis = ({
       )
   payload.platformProfile = resolvedPlatformProfile
   payload.platform_profile = resolvedPlatformProfile
+  payload.pipelinePowerMode = resolvedPipelinePowerMode
+  payload.pipeline_power_mode = resolvedPipelinePowerMode
   payload.hookSelectionMode = resolvedHookSelectionMode
   payload.hook_selection_mode = resolvedHookSelectionMode
   if (resolvedOnlyCuts !== null) {
@@ -24555,6 +24668,7 @@ const getEditOptionsForUser = async (
     soundFx?: boolean | null
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
+    pipelinePowerMode?: PipelinePowerModeSelection | null
     hookSelectionMode?: HookSelectionMode | null
     autoCaptions?: boolean | null
     subtitleStyle?: string | null
@@ -24633,8 +24747,17 @@ const getEditOptionsForUser = async (
     (settings as any)?.contentMode
   )
   const editorMode = resolveEditorModeForTier(requestedEditorMode, effectiveTier)
-  const ultraModeRequested = editorMode === 'ultra'
-  const retentionKingModeRequested = editorMode === 'retention-king'
+  const pipelinePowerMode = resolvePipelinePowerMode(
+    parsePipelinePowerModeSelection(
+      overrides?.pipelinePowerMode ??
+      (settings as any)?.pipelinePowerMode ??
+      (settings as any)?.pipeline_power_mode
+    ),
+    editorMode
+  )
+  const ultraModeRequested = pipelinePowerMode === 'ultra'
+  const retentionKingModeRequested = pipelinePowerMode === 'retention_king'
+  const internalEditorMode = resolveInternalEditorModeForPipelinePowerMode(editorMode, pipelinePowerMode)
   const hookSelectionMode = parseHookSelectionMode(
     overrides?.hookSelectionMode ??
     (settings as any)?.hookSelectionMode ??
@@ -24724,11 +24847,12 @@ const getEditOptionsForUser = async (
     resolvedFastMode = true
   } else if (retentionKingModeRequested) {
     requestedStrategy = 'viral'
-    requestedAggression = 'high'
-    longFormPreset = longFormPreset === 'ultra' ? 'ultra' : 'aggressive'
-    longFormAggression = Math.max(longFormAggression, 88)
-    longFormClarityVsSpeed = Math.min(longFormClarityVsSpeed, 44)
+    requestedAggression = 'viral'
+    longFormPreset = 'ultra'
+    longFormAggression = Math.max(longFormAggression, 92)
+    longFormClarityVsSpeed = Math.min(longFormClarityVsSpeed, 36)
     tangentKiller = true
+    resolvedFastMode = true
   }
   const modeBypassesAdvancedCap = ultraModeRequested || retentionKingModeRequested
   const allowedAggression: RetentionAggressionLevel =
@@ -24763,7 +24887,8 @@ const getEditOptionsForUser = async (
     retentionAggressionLevel: allowedAggression,
     retentionStrategyProfile: allowedStrategy,
     maxCutsRequested,
-    editorMode,
+    editorMode: internalEditorMode,
+    pipelinePowerMode,
     hookSelectionMode,
     longFormPreset,
     longFormAggression,
@@ -24890,6 +25015,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     }
 
     const initialRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const pipelinePowerMode = resolvePipelinePowerMode(options.pipelinePowerMode, options.editorMode ?? null)
     const requestedStrategyProfile = parseRetentionStrategyProfile(
       options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
     )
@@ -24920,22 +25046,30 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     }
     const strategyProfile = runtimeRetentionProfile.strategy
     const aggressionLevel = runtimeRetentionProfile.aggression
-    const editorModePlaybook = resolveEditorModePlaybook(options.editorMode ?? null)
+    const editorModePlaybook = resolvePipelinePowerModePlaybook(pipelinePowerMode)
     const playbookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
-
-    const transcriptCues = await runRetentionStep({
-      jobId,
-      step: 'TRANSCRIBE',
-      maxRetries: 1,
-      statusUpdate: { status: 'analyzing', progress: 18 },
-      run: async () => {
-        const transcriptSrt = await generateSubtitles(tmpIn, analysisWorkDir).catch(() => null)
-        if (!transcriptSrt) return [] as TranscriptCue[]
-        return parseTranscriptCues(transcriptSrt)
-      },
-      summarize: (cues) => ({ cueCount: cues.length, hasTranscript: cues.length > 0 })
-    })
+    const shouldAnalyzeTranscript = shouldAutoTranscribeDuringAnalyze(
+      pipelinePowerMode,
+      initialRenderConfig.mode
+    )
+    if (!shouldAnalyzeTranscript) {
+      console.log(`[${requestId || 'noid'}] transcript analysis skipped for fast horizontal mode`)
+    }
+    const transcriptCues = shouldAnalyzeTranscript
+      ? await runRetentionStep({
+          jobId,
+          step: 'TRANSCRIBE',
+          maxRetries: 1,
+          statusUpdate: { status: 'analyzing', progress: 18 },
+          run: async () => {
+            const transcriptSrt = await generateSubtitles(tmpIn, analysisWorkDir).catch(() => null)
+            if (!transcriptSrt) return [] as TranscriptCue[]
+            return parseTranscriptCues(transcriptSrt)
+          },
+          summarize: (cues) => ({ cueCount: cues.length, hasTranscript: cues.length > 0 })
+        })
+      : ([] as TranscriptCue[])
 
     let editPlan: EditPlan | null = null
     let extractedFrameCount = 0
@@ -25311,6 +25445,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
         editorMode: options.editorMode,
+        pipelinePowerMode: options.pipelinePowerMode,
         hookSelectionMode: options.hookSelectionMode,
         longFormPreset: options.longFormPreset,
         longFormAggression: options.longFormAggression,
@@ -25387,6 +25522,10 @@ const processJob = async (
   let retentionTargetPlatform = requestedTargetPlatform
   let platformProfileId = requestedPlatformProfileId
   const requestedEditorModeRaw = parseEditorModeSelection(options.editorMode ?? getEditorModeFromJob(job) ?? 'auto')
+  const pipelinePowerMode = resolvePipelinePowerMode(
+    options.pipelinePowerMode ?? getPipelinePowerModeFromJob(job),
+    requestedEditorModeRaw
+  )
   let requestedEditorMode: EditorModeSelection | null = requestedEditorModeRaw
   let requestedHookSelectionMode = parseHookSelectionMode(
     options.hookSelectionMode ?? getHookSelectionModeFromJob(job),
@@ -25401,7 +25540,6 @@ const processJob = async (
     (job.analysis as any)?.videoAutoDetect ??
     (job.analysis as any)?.metadata_summary?.retention?.autoDetect
   )
-  let retentionKingBlendDecision = resolveRetentionKingBlendFromScore(existingAutoDetectProfile?.qualityScoreBefore ?? null)
   if (requestedManualTimestampConfig?.enabled) {
     requestedHookSelectionMode = 'manual'
   }
@@ -25449,19 +25587,12 @@ const processJob = async (
     }
   }
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
-  const editorModePlaybook = resolveEditorModePlaybook(editorModeForRender)
+  const editorModePlaybook = resolvePipelinePowerModePlaybook(pipelinePowerMode)
   const editorModePlaybookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
-  if (editorModePlaybook.id === 'ultra') {
+  if (pipelinePowerMode === 'ultra' || pipelinePowerMode === 'retention_king') {
     requestedStrategyProfile = 'viral'
     requestedAggressionLevel = 'viral'
     options.fastMode = true
-  } else if (editorModePlaybook.id === 'retention_king') {
-    retentionKingBlendDecision = resolveRetentionKingBlendFromScore(existingAutoDetectProfile?.qualityScoreBefore ?? null)
-    requestedStrategyProfile = retentionKingBlendDecision.recommendedStrategyProfile
-    requestedAggressionLevel = retentionKingBlendDecision.recommendedAggressionLevel
-    outcomeAutomationNotes.push(
-      `Retention King dynamic blend ${retentionKingBlendDecision.pct.toFixed(1)}% (${retentionKingBlendDecision.level}) from upload quality score ${Number(existingAutoDetectProfile?.qualityScoreBefore ?? 62).toFixed(1)}.`
-    )
   }
   if (editorModePlaybookNotes.length) {
     outcomeAutomationNotes.push(...editorModePlaybookNotes)
@@ -25471,9 +25602,7 @@ const processJob = async (
   options.hookSelectionMode = hookSelectionModeForRender
   options.manualTimestampConfig = requestedManualTimestampConfig
   requestedAggressionLevel = parseRetentionAggressionLevel(
-    editorModePlaybook.id === 'retention_king'
-      ? requestedAggressionLevel
-      : (STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel)
+    STRATEGY_TO_AGGRESSION[requestedStrategyProfile] ?? requestedAggressionLevel
   )
   let platformProfile = PLATFORM_EDIT_PROFILES[platformProfileId] || PLATFORM_EDIT_PROFILES.auto
   let strategyProfile = requestedStrategyProfile
@@ -26309,6 +26438,7 @@ const processJob = async (
           onlyCuts: options.onlyCuts,
           maxCuts: options.maxCutsRequested,
           editorMode: editorModeForRender,
+          pipelinePowerMode: options.pipelinePowerMode,
           hookSelectionMode: options.hookSelectionMode,
           longFormPreset: options.longFormPreset,
           longFormAggression: options.longFormAggression,
@@ -30062,6 +30192,7 @@ const processJob = async (
         onlyCuts: options.onlyCuts,
         maxCuts: options.maxCutsRequested,
         editorMode: editorModeForRender,
+        pipelinePowerMode: options.pipelinePowerMode,
         hookSelectionMode: options.hookSelectionMode,
         longFormPreset: options.longFormPreset,
         longFormAggression: options.longFormAggression,
@@ -30162,6 +30293,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         soundFx: getSoundFxFromJob(existing),
         maxCuts: getMaxCutsFromJob(existing),
         editorMode: getEditorModeFromJob(existing),
+        pipelinePowerMode: getPipelinePowerModeFromJob(existing),
         hookSelectionMode: getHookSelectionModeFromJob(existing),
         longFormPreset: getLongFormPresetFromJob(existing),
         longFormAggression: getLongFormAggressionFromJob(existing),
@@ -30193,6 +30325,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         soundFx: getSoundFxFromJob(latestBeforeProcess),
         maxCuts: getMaxCutsFromJob(latestBeforeProcess),
         editorMode: getEditorModeFromJob(latestBeforeProcess),
+        pipelinePowerMode: getPipelinePowerModeFromJob(latestBeforeProcess),
         hookSelectionMode: getHookSelectionModeFromJob(latestBeforeProcess),
         longFormPreset: getLongFormPresetFromJob(latestBeforeProcess),
         longFormAggression: getLongFormAggressionFromJob(latestBeforeProcess),
@@ -30933,7 +31066,9 @@ const handleCreateJob = async (req: any, res: any) => {
     const settings = await prisma.userSettings.findUnique({ where: { userId } })
     const desiredQuality = getRequestedQuality(requestedQuality, settings?.exportQuality)
     const configSelection = await chooseConfigForJobCreation()
-    const createModePlaybook = resolveEditorModePlaybook(editorModeOverride)
+    const createModePlaybook = resolvePipelinePowerModePlaybook(
+      resolvePipelinePowerMode(getPipelinePowerModeFromPayload(req.body), editorModeOverride)
+    )
 
     const job = await prisma.job.create({
       data: {
@@ -30957,6 +31092,7 @@ const handleCreateJob = async (req: any, res: any) => {
             soundFx: soundFxOverride,
             maxCuts: maxCutsOverride,
             editorMode: editorModeOverride,
+            pipelinePowerMode: createModePlaybook.id,
             hookSelectionMode: hookSelectionModeOverride,
             longFormPreset: longFormPresetOverride,
             longFormAggression: longFormAggressionOverride,
@@ -31926,6 +32062,10 @@ router.post('/:id/analyze', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      pipelinePowerMode: (
+        getPipelinePowerModeFromPayload(req.body) ??
+        getPipelinePowerModeFromJob(job)
+      ),
       hookSelectionMode: requestedHookSelectionMode,
       longFormPreset: requestedLongFormPreset,
       longFormAggression: requestedLongFormAggression,
@@ -32128,6 +32268,10 @@ router.post('/:id/process', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      pipelinePowerMode: (
+        getPipelinePowerModeFromPayload(req.body) ??
+        getPipelinePowerModeFromJob(job)
+      ),
       hookSelectionMode: requestedHookSelectionMode,
       longFormPreset: requestedLongFormPreset,
       longFormAggression: requestedLongFormAggression,
@@ -32337,6 +32481,10 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         soundFx: requestedSoundFx,
         maxCuts: requestedMaxCuts,
         editorMode: requestedEditorMode,
+        pipelinePowerMode: (
+          getPipelinePowerModeFromPayload(req.body) ??
+          getPipelinePowerModeFromJob(job)
+        ),
         hookSelectionMode: requestedHookSelectionMode,
         longFormPreset: requestedLongFormPreset,
         longFormAggression: requestedLongFormAggression,
