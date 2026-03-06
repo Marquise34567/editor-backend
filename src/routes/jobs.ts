@@ -25510,6 +25510,7 @@ const processJob = async (
   const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
   const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
   const renderSubtitlesEnabled = Boolean(
+    renderConfig.mode === 'vertical' &&
     options.autoCaptions &&
     !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
   )
@@ -28526,8 +28527,8 @@ const processJob = async (
           const captionEngine = getCaptionEngineStatus()
           optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
         }
-      } else if (options.autoCaptions && renderFastHorizontalMode) {
-        optimizationNotes.push('Render speed mode: subtitles skipped for horizontal fast render.')
+      } else if (options.autoCaptions && renderConfig.mode === 'horizontal') {
+        optimizationNotes.push('Long-form mode: subtitles skipped.')
       }
 
       await updateJob(jobId, { status: 'audio', progress: 68 })

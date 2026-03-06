@@ -6,6 +6,28 @@ import { __retentionTestUtils } from '../src/routes/jobs'
 
 const ffmpegBin = process.env.FFMPEG_PATH || 'ffmpeg'
 const ffprobeBin = process.env.FFPROBE_PATH || 'ffprobe'
+const rerenderCodec = String(process.env.RERENDER_LOCAL_VIDEO_CODEC || 'libx264').trim() || 'libx264'
+const rerenderPreset = String(
+  process.env.RERENDER_LOCAL_VIDEO_PRESET || (rerenderCodec.includes('nvenc') ? 'p1' : 'superfast')
+).trim() || 'superfast'
+const rerenderCrf = (() => {
+  const value = Number(process.env.RERENDER_LOCAL_VIDEO_CRF || 22)
+  if (!Number.isFinite(value)) return 22
+  return Math.round(Math.min(40, Math.max(16, value)))
+})()
+const rerenderCq = (() => {
+  const value = Number(process.env.RERENDER_LOCAL_VIDEO_CQ || 28)
+  if (!Number.isFinite(value)) return 28
+  return Math.round(Math.min(40, Math.max(16, value)))
+})()
+const rerenderAudioBitrate = String(process.env.RERENDER_LOCAL_AUDIO_BITRATE || '192k').trim() || '192k'
+const rerenderResolution = (() => {
+  const raw = String(process.env.RERENDER_LOCAL_TARGET_RESOLUTION || '1280:720').trim()
+  const parts = raw.split(':').map((part) => Number(part))
+  const width = Number.isFinite(parts[0]) ? Math.round(Math.max(320, parts[0])) : 1280
+  const height = Number.isFinite(parts[1]) ? Math.round(Math.max(180, parts[1])) : 720
+  return { width, height }
+})()
 const AUTO_HOOK_MIN_SECONDS = 5
 const AUTO_HOOK_MAX_SECONDS = 8
 const AUTO_HOOK_LOCK_SECONDS = 8
@@ -396,6 +418,8 @@ const main = async () => {
   if (!densityCappedSegments.length) throw new Error('plan_has_no_segments')
 
   const filterParts: string[] = []
+  const targetWidth = rerenderResolution.width
+  const targetHeight = rerenderResolution.height
   for (let idx = 0; idx < densityCappedSegments.length; idx += 1) {
     const segment = densityCappedSegments[idx]
     const start = segment.start.toFixed(3)
@@ -406,8 +430,8 @@ const main = async () => {
       : `(PTS-STARTPTS)/${speed.toFixed(6)}`
     filterParts.push(
       `[0:v]trim=start=${start}:end=${end},setpts=${videoPtsExpr},` +
-      'scale=1280:720:force_original_aspect_ratio=decrease,' +
-      'pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p' +
+      `scale=${targetWidth}:${targetHeight}:force_original_aspect_ratio=decrease,` +
+      `pad=${targetWidth}:${targetHeight}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p` +
       `[v${idx}]`
     )
 
@@ -439,7 +463,21 @@ const main = async () => {
   )
   fs.writeFileSync(filterScriptPath, filterComplex, 'utf8')
   try {
-    run(ffmpegBin, [
+    const useHardwareCodec = (
+      rerenderCodec.includes('nvenc') ||
+      rerenderCodec.includes('amf') ||
+      rerenderCodec.includes('qsv')
+    )
+    const videoArgs = [
+      '-c:v', rerenderCodec,
+      '-preset', rerenderPreset
+    ]
+    if (useHardwareCodec) {
+      videoArgs.push('-rc:v', 'vbr', '-cq', String(rerenderCq), '-b:v', '0')
+    } else {
+      videoArgs.push('-crf', String(rerenderCrf))
+    }
+    const ffArgs = [
       '-y',
       '-hide_banner',
       '-loglevel', 'error',
@@ -448,16 +486,15 @@ const main = async () => {
       '-map', '[outv]',
       '-map', '[outa]',
       '-movflags', '+faststart',
-      '-c:v', 'libx264',
-      '-preset', 'superfast',
-      '-crf', '22',
+      ...videoArgs,
       '-pix_fmt', 'yuv420p',
       '-c:a', 'aac',
-      '-b:a', '192k',
+      '-b:a', rerenderAudioBitrate,
       '-ar', '48000',
       '-ac', '2',
       cli.output
-    ])
+    ]
+    run(ffmpegBin, ffArgs)
   } finally {
     try {
       fs.unlinkSync(filterScriptPath)
