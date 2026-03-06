@@ -1992,6 +1992,16 @@ const SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES = (() => {
   if (!Number.isFinite(envValue) || envValue < 100 * 1024 * 1024) return 300 * 1024 * 1024
   return Math.round(envValue)
 })()
+const SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS = (() => {
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS || 1.8)
+  if (!Number.isFinite(envValue)) return 1.8
+  return Number(Math.min(8, Math.max(0, envValue)).toFixed(2))
+})()
+const SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS = (() => {
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS || 34)
+  if (!Number.isFinite(envValue) || envValue < 6) return 34
+  return Math.round(envValue)
+})()
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
@@ -29086,18 +29096,67 @@ const processJob = async (
           for (let idx = 0; idx < segments.length; idx += 1) {
             const seg = segments[idx]
             const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
-            const vTrim = `trim=start=${toFilterNumber(seg.start)}:end=${toFilterNumber(seg.end)}`
+            const segmentSourceStart = Number(
+              Math.max(0, seg.start - SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS).toFixed(3)
+            )
+            const segmentSourceEnd = Number(
+              Math.min(durationSeconds, seg.end + SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS).toFixed(3)
+            )
+            const segmentSourceDuration = Number(
+              Math.max(0.16, segmentSourceEnd - segmentSourceStart).toFixed(3)
+            )
+            const relativeStart = Number(
+              Math.max(0, seg.start - segmentSourceStart).toFixed(3)
+            )
+            const relativeEnd = Number(
+              Math.min(
+                segmentSourceDuration,
+                Math.max(relativeStart + MIN_RENDER_SEGMENT_SECONDS, seg.end - segmentSourceStart)
+              ).toFixed(3)
+            )
+            const segmentArgsBase = [
+              '-y',
+              '-nostdin',
+              '-hide_banner',
+              '-loglevel',
+              'error',
+              '-filter_threads',
+              String(RENDER_FILTER_THREADS),
+              '-ss',
+              toFilterNumber(segmentSourceStart),
+              '-t',
+              toFilterNumber(segmentSourceDuration),
+              '-i',
+              tmpIn,
+              '-movflags',
+              '+faststart',
+              '-c:v',
+              'libx264',
+              '-preset',
+              ffPreset,
+              '-crf',
+              ffCrf,
+              '-threads',
+              String(RENDER_CODEC_THREADS),
+              '-pix_fmt',
+              'yuv420p'
+            ]
+            if (withAudio) {
+              segmentArgsBase.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+            }
+            const vTrim = `trim=start=${toFilterNumber(relativeStart)}:end=${toFilterNumber(relativeEnd)}`
             const vSpeed = speed !== 1 ? `setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : 'setpts=PTS-STARTPTS'
             const vChain = `[0:v]${vTrim},${vSpeed},${buildFrameFitFilter(horizontalFit, target.width, target.height)}[vout]`
             const filterParts = [vChain]
             if (withAudio) {
-              const segDuration = Math.max(0.01, roundForFilter((seg.end - seg.start) / speed))
+              const segDuration = Math.max(0.01, roundForFilter((relativeEnd - relativeStart) / speed))
               const aSpeed = speed !== 1 ? buildAtempoChain(speed) : ''
               const gain = Number.isFinite(seg.audioGain) ? clamp(Number(seg.audioGain), 0.8, 1.24) : 1
               const aGain = Math.abs(gain - 1) >= 0.01 ? `volume=${toFilterNumber(gain)}` : ''
               if (hasAudio) {
+                const audioTrimGuard = roundForFilter(0.03)
                 const aChain = [
-                  `[0:a]atrim=start=${toFilterNumber(Math.max(0, seg.start - 0.02))}:end=${toFilterNumber(seg.end + 0.02)}`,
+                  `[0:a]atrim=start=${toFilterNumber(Math.max(0, relativeStart - audioTrimGuard))}:end=${toFilterNumber(Math.min(segmentSourceDuration, relativeEnd + audioTrimGuard))}`,
                   'asetpts=PTS-STARTPTS',
                   aSpeed,
                   aGain,
@@ -29120,7 +29179,7 @@ const processJob = async (
             const segmentPath = path.join(workDir, `segment-${String(idx).padStart(4, '0')}.mp4`)
             const mapArgs = ['-map', '[vout]']
             if (withAudio) mapArgs.push('-map', '[aout]')
-            await runFfmpegWithFilter(argsBase, segmentFilter, mapArgs, segmentPath, `segment-${idx}`)
+            await runFfmpegWithFilter(segmentArgsBase, segmentFilter, mapArgs, segmentPath, `segment-${idx}`)
             segmentFiles.push(segmentPath)
           }
 
@@ -29258,12 +29317,16 @@ const processJob = async (
 
       try {
         if (hasSegments) {
-          const preferSegmentFileFallback = (
+          const segmentFileFallbackEligible = (
             finalSegments.length >= SEGMENT_FILE_FALLBACK_MIN_SEGMENTS &&
             (
               durationSeconds >= SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS ||
               inStats.size >= SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES
             )
+          )
+          const preferSegmentFileFallback = (
+            segmentFileFallbackEligible &&
+            finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
           )
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
           // If using an image watermark we must add the watermark file as a second input
