@@ -1985,6 +1985,11 @@ const FAST_MODE_FFMPEG_CRF = (() => {
   if (!Number.isFinite(envValue)) return 29
   return Math.round(Math.min(35, Math.max(22, envValue)))
 })()
+const FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS = (() => {
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS || 128)
+  if (!Number.isFinite(envValue)) return 128
+  return Math.round(Math.min(256, Math.max(64, envValue)))
+})()
 const SEGMENT_FILE_FALLBACK_MIN_SEGMENTS = (() => {
   const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 20)
   if (!Number.isFinite(envValue) || envValue < 6) return 20
@@ -2015,6 +2020,18 @@ const RENDER_FORCE_FAST_HORIZONTAL = /^(1|true|yes)$/i.test(
 )
 const RENDER_PREFER_SEGMENT_FILE_FALLBACK = /^(1|true|yes)$/i.test(
   String(process.env.RENDER_PREFER_SEGMENT_FILE_FALLBACK || '').trim()
+)
+const RENDER_FAST_HORIZONTAL_CUT_ONLY = /^(1|true|yes)$/i.test(
+  String(process.env.RENDER_FAST_HORIZONTAL_CUT_ONLY || '').trim()
+)
+const RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES = /^(1|true|yes)$/i.test(
+  String(process.env.RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES || '').trim()
+)
+const RENDER_FAST_HORIZONTAL_SKIP_WATERMARK = /^(1|true|yes)$/i.test(
+  String(process.env.RENDER_FAST_HORIZONTAL_SKIP_WATERMARK || '').trim()
+)
+const RENDER_FAST_HORIZONTAL_FORCE_CONCAT = !/^(0|false|no)$/i.test(
+  String(process.env.RENDER_FAST_HORIZONTAL_FORCE_CONCAT || 'true').trim()
 )
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
@@ -19646,6 +19663,19 @@ const buildConcatFilter = (
   return parts.join(';')
 }
 
+const simplifySegmentsForFastHorizontalRender = (segments: Segment[]) => (
+  segments.map((segment) => ({
+    ...segment,
+    zoom: 0,
+    brightness: 0,
+    audioGain: 1,
+    soundFxLevel: 0,
+    brollOverlayHint: false,
+    musicSwell: false,
+    reframeMode: 'none' as const
+  }))
+)
+
 const escapeFilterPath = (value: string) => {
   const escaped = value.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'")
   return `'${escaped}'`
@@ -25476,18 +25506,27 @@ const processJob = async (
     options.fastMode ||
     (renderConfig.mode === 'horizontal' && RENDER_FORCE_FAST_HORIZONTAL)
   )
+  const renderFastHorizontalMode = renderFastMode && renderConfig.mode === 'horizontal'
+  const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
+  const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
+  const renderSubtitlesEnabled = Boolean(
+    options.autoCaptions &&
+    !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
+  )
   const ffPreset = renderFastMode
     ? FAST_MODE_FFMPEG_PRESET
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
   const ffCrf = renderFastMode
     ? String(FAST_MODE_FFMPEG_CRF)
     : (process.env.FFMPEG_CRF || String(adjustedCrf))
-  const ffAudioBitrate = resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
+  const ffAudioBitrate = renderFastMode
+    ? `${FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS}k`
+    : resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
   const ffAudioSampleRate = String(
     resolveAudioSampleRate(process.env.FFMPEG_AUDIO_SAMPLE_RATE, platformProfile.audioSampleRate)
   )
   if (renderConfig.mode === 'horizontal') {
-    if (options.autoCaptions) {
+    if (renderSubtitlesEnabled) {
       if (!features.subtitles.enabled) {
         throw new PlanLimitError('Subtitles are temporarily disabled.', 'subtitles', 'creator')
       }
@@ -25513,11 +25552,12 @@ const processJob = async (
     features.watermark,
     runtimeControls?.watermarkOverride
   )
+  const renderWatermarkEnabled = Boolean(watermarkEnabled && !skipWatermarkForFastHorizontal)
 
   await updateJob(jobId, {
     requestedQuality: desiredQuality,
     finalQuality,
-    watermarkApplied: watermarkEnabled,
+    watermarkApplied: renderWatermarkEnabled,
     priority: features.priorityQueue,
     priorityLevel: features.priorityQueue ? 1 : 2
   })
@@ -26318,7 +26358,7 @@ const processJob = async (
     if (outcomeAutomationNotes.length) {
       optimizationNotes.push(...outcomeAutomationNotes)
     }
-    if (subtitleStyleSource === 'platform' && options.autoCaptions) {
+    if (subtitleStyleSource === 'platform' && renderSubtitlesEnabled) {
       optimizationNotes.push(
         `Applied ${platformProfile.label} profile caption default (${normalizedSubtitle.replace(/_/g, ' ')}).`
       )
@@ -28465,7 +28505,7 @@ const processJob = async (
         console.warn('zoom-cap enforcement failed', e)
       }
 
-      if (options.autoCaptions) {
+      if (renderSubtitlesEnabled) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })
         // Fast path: reuse already-parsed transcript cues from analysis when available.
         if (Array.isArray(processTranscriptCues) && processTranscriptCues.length > 0) {
@@ -28486,6 +28526,8 @@ const processJob = async (
           const captionEngine = getCaptionEngineStatus()
           optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
         }
+      } else if (options.autoCaptions && renderFastHorizontalMode) {
+        optimizationNotes.push('Render speed mode: subtitles skipped for horizontal fast render.')
       }
 
       await updateJob(jobId, { status: 'audio', progress: 68 })
@@ -28493,7 +28535,7 @@ const processJob = async (
       const hasAudio = hasAudioStream(tmpIn)
       audioProfileForAnalysis = hasAudio ? probeAudioStream(tmpIn) : null
       const withAudio = true
-      if (withAudio && finalSegments.length) {
+      if (withAudio && finalSegments.length && !renderFastMode) {
         finalSegments = applyAudioPolishToSegments({
           segments: finalSegments,
           windows: editPlan?.engagementWindows ?? [],
@@ -28521,6 +28563,10 @@ const processJob = async (
         optimizationNotes.push(
           `Render stabilization adjusted segments (${plannedSegmentCount} -> ${finalSegments.length}) for long-form reliability.`
         )
+      }
+      if (renderFastHorizontalCutOnly && finalSegments.length) {
+        finalSegments = simplifySegmentsForFastHorizontalRender(finalSegments)
+        optimizationNotes.push('Render speed mode: horizontal timeline simplified to cut-only render path.')
       }
       const impactBeforeRescue = computeEditImpactRatio(finalSegments, durationSeconds)
       const minImpact = resolveMinimumEditImpactRatio({
@@ -28916,6 +28962,9 @@ const processJob = async (
         optimizationNotes.push('Hard quality bar passed after recovery remediation.')
       }
       optimizationNotes.push(hardQualityAudit.summary)
+      if (renderFastHorizontalCutOnly && finalSegments.length) {
+        finalSegments = simplifySegmentsForFastHorizontalRender(finalSegments)
+      }
       if (!finalSegments.length) {
         await updateJob(jobId, { status: 'failed', error: 'no_renderable_segments' })
         throw new Error('no_renderable_segments')
@@ -28945,7 +28994,7 @@ const processJob = async (
       if (behaviorStyleProfileForAnalysis && !styleArchetypeBlendForAnalysis) {
         styleArchetypeBlendForAnalysis = behaviorStyleProfileForAnalysis.archetypeBlend
       }
-      if (options.autoCaptions && subtitlePath) {
+      if (renderSubtitlesEnabled && subtitlePath) {
         const sourceCues = parseTranscriptCues(subtitlePath)
         const remappedCues = remapTranscriptCuesToEditedTimeline(sourceCues, finalSegments)
         if (!remappedCues.length) {
@@ -29036,10 +29085,10 @@ const processJob = async (
         path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
       ].filter(Boolean)
       const watermarkImagePath = watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || ''
-      const watermarkImageExists = watermarkEnabled && Boolean(watermarkImagePath)
+      const watermarkImageExists = renderWatermarkEnabled && Boolean(watermarkImagePath)
       const watermarkFilter = watermarkImageExists
         ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
-        : watermarkEnabled
+        : renderWatermarkEnabled
         ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
         : ''
       const transitionsEnabledForRender = Boolean(options.transitions && !renderFastMode)
@@ -29407,6 +29456,7 @@ const processJob = async (
           )
           const preferSegmentFileFallback = (
             segmentFileFallbackEligible &&
+            !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_FORCE_CONCAT) &&
             (
               RENDER_PREFER_SEGMENT_FILE_FALLBACK ||
               finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
@@ -29420,7 +29470,7 @@ const processJob = async (
           const candidateVideoChains = [fullVideoChain]
           if (subtitleFilter && watermarkFilter) candidateVideoChains.push(subtitleFilter)
           if (!subtitleFilter && watermarkFilter) candidateVideoChains.push(watermarkFilter)
-          if (!subtitleFilter || !options.autoCaptions) candidateVideoChains.push('')
+          if (!subtitleFilter || !renderSubtitlesEnabled) candidateVideoChains.push('')
           const videoChains = candidateVideoChains.filter((value, idx, arr) => arr.indexOf(value) === idx)
           if (!videoChains.length) videoChains.push('')
           const describeVideoChainFallback = (videoChain: string) => {
@@ -30000,7 +30050,7 @@ const processJob = async (
       progress: 100,
       outputPath: outputPaths[0],
       finalQuality,
-      watermarkApplied: watermarkEnabled,
+      watermarkApplied: renderWatermarkEnabled,
       retentionScore,
       optimizationNotes: optimizationNotes.length ? optimizationNotes : null,
       renderSettings: buildPersistedRenderSettings(renderConfig, {
@@ -31278,18 +31328,12 @@ router.get('/:id', async (req: any, res) => {
       queueEtaSeconds: queueEta?.queueEtaSeconds ?? null,
       renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode,
       steps: [
-        { key: 'queued', label: 'Queued' },
-        { key: 'uploading', label: 'Uploading' },
-        { key: 'analyzing', label: 'Analyzing' },
+        { key: 'uploading', label: 'Upload' },
+        { key: 'analyzing', label: 'Analyze' },
         { key: 'hooking', label: 'Hook' },
-        { key: 'cutting', label: 'Cuts' },
-        { key: 'pacing', label: 'Pacing' },
-        { key: 'story', label: 'Story' },
-        { key: 'audio', label: 'Audio' },
-        { key: 'retention', label: 'Retention' },
-        { key: 'subtitling', label: 'Subtitles' },
-        { key: 'rendering', label: 'Rendering' },
-        { key: 'ready', label: 'Ready' }
+        { key: 'cutting', label: 'Cut' },
+        { key: 'pacing', label: 'Binge Optimize' },
+        { key: 'ready', label: 'Download Ready' }
       ]
     }
     const jobAnalysis = (job.analysis as any) || {}
