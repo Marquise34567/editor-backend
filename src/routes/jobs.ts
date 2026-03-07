@@ -27977,6 +27977,13 @@ const processJob = async (
       const qualityGateRetryCount = options.fastMode
         ? FAST_MODE_QUALITY_GATE_RETRIES
         : MAX_QUALITY_GATE_RETRIES
+      const lockPrimaryHookAcrossVariants =
+        durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
+        selectedContentFormat !== 'tiktok_short' &&
+        (forceLongFormHookMove || options.onlyCuts)
+      if (lockPrimaryHookAcrossVariants) {
+        optimizationNotes.push('Long-form hook lock active: retaining primary opener candidate across variant retries.')
+      }
       const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
         MANDATORY_VARIANT_MIN +
@@ -28021,16 +28028,19 @@ const processJob = async (
       for (let attemptIndex = 0; attemptIndex < variantPlans.length; attemptIndex += 1) {
         const plan = variantPlans[attemptIndex]
         const strategy = plan.strategy
+        const primaryHookCandidate = orderedHookCandidates[0] || initialHook
         const hookCandidate = (
           preferredHookCandidate
             ? preferredHookCandidate
-            : strategy === 'HOOK_FIRST'
-              ? (orderedHookCandidates[1] || orderedHookCandidates[0] || initialHook)
-              : strategy === 'EMOTION_FIRST'
-                ? (orderedHookCandidates[2] || orderedHookCandidates[0] || initialHook)
-                : strategy === 'PACING_FIRST'
-                  ? (orderedHookCandidates[3] || orderedHookCandidates[0] || initialHook)
-                  : (orderedHookCandidates[plan.hookCandidateIndex] || orderedHookCandidates[0] || initialHook)
+            : lockPrimaryHookAcrossVariants
+              ? primaryHookCandidate
+              : strategy === 'HOOK_FIRST'
+                ? (orderedHookCandidates[1] || primaryHookCandidate)
+                : strategy === 'EMOTION_FIRST'
+                  ? (orderedHookCandidates[2] || primaryHookCandidate)
+                  : strategy === 'PACING_FIRST'
+                    ? (orderedHookCandidates[3] || primaryHookCandidate)
+                    : (orderedHookCandidates[plan.hookCandidateIndex] || primaryHookCandidate)
         )
         const attempt = buildAttemptSegments(strategy, hookCandidate)
         const effectiveHookCandidate = attempt.hook
