@@ -28471,27 +28471,18 @@ const processJob = async (
           entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
           entry.teaserTension >= transcriptFallbackTeaserFloor
         )
-        const transcriptAuditedOpeningEntry = transcriptAuditedOpeningFallback
-          ? fallbackPoolRanked.find((entry) => (
-              Math.abs(entry.candidate.start - transcriptAuditedOpeningFallback.start) < 0.01 &&
-              Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
-            )) || null
-          : null
-        const transcriptAuditedOpeningSafeEntry = transcriptAuditedOpeningEntry && (
-          transcriptFallbackSafe(transcriptAuditedOpeningEntry) ||
-          (
-            transcriptAuditedOpeningEntry.candidate.auditPassed &&
-            transcriptAuditedOpeningEntry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
-            transcriptAuditedOpeningEntry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
-            transcriptAuditedOpeningEntry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
-          )
-        )
-          ? transcriptAuditedOpeningEntry
-          : null
         const fallbackInterestingRows = buildInterestingFallbackRankedRows({
           ranked: fallbackPoolRanked,
           durationSeconds,
           hasTranscript: hasTranscriptSignals,
+          recentHooks: recentSourceHookReuseWindows
+        })
+        const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
+          ranked: fallbackPoolRanked,
+          durationSeconds,
+          hasTranscript: hasTranscriptSignals,
+          current: null,
+          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6,
           recentHooks: recentSourceHookReuseWindows
         })
         const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
@@ -28505,97 +28496,10 @@ const processJob = async (
               )
             ))?.entry || null
           : null
-        const transcriptFallbackPick = hasTranscriptSignals
-          ? (
-              transcriptFallbackInterestingSafeEntry ||
-              transcriptAuditedOpeningSafeEntry ||
-              fallbackPoolRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
-              fallbackPoolRanked.find((entry) => transcriptFallbackSafe(entry))
-            )
-          : null
-        const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
-          ranked: fallbackPoolRanked,
-          durationSeconds,
-          hasTranscript: hasTranscriptSignals,
-          current: null,
-          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6,
-          recentHooks: recentSourceHookReuseWindows
-        })
-        const transcriptFallbackPickInterestingUpgrade = (
-          hasTranscriptSignals &&
-          transcriptFallbackPick?.candidate &&
-          interestingFallbackCandidate
-        )
-          ? (() => {
-              const transcriptEntry = fallbackPoolRanked.find((entry) => (
-                Math.abs(entry.candidate.start - transcriptFallbackPick.candidate.start) < 0.01 &&
-                Math.abs(entry.candidate.duration - transcriptFallbackPick.candidate.duration) < 0.01
-              )) || null
-              const interestingEntry = fallbackPoolRanked.find((entry) => (
-                Math.abs(entry.candidate.start - interestingFallbackCandidate.start) < 0.01 &&
-                Math.abs(entry.candidate.duration - interestingFallbackCandidate.duration) < 0.01
-              )) || null
-              if (!transcriptEntry || !interestingEntry) return null
-              const transcriptPriority = computeInterestingHookPriorityFromSignals({
-                candidate: transcriptEntry.candidate,
-                scored: {
-                  confidence: transcriptEntry.confidence,
-                  instantHold: transcriptEntry.instantHold,
-                  introClarity: transcriptEntry.introClarity,
-                  teaserTension: transcriptEntry.teaserTension,
-                  curiosityPressure: transcriptEntry.curiosityPressure,
-                  visualNovelty: transcriptEntry.visualNovelty,
-                  visualImpact: transcriptEntry.visualImpact,
-                  valuePromise: transcriptEntry.valuePromise,
-                  urgency: transcriptEntry.urgency,
-                  contrarianTrigger: transcriptEntry.contrarianTrigger,
-                  overlayReadiness: transcriptEntry.overlayReadiness,
-                  authenticity: transcriptEntry.authenticity,
-                  openerQuality: transcriptEntry.openerQuality,
-                  selectionScore: transcriptEntry.selectionScore
-                },
-                durationSeconds,
-                hasTranscript: true
-              }).priority
-              const interestingPriority = computeInterestingHookPriorityFromSignals({
-                candidate: interestingEntry.candidate,
-                scored: {
-                  confidence: interestingEntry.confidence,
-                  instantHold: interestingEntry.instantHold,
-                  introClarity: interestingEntry.introClarity,
-                  teaserTension: interestingEntry.teaserTension,
-                  curiosityPressure: interestingEntry.curiosityPressure,
-                  visualNovelty: interestingEntry.visualNovelty,
-                  visualImpact: interestingEntry.visualImpact,
-                  valuePromise: interestingEntry.valuePromise,
-                  urgency: interestingEntry.urgency,
-                  contrarianTrigger: interestingEntry.contrarianTrigger,
-                  overlayReadiness: interestingEntry.overlayReadiness,
-                  authenticity: interestingEntry.authenticity,
-                  openerQuality: interestingEntry.openerQuality,
-                  selectionScore: interestingEntry.selectionScore
-                },
-                durationSeconds,
-                hasTranscript: true
-              }).priority
-              return (
-                interestingPriority >= transcriptPriority + 0.05 &&
-                interestingEntry.curiosityPressure >= transcriptEntry.curiosityPressure &&
-                (
-                  interestingEntry.candidate.start >= 2.2 ||
-                  transcriptEntry.candidate.start < 3
-                )
-              )
-                ? interestingEntry.candidate
-                : null
-            })()
-          : null
         let fallbackHook = (
-          transcriptFallbackPickInterestingUpgrade ||
-          transcriptFallbackPick?.candidate ||
+          transcriptFallbackInterestingSafeEntry?.candidate ||
           interestingFallbackCandidate ||
           fallbackInterestingRows[0]?.entry.candidate ||
-          fallbackPoolRanked[0]?.candidate ||
           defaultFallbackHook
         )
         let fallbackSignals = scoreRenderableHookCandidateSignals({
@@ -28942,6 +28846,20 @@ const processJob = async (
         hasTranscriptSignals &&
         !initialHook.auditPassed
       ) {
+        const currentHookEval = evaluateTranscriptHookQuality({
+          candidate: initialHook,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+        })
+        const forceInterestingFallbackAuthorityOnRetry = selectedHookSelectionSource === 'fallback' && (
+          shouldLockInterestingFallbackHookAcrossVariants({
+            candidate: initialHook,
+            scored: currentHookEval.scored,
+            durationSeconds,
+            hasTranscript: true,
+            selectionSource: selectedHookSelectionSource,
+            reason: resolvedHookDecision.reason
+          })
+        )
         const preserveLateInitialHook = isCredibleLateLongFormHook(initialHook)
         const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
           transcriptCues: processTranscriptCues,
@@ -28951,11 +28869,9 @@ const processJob = async (
           searchWindowSeconds: 90,
           targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
         })
-        if (auditedOpeningRetry && !preserveLateInitialHook) {
-          const currentHookEval = evaluateTranscriptHookQuality({
-            candidate: initialHook,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
+        if (forceInterestingFallbackAuthorityOnRetry) {
+          optimizationNotes.push('Fallback authority active: preserved the interest-first fallback opener instead of re-upgrading to an early transcript-safe hook.')
+        } else if (auditedOpeningRetry && !preserveLateInitialHook) {
           const retryHookEval = evaluateTranscriptHookQuality({
             candidate: auditedOpeningRetry,
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
@@ -29010,6 +28926,20 @@ const processJob = async (
           optimizationNotes.push('Hook retry upgraded opener using early transcript audited search.')
         }
       }
+      const fallbackHookAuthoritySignals = scoreRenderableHookCandidateSignals({
+        candidate: initialHook,
+        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+      })
+      const fallbackHookAuthorityActive = selectedHookSelectionSource === 'fallback' && (
+        shouldLockInterestingFallbackHookAcrossVariants({
+          candidate: initialHook,
+          scored: fallbackHookAuthoritySignals,
+          durationSeconds,
+          hasTranscript: hasTranscriptSignals,
+          selectionSource: selectedHookSelectionSource,
+          reason: resolvedHookDecision.reason
+        })
+      )
       const relocationCandidates = [
         initialHook,
         ...hookCandidates.filter((candidate) => (
@@ -29017,7 +28947,7 @@ const processJob = async (
           Math.abs(candidate.duration - initialHook.duration) > 0.01
         ))
       ]
-      const longFormRelocation = selectedHookSelectionSource === 'user_selected'
+      const longFormRelocation = selectedHookSelectionSource === 'user_selected' || fallbackHookAuthorityActive
         ? null
         : selectLongFormDisplacedHookCandidate({
           primary: initialHook,
@@ -29034,6 +28964,7 @@ const processJob = async (
       }
       const shouldForceLongFormHookSourceTiming =
         !preferredHookCandidate &&
+        !fallbackHookAuthorityActive &&
         selectedHookSelectionSource !== 'user_selected' &&
         durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
         selectedContentFormat !== 'tiktok_short'
@@ -29177,7 +29108,7 @@ const processJob = async (
           )}).`
         )
       }
-      const stickyInterestingFallbackHookAcrossVariants = shouldLockInterestingFallbackHookAcrossVariants({
+      const stickyInterestingFallbackHookAcrossVariants = fallbackHookAuthorityActive || shouldLockInterestingFallbackHookAcrossVariants({
         candidate: initialHook,
         scored: initialHookSignals,
         durationSeconds,
@@ -36047,28 +35978,18 @@ const buildEditPlanForTest = async ({
       entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
       entry.teaserTension >= transcriptFallbackTeaserFloor
     )
-    const transcriptAuditedOpeningEntry = transcriptAuditedOpeningFallback
-      ? fallbackRanked.find((entry) => (
-          Math.abs(entry.candidate.start - transcriptAuditedOpeningFallback.start) < 0.01 &&
-          Math.abs(entry.candidate.duration - transcriptAuditedOpeningFallback.duration) < 0.01
-        )) || null
-      : null
-    const transcriptAuditedOpeningSafeEntry = transcriptAuditedOpeningEntry && (
-      transcriptFallbackSafe(transcriptAuditedOpeningEntry) ||
-      (
-        transcriptAuditedOpeningEntry.candidate.auditPassed &&
-        transcriptAuditedOpeningEntry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
-        transcriptAuditedOpeningEntry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
-        transcriptAuditedOpeningEntry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
-      )
-    )
-      ? transcriptAuditedOpeningEntry
-      : null
     const fallbackInterestingRows = buildInterestingFallbackRankedRows({
       ranked: fallbackRanked,
       durationSeconds,
       hasTranscript: hasTranscriptSignals,
       recentHooks: null
+    })
+    const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
+      ranked: fallbackRanked,
+      durationSeconds,
+      hasTranscript: hasTranscriptSignals,
+      current: null,
+      minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
     })
     const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
       ? fallbackInterestingRows.find((row) => (
@@ -36077,98 +35998,12 @@ const buildEditPlanForTest = async ({
             row.entry.candidate.auditPassed &&
             row.entry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
             row.entry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
-            row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
+              row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
           )
         ))?.entry || null
       : null
-    const transcriptFallbackPick = hasTranscriptSignals
-      ? (
-          transcriptFallbackInterestingSafeEntry ||
-          transcriptAuditedOpeningSafeEntry ||
-          fallbackRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
-          fallbackRanked.find((entry) => transcriptFallbackSafe(entry))
-        )
-      : null
-    const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
-      ranked: fallbackRanked,
-      durationSeconds,
-      hasTranscript: hasTranscriptSignals,
-      current: null,
-      minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
-    })
-    const transcriptFallbackPickInterestingUpgrade = (
-      hasTranscriptSignals &&
-      transcriptFallbackPick?.candidate &&
-      interestingFallbackCandidate
-    )
-      ? (() => {
-          const transcriptEntry = fallbackRanked.find((entry) => (
-            Math.abs(entry.candidate.start - transcriptFallbackPick.candidate.start) < 0.01 &&
-            Math.abs(entry.candidate.duration - transcriptFallbackPick.candidate.duration) < 0.01
-          )) || null
-          const interestingEntry = fallbackRanked.find((entry) => (
-            Math.abs(entry.candidate.start - interestingFallbackCandidate.start) < 0.01 &&
-            Math.abs(entry.candidate.duration - interestingFallbackCandidate.duration) < 0.01
-          )) || null
-          if (!transcriptEntry || !interestingEntry) return null
-          const transcriptPriority = computeInterestingHookPriorityFromSignals({
-            candidate: transcriptEntry.candidate,
-            scored: {
-              confidence: transcriptEntry.confidence,
-              instantHold: transcriptEntry.instantHold,
-              introClarity: transcriptEntry.introClarity,
-              teaserTension: transcriptEntry.teaserTension,
-              curiosityPressure: transcriptEntry.curiosityPressure,
-              visualNovelty: transcriptEntry.visualNovelty,
-              visualImpact: transcriptEntry.visualImpact,
-              valuePromise: transcriptEntry.valuePromise,
-              urgency: transcriptEntry.urgency,
-              contrarianTrigger: transcriptEntry.contrarianTrigger,
-              overlayReadiness: transcriptEntry.overlayReadiness,
-              authenticity: transcriptEntry.authenticity,
-              openerQuality: transcriptEntry.openerQuality,
-              selectionScore: transcriptEntry.selectionScore
-            },
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          const interestingPriority = computeInterestingHookPriorityFromSignals({
-            candidate: interestingEntry.candidate,
-            scored: {
-              confidence: interestingEntry.confidence,
-              instantHold: interestingEntry.instantHold,
-              introClarity: interestingEntry.introClarity,
-              teaserTension: interestingEntry.teaserTension,
-              curiosityPressure: interestingEntry.curiosityPressure,
-              visualNovelty: interestingEntry.visualNovelty,
-              visualImpact: interestingEntry.visualImpact,
-              valuePromise: interestingEntry.valuePromise,
-              urgency: interestingEntry.urgency,
-              contrarianTrigger: interestingEntry.contrarianTrigger,
-              overlayReadiness: interestingEntry.overlayReadiness,
-              authenticity: interestingEntry.authenticity,
-              openerQuality: interestingEntry.openerQuality,
-              selectionScore: interestingEntry.selectionScore
-            },
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          return (
-            interestingPriority >= transcriptPriority + 0.05 &&
-            interestingEntry.curiosityPressure >= transcriptEntry.curiosityPressure &&
-            (
-              interestingEntry.candidate.start >= 2.2 ||
-              transcriptEntry.candidate.start < 3
-            )
-          )
-            ? interestingEntry.candidate
-            : null
-        })()
-      : null
-    if (transcriptFallbackPick) {
-      resolvedHook = transcriptFallbackPickInterestingUpgrade || transcriptFallbackPick.candidate
-    } else if (hasTranscriptSignals) {
-      resolvedHook = interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || fallbackRanked[0]?.candidate || null
+    if (hasTranscriptSignals) {
+      resolvedHook = transcriptFallbackInterestingSafeEntry?.candidate || interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || null
       if (resolvedHook) {
         resolvedHook = {
           ...resolvedHook,
@@ -36181,7 +36016,7 @@ const buildEditPlanForTest = async ({
         durationSeconds,
         current: fallbackRanked[0]?.candidate || null
       })
-      resolvedHook = nonVerbalFallback || interestingFallbackCandidate || fallbackRanked[0]?.candidate || storyFallbackHook || null
+      resolvedHook = interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || nonVerbalFallback || storyFallbackHook || null
       if (resolvedHook && !nonVerbalFallback && interestingFallbackCandidate) {
         resolvedHook = {
           ...resolvedHook,
@@ -36191,6 +36026,18 @@ const buildEditPlanForTest = async ({
     }
   }
   if (resolvedHook && !resolvedHook.auditPassed && hasTranscriptSignals) {
+    const resolvedHookEval = evaluateTranscriptHookQuality({
+      candidate: resolvedHook,
+      windows: planWindows
+    })
+    const forceInterestingFallbackAuthority = shouldLockInterestingFallbackHookAcrossVariants({
+      candidate: resolvedHook,
+      scored: resolvedHookEval.scored,
+      durationSeconds,
+      hasTranscript: true,
+      selectionSource: 'fallback',
+      reason: resolvedHook.reason
+    })
     const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
       transcriptCues: normalizedTranscriptCues,
       windows: planWindows,
@@ -36199,11 +36046,10 @@ const buildEditPlanForTest = async ({
       searchWindowSeconds: 90,
       targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
     })
-    if (auditedOpeningRetry) {
-      const currentHookEval = evaluateTranscriptHookQuality({
-        candidate: resolvedHook,
-        windows: planWindows
-      })
+    if (forceInterestingFallbackAuthority) {
+      // Keep buildEditPlanForTest aligned with the real production hook authority.
+    } else if (auditedOpeningRetry) {
+      const currentHookEval = resolvedHookEval
       const retryHookEval = evaluateTranscriptHookQuality({
         candidate: auditedOpeningRetry,
         windows: planWindows
