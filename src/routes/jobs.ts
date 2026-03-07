@@ -27506,6 +27506,92 @@ const processJob = async (
         })
         optimizationNotes.push(longFormRelocation.reason)
       }
+      const shouldForceLongFormHookSourceTiming =
+        !preferredHookCandidate &&
+        selectedHookSelectionSource !== 'user_selected' &&
+        durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
+        selectedContentFormat !== 'tiktok_short'
+      const longFormMinSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
+      if (shouldForceLongFormHookSourceTiming && initialHook.start < longFormMinSourceStart - 0.01) {
+        const lateCandidateEntries = relocationCandidates
+          .map((candidate) => ({
+            candidate,
+            scored: scoreRenderableHookCandidateSignals({
+              candidate,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+          }))
+          .filter((entry) => entry.candidate.start >= longFormMinSourceStart)
+          .sort((a, b) => (
+            Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+            b.scored.selectionScore - a.scored.selectionScore ||
+            b.scored.curiosityPressure - a.scored.curiosityPressure ||
+            b.scored.teaserTension - a.scored.teaserTension ||
+            b.scored.confidence - a.scored.confidence ||
+            a.candidate.start - b.candidate.start
+          ))
+        let forcedHookCandidate = lateCandidateEntries[0]?.candidate || null
+        if (!forcedHookCandidate) {
+          const rescueWindow = (editPlan?.engagementWindows ?? engagementWindowsForAnalysis)
+            .filter((window) => (
+              window.time >= longFormMinSourceStart &&
+              window.time <= Math.max(longFormMinSourceStart + 0.5, durationSeconds - HOOK_MIN)
+            ))
+            .map((window) => ({
+              start: Number(clamp(window.time, 0, Math.max(0, durationSeconds - HOOK_MIN)).toFixed(3)),
+              score: clamp01(
+                0.52 * (window.hookScore ?? window.score) +
+                0.2 * window.emotionIntensity +
+                0.16 * (window.curiosityTrigger ?? 0) +
+                0.12 * window.sceneChangeRate
+              )
+            }))
+            .sort((a, b) => b.score - a.score || a.start - b.start)[0]
+          if (rescueWindow) {
+            const targetEnd = Number(clamp(
+              rescueWindow.start + Math.min(HOOK_MAX, AUTO_HOOK_DURATION_MAX_SECONDS),
+              rescueWindow.start + HOOK_MIN,
+              durationSeconds
+            ).toFixed(3))
+            const alignedRange = hasTranscriptSignals
+              ? alignHookToSentenceBoundaries(
+                rescueWindow.start,
+                targetEnd,
+                processTranscriptCues,
+                durationSeconds
+              )
+              : { start: rescueWindow.start, end: targetEnd }
+            const rescueAudit = runHookAudit({
+              start: alignedRange.start,
+              end: alignedRange.end,
+              transcriptCues: processTranscriptCues,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            forcedHookCandidate = {
+              ...initialHook,
+              start: Number(alignedRange.start.toFixed(3)),
+              duration: Number((alignedRange.end - alignedRange.start).toFixed(3)),
+              score: Number(clamp01(Math.max(rescueWindow.score, initialHook.score || 0.42)).toFixed(4)),
+              auditScore: Number(clamp01(Math.max(rescueAudit.auditScore, rescueWindow.score)).toFixed(4)),
+              auditPassed: Boolean(rescueAudit.passed),
+              text: extractHookText(alignedRange.start, alignedRange.end, processTranscriptCues),
+              reason: 'Long-form source timing enforcement moved opener to a later curiosity peak.',
+              synthetic: true
+            }
+          }
+        }
+        if (forcedHookCandidate) {
+          const previousHookStart = initialHook.start
+          initialHook = enforceAutoHookDurationRange({
+            candidate: forcedHookCandidate,
+            durationSeconds
+          })
+          selectedHookSelectionSource = 'fallback'
+          optimizationNotes.push(
+            `Long-form source timing enforcement relocated opener from ${previousHookStart.toFixed(1)}s to ${initialHook.start.toFixed(1)}s.`
+          )
+        }
+      }
       let initialHookSignals = scoreRenderableHookCandidateSignals({
         candidate: initialHook,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
