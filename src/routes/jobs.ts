@@ -17949,7 +17949,7 @@ const buildEditPlan = async (
   })
 
   if (onStage) await onStage('pacing')
-  const shouldMoveHook = options.autoHookMove && !options.onlyCuts
+  const shouldMoveHook = options.autoHookMove
   const withoutHook = shouldMoveHook ? subtractRange(normalizedKeep, hookRange) : normalizedKeep
   const finalSegments = enforceSegmentLengths(withoutHook.map((seg) => ({ ...seg })), minLen, maxLen, windows)
   const sceneBalancedSegments = options.onlyCuts
@@ -24878,7 +24878,7 @@ const getEditOptionsForUser = async (
   const aggressiveMode = onlyCuts ? true : isAggressiveRetentionLevel(allowedAggression)
   const modeForcesAdvancedBehavior = ultraModeRequested || retentionKingModeRequested
   const baseOptions: EditOptions = {
-    autoHookMove: onlyCuts ? false : (settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove),
+    autoHookMove: settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove,
     removeBoring,
     onlyCuts,
     smartZoom: onlyCuts ? false : (smartZoomOverride ?? settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
@@ -27489,7 +27489,6 @@ const processJob = async (
         selectedHookSelectionSource !== 'user_selected' &&
         !fallbackHookUnsafe
       const shouldMoveHookForRender =
-        !options.onlyCuts &&
         !fallbackHookUnsafe &&
         (options.autoHookMove || selectedHookSelectionSource === 'user_selected' || forceLongFormHookMove)
       if (preferredHookCandidate) {
