@@ -21314,7 +21314,11 @@ const ENABLE_VERTICAL_DESKTOP_PREVIEW = /^(1|true|yes|on)$/i.test(
   String(process.env.VERTICAL_DESKTOP_PREVIEW || '').trim()
 )
 const ALLOW_OPENAI_TRANSCRIPTION_FALLBACK = /^(1|true|yes)$/i.test(
-  String(process.env.ALLOW_OPENAI_TRANSCRIPTION_FALLBACK || '').trim()
+  String(
+    process.env.ALLOW_OPENAI_TRANSCRIPTION_FALLBACK ||
+    process.env.ALLOW_OPENAI_CAPTION_API ||
+    ''
+  ).trim()
 )
 const FAST_WHISPER_SCRIPT_OUTPUT_PATTERN = /\{[\s\S]*"srtPath"[\s\S]*\}/
 
