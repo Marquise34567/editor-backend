@@ -28321,6 +28321,86 @@ const processJob = async (
           candidate: fallbackHook,
           windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
         })
+        if (hasTranscriptSignals && fallbackHook.synthetic) {
+          const currentSyntheticEntry = fallbackPoolRanked.find((entry) => (
+            Math.abs(entry.candidate.start - fallbackHook.start) < 0.01 &&
+            Math.abs(entry.candidate.duration - fallbackHook.duration) < 0.01
+          )) || null
+          const fallbackInterestingRealCandidate = pickMostInterestingFallbackCandidateFromRanked({
+            ranked: fallbackPoolRanked.filter((entry) => !entry.candidate.synthetic),
+            durationSeconds,
+            hasTranscript: true,
+            current: fallbackHook,
+            minStartSeconds: 2.2
+          })
+          const fallbackInterestingRealEntry = fallbackInterestingRealCandidate
+            ? fallbackPoolRanked.find((entry) => (
+                Math.abs(entry.candidate.start - fallbackInterestingRealCandidate.start) < 0.01 &&
+                Math.abs(entry.candidate.duration - fallbackInterestingRealCandidate.duration) < 0.01
+              )) || null
+            : null
+          if (currentSyntheticEntry && fallbackInterestingRealEntry) {
+            const syntheticPriority = computeInterestingHookPriorityFromSignals({
+              candidate: currentSyntheticEntry.candidate,
+              scored: {
+                confidence: currentSyntheticEntry.confidence,
+                instantHold: currentSyntheticEntry.instantHold,
+                introClarity: currentSyntheticEntry.introClarity,
+                teaserTension: currentSyntheticEntry.teaserTension,
+                curiosityPressure: currentSyntheticEntry.curiosityPressure,
+                visualNovelty: currentSyntheticEntry.visualNovelty,
+                visualImpact: currentSyntheticEntry.visualImpact,
+                valuePromise: currentSyntheticEntry.valuePromise,
+                urgency: currentSyntheticEntry.urgency,
+                contrarianTrigger: currentSyntheticEntry.contrarianTrigger,
+                overlayReadiness: currentSyntheticEntry.overlayReadiness,
+                authenticity: currentSyntheticEntry.authenticity,
+                openerQuality: currentSyntheticEntry.openerQuality,
+                selectionScore: currentSyntheticEntry.selectionScore
+              },
+              durationSeconds,
+              hasTranscript: true
+            }).priority
+            const realPriority = computeInterestingHookPriorityFromSignals({
+              candidate: fallbackInterestingRealEntry.candidate,
+              scored: {
+                confidence: fallbackInterestingRealEntry.confidence,
+                instantHold: fallbackInterestingRealEntry.instantHold,
+                introClarity: fallbackInterestingRealEntry.introClarity,
+                teaserTension: fallbackInterestingRealEntry.teaserTension,
+                curiosityPressure: fallbackInterestingRealEntry.curiosityPressure,
+                visualNovelty: fallbackInterestingRealEntry.visualNovelty,
+                visualImpact: fallbackInterestingRealEntry.visualImpact,
+                valuePromise: fallbackInterestingRealEntry.valuePromise,
+                urgency: fallbackInterestingRealEntry.urgency,
+                contrarianTrigger: fallbackInterestingRealEntry.contrarianTrigger,
+                overlayReadiness: fallbackInterestingRealEntry.overlayReadiness,
+                authenticity: fallbackInterestingRealEntry.authenticity,
+                openerQuality: fallbackInterestingRealEntry.openerQuality,
+                selectionScore: fallbackInterestingRealEntry.selectionScore
+              },
+              durationSeconds,
+              hasTranscript: true
+            }).priority
+            const shouldPreferRealCandidate = (
+              realPriority >= syntheticPriority - 0.02 &&
+              fallbackInterestingRealEntry.selectionScore >= currentSyntheticEntry.selectionScore - 0.03 &&
+              fallbackInterestingRealEntry.curiosityPressure >= currentSyntheticEntry.curiosityPressure - 0.03 &&
+              fallbackInterestingRealEntry.candidate.auditScore >= currentSyntheticEntry.candidate.auditScore - 0.04
+            )
+            if (shouldPreferRealCandidate) {
+              fallbackHook = {
+                ...fallbackInterestingRealEntry.candidate,
+                reason: 'Transcript fallback synthetic hook was not clearly better than the strongest real moment, so the editor kept the more interesting real opener.'
+              }
+              fallbackSignals = scoreRenderableHookCandidateSignals({
+                candidate: fallbackHook,
+                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+              })
+              optimizationNotes.push('Hook transcript fallback rejected a synthetic opener because a comparable real candidate was more interesting.')
+            }
+          }
+        }
         const fallbackTranscriptUnsafe = hasTranscriptSignals && (
           fallbackHook.auditScore < transcriptFallbackAuditFloor ||
           fallbackSignals.selectionScore < transcriptFallbackSelectionFloor ||
