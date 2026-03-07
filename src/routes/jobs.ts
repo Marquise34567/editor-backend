@@ -19546,9 +19546,16 @@ const alignSegmentsToTranscriptBoundariesForRender = (
   }
   const boundaries = collectTranscriptBoundaryTimesForRender(transcriptCues, durationSeconds)
   if (!boundaries.length) return segments.map((segment) => ({ ...segment }))
-  const sorted = segments
-    .map((segment) => ({ ...segment }))
-    .sort((left, right) => left.start - right.start || left.end - right.end)
+  const orderedInput = segments.map((segment) => ({ ...segment }))
+  const preserveTimelineOrder = orderedInput.some((segment, index) => (
+    index > 0 &&
+    Number.isFinite(Number(segment.start)) &&
+    Number.isFinite(Number(orderedInput[index - 1]?.start)) &&
+    Number(segment.start) < Number(orderedInput[index - 1].start) - 0.01
+  ))
+  const sorted = preserveTimelineOrder
+    ? orderedInput
+    : orderedInput.sort((left, right) => left.start - right.start || left.end - right.end)
   const aligned: Segment[] = []
   for (const segment of sorted) {
     const normalized = normalizeSegmentForRender(segment, durationSeconds)
@@ -19560,13 +19567,13 @@ const alignSegmentsToTranscriptBoundariesForRender = (
     let start = roundForFilter(clamp(Math.min(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
     let end = roundForFilter(clamp(Math.max(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
     const previous = aligned[aligned.length - 1]
-    if (previous && start < previous.end + 0.01) {
+    if (!preserveTimelineOrder && previous && start < previous.end + 0.01) {
       start = roundForFilter(clamp(previous.end + 0.01, 0, durationSeconds))
     }
     if (end - start < MIN_RENDER_SEGMENT_SECONDS) {
       start = normalized.start
       end = normalized.end
-      if (previous && start < previous.end + 0.01) {
+      if (!preserveTimelineOrder && previous && start < previous.end + 0.01) {
         start = roundForFilter(clamp(previous.end + 0.01, 0, durationSeconds))
       }
     }
@@ -34396,6 +34403,7 @@ export const __retentionTestUtils = {
   executeQualityGateRetriesForTest,
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
+  prepareSegmentsForRenderForTest: prepareSegmentsForRender,
   buildPersistedRenderAnalysis,
   buildVisualIntelligenceSummary,
   buildStoryBeatGraph,
