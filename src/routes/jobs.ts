@@ -10305,13 +10305,48 @@ const selectLongFormDisplacedHookCandidate = ({
       entry.visualImpact >= 0.24 ||
       entry.openerQuality >= 0.54
     )
+    const interesting = computeInterestingHookPriorityFromSignals({
+      candidate: entry.candidate,
+      scored: {
+        confidence: entry.confidence,
+        instantHold: entry.instantHold,
+        introClarity: entry.introClarity,
+        teaserTension: entry.teaserTension,
+        curiosityPressure: entry.curiosityPressure,
+        visualNovelty: entry.visualNovelty,
+        visualImpact: entry.visualImpact,
+        valuePromise: entry.valuePromise,
+        urgency: entry.urgency,
+        contrarianTrigger: entry.contrarianTrigger,
+        overlayReadiness: entry.overlayReadiness,
+        authenticity: entry.authenticity,
+        openerQuality: entry.openerQuality,
+        selectionScore: entry.selectionScore
+      },
+      durationSeconds,
+      hasTranscript: String(entry.candidate.text || '').trim().length > 0
+    })
     return (
       hasSignalSupport &&
-      entry.candidate.auditScore >= 0.52 &&
-      entry.selectionScore >= 0.52 &&
-      entry.curiosityPressure >= 0.36 &&
-      entry.teaserTension >= 0.32 &&
-      entry.confidence >= 0.5
+      entry.confidence >= 0.46 &&
+      (
+        (
+          entry.candidate.auditScore >= 0.52 &&
+          entry.selectionScore >= 0.52 &&
+          entry.curiosityPressure >= 0.36 &&
+          entry.teaserTension >= 0.32
+        ) ||
+        (
+          interesting.priority >= 0.62 &&
+          interesting.textSignals.interestingness >= 0.66 &&
+          (
+            interesting.textSignals.dramaticInterest >= 0.48 ||
+            interesting.textSignals.humorInterest >= 0.46 ||
+            entry.curiosityPressure >= 0.46 ||
+            entry.teaserTension >= 0.42
+          )
+        )
+      )
     )
   }
   const unique: HookCandidate[] = []
@@ -10322,10 +10357,10 @@ const selectLongFormDisplacedHookCandidate = ({
     ))
     if (!duplicate) unique.push(candidate)
   }
-  const ranked: HookSelectionRankedEntry[] = unique
+  const evaluated = unique
     .map((candidate) => {
       const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
-      return {
+      const entry: HookSelectionRankedEntry = {
         candidate,
         confidence: scored.confidence,
         instantHold: scored.instantHold,
@@ -10342,47 +10377,83 @@ const selectLongFormDisplacedHookCandidate = ({
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
+      return {
+        entry,
+        interesting: computeInterestingHookPriorityFromSignals({
+          candidate,
+          scored,
+          durationSeconds,
+          hasTranscript: String(candidate.text || '').trim().length > 0
+        })
+      }
     })
     .sort((a, b) => (
-      b.selectionScore - a.selectionScore ||
-      b.confidence - a.confidence ||
-      b.candidate.score - a.candidate.score ||
-      a.candidate.start - b.candidate.start
+      b.interesting.priority - a.interesting.priority ||
+      b.interesting.textSignals.interestingness - a.interesting.textSignals.interestingness ||
+      b.entry.selectionScore - a.entry.selectionScore ||
+      b.entry.confidence - a.entry.confidence ||
+      a.entry.candidate.start - b.entry.candidate.start
     ))
-  const primaryEntry = ranked.find((entry) => (
-    Math.abs(entry.candidate.start - primary.start) < 0.01 &&
-    Math.abs(entry.candidate.duration - primary.duration) < 0.01
-  )) || ranked[0]
-  if (!primaryEntry) return null
+  const primaryRow = evaluated.find((row) => (
+    Math.abs(row.entry.candidate.start - primary.start) < 0.01 &&
+    Math.abs(row.entry.candidate.duration - primary.duration) < 0.01
+  )) || evaluated[0]
+  if (!primaryRow) return null
+  const primaryEntry = primaryRow.entry
   const nonVerbalPrimary = String(primaryEntry.candidate.text || '').trim().length === 0
-  const minSelectionLift = nonVerbalPrimary ? 0.08 : 0.05
-  const minSelectionFloor = Math.max(0.42, primaryEntry.selectionScore + minSelectionLift)
-  const minTeaserFloor = Math.max(
-    nonVerbalPrimary ? 0.42 : 0.36,
-    primaryEntry.teaserTension + (nonVerbalPrimary ? 0.06 : 0.04)
+  const primaryInterestingPriority = primaryRow.interesting.priority
+  const primaryInterestingness = primaryRow.interesting.textSignals.interestingness
+  const primarySafeOpening = (
+    primaryEntry.candidate.start < Math.max(4.5, minSourceStart * 0.35) &&
+    primaryInterestingPriority < 0.8 &&
+    primaryInterestingness < 0.76
   )
-  const minCuriosityFloor = Math.max(
-    HOOK_STANDARD_CURIOSITY_MIN - 0.04,
-    primaryEntry.curiosityPressure + (nonVerbalPrimary ? 0.05 : 0.03)
-  )
-  const minConfidenceFloor = Math.max(0.52, primaryEntry.confidence - 0.02)
-  const displaced = ranked.find((entry) => (
-    entry.candidate.start >= minSourceStart &&
-    entry.selectionScore >= minSelectionFloor &&
-    entry.teaserTension >= minTeaserFloor &&
-    entry.curiosityPressure >= minCuriosityFloor &&
-    entry.confidence >= minConfidenceFloor &&
-    isCredibleLateHookEntry(entry)
+  let displaced = evaluated.find((row) => (
+    row.entry.candidate.start >= minSourceStart &&
+    isCredibleLateHookEntry(row.entry) &&
+    (
+      row.interesting.priority >= primaryInterestingPriority + 0.02 ||
+      row.interesting.textSignals.interestingness >= primaryInterestingness + 0.05 ||
+      row.interesting.textSignals.dramaticInterest >= primaryRow.interesting.textSignals.dramaticInterest + 0.08 ||
+      row.interesting.textSignals.humorInterest >= primaryRow.interesting.textSignals.humorInterest + 0.08 ||
+      (
+        primarySafeOpening &&
+        row.interesting.priority >= primaryInterestingPriority - 0.01 &&
+        row.interesting.textSignals.interestingness >= 0.66 &&
+        (
+          row.interesting.textSignals.dramaticInterest >= 0.5 ||
+          row.interesting.textSignals.humorInterest >= 0.48 ||
+          row.entry.curiosityPressure >= Math.max(0.46, primaryEntry.curiosityPressure + (nonVerbalPrimary ? 0.02 : 0)) ||
+          row.entry.teaserTension >= Math.max(0.44, primaryEntry.teaserTension + (nonVerbalPrimary ? 0.02 : 0))
+        )
+      )
+    )
   ))
+  if (!displaced && primarySafeOpening) {
+    displaced = evaluated.find((row) => (
+      row.entry.candidate.start >= minSourceStart &&
+      row.entry.confidence >= 0.42 &&
+      (
+        row.interesting.priority >= Math.max(0.6, primaryInterestingPriority - 0.02) ||
+        row.interesting.textSignals.interestingness >= Math.max(0.64, primaryInterestingness - 0.02)
+      ) &&
+      (
+        row.interesting.textSignals.dramaticInterest >= 0.44 ||
+        row.interesting.textSignals.humorInterest >= 0.42 ||
+        row.entry.curiosityPressure >= 0.42 ||
+        row.entry.teaserTension >= 0.4
+      )
+    ))
+  }
   if (!displaced) return null
-  const displacementSeconds = displaced.candidate.start - primary.start
+  const displacementSeconds = displaced.entry.candidate.start - primary.start
   if (displacementSeconds < 4) return null
   return {
-    hook: displaced.candidate,
+    hook: displaced.entry.candidate,
     minSourceStart: Number(minSourceStart.toFixed(3)),
     fromStart: Number(primary.start.toFixed(3)),
-    toStart: Number(displaced.candidate.start.toFixed(3)),
-    reason: `Long-form hook relocation applied: moved source hook from ${primary.start.toFixed(1)}s to ${displaced.candidate.start.toFixed(1)}s after clear opener quality gain.`
+    toStart: Number(displaced.entry.candidate.start.toFixed(3)),
+    reason: `Long-form hook relocation applied: moved source hook from ${primary.start.toFixed(1)}s to ${displaced.entry.candidate.start.toFixed(1)}s because a later moment was clearly more interesting.`
   }
 }
 
@@ -10890,19 +10961,22 @@ const computeInterestingHookPriorityFromSignals = ({
       )
     : 0
   const priority = clamp01(
-    0.18 * scored.selectionScore +
-    0.16 * scored.curiosityPressure +
-    0.12 * scored.visualImpact +
-    0.1 * scored.teaserTension +
+    0.14 * scored.selectionScore +
+    0.15 * scored.curiosityPressure +
+    0.1 * scored.visualImpact +
+    0.09 * scored.teaserTension +
     0.08 * scored.urgency +
     0.08 * scored.contrarianTrigger +
-    0.08 * scored.valuePromise +
+    0.06 * scored.valuePromise +
     0.06 * scored.visualNovelty +
     0.06 * scored.instantHold +
     0.05 * scored.openerQuality +
     0.05 * clamp01(Number(candidate.score || 0)) +
     0.03 * scored.confidence +
     0.03 * scored.authenticity +
+    0.09 * textSignals.interestingness +
+    0.06 * textSignals.dramaticInterest +
+    0.03 * textSignals.humorInterest +
     (hasTranscript ? 0.02 * clamp01(Number(candidate.auditScore || 0)) : 0) +
     postIntroBonus +
     midTimelineBonus -
@@ -10973,7 +11047,8 @@ const pickMostInterestingFallbackCandidateFromRanked = ({
   const currentLooksSafe = Boolean(
     currentRow &&
     currentRow.entry.candidate.start < safeMinStart &&
-    currentRow.evaluated.priority < 0.62 &&
+    currentRow.evaluated.priority < 0.7 &&
+    currentRow.evaluated.textSignals.interestingness < 0.68 &&
     currentRow.entry.curiosityPressure < 0.42 &&
     currentRow.entry.visualImpact < 0.4 &&
     currentRow.entry.teaserTension < 0.42
@@ -10985,11 +11060,17 @@ const pickMostInterestingFallbackCandidateFromRanked = ({
       row.entry.candidate.start >= safeMinStart ||
       row.entry.curiosityPressure >= 0.46 ||
       row.entry.visualImpact >= 0.42 ||
-      row.entry.contrarianTrigger >= 0.34
+      row.entry.contrarianTrigger >= 0.34 ||
+      row.evaluated.textSignals.dramaticInterest >= 0.54 ||
+      row.evaluated.textSignals.humorInterest >= 0.52 ||
+      row.evaluated.textSignals.interestingness >= 0.68
     ) &&
     (
       !currentRow ||
       row.evaluated.priority >= currentPriority + 0.03 ||
+      row.evaluated.textSignals.interestingness >= currentRow.evaluated.textSignals.interestingness + 0.06 ||
+      row.evaluated.textSignals.dramaticInterest >= currentRow.evaluated.textSignals.dramaticInterest + 0.08 ||
+      row.evaluated.textSignals.humorInterest >= currentRow.evaluated.textSignals.humorInterest + 0.08 ||
       row.entry.curiosityPressure >= currentRow.entry.curiosityPressure + 0.05 ||
       row.entry.visualImpact >= currentRow.entry.visualImpact + 0.05 ||
       row.entry.selectionScore >= currentRow.entry.selectionScore + 0.04
@@ -13467,6 +13548,9 @@ const analyzeHookTextQualitySignals = (text: string) => {
       conversational: 0,
       mutedClarity: 0,
       brevityFit: 0,
+      dramaticInterest: 0,
+      humorInterest: 0,
+      interestingness: 0,
       hookTypeStrength: 0,
       primaryHookType: null as string | null,
       weakIntroPenalty: 0,
@@ -13587,6 +13671,20 @@ const analyzeHookTextQualitySignals = (text: string) => {
   const guruPhraseHit = /\b(masterclass|blueprint|game changer|hack your|secret sauce|10x|guru)\b/.test(normalized)
   const timeframePromiseHit = /\b\d+\s*(day|days|week|weeks|month|months|minute|minutes|hour|hours|year|years)\b/.test(normalized)
   const beforeAfterHit = /\b(before(?:\/| and )after|after this|this is what happens when)\b/.test(normalized)
+  const profanityShockHit = /\b(fuck|fucking|shit|damn|wtf|hell|goddamn)\b/.test(normalized)
+  const highStakesHit = /\b(gun|guns|firearm|firearms|police|cop|cops|arrest|arrested|caught|busted|raid|warning|danger|dead|killed|crash|ruined|stolen|lost|scam|fucked)\b/.test(normalized)
+  const conflictCueHit = /\b(what are you|where is it|did you|why are you|look in the back|come back here|put your hands|hands on your head|you're fucked|i knew it|oh my god)\b/.test(normalized)
+  const absurdSpecificityHit = hasNumericSpecificity && /\b(pounds?|million|thousand|hours?|days?|guns?|cops?|sales?|views?)\b/.test(normalized)
+  const humorHits = countPatternHits([
+    /\bfunny\b/,
+    /\bhilarious\b/,
+    /\blmao\b/,
+    /\blol\b/,
+    /\bjoke\b/,
+    /\bbro\b/,
+    /\bain't no way\b/,
+    /\bno way\b/
+  ])
   const weakIntroPenalty = clamp01(
     0.72 * clamp01(weakIntroHits / 2) +
     0.16 * Number(startsGenericBridge && words.length >= 6) +
@@ -13675,6 +13773,21 @@ const analyzeHookTextQualitySignals = (text: string) => {
   const brevityFit = words.length >= 5 && words.length <= 18
     ? 1
     : clamp01(1 - Math.abs(words.length - 10) / 14)
+  const dramaticInterest = clamp01(
+    0.26 * emotionalTrigger +
+    0.18 * Number(profanityShockHit) +
+    0.18 * Number(highStakesHit) +
+    0.16 * Number(conflictCueHit) +
+    0.12 * contradiction +
+    0.1 * Number(absurdSpecificityHit)
+  )
+  const humorInterest = clamp01(
+    0.3 * clamp01(humorHits / 2) +
+    0.22 * Number(/\b(no way|bro|what the hell|what the fuck)\b/.test(normalized)) +
+    0.2 * patternInterrupt +
+    0.14 * relatability +
+    0.14 * Number(absurdSpecificityHit)
+  )
   const hookTypeScores = {
     boldShock: clamp01(
       0.42 * clamp01(emotionalTriggerHits / 3) +
@@ -13722,6 +13835,19 @@ const analyzeHookTextQualitySignals = (text: string) => {
   const hookTypeEntries = Object.entries(hookTypeScores).sort((a, b) => b[1] - a[1])
   const primaryHookType = hookTypeEntries[0]?.[0] || null
   const hookTypeStrength = Number(clamp01(hookTypeEntries[0]?.[1] ?? 0).toFixed(4))
+  const interestingness = clamp01(
+    0.22 * patternInterrupt +
+    0.2 * emotionalTrigger +
+    0.14 * curiosityBlend +
+    0.12 * dramaticInterest +
+    0.08 * humorInterest +
+    0.08 * contradiction +
+    0.06 * hookTypeStrength +
+    0.04 * valuePromise +
+    0.04 * urgency -
+    0.08 * weakIntroPenalty -
+    (isGenericUtterance ? 0.12 : 0)
+  )
   return {
     wordCount: words.length,
     lexicalTokenCount: lexicalTokens.length,
@@ -13739,6 +13865,9 @@ const analyzeHookTextQualitySignals = (text: string) => {
     conversational: Number(conversational.toFixed(4)),
     mutedClarity: Number(mutedClarity.toFixed(4)),
     brevityFit: Number(brevityFit.toFixed(4)),
+    dramaticInterest: Number(dramaticInterest.toFixed(4)),
+    humorInterest: Number(humorInterest.toFixed(4)),
+    interestingness: Number(interestingness.toFixed(4)),
     hookTypeStrength,
     primaryHookType,
     weakIntroPenalty: Number(weakIntroPenalty.toFixed(4)),
@@ -28349,16 +28478,26 @@ const processJob = async (
       const longFormMinSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
       if (shouldForceLongFormHookSourceTiming && initialHook.start < longFormMinSourceStart - 0.01) {
         const lateCandidateEntries = relocationCandidates
-          .map((candidate) => ({
-            candidate,
-            scored: scoreRenderableHookCandidateSignals({
+          .map((candidate) => {
+            const scored = scoreRenderableHookCandidateSignals({
               candidate,
               windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
             })
-          }))
+            return {
+              candidate,
+              scored,
+              interesting: computeInterestingHookPriorityFromSignals({
+                candidate,
+                scored,
+                durationSeconds,
+                hasTranscript: String(candidate.text || '').trim().length > 0
+              })
+            }
+          })
           .filter((entry) => entry.candidate.start >= longFormMinSourceStart)
           .sort((a, b) => (
-            Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
+            b.interesting.priority - a.interesting.priority ||
+            b.interesting.textSignals.interestingness - a.interesting.textSignals.interestingness ||
             b.scored.selectionScore - a.scored.selectionScore ||
             b.scored.curiosityPressure - a.scored.curiosityPressure ||
             b.scored.teaserTension - a.scored.teaserTension ||
@@ -35564,6 +35703,8 @@ export const __retentionTestUtils = {
   alignSegmentsToRhythm,
   enforceSegmentLengthsForTest: enforceSegmentLengths,
   selectRenderableHookCandidate,
+  computeInterestingHookPriorityFromSignals,
+  selectLongFormDisplacedHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   predictVariantRetention,

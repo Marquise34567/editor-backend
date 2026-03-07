@@ -21,6 +21,7 @@ const {
   alignSegmentsToRhythm,
   enforceSegmentLengthsForTest,
   selectRenderableHookCandidate,
+  computeInterestingHookPriorityFromSignals,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   predictVariantRetention,
@@ -479,6 +480,70 @@ const run = () => {
   })
   assert.ok(nonVerbalDecision, 'non-transcript content should still produce a renderable hook decision')
   assert.ok(Boolean(nonVerbalDecision?.candidate), 'hook decision must include a hook candidate')
+
+  // 2b2) Dramatic / chaotic transcript hooks should outrank safer openers when base renderability is similar.
+  const safeHookPriority = computeInterestingHookPriorityFromSignals({
+    candidate: {
+      start: 0,
+      duration: 7.2,
+      score: 0.78,
+      auditScore: 0.66,
+      auditPassed: false,
+      text: '700 pounds of weed was found in a U-Haul. How do you even?',
+      reason: 'early opener'
+    },
+    scored: {
+      confidence: 0.62,
+      instantHold: 0.64,
+      introClarity: 0.58,
+      teaserTension: 0.56,
+      curiosityPressure: 0.6,
+      visualNovelty: 0.42,
+      visualImpact: 0.46,
+      valuePromise: 0.38,
+      urgency: 0.34,
+      contrarianTrigger: 0.3,
+      overlayReadiness: 0.44,
+      authenticity: 0.46,
+      openerQuality: 0.58,
+      selectionScore: 0.6
+    },
+    durationSeconds: 220,
+    hasTranscript: true
+  })
+  const dramaticHookPriority = computeInterestingHookPriorityFromSignals({
+    candidate: {
+      start: 95,
+      duration: 7,
+      score: 0.74,
+      auditScore: 0.58,
+      auditPassed: false,
+      text: "I fucking knew it. Oh my god. You're fucked.",
+      reason: 'dramatic payoff'
+    },
+    scored: {
+      confidence: 0.61,
+      instantHold: 0.63,
+      introClarity: 0.55,
+      teaserTension: 0.58,
+      curiosityPressure: 0.59,
+      visualNovelty: 0.42,
+      visualImpact: 0.46,
+      valuePromise: 0.33,
+      urgency: 0.42,
+      contrarianTrigger: 0.44,
+      overlayReadiness: 0.43,
+      authenticity: 0.48,
+      openerQuality: 0.57,
+      selectionScore: 0.58
+    },
+    durationSeconds: 220,
+    hasTranscript: true
+  })
+  assert.ok(
+    dramaticHookPriority.priority > safeHookPriority.priority,
+    'dramatic curiosity hooks should score above safer openers when renderability is otherwise close'
+  )
 
   // 2c) Adaptive thresholds should relax in no-transcript/low-signal mode.
   const adaptiveThresholds = resolveQualityGateThresholds({
