@@ -356,6 +356,20 @@ class StubDB {
       }).length
     },
     findUnique: async ({ where }: any) => this.jobs.get(where.id) ?? null,
+    updateMany: async ({ where, data }: any) => {
+      let count = 0
+      for (const [id, job] of this.jobs.entries()) {
+        const matchId = where?.id ? job.id === where.id : true
+        const matchStatus = where?.status ? String(job.status || '') === String(where.status) : true
+        const matchUpdatedAt = where?.updatedAt
+          ? new Date(job.updatedAt || 0).getTime() === new Date(where.updatedAt).getTime()
+          : true
+        if (!matchId || !matchStatus || !matchUpdatedAt) continue
+        this.jobs.set(id, { ...job, ...data, updatedAt: new Date() })
+        count += 1
+      }
+      return { count }
+    },
     update: async ({ where, data }: any) => {
       const id = where.id
       const orig = this.jobs.get(id) || {}
