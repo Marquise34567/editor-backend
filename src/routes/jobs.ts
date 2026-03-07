@@ -10809,6 +10809,165 @@ const evaluateTranscriptHookQuality = ({
   }
 }
 
+const computeInterestingHookPriorityFromSignals = ({
+  candidate,
+  scored,
+  durationSeconds,
+  hasTranscript
+}: {
+  candidate: HookCandidate
+  scored: ReturnType<typeof scoreRenderableHookCandidateSignals>
+  durationSeconds: number
+  hasTranscript: boolean
+}) => {
+  const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
+  const safeDuration = Math.max(
+    1,
+    Number(durationSeconds || 0),
+    Number(candidate.start || 0) + Math.max(1, Number(candidate.duration || 0))
+  )
+  const midpoint = Number(candidate.start || 0) + (Number(candidate.duration || 0) / 2)
+  const sourcePosition = clamp01(midpoint / safeDuration)
+  const postIntroBonus = candidate.start >= 2.2 ? 0.05 : 0
+  const midTimelineBonus = (
+    sourcePosition >= 0.08 &&
+    sourcePosition <= 0.78
+  )
+    ? 0.04
+    : sourcePosition > 0.9
+      ? -0.03
+      : 0
+  const genericPenalty = textSignals.isGenericUtterance ? 0.18 : 0
+  const safeIntroPenalty = candidate.start < 3.2
+    ? clamp01(
+        0.34 * (1 - scored.curiosityPressure) +
+        0.26 * (1 - scored.teaserTension) +
+        0.2 * (1 - scored.visualImpact) +
+        0.2 * textSignals.weakIntroPenalty
+      )
+    : 0
+  const priority = clamp01(
+    0.18 * scored.selectionScore +
+    0.16 * scored.curiosityPressure +
+    0.12 * scored.visualImpact +
+    0.1 * scored.teaserTension +
+    0.08 * scored.urgency +
+    0.08 * scored.contrarianTrigger +
+    0.08 * scored.valuePromise +
+    0.06 * scored.visualNovelty +
+    0.06 * scored.instantHold +
+    0.05 * scored.openerQuality +
+    0.05 * clamp01(Number(candidate.score || 0)) +
+    0.03 * scored.confidence +
+    0.03 * scored.authenticity +
+    (hasTranscript ? 0.02 * clamp01(Number(candidate.auditScore || 0)) : 0) +
+    postIntroBonus +
+    midTimelineBonus -
+    0.12 * safeIntroPenalty -
+    0.08 * textSignals.weakIntroPenalty -
+    genericPenalty
+  )
+  return {
+    priority: Number(priority.toFixed(4)),
+    textSignals
+  }
+}
+
+const pickMostInterestingFallbackCandidateFromRanked = ({
+  ranked,
+  durationSeconds,
+  hasTranscript,
+  current,
+  minStartSeconds = 2.2
+}: {
+  ranked: HookSelectionRankedEntry[]
+  durationSeconds: number
+  hasTranscript: boolean
+  current?: HookCandidate | null
+  minStartSeconds?: number
+}): HookCandidate | null => {
+  if (!Array.isArray(ranked) || !ranked.length) return null
+  const safeMinStart = Math.max(0, Number(minStartSeconds || 0))
+  const rows = ranked
+    .map((entry) => ({
+      entry,
+      evaluated: computeInterestingHookPriorityFromSignals({
+        candidate: entry.candidate,
+        scored: {
+          confidence: entry.confidence,
+          instantHold: entry.instantHold,
+          introClarity: entry.introClarity,
+          teaserTension: entry.teaserTension,
+          curiosityPressure: entry.curiosityPressure,
+          visualNovelty: entry.visualNovelty,
+          visualImpact: entry.visualImpact,
+          valuePromise: entry.valuePromise,
+          urgency: entry.urgency,
+          contrarianTrigger: entry.contrarianTrigger,
+          overlayReadiness: entry.overlayReadiness,
+          authenticity: entry.authenticity,
+          openerQuality: entry.openerQuality,
+          selectionScore: entry.selectionScore
+        },
+        durationSeconds,
+        hasTranscript
+      })
+    }))
+    .sort((a, b) => (
+      b.evaluated.priority - a.evaluated.priority ||
+      b.entry.selectionScore - a.entry.selectionScore ||
+      b.entry.curiosityPressure - a.entry.curiosityPressure ||
+      b.entry.visualImpact - a.entry.visualImpact ||
+      a.entry.candidate.start - b.entry.candidate.start
+    ))
+  const currentRow = current
+    ? rows.find((row) => (
+        Math.abs(row.entry.candidate.start - current.start) < 0.01 &&
+        Math.abs(row.entry.candidate.duration - current.duration) < 0.01
+      )) || null
+    : null
+  const currentPriority = currentRow?.evaluated.priority ?? 0
+  const currentLooksSafe = Boolean(
+    currentRow &&
+    currentRow.entry.candidate.start < safeMinStart &&
+    currentRow.evaluated.priority < 0.62 &&
+    currentRow.entry.curiosityPressure < 0.42 &&
+    currentRow.entry.visualImpact < 0.4 &&
+    currentRow.entry.teaserTension < 0.42
+  )
+  const betterAlternative = rows.find((row) => (
+    (!currentRow || row !== currentRow) &&
+    !row.evaluated.textSignals.isGenericUtterance &&
+    (
+      row.entry.candidate.start >= safeMinStart ||
+      row.entry.curiosityPressure >= 0.46 ||
+      row.entry.visualImpact >= 0.42 ||
+      row.entry.contrarianTrigger >= 0.34
+    ) &&
+    (
+      !currentRow ||
+      row.evaluated.priority >= currentPriority + 0.03 ||
+      row.entry.curiosityPressure >= currentRow.entry.curiosityPressure + 0.05 ||
+      row.entry.visualImpact >= currentRow.entry.visualImpact + 0.05 ||
+      row.entry.selectionScore >= currentRow.entry.selectionScore + 0.04
+    )
+  ))
+  if (betterAlternative) return betterAlternative.entry.candidate
+  if (!currentRow) return rows[0]?.entry.candidate || null
+  if (currentLooksSafe) {
+    const replacement = rows.find((row) => (
+      row !== currentRow &&
+      (
+        row.entry.candidate.start >= safeMinStart ||
+        row.evaluated.priority >= currentPriority + 0.02
+      ) &&
+      row.evaluated.priority >= currentPriority - 0.01
+    ))
+    if (replacement) return replacement.entry.candidate
+  }
+  return null
+}
+
 const pickNonVerbalCuriosityCandidateFromRanked = ({
   ranked,
   durationSeconds,
@@ -27391,7 +27550,31 @@ const processJob = async (
           const currentSignals = currentCandidate
             ? analyzeHookTextQualitySignals(String(currentCandidate.text || ''))
             : null
+          const currentRenderableSignals = currentCandidate
+            ? scoreRenderableHookCandidateSignals({
+                candidate: currentCandidate,
+                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+              })
+            : null
           const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
+          const differentPartRenderableSignals = scoreRenderableHookCandidateSignals({
+            candidate: differentPartCandidate,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          const currentInterestingPriority = currentCandidate && currentRenderableSignals
+            ? computeInterestingHookPriorityFromSignals({
+                candidate: currentCandidate,
+                scored: currentRenderableSignals,
+                durationSeconds,
+                hasTranscript: true
+              }).priority
+            : 0
+          const differentPartInterestingPriority = computeInterestingHookPriorityFromSignals({
+            candidate: differentPartCandidate,
+            scored: differentPartRenderableSignals,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
           const differentPartEligible = (
             differentPartCandidate.auditPassed ||
             (
@@ -27412,6 +27595,18 @@ const processJob = async (
             (
               currentCandidate.start < 18 &&
               getHookCandidateConfidence(currentCandidate) < 0.7
+            ) ||
+            (
+              currentCandidate.start < 16 &&
+              differentPartInterestingPriority >= currentInterestingPriority + 0.04 &&
+              differentPartRenderableSignals.curiosityPressure >= Math.max(
+                0.34,
+                Number(currentRenderableSignals?.curiosityPressure ?? 0)
+              ) &&
+              differentPartRenderableSignals.visualImpact >= Math.max(
+                0.28,
+                Number(currentRenderableSignals?.visualImpact ?? 0) - 0.02
+              )
             )
           )
           if (shouldSwapToDifferentPart && differentPartEligible) {
@@ -27631,8 +27826,86 @@ const processJob = async (
               fallbackPoolRanked.find((entry) => transcriptFallbackSafe(entry))
             )
           : null
+        const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
+          ranked: fallbackPoolRanked,
+          durationSeconds,
+          hasTranscript: hasTranscriptSignals,
+          current: null,
+          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
+        })
+        const transcriptFallbackPickInterestingUpgrade = (
+          hasTranscriptSignals &&
+          transcriptFallbackPick?.candidate &&
+          interestingFallbackCandidate
+        )
+          ? (() => {
+              const transcriptEntry = fallbackPoolRanked.find((entry) => (
+                Math.abs(entry.candidate.start - transcriptFallbackPick.candidate.start) < 0.01 &&
+                Math.abs(entry.candidate.duration - transcriptFallbackPick.candidate.duration) < 0.01
+              )) || null
+              const interestingEntry = fallbackPoolRanked.find((entry) => (
+                Math.abs(entry.candidate.start - interestingFallbackCandidate.start) < 0.01 &&
+                Math.abs(entry.candidate.duration - interestingFallbackCandidate.duration) < 0.01
+              )) || null
+              if (!transcriptEntry || !interestingEntry) return null
+              const transcriptPriority = computeInterestingHookPriorityFromSignals({
+                candidate: transcriptEntry.candidate,
+                scored: {
+                  confidence: transcriptEntry.confidence,
+                  instantHold: transcriptEntry.instantHold,
+                  introClarity: transcriptEntry.introClarity,
+                  teaserTension: transcriptEntry.teaserTension,
+                  curiosityPressure: transcriptEntry.curiosityPressure,
+                  visualNovelty: transcriptEntry.visualNovelty,
+                  visualImpact: transcriptEntry.visualImpact,
+                  valuePromise: transcriptEntry.valuePromise,
+                  urgency: transcriptEntry.urgency,
+                  contrarianTrigger: transcriptEntry.contrarianTrigger,
+                  overlayReadiness: transcriptEntry.overlayReadiness,
+                  authenticity: transcriptEntry.authenticity,
+                  openerQuality: transcriptEntry.openerQuality,
+                  selectionScore: transcriptEntry.selectionScore
+                },
+                durationSeconds,
+                hasTranscript: true
+              }).priority
+              const interestingPriority = computeInterestingHookPriorityFromSignals({
+                candidate: interestingEntry.candidate,
+                scored: {
+                  confidence: interestingEntry.confidence,
+                  instantHold: interestingEntry.instantHold,
+                  introClarity: interestingEntry.introClarity,
+                  teaserTension: interestingEntry.teaserTension,
+                  curiosityPressure: interestingEntry.curiosityPressure,
+                  visualNovelty: interestingEntry.visualNovelty,
+                  visualImpact: interestingEntry.visualImpact,
+                  valuePromise: interestingEntry.valuePromise,
+                  urgency: interestingEntry.urgency,
+                  contrarianTrigger: interestingEntry.contrarianTrigger,
+                  overlayReadiness: interestingEntry.overlayReadiness,
+                  authenticity: interestingEntry.authenticity,
+                  openerQuality: interestingEntry.openerQuality,
+                  selectionScore: interestingEntry.selectionScore
+                },
+                durationSeconds,
+                hasTranscript: true
+              }).priority
+              return (
+                interestingPriority >= transcriptPriority + 0.05 &&
+                interestingEntry.curiosityPressure >= transcriptEntry.curiosityPressure &&
+                (
+                  interestingEntry.candidate.start >= 2.2 ||
+                  transcriptEntry.candidate.start < 3
+                )
+              )
+                ? interestingEntry.candidate
+                : null
+            })()
+          : null
         let fallbackHook = (
+          transcriptFallbackPickInterestingUpgrade ||
           transcriptFallbackPick?.candidate ||
+          interestingFallbackCandidate ||
           fallbackPoolRanked[0]?.candidate ||
           defaultFallbackHook
         )
@@ -27647,54 +27920,31 @@ const processJob = async (
           fallbackSignals.teaserTension < transcriptFallbackTeaserFloor
         )
         if (fallbackTranscriptUnsafe && !isCredibleLateLongFormHook(fallbackHook)) {
-          const openingSegment = storySegments[0]
-          const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
-          const openingDuration = Number(clamp(
-            openingSegment ? (openingSegment.end - openingSegment.start) : AUTO_HOOK_DURATION_MAX_SECONDS,
-            HOOK_MIN,
-            HOOK_MAX
-          ).toFixed(3))
-          const alignedOpening = alignHookToSentenceBoundaries(
-            openingStart,
-            openingStart + openingDuration,
-            processTranscriptCues,
-            durationSeconds
-          )
-          const openingAudit = runHookAudit({
-            start: alignedOpening.start,
-            end: alignedOpening.end,
-            transcriptCues: processTranscriptCues,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          const interestingTranscriptFallback = pickMostInterestingFallbackCandidateFromRanked({
+            ranked: fallbackPoolRanked,
+            durationSeconds,
+            hasTranscript: true,
+            current: fallbackHook,
+            minStartSeconds: 2.2
           })
-          const openingCandidate: HookCandidate = {
-            ...fallbackHook,
-            start: Number(alignedOpening.start.toFixed(3)),
-            duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
-            score: Number(clamp01(Math.max(fallbackHook.score, openingAudit.auditScore * 0.92)).toFixed(4)),
-            auditScore: Number(openingAudit.auditScore.toFixed(4)),
-            auditPassed: Boolean(openingAudit.passed),
-            text: extractHookText(alignedOpening.start, alignedOpening.end, processTranscriptCues),
-            reason: 'Transcript fallback candidates missed quality floor; using coherent opening tease from the start aligned to transcript boundaries.'
-          }
-          const currentEval = evaluateTranscriptHookQuality({
-            candidate: fallbackHook,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
-          const openingEval = evaluateTranscriptHookQuality({
-            candidate: openingCandidate,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
-          const shouldUseOpeningFallback = (
-            openingCandidate.auditPassed ||
-            openingEval.qualityScore >= currentEval.qualityScore + 0.04 ||
+          if (
+            interestingTranscriptFallback &&
             (
-              openingCandidate.auditScore >= fallbackHook.auditScore + 0.05 &&
-              openingEval.scored.curiosityPressure >= currentEval.scored.curiosityPressure - 0.02
+              Math.abs(interestingTranscriptFallback.start - fallbackHook.start) > 0.01 ||
+              Math.abs(interestingTranscriptFallback.duration - fallbackHook.duration) > 0.01
             )
-          )
-          if (shouldUseOpeningFallback) {
-            fallbackHook = openingCandidate
-            fallbackSignals = openingEval.scored
+          ) {
+            fallbackHook = {
+              ...interestingTranscriptFallback,
+              reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
+            }
+            fallbackSignals = scoreRenderableHookCandidateSignals({
+              candidate: fallbackHook,
+              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+            })
+            optimizationNotes.push('Hook transcript fallback prioritized the wildest interesting moment instead of a safe opening tease.')
+          } else {
+            optimizationNotes.push('Hook transcript fallback kept the strongest available interesting moment despite transcript quality-floor miss.')
           }
         } else if (fallbackTranscriptUnsafe) {
           optimizationNotes.push('Hook transcript guard kept the best available late opener despite transcript quality-floor miss.')
@@ -27729,18 +27979,34 @@ const processJob = async (
           ) {
             optimizationNotes.push('Hook fallback guard kept the best available late non-verbal opener despite audit miss.')
           } else {
-            const openingSegment = storySegments[0]
-            const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
-            const openingDuration = Number(clamp(
-              openingSegment ? (openingSegment.end - openingSegment.start) : 6,
-              HOOK_MIN,
-              HOOK_MAX
-            ).toFixed(3))
-            fallbackHook = {
-              ...fallbackHook,
-              start: openingStart,
-              duration: openingDuration,
-              reason: 'Fallback hook quality floor not met without transcript support; preserving coherent opener from the beginning of this video.'
+            const interestingNonVerbalFallback = pickMostInterestingFallbackCandidateFromRanked({
+              ranked: fallbackPoolRanked,
+              durationSeconds,
+              hasTranscript: false,
+              current: fallbackHook,
+              minStartSeconds: 1.6
+            })
+            if (
+              interestingNonVerbalFallback &&
+              (
+                Math.abs(interestingNonVerbalFallback.start - fallbackHook.start) > 0.01 ||
+                Math.abs(interestingNonVerbalFallback.duration - fallbackHook.duration) > 0.01
+              )
+            ) {
+              fallbackHook = {
+                ...interestingNonVerbalFallback,
+                reason: 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.'
+              }
+              fallbackSignals = scoreRenderableHookCandidateSignals({
+                candidate: fallbackHook,
+                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+              })
+              optimizationNotes.push('Hook non-verbal fallback prioritized the craziest available moment instead of a safe beginning.')
+            } else {
+              fallbackHook = {
+                ...fallbackHook,
+                reason: 'Fallback hook quality floor not met without transcript support; keeping the strongest interesting moment found in this video.'
+              }
             }
           }
         }
@@ -27922,10 +28188,29 @@ const processJob = async (
             candidate: auditedOpeningRetry,
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
           })
+          const currentInterestingPriority = computeInterestingHookPriorityFromSignals({
+            candidate: initialHook,
+            scored: currentHookEval.scored,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+          const retryInterestingPriority = computeInterestingHookPriorityFromSignals({
+            candidate: auditedOpeningRetry,
+            scored: retryHookEval.scored,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
           const shouldApplyRetry = (
-            auditedOpeningRetry.auditPassed ||
-            retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.04 ||
-            auditedOpeningRetry.auditScore >= initialHook.auditScore + 0.05
+            (
+              auditedOpeningRetry.auditPassed &&
+              retryInterestingPriority >= currentInterestingPriority + 0.06 &&
+              retryHookEval.scored.curiosityPressure >= currentHookEval.scored.curiosityPressure
+            ) ||
+            retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.08 ||
+            (
+              auditedOpeningRetry.auditScore >= initialHook.auditScore + 0.07 &&
+              retryInterestingPriority >= currentInterestingPriority + 0.04
+            )
           )
           if (shouldApplyRetry) {
             initialHook = enforceAutoHookDurationRange({
@@ -28887,7 +29172,7 @@ const processJob = async (
             hook: selectedHook
           })
         if (!overrideReason) {
-          const rescueHookCandidate = preferredHookCandidate || orderedHookCandidates.find((candidate) => candidate.auditPassed) || initialHook
+          const rescueHookCandidate = preferredHookCandidate || initialHook || orderedHookCandidates.find((candidate) => candidate.auditPassed)
           const rescueAttempt = buildAttemptSegments('RESCUE_MODE', rescueHookCandidate)
           const rescueRetention = computeRetentionScore(
             rescueAttempt.segments,
@@ -34696,7 +34981,31 @@ const buildEditPlanForTest = async ({
       const currentSignals = resolvedHook
         ? analyzeHookTextQualitySignals(String(resolvedHook.text || ''))
         : null
+      const currentRenderableSignals = resolvedHook
+        ? scoreRenderableHookCandidateSignals({
+            candidate: resolvedHook,
+            windows: planWindows
+          })
+        : null
       const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
+      const differentPartRenderableSignals = scoreRenderableHookCandidateSignals({
+        candidate: differentPartCandidate,
+        windows: planWindows
+      })
+      const currentInterestingPriority = resolvedHook && currentRenderableSignals
+        ? computeInterestingHookPriorityFromSignals({
+            candidate: resolvedHook,
+            scored: currentRenderableSignals,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+        : 0
+      const differentPartInterestingPriority = computeInterestingHookPriorityFromSignals({
+        candidate: differentPartCandidate,
+        scored: differentPartRenderableSignals,
+        durationSeconds,
+        hasTranscript: true
+      }).priority
       const differentPartEligible = (
         differentPartCandidate.auditPassed ||
         (
@@ -34717,6 +35026,18 @@ const buildEditPlanForTest = async ({
         (
           resolvedHook.start < 18 &&
           getHookCandidateConfidence(resolvedHook) < 0.7
+        ) ||
+        (
+          resolvedHook.start < 16 &&
+          differentPartInterestingPriority >= currentInterestingPriority + 0.04 &&
+          differentPartRenderableSignals.curiosityPressure >= Math.max(
+            0.34,
+            Number(currentRenderableSignals?.curiosityPressure ?? 0)
+          ) &&
+          differentPartRenderableSignals.visualImpact >= Math.max(
+            0.28,
+            Number(currentRenderableSignals?.visualImpact ?? 0) - 0.02
+          )
         )
       )
       if (shouldSwapToDifferentPart && differentPartEligible) {
@@ -34886,59 +35207,91 @@ const buildEditPlanForTest = async ({
           fallbackRanked.find((entry) => transcriptFallbackSafe(entry))
         )
       : null
-    if (transcriptFallbackPick) {
-      resolvedHook = transcriptFallbackPick.candidate
-    } else if (hasTranscriptSignals) {
-      const looseTranscriptCandidate = fallbackRanked[0]?.candidate || null
-      const openingSegment = planSegments[0]
-      const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
-      const openingDuration = Number(clamp(
-        openingSegment ? (openingSegment.end - openingSegment.start) : AUTO_HOOK_DURATION_MAX_SECONDS,
-        HOOK_MIN,
-        HOOK_MAX
-      ).toFixed(3))
-      const alignedOpening = alignHookToSentenceBoundaries(
-        openingStart,
-        openingStart + openingDuration,
-        normalizedTranscriptCues,
-        durationSeconds
-      )
-      const openingAudit = runHookAudit({
-        start: alignedOpening.start,
-        end: alignedOpening.end,
-        transcriptCues: normalizedTranscriptCues,
-        windows: planWindows
-      })
-      const openingCandidate: HookCandidate = {
-        start: Number(alignedOpening.start.toFixed(3)),
-        duration: Number((alignedOpening.end - alignedOpening.start).toFixed(3)),
-        score: Number(clamp01(openingAudit.auditScore * 0.92 + 0.08).toFixed(4)),
-        auditScore: Number(openingAudit.auditScore.toFixed(4)),
-        auditPassed: Boolean(openingAudit.passed),
-        text: extractHookText(alignedOpening.start, alignedOpening.end, normalizedTranscriptCues),
-        reason: 'Fallback candidates missed transcript quality floor; using coherent opening tease aligned to transcript boundaries.',
-        synthetic: true
-      } as HookCandidate
-      if (!looseTranscriptCandidate) {
-        resolvedHook = openingCandidate
-      } else {
-        const looseEval = evaluateTranscriptHookQuality({
-          candidate: looseTranscriptCandidate,
-          windows: planWindows
-        })
-        const openingEval = evaluateTranscriptHookQuality({
-          candidate: openingCandidate,
-          windows: planWindows
-        })
-        const shouldUseOpeningFallback = (
-          openingCandidate.auditPassed ||
-          openingEval.qualityScore >= looseEval.qualityScore + 0.04 ||
-          (
-            openingCandidate.auditScore >= looseTranscriptCandidate.auditScore + 0.05 &&
-            openingEval.scored.curiosityPressure >= looseEval.scored.curiosityPressure - 0.02
+    const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
+      ranked: fallbackRanked,
+      durationSeconds,
+      hasTranscript: hasTranscriptSignals,
+      current: null,
+      minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
+    })
+    const transcriptFallbackPickInterestingUpgrade = (
+      hasTranscriptSignals &&
+      transcriptFallbackPick?.candidate &&
+      interestingFallbackCandidate
+    )
+      ? (() => {
+          const transcriptEntry = fallbackRanked.find((entry) => (
+            Math.abs(entry.candidate.start - transcriptFallbackPick.candidate.start) < 0.01 &&
+            Math.abs(entry.candidate.duration - transcriptFallbackPick.candidate.duration) < 0.01
+          )) || null
+          const interestingEntry = fallbackRanked.find((entry) => (
+            Math.abs(entry.candidate.start - interestingFallbackCandidate.start) < 0.01 &&
+            Math.abs(entry.candidate.duration - interestingFallbackCandidate.duration) < 0.01
+          )) || null
+          if (!transcriptEntry || !interestingEntry) return null
+          const transcriptPriority = computeInterestingHookPriorityFromSignals({
+            candidate: transcriptEntry.candidate,
+            scored: {
+              confidence: transcriptEntry.confidence,
+              instantHold: transcriptEntry.instantHold,
+              introClarity: transcriptEntry.introClarity,
+              teaserTension: transcriptEntry.teaserTension,
+              curiosityPressure: transcriptEntry.curiosityPressure,
+              visualNovelty: transcriptEntry.visualNovelty,
+              visualImpact: transcriptEntry.visualImpact,
+              valuePromise: transcriptEntry.valuePromise,
+              urgency: transcriptEntry.urgency,
+              contrarianTrigger: transcriptEntry.contrarianTrigger,
+              overlayReadiness: transcriptEntry.overlayReadiness,
+              authenticity: transcriptEntry.authenticity,
+              openerQuality: transcriptEntry.openerQuality,
+              selectionScore: transcriptEntry.selectionScore
+            },
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+          const interestingPriority = computeInterestingHookPriorityFromSignals({
+            candidate: interestingEntry.candidate,
+            scored: {
+              confidence: interestingEntry.confidence,
+              instantHold: interestingEntry.instantHold,
+              introClarity: interestingEntry.introClarity,
+              teaserTension: interestingEntry.teaserTension,
+              curiosityPressure: interestingEntry.curiosityPressure,
+              visualNovelty: interestingEntry.visualNovelty,
+              visualImpact: interestingEntry.visualImpact,
+              valuePromise: interestingEntry.valuePromise,
+              urgency: interestingEntry.urgency,
+              contrarianTrigger: interestingEntry.contrarianTrigger,
+              overlayReadiness: interestingEntry.overlayReadiness,
+              authenticity: interestingEntry.authenticity,
+              openerQuality: interestingEntry.openerQuality,
+              selectionScore: interestingEntry.selectionScore
+            },
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+          return (
+            interestingPriority >= transcriptPriority + 0.05 &&
+            interestingEntry.curiosityPressure >= transcriptEntry.curiosityPressure &&
+            (
+              interestingEntry.candidate.start >= 2.2 ||
+              transcriptEntry.candidate.start < 3
+            )
           )
-        )
-        resolvedHook = shouldUseOpeningFallback ? openingCandidate : looseTranscriptCandidate
+            ? interestingEntry.candidate
+            : null
+        })()
+      : null
+    if (transcriptFallbackPick) {
+      resolvedHook = transcriptFallbackPickInterestingUpgrade || transcriptFallbackPick.candidate
+    } else if (hasTranscriptSignals) {
+      resolvedHook = interestingFallbackCandidate || fallbackRanked[0]?.candidate || null
+      if (resolvedHook) {
+        resolvedHook = {
+          ...resolvedHook,
+          reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
+        } as HookCandidate
       }
     } else {
       const nonVerbalFallback = pickNonVerbalCuriosityCandidateFromRanked({
@@ -34946,7 +35299,13 @@ const buildEditPlanForTest = async ({
         durationSeconds,
         current: fallbackRanked[0]?.candidate || null
       })
-      resolvedHook = nonVerbalFallback || fallbackRanked[0]?.candidate || storyFallbackHook || null
+      resolvedHook = nonVerbalFallback || interestingFallbackCandidate || fallbackRanked[0]?.candidate || storyFallbackHook || null
+      if (resolvedHook && !nonVerbalFallback && interestingFallbackCandidate) {
+        resolvedHook = {
+          ...resolvedHook,
+          reason: 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.'
+        } as HookCandidate
+      }
     }
   }
   if (resolvedHook && !resolvedHook.auditPassed && hasTranscriptSignals) {
@@ -34959,7 +35318,41 @@ const buildEditPlanForTest = async ({
       targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
     })
     if (auditedOpeningRetry) {
-      resolvedHook = auditedOpeningRetry
+      const currentHookEval = evaluateTranscriptHookQuality({
+        candidate: resolvedHook,
+        windows: planWindows
+      })
+      const retryHookEval = evaluateTranscriptHookQuality({
+        candidate: auditedOpeningRetry,
+        windows: planWindows
+      })
+      const currentInterestingPriority = computeInterestingHookPriorityFromSignals({
+        candidate: resolvedHook,
+        scored: currentHookEval.scored,
+        durationSeconds,
+        hasTranscript: true
+      }).priority
+      const retryInterestingPriority = computeInterestingHookPriorityFromSignals({
+        candidate: auditedOpeningRetry,
+        scored: retryHookEval.scored,
+        durationSeconds,
+        hasTranscript: true
+      }).priority
+      const shouldApplyRetry = (
+        (
+          auditedOpeningRetry.auditPassed &&
+          retryInterestingPriority >= currentInterestingPriority + 0.06 &&
+          retryHookEval.scored.curiosityPressure >= currentHookEval.scored.curiosityPressure
+        ) ||
+        retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.08 ||
+        (
+          auditedOpeningRetry.auditScore >= resolvedHook.auditScore + 0.07 &&
+          retryInterestingPriority >= currentInterestingPriority + 0.04
+        )
+      )
+      if (shouldApplyRetry) {
+        resolvedHook = auditedOpeningRetry
+      }
     }
   }
   if (!resolvedHook) {
