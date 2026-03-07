@@ -10010,6 +10010,17 @@ type HookSelectionRankedEntry = {
   openerQuality: number
   selectionScore: number
 }
+type HookReuseWindow = {
+  start: number
+  duration: number
+  count: number
+}
+type InterestingFallbackRankedRow = {
+  entry: HookSelectionRankedEntry
+  evaluated: ReturnType<typeof computeInterestingHookPriorityFromSignals>
+  repeatPenalty: number
+  adjustedPriority: number
+}
 
 const scoreRenderableHookCandidateSignals = ({
   candidate,
@@ -11028,25 +11039,133 @@ const computeInterestingHookPriorityFromSignals = ({
   }
 }
 
-const pickMostInterestingFallbackCandidateFromRanked = ({
+const normalizeHookSourceBasename = (inputPath: unknown) => {
+  const raw = path.basename(String(inputPath || '').split('?')[0] || '').trim().toLowerCase()
+  if (!raw) return ''
+  return raw
+    .replace(/^\d{10,14}[-_]+/, '')
+    .replace(/[_\s]+/g, ' ')
+    .trim()
+}
+
+const isLikelySameHookSource = ({
+  sourceBasename,
+  candidateInputPath,
+  durationSeconds,
+  candidateDurationSeconds
+}: {
+  sourceBasename: string
+  candidateInputPath: unknown
+  durationSeconds: number
+  candidateDurationSeconds?: unknown
+}) => {
+  if (!sourceBasename) return false
+  if (normalizeHookSourceBasename(candidateInputPath) !== sourceBasename) return false
+  const safeDuration = Number(durationSeconds || 0)
+  const safeCandidateDuration = Number(candidateDurationSeconds || 0)
+  if (
+    Number.isFinite(safeDuration) &&
+    safeDuration > 0 &&
+    Number.isFinite(safeCandidateDuration) &&
+    safeCandidateDuration > 0
+  ) {
+    const tolerance = Math.max(3, Math.min(18, safeDuration * 0.04))
+    if (Math.abs(safeCandidateDuration - safeDuration) > tolerance) return false
+  }
+  return true
+}
+
+const summarizeRecentHookReuseWindows = ({
+  rows,
+  inputPath,
+  durationSeconds
+}: {
+  rows: Array<{ inputPath?: string | null; inputDurationSeconds?: number | null; analysis?: any }>
+  inputPath?: string | null
+  durationSeconds: number
+}): HookReuseWindow[] => {
+  const sourceBasename = normalizeHookSourceBasename(inputPath)
+  if (!sourceBasename || !Array.isArray(rows) || !rows.length) return []
+  const grouped = new Map<string, HookReuseWindow>()
+  for (const row of rows) {
+    if (!isLikelySameHookSource({
+      sourceBasename,
+      candidateInputPath: row?.inputPath,
+      durationSeconds,
+      candidateDurationSeconds: row?.inputDurationSeconds
+    })) {
+      continue
+    }
+    const analysis = row?.analysis || {}
+    const start = Number(analysis?.hook_start_time ?? analysis?.hookStartTime ?? NaN)
+    const end = Number(analysis?.hook_end_time ?? analysis?.hookEndTime ?? NaN)
+    const duration = Number.isFinite(end) && end > start + 0.1
+      ? end - start
+      : Number(analysis?.hook?.duration ?? NaN)
+    if (!Number.isFinite(start) || !Number.isFinite(duration) || duration <= 0.1) continue
+    const startBucket = Number((Math.round(start * 2) / 2).toFixed(1))
+    const durationBucket = Number((Math.round(duration * 2) / 2).toFixed(1))
+    const key = `${startBucket}:${durationBucket}`
+    const existing = grouped.get(key)
+    if (existing) {
+      existing.count += 1
+      continue
+    }
+    grouped.set(key, { start: startBucket, duration: durationBucket, count: 1 })
+  }
+  return Array.from(grouped.values())
+    .sort((a, b) => b.count - a.count || a.start - b.start)
+}
+
+const computeHookRepeatPenalty = ({
+  candidate,
+  recentHooks
+}: {
+  candidate: HookCandidate
+  recentHooks?: HookReuseWindow[] | null
+}) => {
+  if (!Array.isArray(recentHooks) || !recentHooks.length) return 0
+  const candidateStart = Number(candidate.start || 0)
+  const candidateDuration = Math.max(HOOK_MIN, Number(candidate.duration || HOOK_MIN))
+  const candidateMidpoint = candidateStart + candidateDuration / 2
+  let penalty = 0
+  for (const recentHook of recentHooks) {
+    const recentStart = Number(recentHook?.start || 0)
+    const recentDuration = Math.max(HOOK_MIN, Number(recentHook?.duration || HOOK_MIN))
+    const recentMidpoint = recentStart + recentDuration / 2
+    const startDistance = Math.abs(recentStart - candidateStart)
+    const midpointDistance = Math.abs(recentMidpoint - candidateMidpoint)
+    const allowedStartDistance = Math.max(5, Math.min(20, Math.max(candidateDuration, recentDuration) * 2.4))
+    const allowedMidpointDistance = Math.max(6, Math.min(24, Math.max(candidateDuration, recentDuration) * 2.8))
+    const startSimilarity = startDistance <= allowedStartDistance
+      ? 1 - (startDistance / allowedStartDistance)
+      : 0
+    const midpointSimilarity = midpointDistance <= allowedMidpointDistance
+      ? 1 - (midpointDistance / allowedMidpointDistance)
+      : 0
+    const similarity = Math.max(startSimilarity, midpointSimilarity * 0.92)
+    if (similarity <= 0) continue
+    const repeatWeight = Math.min(0.24, 0.1 + Math.max(0, recentHook.count - 1) * 0.04)
+    penalty += similarity * repeatWeight
+  }
+  return Number(clamp(penalty, 0, 0.26).toFixed(4))
+}
+
+const buildInterestingFallbackRankedRows = ({
   ranked,
   durationSeconds,
   hasTranscript,
-  current,
-  minStartSeconds = 2.2
+  recentHooks
 }: {
   ranked: HookSelectionRankedEntry[]
   durationSeconds: number
   hasTranscript: boolean
-  current?: HookCandidate | null
-  minStartSeconds?: number
-}): HookCandidate | null => {
-  if (!Array.isArray(ranked) || !ranked.length) return null
-  const safeMinStart = Math.max(0, Number(minStartSeconds || 0))
-  const rows = ranked
-    .map((entry) => ({
-      entry,
-      evaluated: computeInterestingHookPriorityFromSignals({
+  recentHooks?: HookReuseWindow[] | null
+}): InterestingFallbackRankedRow[] => {
+  if (!Array.isArray(ranked) || !ranked.length) return []
+  return ranked
+    .map((entry) => {
+      const evaluated = computeInterestingHookPriorityFromSignals({
         candidate: entry.candidate,
         scored: {
           confidence: entry.confidence,
@@ -11067,14 +11186,96 @@ const pickMostInterestingFallbackCandidateFromRanked = ({
         durationSeconds,
         hasTranscript
       })
-    }))
+      const repeatPenalty = computeHookRepeatPenalty({
+        candidate: entry.candidate,
+        recentHooks
+      })
+      return {
+        entry,
+        evaluated,
+        repeatPenalty,
+        adjustedPriority: Number((evaluated.priority - repeatPenalty).toFixed(4))
+      }
+    })
     .sort((a, b) => (
+      b.adjustedPriority - a.adjustedPriority ||
       b.evaluated.priority - a.evaluated.priority ||
-      b.entry.selectionScore - a.entry.selectionScore ||
       b.entry.curiosityPressure - a.entry.curiosityPressure ||
+      b.entry.teaserTension - a.entry.teaserTension ||
       b.entry.visualImpact - a.entry.visualImpact ||
+      b.entry.selectionScore - a.entry.selectionScore ||
+      b.entry.candidate.auditScore - a.entry.candidate.auditScore ||
+      Number(Boolean(a.entry.candidate.synthetic)) - Number(Boolean(b.entry.candidate.synthetic)) ||
       a.entry.candidate.start - b.entry.candidate.start
     ))
+}
+
+const loadRecentSourceHookReuseWindows = async ({
+  userId,
+  currentJobId,
+  inputPath,
+  durationSeconds
+}: {
+  userId?: string | null
+  currentJobId?: string | null
+  inputPath?: string | null
+  durationSeconds: number
+}): Promise<HookReuseWindow[]> => {
+  const safeUserId = String(userId || '').trim()
+  const safeCurrentJobId = String(currentJobId || '').trim()
+  const sourceBasename = normalizeHookSourceBasename(inputPath)
+  if (!safeUserId || !safeCurrentJobId || !sourceBasename) return []
+  try {
+    const rows = await prisma.job.findMany({
+      where: {
+        userId: safeUserId,
+        id: { not: safeCurrentJobId },
+        createdAt: {
+          gte: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+        }
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 24,
+      select: {
+        inputPath: true,
+        inputDurationSeconds: true,
+        analysis: true
+      }
+    })
+    return summarizeRecentHookReuseWindows({
+      rows,
+      inputPath,
+      durationSeconds
+    })
+  } catch (error) {
+    console.warn('recent hook reuse lookup failed', error)
+    return []
+  }
+}
+
+const pickMostInterestingFallbackCandidateFromRanked = ({
+  ranked,
+  durationSeconds,
+  hasTranscript,
+  current,
+  minStartSeconds = 2.2,
+  recentHooks
+}: {
+  ranked: HookSelectionRankedEntry[]
+  durationSeconds: number
+  hasTranscript: boolean
+  current?: HookCandidate | null
+  minStartSeconds?: number
+  recentHooks?: HookReuseWindow[] | null
+}): HookCandidate | null => {
+  if (!Array.isArray(ranked) || !ranked.length) return null
+  const safeMinStart = Math.max(0, Number(minStartSeconds || 0))
+  const rows = buildInterestingFallbackRankedRows({
+    ranked,
+    durationSeconds,
+    hasTranscript,
+    recentHooks
+  })
   const currentRow = current
     ? rows.find((row) => (
         Math.abs(row.entry.candidate.start - current.start) < 0.01 &&
@@ -27767,6 +27968,12 @@ const processJob = async (
             ? hookCandidatesFromStoredAnalysis
             : (editPlan?.hook ? [editPlan.hook] : [])
       ).filter((candidate): candidate is HookCandidate => Boolean(candidate))
+      const recentSourceHookReuseWindows = await loadRecentSourceHookReuseWindows({
+        userId: job.userId,
+        currentJobId: jobId,
+        inputPath: job.inputPath,
+        durationSeconds
+      })
       const hookDecision = selectRenderableHookCandidate({
         candidates: hookCandidates,
         aggressionLevel,
@@ -28227,8 +28434,26 @@ const processJob = async (
         )
           ? transcriptAuditedOpeningEntry
           : null
+        const fallbackInterestingRows = buildInterestingFallbackRankedRows({
+          ranked: fallbackPoolRanked,
+          durationSeconds,
+          hasTranscript: hasTranscriptSignals,
+          recentHooks: recentSourceHookReuseWindows
+        })
+        const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
+          ? fallbackInterestingRows.find((row) => (
+              transcriptFallbackSafe(row.entry) ||
+              (
+                row.entry.candidate.auditPassed &&
+                row.entry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
+                row.entry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
+                row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
+              )
+            ))?.entry || null
+          : null
         const transcriptFallbackPick = hasTranscriptSignals
           ? (
+              transcriptFallbackInterestingSafeEntry ||
               transcriptAuditedOpeningSafeEntry ||
               fallbackPoolRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
               fallbackPoolRanked.find((entry) => transcriptFallbackSafe(entry))
@@ -28239,7 +28464,8 @@ const processJob = async (
           durationSeconds,
           hasTranscript: hasTranscriptSignals,
           current: null,
-          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
+          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6,
+          recentHooks: recentSourceHookReuseWindows
         })
         const transcriptFallbackPickInterestingUpgrade = (
           hasTranscriptSignals &&
@@ -28314,6 +28540,7 @@ const processJob = async (
           transcriptFallbackPickInterestingUpgrade ||
           transcriptFallbackPick?.candidate ||
           interestingFallbackCandidate ||
+          fallbackInterestingRows[0]?.entry.candidate ||
           fallbackPoolRanked[0]?.candidate ||
           defaultFallbackHook
         )
@@ -28331,7 +28558,8 @@ const processJob = async (
             durationSeconds,
             hasTranscript: true,
             current: fallbackHook,
-            minStartSeconds: 2.2
+            minStartSeconds: 2.2,
+            recentHooks: recentSourceHookReuseWindows
           })
           const fallbackInterestingRealEntry = fallbackInterestingRealCandidate
             ? fallbackPoolRanked.find((entry) => (
@@ -28413,7 +28641,8 @@ const processJob = async (
             durationSeconds,
             hasTranscript: true,
             current: fallbackHook,
-            minStartSeconds: 2.2
+            minStartSeconds: 2.2,
+            recentHooks: recentSourceHookReuseWindows
           })
           if (
             interestingTranscriptFallback &&
@@ -28467,13 +28696,14 @@ const processJob = async (
           ) {
             optimizationNotes.push('Hook fallback guard kept the best available late non-verbal opener despite audit miss.')
           } else {
-            const interestingNonVerbalFallback = pickMostInterestingFallbackCandidateFromRanked({
-              ranked: fallbackPoolRanked,
-              durationSeconds,
-              hasTranscript: false,
-              current: fallbackHook,
-              minStartSeconds: 1.6
-            })
+          const interestingNonVerbalFallback = pickMostInterestingFallbackCandidateFromRanked({
+            ranked: fallbackPoolRanked,
+            durationSeconds,
+            hasTranscript: false,
+            current: fallbackHook,
+            minStartSeconds: 1.6,
+            recentHooks: recentSourceHookReuseWindows
+          })
             if (
               interestingNonVerbalFallback &&
               (
@@ -35766,8 +35996,26 @@ const buildEditPlanForTest = async ({
     )
       ? transcriptAuditedOpeningEntry
       : null
+    const fallbackInterestingRows = buildInterestingFallbackRankedRows({
+      ranked: fallbackRanked,
+      durationSeconds,
+      hasTranscript: hasTranscriptSignals,
+      recentHooks: null
+    })
+    const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
+      ? fallbackInterestingRows.find((row) => (
+          transcriptFallbackSafe(row.entry) ||
+          (
+            row.entry.candidate.auditPassed &&
+            row.entry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
+            row.entry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
+            row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
+          )
+        ))?.entry || null
+      : null
     const transcriptFallbackPick = hasTranscriptSignals
       ? (
+          transcriptFallbackInterestingSafeEntry ||
           transcriptAuditedOpeningSafeEntry ||
           fallbackRanked.find((entry) => entry.candidate.auditPassed && transcriptFallbackSafe(entry)) ||
           fallbackRanked.find((entry) => transcriptFallbackSafe(entry))
@@ -35852,7 +36100,7 @@ const buildEditPlanForTest = async ({
     if (transcriptFallbackPick) {
       resolvedHook = transcriptFallbackPickInterestingUpgrade || transcriptFallbackPick.candidate
     } else if (hasTranscriptSignals) {
-      resolvedHook = interestingFallbackCandidate || fallbackRanked[0]?.candidate || null
+      resolvedHook = interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || fallbackRanked[0]?.candidate || null
       if (resolvedHook) {
         resolvedHook = {
           ...resolvedHook,
