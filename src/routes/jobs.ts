@@ -10247,6 +10247,24 @@ const selectLongFormDisplacedHookCandidate = ({
   if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return null
   const minSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
   if (primary.start >= minSourceStart) return null
+  const isCredibleLateHookEntry = (entry: HookSelectionRankedEntry | null | undefined) => {
+    if (!entry) return false
+    if (entry.candidate.start < minSourceStart) return false
+    if (entry.candidate.auditPassed) return true
+    const hasSignalSupport = (
+      String(entry.candidate.text || '').trim().length > 0 ||
+      entry.visualImpact >= 0.24 ||
+      entry.openerQuality >= 0.54
+    )
+    return (
+      hasSignalSupport &&
+      entry.candidate.auditScore >= 0.52 &&
+      entry.selectionScore >= 0.52 &&
+      entry.curiosityPressure >= 0.36 &&
+      entry.teaserTension >= 0.32 &&
+      entry.confidence >= 0.5
+    )
+  }
   const unique: HookCandidate[] = []
   for (const candidate of [primary, ...candidates]) {
     const duplicate = unique.some((entry) => (
@@ -10305,7 +10323,7 @@ const selectLongFormDisplacedHookCandidate = ({
     entry.teaserTension >= minTeaserFloor &&
     entry.curiosityPressure >= minCuriosityFloor &&
     entry.confidence >= minConfidenceFloor &&
-    entry.candidate.auditPassed
+    isCredibleLateHookEntry(entry)
   ))
   if (!displaced) return null
   const displacementSeconds = displaced.candidate.start - primary.start
@@ -26759,6 +26777,51 @@ const processJob = async (
         thresholdOffset: hookThresholdOffset,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
+      const scoreHookSelectionEntry = (candidate: HookCandidate): HookSelectionRankedEntry => {
+        const scored = scoreRenderableHookCandidateSignals({
+          candidate,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+        })
+        return {
+          candidate,
+          confidence: scored.confidence,
+          instantHold: scored.instantHold,
+          introClarity: scored.introClarity,
+          teaserTension: scored.teaserTension,
+          curiosityPressure: scored.curiosityPressure,
+          visualNovelty: scored.visualNovelty,
+          visualImpact: scored.visualImpact,
+          valuePromise: scored.valuePromise,
+          urgency: scored.urgency,
+          contrarianTrigger: scored.contrarianTrigger,
+          overlayReadiness: scored.overlayReadiness,
+          authenticity: scored.authenticity,
+          openerQuality: scored.openerQuality,
+          selectionScore: scored.selectionScore
+        }
+      }
+      const isCredibleLateLongFormHook = (candidate: HookCandidate | null | undefined) => {
+        if (!candidate || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return false
+        const entry = scoreHookSelectionEntry(candidate)
+        return (
+          entry.candidate.start >= resolveLongFormMinHookSourceStart(durationSeconds) &&
+          (
+            entry.candidate.auditPassed ||
+            (
+              (
+                String(entry.candidate.text || '').trim().length > 0 ||
+                entry.visualImpact >= 0.24 ||
+                entry.openerQuality >= 0.54
+              ) &&
+              entry.candidate.auditScore >= 0.52 &&
+              entry.selectionScore >= 0.52 &&
+              entry.curiosityPressure >= 0.36 &&
+              entry.teaserTension >= 0.32 &&
+              entry.confidence >= 0.5
+            )
+          )
+        )
+      }
       let resolvedHookDecision: HookSelectionDecision | null = hookDecision
       if (!hasTranscriptSignals && hookSelectionModeForRender === 'auto' && hookCandidates.length > 0) {
         const nonVerbalRanked: HookSelectionRankedEntry[] = hookCandidates
@@ -26820,12 +26883,15 @@ const processJob = async (
         hasTranscriptSignals &&
         (!resolvedHookDecision || !resolvedHookDecision.candidate.auditPassed)
       ) {
+        const preserveCurrentLateHook = isCredibleLateLongFormHook(
+          resolvedHookDecision?.candidate || null
+        )
         const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
           candidates: hookCandidates,
           durationSeconds,
           maxStartSeconds: 45
         })
-        if (auditedOpeningFromPool) {
+        if (auditedOpeningFromPool && !preserveCurrentLateHook) {
           const auditedThreshold = resolveHookScoreThreshold({
             aggressionLevel,
             hasTranscript: hasTranscriptSignals,
@@ -26840,6 +26906,8 @@ const processJob = async (
             reason: 'Hook retry: selected audited opening candidate from first 45s candidate pool.',
             debug: resolvedHookDecision?.debug || null
           }
+        } else if (auditedOpeningFromPool && preserveCurrentLateHook) {
+          optimizationNotes.push('Hook transcript guard kept a credible late opener instead of collapsing back to the chronological start.')
         }
       }
       if (hasTranscriptSignals && hookSelectionModeForRender === 'auto') {
@@ -27109,7 +27177,7 @@ const processJob = async (
           fallbackSignals.curiosityPressure < transcriptFallbackCuriosityFloor ||
           fallbackSignals.teaserTension < transcriptFallbackTeaserFloor
         )
-        if (fallbackTranscriptUnsafe) {
+        if (fallbackTranscriptUnsafe && !isCredibleLateLongFormHook(fallbackHook)) {
           const openingSegment = storySegments[0]
           const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
           const openingDuration = Number(clamp(
@@ -27159,6 +27227,8 @@ const processJob = async (
             fallbackHook = openingCandidate
             fallbackSignals = openingEval.scored
           }
+        } else if (fallbackTranscriptUnsafe) {
+          optimizationNotes.push('Hook transcript guard kept the best available late opener despite transcript quality-floor miss.')
         }
         const fallbackNoTranscriptUnsafe = !hasTranscriptSignals && (
           !fallbackHook.auditPassed ||
@@ -27365,6 +27435,7 @@ const processJob = async (
         hasTranscriptSignals &&
         !initialHook.auditPassed
       ) {
+        const preserveLateInitialHook = isCredibleLateLongFormHook(initialHook)
         const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
           transcriptCues: processTranscriptCues,
           windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
@@ -27373,7 +27444,7 @@ const processJob = async (
           searchWindowSeconds: 90,
           targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
         })
-        if (auditedOpeningRetry) {
+        if (auditedOpeningRetry && !preserveLateInitialHook) {
           const currentHookEval = evaluateTranscriptHookQuality({
             candidate: initialHook,
             windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
@@ -27393,6 +27464,8 @@ const processJob = async (
               durationSeconds
             })
           }
+        } else if (auditedOpeningRetry && preserveLateInitialHook) {
+          optimizationNotes.push('Hook retry guard preserved the later long-form opener instead of replacing it with an early transcript-safe opening.')
         }
         if (
           auditedOpeningRetry &&
