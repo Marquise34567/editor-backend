@@ -29,7 +29,8 @@ const {
   buildPersistedRenderAnalysis,
   applyEliteCutRefinementForTest,
   summarizeBoundaryPathologyForTest,
-  evaluateHardQualityBar
+  evaluateHardQualityBar,
+  shouldAutoTranscribeDuringAnalyze
 } = __retentionTestUtils
 
 const makeWindow = (time: number, overrides: Record<string, any> = {}) => ({
@@ -123,6 +124,16 @@ const run = () => {
   assert.ok(representedSections.size >= 3, 'top hook candidates should represent multiple timeline sections')
   assert.strictEqual(sectionIndex(longPick.selected.start), 2, 'selected hook should come from strongest section')
   assert.ok(longPick.selected.duration >= 7 && longPick.selected.duration <= 8, 'partition hook winner should stay near 8 seconds')
+  assert.strictEqual(
+    shouldAutoTranscribeDuringAnalyze('ultra', 'horizontal', 420),
+    true,
+    'long-form ultra horizontal jobs should still auto-transcribe for hook analysis'
+  )
+  assert.strictEqual(
+    shouldAutoTranscribeDuringAnalyze('ultra', 'horizontal', 42),
+    false,
+    'short-form ultra horizontal jobs may still skip transcript analysis for speed'
+  )
 
   // 1c) Style inference should adapt pacing/aggression for different content archetypes.
   const reactionWindows = new Array(36).fill(null).map((_, idx) =>

@@ -2339,9 +2339,14 @@ const resolvePipelinePowerModePlaybook = (
 
 const shouldAutoTranscribeDuringAnalyze = (
   pipelinePowerMode: PipelinePowerModeSelection,
-  renderMode: RenderMode
+  renderMode: RenderMode,
+  durationSeconds?: number | null
 ) => {
   if (renderMode !== 'horizontal') return true
+  const safeDuration = Number(durationSeconds || 0)
+  if (Number.isFinite(safeDuration) && safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS) {
+    return true
+  }
   return pipelinePowerMode !== 'ultra'
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
@@ -25883,10 +25888,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
     const shouldAnalyzeTranscript = shouldAutoTranscribeDuringAnalyze(
       pipelinePowerMode,
-      initialRenderConfig.mode
+      initialRenderConfig.mode,
+      duration
     )
     if (!shouldAnalyzeTranscript) {
-      console.log(`[${requestId || 'noid'}] transcript analysis skipped for fast horizontal mode`)
+      console.log(`[${requestId || 'noid'}] transcript analysis skipped for fast short-form horizontal mode`)
     }
     const transcriptCues = shouldAnalyzeTranscript
       ? await runRetentionStep({
@@ -27377,7 +27383,7 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       targetPlatform: retentionTargetPlatform
     })
-    const processTranscriptCues: TranscriptCue[] = (
+    let processTranscriptCues: TranscriptCue[] = (
       Array.isArray((job.analysis as any)?.transcript_cues)
         ? ((job.analysis as any).transcript_cues as any[])
         : Array.isArray((job.analysis as any)?.transcriptCues)
@@ -27397,6 +27403,36 @@ const processJob = async (
       }))
       .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.01)
       .slice(0, 1200)
+    if (
+      renderConfig.mode === 'horizontal' &&
+      durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
+      !processTranscriptCues.length
+    ) {
+      const transcriptRescueDir = path.join(workDir, 'hook-transcript-rescue')
+      try {
+        fs.mkdirSync(transcriptRescueDir, { recursive: true })
+        const rescuedTranscriptSrt = await generateSubtitles(tmpIn, transcriptRescueDir)
+        if (rescuedTranscriptSrt) {
+          const rescuedTranscriptCues = parseTranscriptCues(rescuedTranscriptSrt).slice(0, 1200)
+          if (rescuedTranscriptCues.length) {
+            processTranscriptCues = rescuedTranscriptCues
+            optimizationNotes.push(
+              'Hook transcript rescue generated transcript cues during render because analysis had none.'
+            )
+            console.log(`[${requestId || 'noid'}] transcript cue rescue enabled during process`, {
+              cueCount: processTranscriptCues.length,
+              durationSeconds
+            })
+          } else {
+            console.warn(`[${requestId || 'noid'}] transcript cue rescue produced no usable cues`)
+          }
+        } else {
+          console.warn(`[${requestId || 'noid'}] transcript cue rescue failed to generate subtitles`)
+        }
+      } catch (error) {
+        console.warn(`[${requestId || 'noid'}] transcript cue rescue failed`, error)
+      }
+    }
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
       ? ((job.analysis as any).beat_anchors as number[])
       : []
@@ -35720,7 +35756,8 @@ export const __retentionTestUtils = {
   aggregatePlayerTelemetrySessions,
   summarizePlayerTelemetry,
   buildUniquenessSignatureForTest,
-  buildEditPlanForTest
+  buildEditPlanForTest,
+  shouldAutoTranscribeDuringAnalyze
 }
 
 export default router
