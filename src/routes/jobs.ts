@@ -18644,17 +18644,38 @@ const mergeSegmentsToLimitCount = (
   if (segments.length <= maxSegments) return segments
   const hardLimit = opts?.hardLimit === true
   const merged = segments.map((seg) => ({ ...seg }))
+  const hasTimelineReorder = merged.some((segment, index) => (
+    index > 0 &&
+    Number.isFinite(Number(segment.start)) &&
+    Number.isFinite(Number(merged[index - 1]?.start)) &&
+    Number(segment.start) < Number(merged[index - 1].start) - 0.01
+  ))
   const overflowAllowance = Math.max(4, Math.min(14, Math.round(maxSegments * 0.28)))
   const softTarget = hardLimit ? maxSegments : maxSegments + overflowAllowance
   const findMergeIndex = (maxGapSeconds: number, maxMergedSpanSeconds: number) => {
     let mergeIdx = -1
     let bestCost = Number.POSITIVE_INFINITY
     for (let i = 0; i < merged.length - 1; i += 1) {
+      if (hasTimelineReorder && i === 0) continue
       const left = merged[i]
       const right = merged[i + 1]
-      const gap = Math.max(0, right.start - left.end)
+      const leftStart = Number(left.start)
+      const leftEnd = Number(left.end)
+      const rightStart = Number(right.start)
+      const rightEnd = Number(right.end)
+      if (
+        !Number.isFinite(leftStart) ||
+        !Number.isFinite(leftEnd) ||
+        !Number.isFinite(rightStart) ||
+        !Number.isFinite(rightEnd)
+      ) {
+        continue
+      }
+      // Preserve intentional hook-first/source-reordered timelines.
+      if (rightStart < leftStart - 0.01) continue
+      const gap = Math.max(0, rightStart - leftEnd)
       if (gap > maxGapSeconds) continue
-      const mergedSpan = Math.max(0.001, right.end - left.start)
+      const mergedSpan = Math.max(0.001, Math.max(leftEnd, rightEnd) - Math.min(leftStart, rightStart))
       if (mergedSpan > maxMergedSpanSeconds) continue
       const speedDelta = Math.abs((left.speed ?? 1) - (right.speed ?? 1))
       const emphasizePenalty = left.emphasize || right.emphasize ? 0.2 : 0
@@ -18674,7 +18695,8 @@ const mergeSegmentsToLimitCount = (
     const blendedBrightness = Number(clamp(((left.brightness ?? 0) + (right.brightness ?? 0)) / 2, -0.35, 0.35).toFixed(3))
     merged.splice(mergeIdx, 2, {
       ...left,
-      end: right.end,
+      start: roundForFilter(Math.min(Number(left.start), Number(right.start))),
+      end: roundForFilter(Math.max(Number(left.end), Number(right.end))),
       speed: blendedSpeed,
       zoom: blendedZoom,
       brightness: blendedBrightness,
