@@ -18718,6 +18718,15 @@ const enforceCutDensityLimit = ({
   return mergeSegmentsToLimitCount(segments, maxSegments, { hardLimit: false })
 }
 
+const hasIntentionalTimelineReorder = (segments: Array<Pick<Segment, 'start'>>) => (
+  segments.some((segment, index) => (
+    index > 0 &&
+    Number.isFinite(Number(segment.start)) &&
+    Number.isFinite(Number(segments[index - 1]?.start)) &&
+    Number(segment.start) < Number(segments[index - 1].start) - 0.01
+  ))
+)
+
 const enforceLongFormComprehensionFloor = ({
   segments,
   hookRange,
@@ -18748,10 +18757,14 @@ const enforceLongFormComprehensionFloor = ({
     durationSeconds
   ).toFixed(3))
   if (contextSeedEnd <= contextStart) return segments
-  const seeded = [
-    ...segments.map((segment) => ({ ...segment })),
-    { start: contextStart, end: contextSeedEnd, speed: 1 }
-  ].sort((left, right) => left.start - right.start || left.end - right.end)
+  const seededContext: Segment = { start: contextStart, end: contextSeedEnd, speed: 1 }
+  const seeded = segments.map((segment) => ({ ...segment }))
+  if (!seeded.length) return [seededContext]
+  if (hasIntentionalTimelineReorder(seeded)) {
+    return [seeded[0], seededContext, ...seeded.slice(1)]
+  }
+  seeded.push(seededContext)
+  seeded.sort((left, right) => left.start - right.start || left.end - right.end)
   return seeded
 }
 
@@ -19547,12 +19560,7 @@ const alignSegmentsToTranscriptBoundariesForRender = (
   const boundaries = collectTranscriptBoundaryTimesForRender(transcriptCues, durationSeconds)
   if (!boundaries.length) return segments.map((segment) => ({ ...segment }))
   const orderedInput = segments.map((segment) => ({ ...segment }))
-  const preserveTimelineOrder = orderedInput.some((segment, index) => (
-    index > 0 &&
-    Number.isFinite(Number(segment.start)) &&
-    Number.isFinite(Number(orderedInput[index - 1]?.start)) &&
-    Number(segment.start) < Number(orderedInput[index - 1].start) - 0.01
-  ))
+  const preserveTimelineOrder = hasIntentionalTimelineReorder(orderedInput)
   const sorted = preserveTimelineOrder
     ? orderedInput
     : orderedInput.sort((left, right) => left.start - right.start || left.end - right.end)
@@ -34403,6 +34411,7 @@ export const __retentionTestUtils = {
   executeQualityGateRetriesForTest,
   predictVariantRetention,
   buildTimelineWithHookAtStartForTest,
+  enforceLongFormComprehensionFloorForTest: enforceLongFormComprehensionFloor,
   prepareSegmentsForRenderForTest: prepareSegmentsForRender,
   buildPersistedRenderAnalysis,
   buildVisualIntelligenceSummary,
