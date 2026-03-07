@@ -1,5 +1,6 @@
 import { createServer } from 'http'
-import { exec } from 'child_process'
+import { exec, spawnSync } from 'child_process'
+import path from 'path'
 import app from './app'
 import { initRealtime } from './realtime'
 import { FFMPEG_PATH, formatCommand } from './lib/ffmpeg'
@@ -12,6 +13,9 @@ const STARTUP_LOG_LIMIT = 64 * 1024
 const REQUIRE_FFMPEG_ON_STARTUP = /^(1|true|yes)$/i.test(
   String(process.env.REQUIRE_FFMPEG_ON_STARTUP || '').trim()
 )
+const SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP = /^(1|true|yes|on)$/i.test(
+  String(process.env.INSTALL_CAPTION_RUNTIME || '').trim()
+) || Boolean(String(process.env.RAILWAY_ENVIRONMENT || '').trim())
 
 const server = createServer(app)
 initRealtime(server)
@@ -53,9 +57,25 @@ const verifyFfmpegOnStartup = async () => {
   })
 }
 
+const ensureCaptionRuntimeOnStartup = () => {
+  if (!SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP) return
+  const installerPath = path.resolve(process.cwd(), 'scripts/install-caption-runtime.js')
+  console.log('[startup] Ensuring caption runtime')
+  const result = spawnSync(process.execPath, [installerPath], {
+    env: process.env,
+    stdio: 'inherit',
+    windowsHide: true
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    throw new Error(`caption_runtime_install_failed:${result.status}`)
+  }
+}
+
 const start = async () => {
   const ffmpegOk = await verifyFfmpegOnStartup()
   if (!ffmpegOk) process.exit(1)
+  ensureCaptionRuntimeOnStartup()
   const captions = getCaptionEngineStatus({ force: true })
   if (captions.available) {
     console.log(`[startup] Caption engine ready: ${captions.provider} (${captions.command})`)
