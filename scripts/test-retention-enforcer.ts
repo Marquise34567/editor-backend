@@ -87,6 +87,49 @@ const run = () => {
   assert.strictEqual(Number(timelineWithHookFirst[0].start.toFixed(3)), Number(pickA.selected.start.toFixed(3)), 'hook must be first in timeline order')
   assert.strictEqual(Number((timelineWithHookFirst[0].end - timelineWithHookFirst[0].start).toFixed(3)), Number(pickA.selected.duration.toFixed(3)), 'first segment must match selected hook length')
 
+  // 1a) Hooks should trim dead visual/setup lead-ins instead of opening on black/loading frames.
+  const deadLeadWindows = new Array(24).fill(null).map((_, idx) => makeWindow(idx, {
+    score: 0.16,
+    hookScore: 0.14,
+    audioEnergy: 0.12,
+    speechIntensity: 0.14,
+    motionScore: 0.03,
+    facePresence: 0.02,
+    textDensity: 0.02,
+    sceneChangeRate: 0.03,
+    emotionIntensity: 0.12,
+    vocalExcitement: 0.1,
+    curiosityTrigger: 0.03,
+    keywordIntensity: 0.02
+  }))
+  for (let second = 2; second <= 8; second += 1) {
+    deadLeadWindows[second] = makeWindow(second, {
+      score: 0.92,
+      hookScore: 0.94,
+      audioEnergy: 0.58,
+      speechIntensity: 0.78,
+      motionScore: 0.66,
+      facePresence: 0.44,
+      textDensity: 0.18,
+      sceneChangeRate: 0.36,
+      emotionIntensity: 0.76,
+      vocalExcitement: 0.74,
+      curiosityTrigger: 0.84,
+      keywordIntensity: 0.72
+    })
+  }
+  const deadLeadCues = [
+    { start: 2.0, end: 4.1, text: 'No way this actually happened.', keywordIntensity: 0.82, curiosityTrigger: 0.88, fillerDensity: 0 },
+    { start: 4.1, end: 7.7, text: 'Wait until you see what he opens next.', keywordIntensity: 0.84, curiosityTrigger: 0.9, fillerDensity: 0 }
+  ]
+  const deadLeadPick = pickTopHookCandidates({
+    durationSeconds: 24,
+    segments: [{ start: 0, end: 24 }],
+    windows: deadLeadWindows,
+    transcriptCues: deadLeadCues
+  })
+  assert.ok(deadLeadPick.selected.start >= 1.8, 'hook should skip dead visual lead-in and start on the actual moment')
+
   // 1b) Partition-first hooking should pick one strong 8s candidate from each section, then choose best.
   const longWindows = new Array(96).fill(null).map((_, idx) => makeWindow(idx))
   const boostRange = (start: number, end: number, boost: Record<string, number>) => {

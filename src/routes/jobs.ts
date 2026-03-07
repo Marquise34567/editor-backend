@@ -2271,7 +2271,7 @@ Core hook rules:
 
 Format adaptation:
 - Short-form: 3-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
-- Long-form: 10-20s opener (ideal 10-15s), 3-5s attention spike, then 8+ second teaser, then story promise.
+- Long-form: 5-8s opener with a hard cap under 10s, strongest visible story content in the first 1-3s, no black/loading/setup lead-ins, then immediate story promise.
 
 Required output framing:
 - Selected peak moment [description + score + why]
@@ -10117,6 +10117,18 @@ const scoreRenderableHookCandidateSignals = ({
     0.34 * firstFrameImpact +
     0.24 * patternBreak
   )
+  const visualLeadScore = computeHookVisibleLeadScore({
+    start: hookStart,
+    end: hookEnd,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
+  const deadLeadPenalty = computeHookDeadLeadPenalty({
+    start: hookStart,
+    end: hookEnd,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
   const valuePromise = introText
     ? textSignals.valuePromise
     : clamp01(0.42 * curiosityPressure + 0.32 * teaserTension + 0.26 * visualImpact)
@@ -10158,8 +10170,10 @@ const scoreRenderableHookCandidateSignals = ({
     0.06 * mutedClarity +
     0.07 * visualNovelty +
     0.09 * visualImpact +
+    0.05 * visualLeadScore +
     0.04 * overlayReadiness +
-    0.04 * urgency
+    0.04 * urgency -
+    0.12 * deadLeadPenalty
   )
   const totalTimelineSeconds = windows.length
     ? Math.max(1, Number((windows[windows.length - 1]?.time ?? hookEnd) + 1))
@@ -10182,12 +10196,14 @@ const scoreRenderableHookCandidateSignals = ({
     0.08 * valuePromise +
     0.04 * urgency +
     0.03 * mutedClarity +
+    0.03 * visualLeadScore +
     0.05 * openerTimingScore +
     0.02 * contrarianTrigger +
     0.02 * relatability +
     0.02 * conversational +
     0.02 * textSignals.hookTypeStrength +
     0.01 * authenticity -
+    0.08 * deadLeadPenalty -
     0.05 * textSignals.weakIntroPenalty -
     0.06 * lateSourcePenalty
   )
@@ -12004,6 +12020,85 @@ const averageWindowMetric = (
   return relevant.reduce((sum, window) => sum + metric(window), 0) / relevant.length
 }
 
+const computeHookVisibleLeadScore = ({
+  start,
+  end,
+  windows,
+  introSeconds = 1.2
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  introSeconds?: number
+}) => {
+  const leadEnd = Math.min(end, start + Math.max(0.4, Number(introSeconds || 1.2)))
+  if (leadEnd - start <= 0.1 || !windows.length) return 0
+  return Number(clamp01(averageWindowMetric(windows, start, leadEnd, (window) => (
+    0.26 * (window.visualImpact ?? window.score) +
+    0.18 * window.motionScore +
+    0.16 * window.sceneChangeRate +
+    0.18 * (window.faceIntensity ?? window.facePresence) +
+    0.12 * window.facePresence +
+    0.1 * window.textDensity
+  ))).toFixed(4))
+}
+
+const computeHookDeadLeadPenalty = ({
+  start,
+  end,
+  windows,
+  introSeconds = HOOK_OPENER_FIRST_SECONDS
+}: {
+  start: number
+  end: number
+  windows: EngagementWindow[]
+  introSeconds?: number
+}) => {
+  const leadWindowSeconds = Math.max(0.6, Math.min(1.35, Number(introSeconds || HOOK_OPENER_FIRST_SECONDS)))
+  const firstBeatEnd = Math.min(end, start + leadWindowSeconds)
+  if (firstBeatEnd - start <= 0.2 || !windows.length) return 0
+  const leadVisibility = computeHookVisibleLeadScore({
+    start,
+    end,
+    windows,
+    introSeconds: leadWindowSeconds
+  })
+  const leadNarrative = clamp01(averageWindowMetric(windows, start, firstBeatEnd, (window) => (
+    0.24 * (window.hookScore ?? window.score) +
+    0.22 * window.speechIntensity +
+    0.16 * window.emotionIntensity +
+    0.12 * window.vocalExcitement +
+    0.1 * (window.curiosityTrigger ?? 0) +
+    0.08 * window.textDensity +
+    0.08 * window.facePresence
+  )))
+  const laterStart = Math.min(end, start + Math.max(0.8, leadWindowSeconds))
+  const laterImpact = laterStart < end
+    ? clamp01(averageWindowMetric(windows, laterStart, end, (window) => (
+      0.24 * (window.hookScore ?? window.score) +
+      0.18 * (window.visualImpact ?? window.score) +
+      0.16 * window.speechIntensity +
+      0.14 * window.emotionIntensity +
+      0.12 * window.vocalExcitement +
+      0.1 * (window.curiosityTrigger ?? 0) +
+      0.06 * (window.actionSpike ?? 0)
+    )))
+    : leadNarrative
+  const delayedLift = clamp01(Math.max(0, laterImpact - leadNarrative) * 1.55)
+  const deadVisual = clamp01(1 - leadVisibility * 1.7)
+  const deadNarrative = clamp01(1 - leadNarrative * 1.55)
+  const penalty = clamp01(
+    0.4 * deadVisual +
+    0.28 * deadNarrative +
+    0.2 * delayedLift +
+    0.12 * Number(leadVisibility < 0.2 && laterImpact > leadNarrative + 0.14)
+  )
+  if (leadVisibility >= 0.34 || leadNarrative >= 0.48) {
+    return Number((penalty * 0.45).toFixed(4))
+  }
+  return Number(penalty.toFixed(4))
+}
+
 const tightenHookRangeForRetention = ({
   range,
   windows,
@@ -12025,8 +12120,8 @@ const tightenHookRangeForRetention = ({
   let end = clamp(range.end, start + 0.2, durationSeconds)
   const minHookSeconds = clamp(HOOK_MIN - 1.4, 3.2, HOOK_MIN)
   const probeSeconds = 0.62
-  const stepSeconds = 0.22
-  const maxHeadTrim = 1.7
+  const stepSeconds = 0.18
+  const maxHeadTrim = 2.6
   const maxTailTrim = 1.3
   let headTrimmed = 0
   let tailTrimmed = 0
@@ -12036,8 +12131,26 @@ const tightenHookRangeForRetention = ({
     const hookSignal = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.hookScore ?? window.score)
     const speech = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.speechIntensity)
     const energy = averageWindowMetric(windows, probeRange.start, probeRange.end, (window) => window.audioEnergy)
+    const visibleLead = computeHookVisibleLeadScore({
+      start,
+      end,
+      windows,
+      introSeconds: probeSeconds
+    })
+    const deadLeadPenalty = computeHookDeadLeadPenalty({
+      start,
+      end,
+      windows,
+      introSeconds: Math.min(HOOK_OPENER_FIRST_SECONDS, Math.max(0.6, end - start))
+    })
     const silenceRatio = getSilenceCoverageRatio(probeRange, silences)
-    const weakLead = silenceRatio >= 0.28 || (hookSignal < 0.44 && speech < 0.5 && energy < 0.46)
+    const weakLead = (
+      silenceRatio >= 0.28 ||
+      deadLeadPenalty >= 0.46 ||
+      (hookSignal < 0.44 && speech < 0.5 && energy < 0.46) ||
+      (visibleLead < 0.18 && speech < 0.42 && hookSignal < 0.5) ||
+      (visibleLead < 0.24 && deadLeadPenalty >= 0.38)
+    )
     if (!weakLead) break
     start += stepSeconds
     headTrimmed += stepSeconds
@@ -14576,11 +14689,25 @@ const computeHookInstantHoldScore = ({
   const introAction = averageWindowMetric(windows, start, introEnd, (window) => window.actionSpike ?? 0)
   const introSpeech = averageWindowMetric(windows, start, introEnd, (window) => window.speechIntensity)
   const introVisual = averageWindowMetric(windows, start, introEnd, (window) => (
-    0.34 * window.motionScore +
-    0.26 * window.sceneChangeRate +
-    0.2 * (window.visualImpact ?? window.score) +
-    0.2 * window.textDensity
+    0.26 * window.motionScore +
+    0.22 * window.sceneChangeRate +
+    0.18 * (window.visualImpact ?? window.score) +
+    0.16 * window.facePresence +
+    0.04 * (window.faceIntensity ?? window.facePresence) +
+    0.14 * window.textDensity
   ))
+  const visualLeadScore = computeHookVisibleLeadScore({
+    start,
+    end,
+    windows,
+    introSeconds: introWindowSeconds
+  })
+  const deadLeadPenalty = computeHookDeadLeadPenalty({
+    start,
+    end,
+    windows,
+    introSeconds: introWindowSeconds
+  })
   const firstBeatEnd = Math.min(introEnd, start + Math.min(1.2, Math.max(0.4, introWindowSeconds * 0.45)))
   const firstBeatSignal = averageWindowMetric(windows, start, firstBeatEnd, (window) => (
     0.45 * (window.hookScore ?? window.score) +
@@ -14615,8 +14742,10 @@ const computeHookInstantHoldScore = ({
     0.08 * introAction +
     0.06 * introSpeech +
     0.08 * introVisual +
+    0.06 * visualLeadScore +
     0.07 * firstBeatPatternInterrupt +
-    0.05 * momentum
+    0.05 * momentum -
+    0.24 * deadLeadPenalty
   ).toFixed(4))
 }
 
@@ -14679,6 +14808,18 @@ const runHookAudit = ({
     end,
     windows
   })
+  const visualLeadScore = computeHookVisibleLeadScore({
+    start,
+    end,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
+  const deadLeadPenalty = computeHookDeadLeadPenalty({
+    start,
+    end,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
   const introClarity = computeHookIntroClarityScore({
     start,
     end,
@@ -14714,8 +14855,10 @@ const runHookAudit = ({
   const instantAttentionSignal = clamp01(
     0.42 * instantHold +
     0.26 * textQualitySignals.patternInterrupt +
+    0.12 * visualLeadScore +
     0.16 * nonVerbalClarity +
     0.16 * textQualitySignals.brevityFit -
+    0.2 * deadLeadPenalty -
     0.24 * textQualitySignals.weakIntroPenalty
   )
   const valueGapSignal = clamp01(
@@ -14735,6 +14878,7 @@ const runHookAudit = ({
   const mutedViewerSignal = clamp01(
     0.38 * textQualitySignals.mutedClarity +
     0.26 * nonVerbalClarity +
+    0.12 * visualLeadScore +
     0.18 * averageWindowMetric(windows, start, end, (window) => window.textDensity) +
     0.18 * averageWindowMetric(windows, start, end, (window) => window.motionScore)
   )
@@ -14784,6 +14928,8 @@ const runHookAudit = ({
   const specificityPass = !hasTranscriptSupport || specificitySignal >= 0.22 || textQualitySignals.hookTypeStrength >= 0.34
   const conversationalPass = !hasTranscriptSupport || conversationalSignal >= 0.22
   const mutedSynergyPass = mutedViewerSignal >= (hasTranscriptSupport ? 0.26 : 0.3)
+  const visibleLeadPass = visualLeadScore >= (hasTranscriptSupport ? 0.22 : 0.18)
+  const deadLeadPass = deadLeadPenalty <= 0.52
   const weakIntroPass = textQualitySignals.weakIntroPenalty < 0.44
   const auditScore = hasTranscriptSupport
     ? clamp01(
@@ -14798,10 +14944,12 @@ const runHookAudit = ({
         0.06 * mutedViewerSignal +
         0.08 * teaserStrength +
         0.06 * endingUnresolved +
+        0.04 * visualLeadScore +
         0.04 * introClarity +
         0.03 * textQualitySignals.hookTypeStrength +
         0.04 * (1 - contextPenalty) +
         0.02 * (1 - spoilerRisk) -
+        0.06 * deadLeadPenalty -
         0.05 * textQualitySignals.weakIntroPenalty
       )
     : clamp01(
@@ -14813,9 +14961,11 @@ const runHookAudit = ({
         0.08 * teaserStrength +
         0.08 * mutedViewerSignal +
         0.08 * endingUnresolved +
+        0.05 * visualLeadScore +
         0.06 * introClarity +
         0.05 * (1 - contextPenalty) +
-        0.05 * (1 - spoilerRisk)
+        0.05 * (1 - spoilerRisk) -
+        0.07 * deadLeadPenalty
       )
   const passThreshold = hasTranscriptSupport ? 0.72 : 0.6
   const reasons: string[] = []
@@ -14828,6 +14978,8 @@ const runHookAudit = ({
   if (!specificityPass) reasons.push('Hook is too generic; needs more specificity or relatability')
   if (!conversationalPass) reasons.push('Delivery feels too scripted; opener should sound more human and direct')
   if (!mutedSynergyPass) reasons.push('Muted-view clarity is weak; opener needs stronger text/visual support')
+  if (!visibleLeadPass) reasons.push('Opener does not show enough visible story content in the first 1-2 seconds')
+  if (!deadLeadPass) reasons.push('Opener starts with dead visual lead-in instead of the actual moment')
   if (!teaserPass) reasons.push('Hook reveals too much or has weak teaser pressure')
   if (!endingTensionPass) reasons.push('Ending resolves too cleanly; opener should end with stronger unresolved tension')
   if (!noOverReveal) reasons.push('Reveals too much too early; keep the opener as a curiosity teaser')
@@ -14844,6 +14996,8 @@ const runHookAudit = ({
       specificityPass &&
       conversationalPass &&
       mutedSynergyPass &&
+      visibleLeadPass &&
+      deadLeadPass &&
       teaserPass &&
       endingTensionPass &&
       noOverReveal &&
@@ -15024,6 +15178,18 @@ const scoreHookFaceoffCandidate = ({
     end,
     windows
   })
+  const visualLeadScore = computeHookVisibleLeadScore({
+    start,
+    end,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
+  const deadLeadPenalty = computeHookDeadLeadPenalty({
+    start,
+    end,
+    windows,
+    introSeconds: HOOK_OPENER_FIRST_SECONDS
+  })
   const introClarity = computeHookIntroClarityScore({
     start,
     end,
@@ -15041,7 +15207,9 @@ const scoreHookFaceoffCandidate = ({
     weights.emotionalSpike * emotionalSpike +
     0.08 * emotionalPull +
     0.08 * instantHold * modeHookProfile.faceoffInstantHoldMultiplier +
+    0.04 * visualLeadScore +
     0.06 * introClarity -
+    0.08 * deadLeadPenalty -
     0.06 * contextPenalty * modeHookProfile.faceoffContextPenaltyMultiplier -
     0.05 * spoilerRisk * modeHookProfile.faceoffSpoilerPenaltyMultiplier +
     modeHookProfile.baseBias
@@ -15153,6 +15321,18 @@ const pickTopHookCandidates = ({
         end: aligned.end,
         windows
       })
+      const visualLeadScore = computeHookVisibleLeadScore({
+        start: aligned.start,
+        end: aligned.end,
+        windows,
+        introSeconds: HOOK_OPENER_FIRST_SECONDS
+      })
+      const deadLeadPenalty = computeHookDeadLeadPenalty({
+        start: aligned.start,
+        end: aligned.end,
+        windows,
+        introSeconds: HOOK_OPENER_FIRST_SECONDS
+      })
       const introClarityScore = computeHookIntroClarityScore({
         start: aligned.start,
         end: aligned.end,
@@ -15167,8 +15347,9 @@ const pickTopHookCandidates = ({
       const firstThreeSecondGrab = clamp01(
         0.44 * instantHoldScore +
         0.24 * textSignals.patternInterrupt +
-        0.18 * visualImpact +
+        0.18 * visualLeadScore +
         0.14 * introClarityScore -
+        0.12 * deadLeadPenalty -
         0.22 * textSignals.weakIntroPenalty
       )
       const promiseOrGap = clamp01(
@@ -15196,7 +15377,8 @@ const pickTopHookCandidates = ({
       const mutedViewerFit = clamp01(
         0.42 * textSignals.mutedClarity +
         0.34 * textSignals.overlayReadiness +
-        0.24 * visualImpact
+        0.14 * visualImpact +
+        0.1 * visualLeadScore
       )
       const teaserReserve = clamp01(1 - audit.spoilerRisk)
       const longFormStartPenalty = longFormMinHookSourceStart > 0
@@ -15244,11 +15426,13 @@ const pickTopHookCandidates = ({
         0.08 * audit.auditScore * modeHookProfile.auditMultiplier +
         0.05 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
         0.03 * dynamicLift.peakDensity -
+        0.1 * deadLeadPenalty -
         0.1 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier -
         0.05 * textSignals.weakIntroPenalty +
+        0.05 * visualLeadScore +
         modeHookProfile.baseBias
       )
       evaluated.push({
