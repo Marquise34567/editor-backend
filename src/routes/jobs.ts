@@ -10331,6 +10331,393 @@ const buildHookSelectionDebugPayload = ({
   }
 }
 
+const buildHookSelectionRankedEntries = ({
+  candidates,
+  windows
+}: {
+  candidates: HookCandidate[]
+  windows: EngagementWindow[]
+}): HookSelectionRankedEntry[] => {
+  const deduped = candidates.filter((candidate, index) => (
+    candidate &&
+    Number.isFinite(candidate.start) &&
+    Number.isFinite(candidate.duration) &&
+    candidate.duration >= HOOK_MIN &&
+    candidate.duration <= HOOK_MAX &&
+    candidates.findIndex((entry) => (
+      Math.abs((entry?.start ?? -9999) - candidate.start) < 0.01 &&
+      Math.abs((entry?.duration ?? -9999) - candidate.duration) < 0.01
+    )) === index
+  ))
+  return deduped
+    .map((candidate) => {
+      const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
+      return {
+        candidate,
+        confidence: scored.confidence,
+        instantHold: scored.instantHold,
+        introClarity: scored.introClarity,
+        teaserTension: scored.teaserTension,
+        curiosityPressure: scored.curiosityPressure,
+        visualNovelty: scored.visualNovelty,
+        visualImpact: scored.visualImpact,
+        valuePromise: scored.valuePromise,
+        urgency: scored.urgency,
+        contrarianTrigger: scored.contrarianTrigger,
+        overlayReadiness: scored.overlayReadiness,
+        authenticity: scored.authenticity,
+        openerQuality: scored.openerQuality,
+        selectionScore: scored.selectionScore
+      }
+    })
+    .sort((a, b) => (
+      b.selectionScore - a.selectionScore ||
+      b.confidence - a.confidence ||
+      b.candidate.score - a.candidate.score ||
+      a.candidate.start - b.candidate.start
+    ))
+}
+
+const findHookSelectionRankedEntry = ({
+  ranked,
+  candidate,
+  windows
+}: {
+  ranked: HookSelectionRankedEntry[]
+  candidate: HookCandidate
+  windows: EngagementWindow[]
+}) => (
+  ranked.find((entry) => (
+    Math.abs(entry.candidate.start - candidate.start) < 0.01 &&
+    Math.abs(entry.candidate.duration - candidate.duration) < 0.01
+  )) || (() => {
+    const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
+    return {
+      candidate,
+      confidence: scored.confidence,
+      instantHold: scored.instantHold,
+      introClarity: scored.introClarity,
+      teaserTension: scored.teaserTension,
+      curiosityPressure: scored.curiosityPressure,
+      visualNovelty: scored.visualNovelty,
+      visualImpact: scored.visualImpact,
+      valuePromise: scored.valuePromise,
+      urgency: scored.urgency,
+      contrarianTrigger: scored.contrarianTrigger,
+      overlayReadiness: scored.overlayReadiness,
+      authenticity: scored.authenticity,
+      openerQuality: scored.openerQuality,
+      selectionScore: scored.selectionScore
+    } satisfies HookSelectionRankedEntry
+  })()
+)
+
+const selectAuthoritativeAutoHookDecision = ({
+  candidates,
+  aggressionLevel,
+  hasTranscript,
+  signalStrength,
+  thresholdOffset = 0,
+  windows = [],
+  transcriptCues = [],
+  segments = [],
+  silences = [],
+  durationSeconds,
+  recentHooks = null
+}: {
+  candidates: HookCandidate[]
+  aggressionLevel: RetentionAggressionLevel
+  hasTranscript: boolean
+  signalStrength: number
+  thresholdOffset?: number
+  windows?: EngagementWindow[]
+  transcriptCues?: TranscriptCue[]
+  segments?: Segment[]
+  silences?: TimeRange[]
+  durationSeconds: number
+  recentHooks?: HookReuseWindow[] | null
+}): HookSelectionDecision | null => {
+  const threshold = resolveHookScoreThreshold({
+    aggressionLevel,
+    hasTranscript,
+    signalStrength,
+    thresholdOffset
+  })
+  const relaxedThreshold = clamp(
+    threshold - (hasTranscript ? 0.08 : 0.16) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.4,
+    threshold
+  )
+  const relaxedInstantHoldFloor = clamp(
+    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.08 : 0.14) - (signalStrength < 0.5 ? 0.05 : 0),
+    0.34,
+    HOOK_STANDARD_INSTANT_HOLD_MIN
+  )
+  const relaxedTeaserFloor = clamp(
+    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.26,
+    HOOK_STANDARD_TEASER_TENSION_MIN
+  )
+  const relaxedCuriosityFloor = clamp(
+    HOOK_STANDARD_CURIOSITY_MIN - (hasTranscript ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.26,
+    HOOK_STANDARD_CURIOSITY_MIN
+  )
+  const strictVisualImpactFloor = clamp(
+    0.46 - (hasTranscript ? 0.02 : 0) - (signalStrength < 0.5 ? 0.04 : 0),
+    0.34,
+    0.5
+  )
+  const relaxedVisualImpactFloor = clamp(
+    strictVisualImpactFloor - 0.08,
+    0.28,
+    strictVisualImpactFloor
+  )
+  const relaxedTranscriptAuditFloor = clamp(
+    Math.max(HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE, relaxedThreshold - 0.02),
+    0.5,
+    0.72
+  )
+  const strictFallbackInstantFloor = clamp(
+    HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscript ? 0.015 : 0.03) - (signalStrength < 0.5 ? 0.01 : 0),
+    relaxedInstantHoldFloor,
+    HOOK_STANDARD_INSTANT_HOLD_MIN
+  )
+  const strictFallbackTeaserFloor = clamp(
+    HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscript ? 0.01 : 0.02) - (signalStrength < 0.5 ? 0.01 : 0),
+    relaxedTeaserFloor,
+    HOOK_STANDARD_TEASER_TENSION_MIN
+  )
+  const strictFallbackCuriosityFloor = clamp(
+    HOOK_STANDARD_CURIOSITY_MIN - (hasTranscript ? 0.01 : 0.02) - (signalStrength < 0.5 ? 0.01 : 0),
+    relaxedCuriosityFloor,
+    HOOK_STANDARD_CURIOSITY_MIN
+  )
+  const baseRanked = buildHookSelectionRankedEntries({
+    candidates,
+    windows
+  })
+  const selectionDurationSeconds = Math.max(
+    1,
+    Number(durationSeconds || 0),
+    windows.length
+      ? Number((windows[windows.length - 1]?.time ?? 0) + 1)
+      : 0,
+    ...baseRanked.map((entry) => Number(entry.candidate.start + entry.candidate.duration || 0))
+  )
+  const baseInterestingRows = buildInterestingFallbackRankedRows({
+    ranked: baseRanked,
+    durationSeconds: selectionDurationSeconds,
+    hasTranscript,
+    recentHooks
+  })
+  const baseCurrent = baseInterestingRows[0]?.entry.candidate || baseRanked[0]?.candidate || null
+  const additionalCandidates: HookCandidate[] = []
+  if (hasTranscript && candidates.length) {
+    const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
+      candidates,
+      durationSeconds,
+      maxStartSeconds: 45
+    })
+    if (auditedOpeningFromPool) additionalCandidates.push(auditedOpeningFromPool)
+    const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
+      candidates,
+      durationSeconds,
+      minStartSeconds: 24,
+      maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
+    })
+    if (differentPartCandidate) additionalCandidates.push(differentPartCandidate)
+    if (baseCurrent && transcriptCues.length) {
+      const rescueCandidate = pickTranscriptHookQualityRescueCandidate({
+        current: baseCurrent,
+        candidates,
+        transcriptCues,
+        windows,
+        durationSeconds,
+        segments
+      })
+      if (rescueCandidate) additionalCandidates.push(rescueCandidate)
+    }
+  }
+  if (hasTranscript && transcriptCues.length) {
+    const transcriptAuditedOpeningFallback = buildAuditedOpeningHookCandidateFromTranscript({
+      transcriptCues,
+      windows,
+      durationSeconds,
+      segments,
+      searchWindowSeconds: 90,
+      targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+    })
+    if (transcriptAuditedOpeningFallback) additionalCandidates.push(transcriptAuditedOpeningFallback)
+    const transcriptCuriosityFallback = buildCuriosityFallbackHookCandidateFromTranscript({
+      transcriptCues,
+      windows,
+      durationSeconds,
+      segments
+    })
+    if (transcriptCuriosityFallback) additionalCandidates.push(transcriptCuriosityFallback)
+    const transcriptSyntheticFallback = buildSyntheticHookCandidate({
+      durationSeconds,
+      segments,
+      windows,
+      transcriptCues
+    })
+    if (transcriptSyntheticFallback) additionalCandidates.push(transcriptSyntheticFallback)
+  }
+  const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
+    segments,
+    windows,
+    silences,
+    durationSeconds
+  })
+  if (storyFallbackHook) additionalCandidates.push(storyFallbackHook)
+  const ranked = buildHookSelectionRankedEntries({
+    candidates: [...candidates, ...additionalCandidates],
+    windows
+  })
+  if (!ranked.length) return null
+  const passesRelaxedAuditGate = (entry: HookSelectionRankedEntry) => {
+    if (entry.candidate.auditPassed) return true
+    if (!hasTranscript) return signalStrength < 0.48
+    if (signalStrength >= 0.48) return false
+    return (
+      entry.candidate.auditScore >= relaxedTranscriptAuditFloor &&
+      entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER) &&
+      entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY)
+    )
+  }
+  const passesNonVerbalSafety = (entry: HookSelectionRankedEntry) => {
+    const hasHookText = String(entry.candidate.text || '').trim().length > 0
+    if (hasTranscript || hasHookText) return true
+    const lowSignalNoTranscript = signalStrength < 0.48
+    const relaxedNonVerbalAuditFloor = clamp(
+      Math.max(HOOK_NON_VERBAL_MIN_AUDIT_SCORE - 0.1, relaxedTranscriptAuditFloor - 0.04),
+      0.36,
+      HOOK_NON_VERBAL_MIN_AUDIT_SCORE
+    )
+    const relaxedNonVerbalSelectionFloor = clamp(
+      HOOK_NON_VERBAL_MIN_SELECTION_SCORE - 0.1 - (signalStrength < 0.42 ? 0.04 : 0),
+      0.42,
+      HOOK_NON_VERBAL_MIN_SELECTION_SCORE
+    )
+    if (!entry.candidate.auditPassed) {
+      if (!lowSignalNoTranscript) return false
+      return (
+        entry.confidence >= Math.max(HOOK_NON_VERBAL_MIN_CONFIDENCE - 0.1, relaxedThreshold - 0.05) &&
+        entry.candidate.auditScore >= relaxedNonVerbalAuditFloor &&
+        entry.selectionScore >= relaxedNonVerbalSelectionFloor &&
+        entry.instantHold >= relaxedInstantHoldFloor &&
+        entry.teaserTension >= relaxedTeaserFloor &&
+        entry.curiosityPressure >= relaxedCuriosityFloor
+      )
+    }
+    return (
+      entry.confidence >= HOOK_NON_VERBAL_MIN_CONFIDENCE &&
+      entry.candidate.auditScore >= HOOK_NON_VERBAL_MIN_AUDIT_SCORE &&
+      entry.selectionScore >= HOOK_NON_VERBAL_MIN_SELECTION_SCORE &&
+      entry.instantHold >= HOOK_STANDARD_INSTANT_HOLD_MIN &&
+      entry.teaserTension >= HOOK_STANDARD_TEASER_TENSION_MIN &&
+      entry.curiosityPressure >= HOOK_STANDARD_CURIOSITY_MIN
+    )
+  }
+  const interestingRows = buildInterestingFallbackRankedRows({
+    ranked,
+    durationSeconds: selectionDurationSeconds,
+    hasTranscript,
+    recentHooks
+  })
+  const strictRow = interestingRows.find((row) => {
+    const entry = row.entry
+    return (
+      entry.candidate.auditPassed &&
+      entry.confidence >= threshold &&
+      entry.openerQuality >= strictFallbackInstantFloor &&
+      entry.teaserTension >= strictFallbackTeaserFloor &&
+      entry.curiosityPressure >= strictFallbackCuriosityFloor &&
+      entry.visualImpact >= strictVisualImpactFloor &&
+      entry.introClarity >= HOOK_STANDARD_INTRO_CLARITY_MIN &&
+      passesNonVerbalSafety(entry)
+    )
+  }) || null
+  const relaxedRow = interestingRows.find((row) => {
+    const entry = row.entry
+    return (
+      entry.confidence >= relaxedThreshold &&
+      entry.openerQuality >= relaxedInstantHoldFloor &&
+      entry.teaserTension >= relaxedTeaserFloor &&
+      entry.curiosityPressure >= relaxedCuriosityFloor &&
+      entry.visualImpact >= relaxedVisualImpactFloor &&
+      passesRelaxedAuditGate(entry) &&
+      passesNonVerbalSafety(entry)
+    )
+  }) || interestingRows.find((row) => {
+    const entry = row.entry
+    return (
+      entry.confidence >= relaxedThreshold &&
+      entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.06, 0.24) &&
+      entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.06, 0.24) &&
+      entry.visualImpact >= Math.max(relaxedVisualImpactFloor - 0.06, 0.22) &&
+      passesRelaxedAuditGate(entry) &&
+      passesNonVerbalSafety(entry)
+    )
+  }) || null
+  let selectedEntry = strictRow?.entry || relaxedRow?.entry || interestingRows[0]?.entry || ranked[0]
+  let selectionMode: 'strict' | 'relaxed' | 'fallback' = strictRow
+    ? 'strict'
+    : relaxedRow
+      ? 'relaxed'
+      : 'fallback'
+  let usedFallback = selectionMode !== 'strict'
+  let reason: string | null = selectionMode === 'strict'
+    ? null
+    : selectionMode === 'relaxed'
+      ? (hasTranscript
+          ? 'Authoritative hook selector picked the most interesting near-threshold transcript moment instead of defaulting to a safe opener.'
+          : 'Authoritative hook selector picked the most interesting near-threshold visual moment instead of defaulting to a safe opener.')
+      : (hasTranscript
+          ? 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
+          : 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.')
+  const relocated = selectLongFormDisplacedHookCandidate({
+    primary: selectedEntry.candidate,
+    candidates: ranked.map((entry) => entry.candidate),
+    windows,
+    durationSeconds
+  })
+  if (relocated) {
+    selectedEntry = findHookSelectionRankedEntry({
+      ranked,
+      candidate: relocated.hook,
+      windows
+    })
+    selectionMode = 'fallback'
+    usedFallback = true
+    reason = relocated.reason
+  }
+  const debug = buildHookSelectionDebugPayload({
+    ranked: interestingRows.length ? interestingRows.map((row) => row.entry) : ranked,
+    selected: selectedEntry,
+    threshold,
+    relaxedThreshold,
+    relaxedInstantHoldFloor,
+    relaxedTeaserFloor,
+    relaxedCuriosityFloor,
+    relaxedTranscriptAuditFloor,
+    selectionMode,
+    hasTranscript,
+    signalStrength,
+    reason,
+    usedFallback
+  })
+  return {
+    candidate: selectedEntry.candidate,
+    confidence: selectedEntry.confidence,
+    threshold,
+    usedFallback,
+    reason,
+    debug
+  }
+}
+
 const selectLongFormDisplacedHookCandidate = ({
   primary,
   candidates,
@@ -28028,761 +28415,19 @@ const processJob = async (
         inputPath: job.inputPath,
         durationSeconds
       })
-      const hookDecision = selectRenderableHookCandidate({
+      const resolvedHookDecision = selectAuthoritativeAutoHookDecision({
         candidates: hookCandidates,
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength,
         thresholdOffset: hookThresholdOffset,
-        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+        transcriptCues: processTranscriptCues,
+        segments: storySegments,
+        silences: editPlan?.silences ?? [],
+        durationSeconds,
+        recentHooks: recentSourceHookReuseWindows
       })
-      const scoreHookSelectionEntry = (candidate: HookCandidate): HookSelectionRankedEntry => {
-        const scored = scoreRenderableHookCandidateSignals({
-          candidate,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-        })
-        return {
-          candidate,
-          confidence: scored.confidence,
-          instantHold: scored.instantHold,
-          introClarity: scored.introClarity,
-          teaserTension: scored.teaserTension,
-          curiosityPressure: scored.curiosityPressure,
-          visualNovelty: scored.visualNovelty,
-          visualImpact: scored.visualImpact,
-          valuePromise: scored.valuePromise,
-          urgency: scored.urgency,
-          contrarianTrigger: scored.contrarianTrigger,
-          overlayReadiness: scored.overlayReadiness,
-          authenticity: scored.authenticity,
-          openerQuality: scored.openerQuality,
-          selectionScore: scored.selectionScore
-        }
-      }
-      const isCredibleLateLongFormHook = (candidate: HookCandidate | null | undefined) => {
-        if (!candidate || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return false
-        const entry = scoreHookSelectionEntry(candidate)
-        return (
-          entry.candidate.start >= resolveLongFormMinHookSourceStart(durationSeconds) &&
-          (
-            entry.candidate.auditPassed ||
-            (
-              (
-                String(entry.candidate.text || '').trim().length > 0 ||
-                entry.visualImpact >= 0.24 ||
-                entry.openerQuality >= 0.54
-              ) &&
-              entry.candidate.auditScore >= 0.52 &&
-              entry.selectionScore >= 0.52 &&
-              entry.curiosityPressure >= 0.36 &&
-              entry.teaserTension >= 0.32 &&
-              entry.confidence >= 0.5
-            )
-          )
-        )
-      }
-      let resolvedHookDecision: HookSelectionDecision | null = hookDecision
-      if (!hasTranscriptSignals && hookSelectionModeForRender === 'auto' && hookCandidates.length > 0) {
-        const nonVerbalRanked: HookSelectionRankedEntry[] = hookCandidates
-          .map((candidate) => {
-            const scored = scoreRenderableHookCandidateSignals({
-              candidate,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            return {
-              candidate,
-              confidence: scored.confidence,
-              instantHold: scored.instantHold,
-              introClarity: scored.introClarity,
-              teaserTension: scored.teaserTension,
-              curiosityPressure: scored.curiosityPressure,
-              visualNovelty: scored.visualNovelty,
-              visualImpact: scored.visualImpact,
-              valuePromise: scored.valuePromise,
-              urgency: scored.urgency,
-              contrarianTrigger: scored.contrarianTrigger,
-              overlayReadiness: scored.overlayReadiness,
-              authenticity: scored.authenticity,
-              openerQuality: scored.openerQuality,
-              selectionScore: scored.selectionScore
-            }
-          })
-          .sort((a, b) => (
-            b.selectionScore - a.selectionScore ||
-            b.curiosityPressure - a.curiosityPressure ||
-            b.teaserTension - a.teaserTension ||
-            b.visualImpact - a.visualImpact ||
-            b.confidence - a.confidence ||
-            a.candidate.start - b.candidate.start
-          ))
-        const upgradedNonVerbalHook = pickNonVerbalCuriosityCandidateFromRanked({
-          ranked: nonVerbalRanked,
-          durationSeconds,
-          current: resolvedHookDecision?.candidate || null
-        })
-        if (upgradedNonVerbalHook) {
-          const upgradeThreshold = resolveHookScoreThreshold({
-            aggressionLevel,
-            hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength,
-            thresholdOffset: hookThresholdOffset
-          })
-          resolvedHookDecision = {
-            candidate: upgradedNonVerbalHook,
-            confidence: getHookCandidateConfidence(upgradedNonVerbalHook),
-            threshold: upgradeThreshold,
-            usedFallback: true,
-            reason: upgradedNonVerbalHook.reason,
-            debug: resolvedHookDecision?.debug || null
-          }
-          optimizationNotes.push('Hook upgrade: prioritized strongest non-verbal curiosity moment for opener.')
-        }
-      }
-      if (
-        hasTranscriptSignals &&
-        (!resolvedHookDecision || !resolvedHookDecision.candidate.auditPassed)
-      ) {
-        const preserveCurrentLateHook = isCredibleLateLongFormHook(
-          resolvedHookDecision?.candidate || null
-        )
-        const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
-          candidates: hookCandidates,
-          durationSeconds,
-          maxStartSeconds: 45
-        })
-        if (auditedOpeningFromPool && !preserveCurrentLateHook) {
-          const currentCandidate = resolvedHookDecision?.candidate || null
-          const currentRenderableSignals = currentCandidate
-            ? scoreRenderableHookCandidateSignals({
-                candidate: currentCandidate,
-                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-              })
-            : null
-          const openingRenderableSignals = scoreRenderableHookCandidateSignals({
-            candidate: auditedOpeningFromPool,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
-          const currentInterestingPriority = currentCandidate && currentRenderableSignals
-            ? computeInterestingHookPriorityFromSignals({
-                candidate: currentCandidate,
-                scored: currentRenderableSignals,
-                durationSeconds,
-                hasTranscript: true
-              }).priority
-            : 0
-          const openingInterestingPriority = computeInterestingHookPriorityFromSignals({
-            candidate: auditedOpeningFromPool,
-            scored: openingRenderableSignals,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          const shouldUseAuditedOpening = (
-            !currentCandidate ||
-            openingInterestingPriority >= currentInterestingPriority + 0.06 ||
-            (
-              currentCandidate.start < 4 &&
-              currentInterestingPriority < 0.58 &&
-              openingInterestingPriority >= currentInterestingPriority - 0.02
-            )
-          )
-          if (shouldUseAuditedOpening) {
-            const auditedThreshold = resolveHookScoreThreshold({
-              aggressionLevel,
-              hasTranscript: hasTranscriptSignals,
-              signalStrength: contentSignalStrength,
-              thresholdOffset: hookThresholdOffset
-            })
-            resolvedHookDecision = {
-              candidate: auditedOpeningFromPool,
-              confidence: getHookCandidateConfidence(auditedOpeningFromPool),
-              threshold: auditedThreshold,
-              usedFallback: true,
-              reason: 'Hook retry: selected audited opening candidate from first 45s candidate pool.',
-              debug: resolvedHookDecision?.debug || null
-            }
-          } else {
-            optimizationNotes.push('Hook transcript guard rejected a safe audited opening because a more interesting moment already won.')
-          }
-        } else if (auditedOpeningFromPool && preserveCurrentLateHook) {
-          optimizationNotes.push('Hook transcript guard kept a credible late opener instead of collapsing back to the chronological start.')
-        }
-      }
-      if (hasTranscriptSignals && hookSelectionModeForRender === 'auto') {
-        const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
-          candidates: hookCandidates,
-          durationSeconds,
-          minStartSeconds: 24,
-          maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
-        })
-        if (differentPartCandidate) {
-          const currentCandidate = resolvedHookDecision?.candidate || null
-          const currentSignals = currentCandidate
-            ? analyzeHookTextQualitySignals(String(currentCandidate.text || ''))
-            : null
-          const currentRenderableSignals = currentCandidate
-            ? scoreRenderableHookCandidateSignals({
-                candidate: currentCandidate,
-                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-              })
-            : null
-          const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
-          const differentPartRenderableSignals = scoreRenderableHookCandidateSignals({
-            candidate: differentPartCandidate,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
-          const currentInterestingPriority = currentCandidate && currentRenderableSignals
-            ? computeInterestingHookPriorityFromSignals({
-                candidate: currentCandidate,
-                scored: currentRenderableSignals,
-                durationSeconds,
-                hasTranscript: true
-              }).priority
-            : 0
-          const differentPartInterestingPriority = computeInterestingHookPriorityFromSignals({
-            candidate: differentPartCandidate,
-            scored: differentPartRenderableSignals,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          const differentPartEligible = (
-            differentPartCandidate.auditPassed ||
-            (
-              differentPartCandidate.auditScore >= Math.max(
-                HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE,
-                Number(currentCandidate?.auditScore ?? 0) + 0.03
-              ) &&
-              differentPartSignals.curiosityBlend >= 0.34 &&
-              differentPartSignals.specificity >= 0.28 &&
-              !differentPartSignals.isGenericUtterance
-            )
-          )
-          const shouldSwapToDifferentPart = (
-            !currentCandidate ||
-            !currentCandidate.auditPassed ||
-            Boolean(currentSignals?.isGenericUtterance) ||
-            Number(currentSignals?.curiosityBlend ?? 0) < 0.3 ||
-            (
-              currentCandidate.start < 18 &&
-              getHookCandidateConfidence(currentCandidate) < 0.7
-            ) ||
-            (
-              currentCandidate.start < 16 &&
-              differentPartInterestingPriority >= currentInterestingPriority + 0.04 &&
-              differentPartRenderableSignals.curiosityPressure >= Math.max(
-                0.34,
-                Number(currentRenderableSignals?.curiosityPressure ?? 0)
-              ) &&
-              differentPartRenderableSignals.visualImpact >= Math.max(
-                0.28,
-                Number(currentRenderableSignals?.visualImpact ?? 0) - 0.02
-              )
-            )
-          )
-          if (shouldSwapToDifferentPart && differentPartEligible) {
-            const differentPartThreshold = resolveHookScoreThreshold({
-              aggressionLevel,
-              hasTranscript: hasTranscriptSignals,
-              signalStrength: contentSignalStrength,
-              thresholdOffset: hookThresholdOffset
-            })
-            resolvedHookDecision = {
-              candidate: differentPartCandidate,
-              confidence: getHookCandidateConfidence(differentPartCandidate),
-              threshold: differentPartThreshold,
-              usedFallback: true,
-              reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.',
-              debug: resolvedHookDecision?.debug || null
-            }
-          }
-        }
-      }
-      if (
-        hasTranscriptSignals &&
-        resolvedHookDecision?.candidate &&
-        hookSelectionModeForRender === 'auto'
-      ) {
-        const rescuedHookCandidate = pickTranscriptHookQualityRescueCandidate({
-          current: resolvedHookDecision.candidate,
-          candidates: hookCandidates,
-          transcriptCues: processTranscriptCues,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-          durationSeconds,
-          segments: storySegments
-        })
-        if (rescuedHookCandidate) {
-          const rescueThreshold = resolveHookScoreThreshold({
-            aggressionLevel,
-            hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength,
-            thresholdOffset: hookThresholdOffset
-          })
-          resolvedHookDecision = {
-            candidate: rescuedHookCandidate,
-            confidence: getHookCandidateConfidence(rescuedHookCandidate),
-            threshold: rescueThreshold,
-            usedFallback: true,
-            reason: rescuedHookCandidate.reason,
-            debug: resolvedHookDecision?.debug || null
-          }
-        }
-      }
-      if (!resolvedHookDecision) {
-        const fallbackThreshold = resolveHookScoreThreshold({
-          aggressionLevel,
-          hasTranscript: hasTranscriptSignals,
-          signalStrength: contentSignalStrength,
-          thresholdOffset: hookThresholdOffset
-        })
-        const fallbackRelaxedThreshold = clamp(
-          fallbackThreshold - (hasTranscriptSignals ? 0.08 : 0.16) - (contentSignalStrength < 0.5 ? 0.04 : 0),
-          0.4,
-          fallbackThreshold
-        )
-        const fallbackRelaxedInstantHoldFloor = clamp(
-          HOOK_STANDARD_INSTANT_HOLD_MIN - (hasTranscriptSignals ? 0.08 : 0.14) - (contentSignalStrength < 0.5 ? 0.05 : 0),
-          0.34,
-          HOOK_STANDARD_INSTANT_HOLD_MIN
-        )
-        const fallbackRelaxedTeaserFloor = clamp(
-          HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (contentSignalStrength < 0.5 ? 0.04 : 0),
-          0.26,
-          HOOK_STANDARD_TEASER_TENSION_MIN
-        )
-        const fallbackRelaxedCuriosityFloor = clamp(
-          HOOK_STANDARD_CURIOSITY_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (contentSignalStrength < 0.5 ? 0.04 : 0),
-          0.26,
-          HOOK_STANDARD_CURIOSITY_MIN
-        )
-        const transcriptCuriosityFallback = hasTranscriptSignals
-          ? buildCuriosityFallbackHookCandidateFromTranscript({
-            transcriptCues: processTranscriptCues,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-            durationSeconds,
-            segments: storySegments
-          })
-          : null
-        const transcriptAuditedOpeningFallback = hasTranscriptSignals
-          ? buildAuditedOpeningHookCandidateFromTranscript({
-            transcriptCues: processTranscriptCues,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-            durationSeconds,
-            segments: storySegments,
-            searchWindowSeconds: 90,
-            targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
-          })
-          : null
-        const transcriptSyntheticFallback = hasTranscriptSignals
-          ? buildSyntheticHookCandidate({
-            durationSeconds,
-            segments: storySegments,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-            transcriptCues: processTranscriptCues
-          })
-          : null
-        const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
-          segments: storySegments,
-          windows: editPlan?.engagementWindows ?? [],
-          silences: editPlan?.silences ?? [],
-          durationSeconds
-        })
-        const defaultFallbackHook: HookCandidate = {
-          start: Number((storySegments[0]?.start ?? 0).toFixed(3)),
-          duration: Number(
-            clamp(
-              storySegments[0] ? (storySegments[0].end - storySegments[0].start) : 6,
-              HOOK_MIN,
-              HOOK_MAX
-            ).toFixed(3)
-          ),
-          score: 0.46,
-          auditScore: 0.44,
-          auditPassed: false,
-          text: '',
-          reason: 'Fallback hook generated from this video\'s strongest high-energy moment with best available first-3-second hold due weak candidate pool (no fixed timestamp).',
-          synthetic: true
-        }
-        const fallbackPool = [
-          transcriptAuditedOpeningFallback,
-          transcriptCuriosityFallback,
-          transcriptSyntheticFallback,
-          storyFallbackHook,
-          ...hookCandidates,
-          defaultFallbackHook
-        ].filter((candidate): candidate is HookCandidate => Boolean(candidate))
-        const dedupedFallbackPool = fallbackPool.filter((candidate, index) => (
-          fallbackPool.findIndex((entry) => (
-            Math.abs(entry.start - candidate.start) < 0.01 &&
-            Math.abs(entry.duration - candidate.duration) < 0.01
-          )) === index
-        ))
-        const fallbackPoolRanked: HookSelectionRankedEntry[] = dedupedFallbackPool
-          .map((candidate) => {
-            const scored = scoreRenderableHookCandidateSignals({
-              candidate,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            return {
-              candidate,
-              confidence: scored.confidence,
-              instantHold: scored.instantHold,
-              introClarity: scored.introClarity,
-              teaserTension: scored.teaserTension,
-              curiosityPressure: scored.curiosityPressure,
-              visualNovelty: scored.visualNovelty,
-              visualImpact: scored.visualImpact,
-              valuePromise: scored.valuePromise,
-              urgency: scored.urgency,
-              contrarianTrigger: scored.contrarianTrigger,
-              overlayReadiness: scored.overlayReadiness,
-              authenticity: scored.authenticity,
-              openerQuality: scored.openerQuality,
-              selectionScore: scored.selectionScore
-            }
-          })
-          .sort((a, b) => (
-            Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
-            b.candidate.auditScore - a.candidate.auditScore ||
-            b.selectionScore - a.selectionScore ||
-            b.confidence - a.confidence ||
-            b.candidate.score - a.candidate.score ||
-            Number(Boolean(a.candidate.synthetic)) - Number(Boolean(b.candidate.synthetic)) ||
-            a.candidate.start - b.candidate.start
-          ))
-        const transcriptFallbackAuditFloor = clamp(
-          Math.max(HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE, fallbackRelaxedThreshold - 0.03),
-          0.5,
-          0.72
-        )
-        const transcriptFallbackSelectionFloor = Math.max(
-          HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE,
-          fallbackRelaxedThreshold
-        )
-        const transcriptFallbackCuriosityFloor = Math.max(
-          HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY,
-          fallbackRelaxedCuriosityFloor - 0.02
-        )
-        const transcriptFallbackTeaserFloor = Math.max(
-          HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER,
-          fallbackRelaxedTeaserFloor - 0.02
-        )
-        const transcriptFallbackSafe = (entry: HookSelectionRankedEntry) => (
-          entry.candidate.auditScore >= transcriptFallbackAuditFloor &&
-          entry.selectionScore >= transcriptFallbackSelectionFloor &&
-          entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
-          entry.teaserTension >= transcriptFallbackTeaserFloor
-        )
-        const fallbackInterestingRows = buildInterestingFallbackRankedRows({
-          ranked: fallbackPoolRanked,
-          durationSeconds,
-          hasTranscript: hasTranscriptSignals,
-          recentHooks: recentSourceHookReuseWindows
-        })
-        const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
-          ranked: fallbackPoolRanked,
-          durationSeconds,
-          hasTranscript: hasTranscriptSignals,
-          current: null,
-          minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6,
-          recentHooks: recentSourceHookReuseWindows
-        })
-        const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
-          ? fallbackInterestingRows.find((row) => (
-              transcriptFallbackSafe(row.entry) ||
-              (
-                row.entry.candidate.auditPassed &&
-                row.entry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
-                row.entry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
-                row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
-              )
-            ))?.entry || null
-          : null
-        let fallbackHook = (
-          transcriptFallbackInterestingSafeEntry?.candidate ||
-          interestingFallbackCandidate ||
-          fallbackInterestingRows[0]?.entry.candidate ||
-          defaultFallbackHook
-        )
-        let fallbackSignals = scoreRenderableHookCandidateSignals({
-          candidate: fallbackHook,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-        })
-        if (hasTranscriptSignals && fallbackHook.synthetic) {
-          const currentSyntheticEntry = fallbackPoolRanked.find((entry) => (
-            Math.abs(entry.candidate.start - fallbackHook.start) < 0.01 &&
-            Math.abs(entry.candidate.duration - fallbackHook.duration) < 0.01
-          )) || null
-          const fallbackInterestingRealCandidate = pickMostInterestingFallbackCandidateFromRanked({
-            ranked: fallbackPoolRanked.filter((entry) => !entry.candidate.synthetic),
-            durationSeconds,
-            hasTranscript: true,
-            current: fallbackHook,
-            minStartSeconds: 2.2,
-            recentHooks: recentSourceHookReuseWindows
-          })
-          const fallbackInterestingRealEntry = fallbackInterestingRealCandidate
-            ? fallbackPoolRanked.find((entry) => (
-                Math.abs(entry.candidate.start - fallbackInterestingRealCandidate.start) < 0.01 &&
-                Math.abs(entry.candidate.duration - fallbackInterestingRealCandidate.duration) < 0.01
-              )) || null
-            : null
-          if (currentSyntheticEntry && fallbackInterestingRealEntry) {
-            const syntheticPriority = computeInterestingHookPriorityFromSignals({
-              candidate: currentSyntheticEntry.candidate,
-              scored: {
-                confidence: currentSyntheticEntry.confidence,
-                instantHold: currentSyntheticEntry.instantHold,
-                introClarity: currentSyntheticEntry.introClarity,
-                teaserTension: currentSyntheticEntry.teaserTension,
-                curiosityPressure: currentSyntheticEntry.curiosityPressure,
-                visualNovelty: currentSyntheticEntry.visualNovelty,
-                visualImpact: currentSyntheticEntry.visualImpact,
-                valuePromise: currentSyntheticEntry.valuePromise,
-                urgency: currentSyntheticEntry.urgency,
-                contrarianTrigger: currentSyntheticEntry.contrarianTrigger,
-                overlayReadiness: currentSyntheticEntry.overlayReadiness,
-                authenticity: currentSyntheticEntry.authenticity,
-                openerQuality: currentSyntheticEntry.openerQuality,
-                selectionScore: currentSyntheticEntry.selectionScore
-              },
-              durationSeconds,
-              hasTranscript: true
-            }).priority
-            const realPriority = computeInterestingHookPriorityFromSignals({
-              candidate: fallbackInterestingRealEntry.candidate,
-              scored: {
-                confidence: fallbackInterestingRealEntry.confidence,
-                instantHold: fallbackInterestingRealEntry.instantHold,
-                introClarity: fallbackInterestingRealEntry.introClarity,
-                teaserTension: fallbackInterestingRealEntry.teaserTension,
-                curiosityPressure: fallbackInterestingRealEntry.curiosityPressure,
-                visualNovelty: fallbackInterestingRealEntry.visualNovelty,
-                visualImpact: fallbackInterestingRealEntry.visualImpact,
-                valuePromise: fallbackInterestingRealEntry.valuePromise,
-                urgency: fallbackInterestingRealEntry.urgency,
-                contrarianTrigger: fallbackInterestingRealEntry.contrarianTrigger,
-                overlayReadiness: fallbackInterestingRealEntry.overlayReadiness,
-                authenticity: fallbackInterestingRealEntry.authenticity,
-                openerQuality: fallbackInterestingRealEntry.openerQuality,
-                selectionScore: fallbackInterestingRealEntry.selectionScore
-              },
-              durationSeconds,
-              hasTranscript: true
-            }).priority
-            const shouldPreferRealCandidate = (
-              realPriority >= syntheticPriority - 0.02 &&
-              fallbackInterestingRealEntry.selectionScore >= currentSyntheticEntry.selectionScore - 0.03 &&
-              fallbackInterestingRealEntry.curiosityPressure >= currentSyntheticEntry.curiosityPressure - 0.03 &&
-              fallbackInterestingRealEntry.candidate.auditScore >= currentSyntheticEntry.candidate.auditScore - 0.04
-            )
-            if (shouldPreferRealCandidate) {
-              fallbackHook = {
-                ...fallbackInterestingRealEntry.candidate,
-                reason: 'Transcript fallback synthetic hook was not clearly better than the strongest real moment, so the editor kept the more interesting real opener.'
-              }
-              fallbackSignals = scoreRenderableHookCandidateSignals({
-                candidate: fallbackHook,
-                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-              })
-              optimizationNotes.push('Hook transcript fallback rejected a synthetic opener because a comparable real candidate was more interesting.')
-            }
-          }
-        }
-        const fallbackTranscriptUnsafe = hasTranscriptSignals && (
-          fallbackHook.auditScore < transcriptFallbackAuditFloor ||
-          fallbackSignals.selectionScore < transcriptFallbackSelectionFloor ||
-          fallbackSignals.curiosityPressure < transcriptFallbackCuriosityFloor ||
-          fallbackSignals.teaserTension < transcriptFallbackTeaserFloor
-        )
-        if (fallbackTranscriptUnsafe && !isCredibleLateLongFormHook(fallbackHook)) {
-          const interestingTranscriptFallback = pickMostInterestingFallbackCandidateFromRanked({
-            ranked: fallbackPoolRanked,
-            durationSeconds,
-            hasTranscript: true,
-            current: fallbackHook,
-            minStartSeconds: 2.2,
-            recentHooks: recentSourceHookReuseWindows
-          })
-          if (
-            interestingTranscriptFallback &&
-            (
-              Math.abs(interestingTranscriptFallback.start - fallbackHook.start) > 0.01 ||
-              Math.abs(interestingTranscriptFallback.duration - fallbackHook.duration) > 0.01
-            )
-          ) {
-            fallbackHook = {
-              ...interestingTranscriptFallback,
-              reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
-            }
-            fallbackSignals = scoreRenderableHookCandidateSignals({
-              candidate: fallbackHook,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            optimizationNotes.push('Hook transcript fallback prioritized the wildest interesting moment instead of a safe opening tease.')
-          } else {
-            optimizationNotes.push('Hook transcript fallback kept the strongest available interesting moment despite transcript quality-floor miss.')
-          }
-        } else if (fallbackTranscriptUnsafe) {
-          optimizationNotes.push('Hook transcript guard kept the best available late opener despite transcript quality-floor miss.')
-        }
-        const fallbackNoTranscriptUnsafe = !hasTranscriptSignals && (
-          !fallbackHook.auditPassed ||
-          fallbackHook.auditScore < HOOK_NON_VERBAL_MIN_AUDIT_SCORE ||
-          fallbackSignals.confidence < HOOK_NON_VERBAL_MIN_CONFIDENCE ||
-          fallbackSignals.selectionScore < HOOK_NON_VERBAL_MIN_SELECTION_SCORE ||
-          fallbackSignals.curiosityPressure < HOOK_STANDARD_CURIOSITY_MIN
-        )
-        if (fallbackNoTranscriptUnsafe) {
-          const nonVerbalCuriosityFallback = pickNonVerbalCuriosityCandidateFromRanked({
-            ranked: fallbackPoolRanked,
-            durationSeconds,
-            current: fallbackHook
-          })
-          if (nonVerbalCuriosityFallback) {
-            fallbackHook = nonVerbalCuriosityFallback
-            fallbackSignals = scoreRenderableHookCandidateSignals({
-              candidate: fallbackHook,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            optimizationNotes.push('Hook fallback rescue: replaced weak non-verbal opener with higher-curiosity visual/tension candidate.')
-          } else if (
-            fallbackHook.start >= HOOK_RELOCATE_MIN_START &&
-            (
-              fallbackSignals.curiosityPressure >= Math.max(0.28, HOOK_STANDARD_CURIOSITY_MIN - 0.2) ||
-              fallbackSignals.selectionScore >= Math.max(0.34, HOOK_NON_VERBAL_MIN_SELECTION_SCORE - 0.2) ||
-              fallbackSignals.visualImpact >= 0.24
-            )
-          ) {
-            optimizationNotes.push('Hook fallback guard kept the best available late non-verbal opener despite audit miss.')
-          } else {
-          const interestingNonVerbalFallback = pickMostInterestingFallbackCandidateFromRanked({
-            ranked: fallbackPoolRanked,
-            durationSeconds,
-            hasTranscript: false,
-            current: fallbackHook,
-            minStartSeconds: 1.6,
-            recentHooks: recentSourceHookReuseWindows
-          })
-            if (
-              interestingNonVerbalFallback &&
-              (
-                Math.abs(interestingNonVerbalFallback.start - fallbackHook.start) > 0.01 ||
-                Math.abs(interestingNonVerbalFallback.duration - fallbackHook.duration) > 0.01
-              )
-            ) {
-              fallbackHook = {
-                ...interestingNonVerbalFallback,
-                reason: 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.'
-              }
-              fallbackSignals = scoreRenderableHookCandidateSignals({
-                candidate: fallbackHook,
-                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-              })
-              optimizationNotes.push('Hook non-verbal fallback prioritized the craziest available moment instead of a safe beginning.')
-            } else {
-              fallbackHook = {
-                ...fallbackHook,
-                reason: 'Fallback hook quality floor not met without transcript support; keeping the strongest interesting moment found in this video.'
-              }
-            }
-          }
-        }
-        if (
-          hasTranscriptSignals &&
-          fallbackHook.synthetic &&
-          fallbackHook.start <= 2.2 &&
-          (
-            fallbackHook.auditScore < Math.max(0.62, transcriptFallbackAuditFloor - 0.02) ||
-            fallbackSignals.selectionScore < Math.max(0.6, transcriptFallbackSelectionFloor - 0.02) ||
-            fallbackSignals.curiosityPressure < Math.max(0.46, transcriptFallbackCuriosityFloor - 0.02)
-          )
-        ) {
-          const replacement = fallbackPoolRanked.find((entry) => (
-            entry.candidate.start >= 2.2 &&
-            !entry.candidate.synthetic &&
-            entry.selectionScore >= Math.max(0.58, transcriptFallbackSelectionFloor - 0.05) &&
-            entry.curiosityPressure >= Math.max(0.44, transcriptFallbackCuriosityFloor - 0.04) &&
-            entry.teaserTension >= Math.max(0.44, transcriptFallbackTeaserFloor - 0.04)
-          )) || fallbackPoolRanked.find((entry) => (
-            entry.candidate.start >= 2.2 &&
-            entry.selectionScore >= Math.max(0.6, fallbackSignals.selectionScore + 0.03)
-          ))
-          if (replacement) {
-            fallbackHook = replacement.candidate
-            fallbackSignals = scoreRenderableHookCandidateSignals({
-              candidate: fallbackHook,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            optimizationNotes.push('Hook fallback guard replaced weak synthetic opening with stronger candidate.')
-          }
-        }
-        const fallbackCandidatesForDebug = [
-          fallbackHook,
-          ...dedupedFallbackPool.filter((candidate) => (
-            Math.abs(candidate.start - fallbackHook.start) > 0.01 ||
-            Math.abs(candidate.duration - fallbackHook.duration) > 0.01
-          ))
-        ]
-        const fallbackRanked: HookSelectionRankedEntry[] = fallbackCandidatesForDebug
-          .map((candidate) => {
-            const scored = scoreRenderableHookCandidateSignals({
-              candidate,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            return {
-              candidate,
-              confidence: scored.confidence,
-              instantHold: scored.instantHold,
-              introClarity: scored.introClarity,
-              teaserTension: scored.teaserTension,
-              curiosityPressure: scored.curiosityPressure,
-              visualNovelty: scored.visualNovelty,
-              visualImpact: scored.visualImpact,
-              valuePromise: scored.valuePromise,
-              urgency: scored.urgency,
-              contrarianTrigger: scored.contrarianTrigger,
-              overlayReadiness: scored.overlayReadiness,
-              authenticity: scored.authenticity,
-              openerQuality: scored.openerQuality,
-              selectionScore: scored.selectionScore
-            }
-          })
-          .sort((a, b) => (
-            b.selectionScore - a.selectionScore ||
-            b.confidence - a.confidence ||
-            b.candidate.score - a.candidate.score ||
-            a.candidate.start - b.candidate.start
-          ))
-        const fallbackSelectedEntry = fallbackRanked.find((entry) => (
-          Math.abs(entry.candidate.start - fallbackHook.start) < 0.01 &&
-          Math.abs(entry.candidate.duration - fallbackHook.duration) < 0.01
-        )) || fallbackRanked[0]
-        const fallbackDebug = fallbackSelectedEntry
-          ? buildHookSelectionDebugPayload({
-            ranked: fallbackRanked,
-            selected: fallbackSelectedEntry,
-            threshold: fallbackThreshold,
-            relaxedThreshold: fallbackRelaxedThreshold,
-            relaxedInstantHoldFloor: fallbackRelaxedInstantHoldFloor,
-            relaxedTeaserFloor: fallbackRelaxedTeaserFloor,
-            relaxedCuriosityFloor: fallbackRelaxedCuriosityFloor,
-            relaxedTranscriptAuditFloor: hasTranscriptSignals ? transcriptFallbackAuditFloor : 0,
-            selectionMode: 'fallback',
-            hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength,
-            reason: fallbackHook.reason,
-            usedFallback: true
-          })
-          : null
-        resolvedHookDecision = {
-          candidate: fallbackHook,
-          confidence: getHookCandidateConfidence(fallbackHook),
-          threshold: fallbackThreshold,
-          usedFallback: true,
-          reason: fallbackHook.reason,
-          debug: fallbackDebug
-        }
-        optimizationNotes.push('Hook fallback applied: no strong candidate passed; selected this video\'s highest-impact timeline peak.')
-      }
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
       }
@@ -28832,238 +28477,17 @@ const processJob = async (
         optimizationNotes.push('Auto hook mode enabled: editor-selected hook used for opening.')
       }
       const autoHookSource = preferredHookCandidate || resolvedHookDecision.candidate
-      let initialHook = enforceAutoHookDurationRange({
+      const initialHook = enforceAutoHookDurationRange({
         candidate: autoHookSource,
         durationSeconds
       })
-      selectedHookSelectionSource = preferredHookCandidate
-        ? 'user_selected'
-        : resolvedHookDecision.usedFallback
-          ? 'fallback'
-          : 'auto'
-      if (
-        !preferredHookCandidate &&
-        hasTranscriptSignals &&
-        !initialHook.auditPassed
-      ) {
-        const currentHookEval = evaluateTranscriptHookQuality({
-          candidate: initialHook,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-        })
-        const forceInterestingFallbackAuthorityOnRetry = selectedHookSelectionSource === 'fallback' && (
-          shouldLockInterestingFallbackHookAcrossVariants({
-            candidate: initialHook,
-            scored: currentHookEval.scored,
-            durationSeconds,
-            hasTranscript: true,
-            selectionSource: selectedHookSelectionSource,
-            reason: resolvedHookDecision.reason
-          })
-        )
-        const preserveLateInitialHook = isCredibleLateLongFormHook(initialHook)
-        const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
-          transcriptCues: processTranscriptCues,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-          durationSeconds,
-          segments: storySegments,
-          searchWindowSeconds: 90,
-          targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
-        })
-        if (forceInterestingFallbackAuthorityOnRetry) {
-          optimizationNotes.push('Fallback authority active: preserved the interest-first fallback opener instead of re-upgrading to an early transcript-safe hook.')
-        } else if (auditedOpeningRetry && !preserveLateInitialHook) {
-          const retryHookEval = evaluateTranscriptHookQuality({
-            candidate: auditedOpeningRetry,
-            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-          })
-          const currentInterestingPriority = computeInterestingHookPriorityFromSignals({
-            candidate: initialHook,
-            scored: currentHookEval.scored,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          const retryInterestingPriority = computeInterestingHookPriorityFromSignals({
-            candidate: auditedOpeningRetry,
-            scored: retryHookEval.scored,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-          const shouldApplyRetry = (
-            (
-              auditedOpeningRetry.auditPassed &&
-              retryInterestingPriority >= currentInterestingPriority + 0.06 &&
-              retryHookEval.scored.curiosityPressure >= currentHookEval.scored.curiosityPressure
-            ) ||
-            retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.08 ||
-            (
-              auditedOpeningRetry.auditScore >= initialHook.auditScore + 0.07 &&
-              retryInterestingPriority >= currentInterestingPriority + 0.04
-            )
-          )
-          if (shouldApplyRetry) {
-            initialHook = enforceAutoHookDurationRange({
-              candidate: auditedOpeningRetry,
-              durationSeconds
-            })
-          }
-        } else if (auditedOpeningRetry && preserveLateInitialHook) {
-          optimizationNotes.push('Hook retry guard preserved the later long-form opener instead of replacing it with an early transcript-safe opening.')
-        }
-        if (
-          auditedOpeningRetry &&
-          Math.abs(initialHook.start - auditedOpeningRetry.start) < 0.01 &&
-          Math.abs(initialHook.duration - auditedOpeningRetry.duration) < 0.01
-        ) {
-          resolvedHookDecision = {
-            candidate: initialHook,
-            confidence: getHookCandidateConfidence(initialHook),
-            threshold: resolvedHookDecision.threshold,
-            usedFallback: true,
-            reason: 'Hook retry: early transcript search found an audited opener with stronger curiosity/payoff framing.',
-            debug: resolvedHookDecision.debug
-          }
-          selectedHookSelectionSource = 'fallback'
-          optimizationNotes.push('Hook retry upgraded opener using early transcript audited search.')
-        }
-      }
-      const fallbackHookAuthoritySignals = scoreRenderableHookCandidateSignals({
+      const authoritativeAutoHookLock = !preferredHookCandidate && hookSelectionModeForRender === 'auto'
+      selectedHookSelectionSource = preferredHookCandidate ? 'user_selected' : 'auto'
+      const initialHookSignals = scoreRenderableHookCandidateSignals({
         candidate: initialHook,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
       })
-      const fallbackHookAuthorityActive = selectedHookSelectionSource === 'fallback' && (
-        shouldLockInterestingFallbackHookAcrossVariants({
-          candidate: initialHook,
-          scored: fallbackHookAuthoritySignals,
-          durationSeconds,
-          hasTranscript: hasTranscriptSignals,
-          selectionSource: selectedHookSelectionSource,
-          reason: resolvedHookDecision.reason
-        })
-      )
-      const relocationCandidates = [
-        initialHook,
-        ...hookCandidates.filter((candidate) => (
-          Math.abs(candidate.start - initialHook.start) > 0.01 ||
-          Math.abs(candidate.duration - initialHook.duration) > 0.01
-        ))
-      ]
-      const longFormRelocation = selectedHookSelectionSource === 'user_selected' || fallbackHookAuthorityActive
-        ? null
-        : selectLongFormDisplacedHookCandidate({
-          primary: initialHook,
-          candidates: relocationCandidates,
-          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
-          durationSeconds
-        })
-      if (longFormRelocation) {
-        initialHook = enforceAutoHookDurationRange({
-          candidate: longFormRelocation.hook,
-          durationSeconds
-        })
-        optimizationNotes.push(longFormRelocation.reason)
-      }
-      const shouldForceLongFormHookSourceTiming =
-        !preferredHookCandidate &&
-        !fallbackHookAuthorityActive &&
-        selectedHookSelectionSource !== 'user_selected' &&
-        durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
-        selectedContentFormat !== 'tiktok_short'
-      const longFormMinSourceStart = resolveLongFormMinHookSourceStart(durationSeconds)
-      if (shouldForceLongFormHookSourceTiming && initialHook.start < longFormMinSourceStart - 0.01) {
-        const lateCandidateEntries = relocationCandidates
-          .map((candidate) => {
-            const scored = scoreRenderableHookCandidateSignals({
-              candidate,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            return {
-              candidate,
-              scored,
-              interesting: computeInterestingHookPriorityFromSignals({
-                candidate,
-                scored,
-                durationSeconds,
-                hasTranscript: String(candidate.text || '').trim().length > 0
-              })
-            }
-          })
-          .filter((entry) => entry.candidate.start >= longFormMinSourceStart)
-          .sort((a, b) => (
-            b.interesting.priority - a.interesting.priority ||
-            b.interesting.textSignals.interestingness - a.interesting.textSignals.interestingness ||
-            b.scored.selectionScore - a.scored.selectionScore ||
-            b.scored.curiosityPressure - a.scored.curiosityPressure ||
-            b.scored.teaserTension - a.scored.teaserTension ||
-            b.scored.confidence - a.scored.confidence ||
-            a.candidate.start - b.candidate.start
-          ))
-        let forcedHookCandidate = lateCandidateEntries[0]?.candidate || null
-        if (!forcedHookCandidate) {
-          const rescueWindow = (editPlan?.engagementWindows ?? engagementWindowsForAnalysis)
-            .filter((window) => (
-              window.time >= longFormMinSourceStart &&
-              window.time <= Math.max(longFormMinSourceStart + 0.5, durationSeconds - HOOK_MIN)
-            ))
-            .map((window) => ({
-              start: Number(clamp(window.time, 0, Math.max(0, durationSeconds - HOOK_MIN)).toFixed(3)),
-              score: clamp01(
-                0.52 * (window.hookScore ?? window.score) +
-                0.2 * window.emotionIntensity +
-                0.16 * (window.curiosityTrigger ?? 0) +
-                0.12 * window.sceneChangeRate
-              )
-            }))
-            .sort((a, b) => b.score - a.score || a.start - b.start)[0]
-          if (rescueWindow) {
-            const targetEnd = Number(clamp(
-              rescueWindow.start + Math.min(HOOK_MAX, AUTO_HOOK_DURATION_MAX_SECONDS),
-              rescueWindow.start + HOOK_MIN,
-              durationSeconds
-            ).toFixed(3))
-            const alignedRange = hasTranscriptSignals
-              ? alignHookToSentenceBoundaries(
-                rescueWindow.start,
-                targetEnd,
-                processTranscriptCues,
-                durationSeconds
-              )
-              : { start: rescueWindow.start, end: targetEnd }
-            const rescueAudit = runHookAudit({
-              start: alignedRange.start,
-              end: alignedRange.end,
-              transcriptCues: processTranscriptCues,
-              windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-            })
-            forcedHookCandidate = {
-              ...initialHook,
-              start: Number(alignedRange.start.toFixed(3)),
-              duration: Number((alignedRange.end - alignedRange.start).toFixed(3)),
-              score: Number(clamp01(Math.max(rescueWindow.score, initialHook.score || 0.42)).toFixed(4)),
-              auditScore: Number(clamp01(Math.max(rescueAudit.auditScore, rescueWindow.score)).toFixed(4)),
-              auditPassed: Boolean(rescueAudit.passed),
-              text: extractHookText(alignedRange.start, alignedRange.end, processTranscriptCues),
-              reason: 'Long-form source timing enforcement moved opener to a later curiosity peak.',
-              synthetic: true
-            }
-          }
-        }
-        if (forcedHookCandidate) {
-          const previousHookStart = initialHook.start
-          initialHook = enforceAutoHookDurationRange({
-            candidate: forcedHookCandidate,
-            durationSeconds
-          })
-          selectedHookSelectionSource = 'fallback'
-          optimizationNotes.push(
-            `Long-form source timing enforcement relocated opener from ${previousHookStart.toFixed(1)}s to ${initialHook.start.toFixed(1)}s.`
-          )
-        }
-      }
-      let initialHookSignals = scoreRenderableHookCandidateSignals({
-        candidate: initialHook,
-        windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
-      })
-      let resolvedHookDebug = resolvedHookDecision.debug
+      const resolvedHookDebug = resolvedHookDecision.debug
         ? {
           ...resolvedHookDecision.debug,
           selected: {
@@ -29087,15 +28511,6 @@ const processJob = async (
           generatedAt: toIsoNow()
         }
         : null
-      if (resolvedHookDebug && longFormRelocation) {
-        ;(resolvedHookDebug as any).longFormRelocation = {
-          applied: true,
-          minSourceStart: longFormRelocation.minSourceStart,
-          fromStart: longFormRelocation.fromStart,
-          toStart: longFormRelocation.toStart,
-          reason: longFormRelocation.reason
-        }
-      }
       if (resolvedHookDebug) hookDebugForAnalysis = resolvedHookDebug
       if (
         Math.abs(initialHook.duration - autoHookSource.duration) > 0.001 ||
@@ -29107,25 +28522,6 @@ const processJob = async (
             initialHook.start + initialHook.duration
           )}).`
         )
-      }
-      const stickyInterestingFallbackHookAcrossVariants = fallbackHookAuthorityActive || shouldLockInterestingFallbackHookAcrossVariants({
-        candidate: initialHook,
-        scored: initialHookSignals,
-        durationSeconds,
-        hasTranscript: hasTranscriptSignals,
-        selectionSource: selectedHookSelectionSource,
-        reason: resolvedHookDecision.reason
-      })
-      // User-selected hooks must always be stitched to the opening so the
-      // chosen intro is guaranteed to lead the final edit.
-      const fallbackHookUnsafe = selectedHookSelectionSource === 'fallback' && (
-        !initialHook.auditPassed ||
-        initialHook.auditScore < HOOK_NON_VERBAL_MIN_AUDIT_SCORE ||
-        initialHookSignals.confidence < HOOK_NON_VERBAL_MIN_CONFIDENCE ||
-        initialHookSignals.selectionScore < HOOK_NON_VERBAL_MIN_SELECTION_SCORE
-      )
-      if (fallbackHookUnsafe) {
-        optimizationNotes.push('Fallback hook missed non-verbal quality floor; hook-first export will still pin the best available opener.')
       }
       const forceLongFormHookMove =
         durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
@@ -29139,10 +28535,12 @@ const processJob = async (
             preferredHookCandidate.start + preferredHookCandidate.duration
           )}).`
         )
+      } else if (authoritativeAutoHookLock) {
+        optimizationNotes.push('Authoritative auto hook lock active: retry variants may adjust pacing and cuts, but they cannot replace the chosen opener.')
       }
       const orderedHookCandidates = [
         initialHook,
-        ...relocationCandidates.filter((candidate) => (
+        ...hookCandidates.filter((candidate) => (
           Math.abs(candidate.start - initialHook.start) > 0.01 ||
           Math.abs(candidate.duration - initialHook.duration) > 0.01
         ))
@@ -29539,17 +28937,14 @@ const processJob = async (
         ? FAST_MODE_QUALITY_GATE_RETRIES
         : MAX_QUALITY_GATE_RETRIES
       const lockPrimaryHookAcrossVariants =
+        authoritativeAutoHookLock ||
         (
           durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
           selectedContentFormat !== 'tiktok_short' &&
           (forceLongFormHookMove || options.onlyCuts)
-        ) ||
-        stickyInterestingFallbackHookAcrossVariants
+        )
       if (lockPrimaryHookAcrossVariants) {
         optimizationNotes.push('Primary hook lock active: retaining the selected opener candidate across variant retries.')
-      }
-      if (stickyInterestingFallbackHookAcrossVariants) {
-        optimizationNotes.push('Interesting fallback hook lock active: variant retries may change pacing/cuts, but not replace the forced opener with a safer default.')
       }
       const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
@@ -35665,432 +35060,24 @@ const buildEditPlanForTest = async ({
   const planSilences = Array.isArray(plan?.silences) ? plan.silences : []
   const hasTranscriptSignals = normalizedTranscriptCues.length > 0
   const signalStrength = computeContentSignalStrength(planWindows)
-  const hookDecision = candidatePool.length
-    ? selectRenderableHookCandidate({
-      candidates: candidatePool,
-      aggressionLevel: normalizedAggression,
-      hasTranscript: hasTranscriptSignals,
-      signalStrength,
-      windows: planWindows
-    })
-    : null
-  let resolvedHook = hookDecision?.candidate || null
-  if (!hasTranscriptSignals && candidatePool.length > 0) {
-    const nonVerbalRanked: HookSelectionRankedEntry[] = candidatePool
-      .map((candidate) => {
-        const scored = scoreRenderableHookCandidateSignals({
-          candidate,
-          windows: planWindows
-        })
-        return {
-          candidate,
-          confidence: scored.confidence,
-          instantHold: scored.instantHold,
-          introClarity: scored.introClarity,
-          teaserTension: scored.teaserTension,
-          curiosityPressure: scored.curiosityPressure,
-          visualNovelty: scored.visualNovelty,
-          visualImpact: scored.visualImpact,
-          valuePromise: scored.valuePromise,
-          urgency: scored.urgency,
-          contrarianTrigger: scored.contrarianTrigger,
-          overlayReadiness: scored.overlayReadiness,
-          authenticity: scored.authenticity,
-          openerQuality: scored.openerQuality,
-          selectionScore: scored.selectionScore
-        }
-      })
-      .sort((a, b) => (
-        b.selectionScore - a.selectionScore ||
-        b.curiosityPressure - a.curiosityPressure ||
-        b.teaserTension - a.teaserTension ||
-        b.visualImpact - a.visualImpact ||
-        b.confidence - a.confidence ||
-        a.candidate.start - b.candidate.start
-      ))
-    const upgradedNonVerbalHook = pickNonVerbalCuriosityCandidateFromRanked({
-      ranked: nonVerbalRanked,
-      durationSeconds,
-      current: resolvedHook
-    })
-    if (upgradedNonVerbalHook) {
-      resolvedHook = upgradedNonVerbalHook
-    }
-  }
-  if (
-    hasTranscriptSignals &&
-    (!resolvedHook || !resolvedHook.auditPassed)
-  ) {
-    const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
-      candidates: candidatePool,
-      durationSeconds,
-      maxStartSeconds: 45
-    })
-    if (auditedOpeningFromPool) {
-      const currentRenderableSignals = resolvedHook
-        ? scoreRenderableHookCandidateSignals({
-            candidate: resolvedHook,
-            windows: planWindows
-          })
-        : null
-      const openingRenderableSignals = scoreRenderableHookCandidateSignals({
-        candidate: auditedOpeningFromPool,
-        windows: planWindows
-      })
-      const currentInterestingPriority = resolvedHook && currentRenderableSignals
-        ? computeInterestingHookPriorityFromSignals({
-            candidate: resolvedHook,
-            scored: currentRenderableSignals,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-        : 0
-      const openingInterestingPriority = computeInterestingHookPriorityFromSignals({
-        candidate: auditedOpeningFromPool,
-        scored: openingRenderableSignals,
-        durationSeconds,
-        hasTranscript: true
-      }).priority
-      const shouldUseAuditedOpening = (
-        !resolvedHook ||
-        openingInterestingPriority >= currentInterestingPriority + 0.06 ||
-        (
-          resolvedHook.start < 4 &&
-          currentInterestingPriority < 0.58 &&
-          openingInterestingPriority >= currentInterestingPriority - 0.02
-        )
-      )
-      if (shouldUseAuditedOpening) {
-        resolvedHook = auditedOpeningFromPool
-      }
-    }
-  }
-  if (hasTranscriptSignals) {
-    const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
-      candidates: candidatePool,
-      durationSeconds,
-      minStartSeconds: 24,
-      maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
-    })
-    if (differentPartCandidate) {
-      const currentSignals = resolvedHook
-        ? analyzeHookTextQualitySignals(String(resolvedHook.text || ''))
-        : null
-      const currentRenderableSignals = resolvedHook
-        ? scoreRenderableHookCandidateSignals({
-            candidate: resolvedHook,
-            windows: planWindows
-          })
-        : null
-      const differentPartSignals = analyzeHookTextQualitySignals(String(differentPartCandidate.text || ''))
-      const differentPartRenderableSignals = scoreRenderableHookCandidateSignals({
-        candidate: differentPartCandidate,
-        windows: planWindows
-      })
-      const currentInterestingPriority = resolvedHook && currentRenderableSignals
-        ? computeInterestingHookPriorityFromSignals({
-            candidate: resolvedHook,
-            scored: currentRenderableSignals,
-            durationSeconds,
-            hasTranscript: true
-          }).priority
-        : 0
-      const differentPartInterestingPriority = computeInterestingHookPriorityFromSignals({
-        candidate: differentPartCandidate,
-        scored: differentPartRenderableSignals,
-        durationSeconds,
-        hasTranscript: true
-      }).priority
-      const differentPartEligible = (
-        differentPartCandidate.auditPassed ||
-        (
-          differentPartCandidate.auditScore >= Math.max(
-            HOOK_TRANSCRIPT_RESCUE_MIN_AUDIT_SCORE,
-            Number(resolvedHook?.auditScore ?? 0) + 0.03
-          ) &&
-          differentPartSignals.curiosityBlend >= 0.34 &&
-          differentPartSignals.specificity >= 0.28 &&
-          !differentPartSignals.isGenericUtterance
-        )
-      )
-      const shouldSwapToDifferentPart = (
-        !resolvedHook ||
-        !resolvedHook.auditPassed ||
-        Boolean(currentSignals?.isGenericUtterance) ||
-        Number(currentSignals?.curiosityBlend ?? 0) < 0.3 ||
-        (
-          resolvedHook.start < 18 &&
-          getHookCandidateConfidence(resolvedHook) < 0.7
-        ) ||
-        (
-          resolvedHook.start < 16 &&
-          differentPartInterestingPriority >= currentInterestingPriority + 0.04 &&
-          differentPartRenderableSignals.curiosityPressure >= Math.max(
-            0.34,
-            Number(currentRenderableSignals?.curiosityPressure ?? 0)
-          ) &&
-          differentPartRenderableSignals.visualImpact >= Math.max(
-            0.28,
-            Number(currentRenderableSignals?.visualImpact ?? 0) - 0.02
-          )
-        )
-      )
-      if (shouldSwapToDifferentPart && differentPartEligible) {
-        resolvedHook = {
-          ...differentPartCandidate,
-          reason: 'Hook retry: selected a stronger curiosity hook from a different section of this video.'
-        } as HookCandidate
-      }
-    }
-  }
-  if (hasTranscriptSignals && resolvedHook) {
-    const rescuedHookCandidate = pickTranscriptHookQualityRescueCandidate({
-      current: resolvedHook,
-      candidates: candidatePool,
-      transcriptCues: normalizedTranscriptCues,
-      windows: planWindows,
-      durationSeconds,
-      segments: planSegments
-    })
-    if (rescuedHookCandidate) {
-      resolvedHook = rescuedHookCandidate
-    }
-  }
-  if (!resolvedHook) {
-    const fallbackThreshold = resolveHookScoreThreshold({
-      aggressionLevel: normalizedAggression,
-      hasTranscript: hasTranscriptSignals,
-      signalStrength
-    })
-    const fallbackRelaxedThreshold = clamp(
-      fallbackThreshold - (hasTranscriptSignals ? 0.08 : 0.16) - (signalStrength < 0.5 ? 0.04 : 0),
-      0.4,
-      fallbackThreshold
-    )
-    const fallbackRelaxedTeaserFloor = clamp(
-      HOOK_STANDARD_TEASER_TENSION_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
-      0.26,
-      HOOK_STANDARD_TEASER_TENSION_MIN
-    )
-    const fallbackRelaxedCuriosityFloor = clamp(
-      HOOK_STANDARD_CURIOSITY_MIN - (hasTranscriptSignals ? 0.07 : 0.12) - (signalStrength < 0.5 ? 0.04 : 0),
-      0.26,
-      HOOK_STANDARD_CURIOSITY_MIN
-    )
-    const transcriptCuriosityFallback = hasTranscriptSignals
-      ? buildCuriosityFallbackHookCandidateFromTranscript({
-        transcriptCues: normalizedTranscriptCues,
-        windows: planWindows,
-        durationSeconds,
-        segments: planSegments
-      })
-      : null
-    const transcriptAuditedOpeningFallback = hasTranscriptSignals
-      ? buildAuditedOpeningHookCandidateFromTranscript({
-        transcriptCues: normalizedTranscriptCues,
-        windows: planWindows,
-        durationSeconds,
-        segments: planSegments,
-        searchWindowSeconds: 90,
-        targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
-      })
-      : null
-    const transcriptSyntheticFallback = hasTranscriptSignals
-      ? buildSyntheticHookCandidate({
-        durationSeconds,
-        segments: planSegments,
-        windows: planWindows,
-        transcriptCues: normalizedTranscriptCues
-      })
-      : null
-    const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
-      segments: planSegments,
-      windows: planWindows,
-      silences: planSilences,
-      durationSeconds,
-    })
-    const fallbackPool = [
-      transcriptAuditedOpeningFallback,
-      transcriptCuriosityFallback,
-      transcriptSyntheticFallback,
-      storyFallbackHook,
-      ...candidatePool
-    ].filter((candidate): candidate is HookCandidate => Boolean(candidate))
-    const dedupedFallbackPool = fallbackPool.filter((candidate, index) => (
-      fallbackPool.findIndex((entry) => (
-        Math.abs(entry.start - candidate.start) < 0.01 &&
-        Math.abs(entry.duration - candidate.duration) < 0.01
-      )) === index
-    ))
-    const fallbackRanked: HookSelectionRankedEntry[] = dedupedFallbackPool
-      .map((candidate) => {
-        const scored = scoreRenderableHookCandidateSignals({
-          candidate,
-          windows: planWindows
-        })
-        return {
-          candidate,
-          confidence: scored.confidence,
-          instantHold: scored.instantHold,
-          introClarity: scored.introClarity,
-          teaserTension: scored.teaserTension,
-          curiosityPressure: scored.curiosityPressure,
-          visualNovelty: scored.visualNovelty,
-          visualImpact: scored.visualImpact,
-          valuePromise: scored.valuePromise,
-          urgency: scored.urgency,
-          contrarianTrigger: scored.contrarianTrigger,
-          overlayReadiness: scored.overlayReadiness,
-          authenticity: scored.authenticity,
-          openerQuality: scored.openerQuality,
-          selectionScore: scored.selectionScore
-        }
-      })
-      .sort((a, b) => (
-        Number(Boolean(b.candidate.auditPassed)) - Number(Boolean(a.candidate.auditPassed)) ||
-        b.candidate.auditScore - a.candidate.auditScore ||
-        b.selectionScore - a.selectionScore ||
-        b.confidence - a.confidence ||
-        b.candidate.score - a.candidate.score ||
-        Number(Boolean(a.candidate.synthetic)) - Number(Boolean(b.candidate.synthetic)) ||
-        a.candidate.start - b.candidate.start
-      ))
-    const transcriptFallbackAuditFloor = clamp(
-      Math.max(HOOK_FALLBACK_TRANSCRIPT_MIN_AUDIT_SCORE, fallbackRelaxedThreshold - 0.03),
-      0.5,
-      0.72
-    )
-    const transcriptFallbackSelectionFloor = Math.max(
-      HOOK_FALLBACK_TRANSCRIPT_MIN_SELECTION_SCORE,
-      fallbackRelaxedThreshold
-    )
-    const transcriptFallbackCuriosityFloor = Math.max(
-      HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY,
-      fallbackRelaxedCuriosityFloor - 0.02
-    )
-    const transcriptFallbackTeaserFloor = Math.max(
-      HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER,
-      fallbackRelaxedTeaserFloor - 0.02
-    )
-    const transcriptFallbackSafe = (entry: HookSelectionRankedEntry) => (
-      entry.candidate.auditScore >= transcriptFallbackAuditFloor &&
-      entry.selectionScore >= transcriptFallbackSelectionFloor &&
-      entry.curiosityPressure >= transcriptFallbackCuriosityFloor &&
-      entry.teaserTension >= transcriptFallbackTeaserFloor
-    )
-    const fallbackInterestingRows = buildInterestingFallbackRankedRows({
-      ranked: fallbackRanked,
-      durationSeconds,
-      hasTranscript: hasTranscriptSignals,
-      recentHooks: null
-    })
-    const interestingFallbackCandidate = pickMostInterestingFallbackCandidateFromRanked({
-      ranked: fallbackRanked,
-      durationSeconds,
-      hasTranscript: hasTranscriptSignals,
-      current: null,
-      minStartSeconds: hasTranscriptSignals ? 2.2 : 1.6
-    })
-    const transcriptFallbackInterestingSafeEntry = hasTranscriptSignals
-      ? fallbackInterestingRows.find((row) => (
-          transcriptFallbackSafe(row.entry) ||
-          (
-            row.entry.candidate.auditPassed &&
-            row.entry.selectionScore >= transcriptFallbackSelectionFloor - 0.03 &&
-            row.entry.curiosityPressure >= transcriptFallbackCuriosityFloor - 0.03 &&
-              row.entry.teaserTension >= transcriptFallbackTeaserFloor - 0.03
-          )
-        ))?.entry || null
-      : null
-    if (hasTranscriptSignals) {
-      resolvedHook = transcriptFallbackInterestingSafeEntry?.candidate || interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || null
-      if (resolvedHook) {
-        resolvedHook = {
-          ...resolvedHook,
-          reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
-        } as HookCandidate
-      }
-    } else {
-      const nonVerbalFallback = pickNonVerbalCuriosityCandidateFromRanked({
-        ranked: fallbackRanked,
-        durationSeconds,
-        current: fallbackRanked[0]?.candidate || null
-      })
-      resolvedHook = interestingFallbackCandidate || fallbackInterestingRows[0]?.entry.candidate || nonVerbalFallback || storyFallbackHook || null
-      if (resolvedHook && !nonVerbalFallback && interestingFallbackCandidate) {
-        resolvedHook = {
-          ...resolvedHook,
-          reason: 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.'
-        } as HookCandidate
-      }
-    }
-  }
-  if (resolvedHook && !resolvedHook.auditPassed && hasTranscriptSignals) {
-    const resolvedHookEval = evaluateTranscriptHookQuality({
-      candidate: resolvedHook,
-      windows: planWindows
-    })
-    const forceInterestingFallbackAuthority = shouldLockInterestingFallbackHookAcrossVariants({
-      candidate: resolvedHook,
-      scored: resolvedHookEval.scored,
-      durationSeconds,
-      hasTranscript: true,
-      selectionSource: 'fallback',
-      reason: resolvedHook.reason
-    })
-    const auditedOpeningRetry = buildAuditedOpeningHookCandidateFromTranscript({
-      transcriptCues: normalizedTranscriptCues,
-      windows: planWindows,
-      durationSeconds,
-      segments: planSegments,
-      searchWindowSeconds: 90,
-      targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
-    })
-    if (forceInterestingFallbackAuthority) {
-      // Keep buildEditPlanForTest aligned with the real production hook authority.
-    } else if (auditedOpeningRetry) {
-      const currentHookEval = resolvedHookEval
-      const retryHookEval = evaluateTranscriptHookQuality({
-        candidate: auditedOpeningRetry,
-        windows: planWindows
-      })
-      const currentInterestingPriority = computeInterestingHookPriorityFromSignals({
-        candidate: resolvedHook,
-        scored: currentHookEval.scored,
-        durationSeconds,
-        hasTranscript: true
-      }).priority
-      const retryInterestingPriority = computeInterestingHookPriorityFromSignals({
-        candidate: auditedOpeningRetry,
-        scored: retryHookEval.scored,
-        durationSeconds,
-        hasTranscript: true
-      }).priority
-      const shouldApplyRetry = (
-        (
-          auditedOpeningRetry.auditPassed &&
-          retryInterestingPriority >= currentInterestingPriority + 0.06 &&
-          retryHookEval.scored.curiosityPressure >= currentHookEval.scored.curiosityPressure
-        ) ||
-        retryHookEval.qualityScore >= currentHookEval.qualityScore + 0.08 ||
-        (
-          auditedOpeningRetry.auditScore >= resolvedHook.auditScore + 0.07 &&
-          retryInterestingPriority >= currentInterestingPriority + 0.04
-        )
-      )
-      if (shouldApplyRetry) {
-        resolvedHook = auditedOpeningRetry
-      }
-    }
-  }
-  if (!resolvedHook) {
-    resolvedHook = buildFallbackHookCandidateFromStorySegments({
-      segments: planSegments,
-      windows: planWindows,
-      silences: planSilences,
-      durationSeconds
-    })
-  }
+  const hookDecision = selectAuthoritativeAutoHookDecision({
+    candidates: candidatePool,
+    aggressionLevel: normalizedAggression,
+    hasTranscript: hasTranscriptSignals,
+    signalStrength,
+    windows: planWindows,
+    transcriptCues: normalizedTranscriptCues,
+    segments: planSegments,
+    silences: planSilences,
+    durationSeconds,
+    recentHooks: null
+  })
+  const resolvedHook = hookDecision?.candidate || buildFallbackHookCandidateFromStorySegments({
+    segments: planSegments,
+    windows: planWindows,
+    silences: planSilences,
+    durationSeconds
+  })
   if (resolvedHook) {
     const enforcedHook = enforceAutoHookDurationRange({
       candidate: resolvedHook,
