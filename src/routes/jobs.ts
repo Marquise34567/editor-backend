@@ -27180,6 +27180,15 @@ const processJob = async (
               windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
             })
             optimizationNotes.push('Hook fallback rescue: replaced weak non-verbal opener with higher-curiosity visual/tension candidate.')
+          } else if (
+            fallbackHook.start >= HOOK_RELOCATE_MIN_START &&
+            (
+              fallbackSignals.curiosityPressure >= Math.max(0.28, HOOK_STANDARD_CURIOSITY_MIN - 0.2) ||
+              fallbackSignals.selectionScore >= Math.max(0.34, HOOK_NON_VERBAL_MIN_SELECTION_SCORE - 0.2) ||
+              fallbackSignals.visualImpact >= 0.24
+            )
+          ) {
+            optimizationNotes.push('Hook fallback guard kept the best available late non-verbal opener despite audit miss.')
           } else {
             const openingSegment = storySegments[0]
             const openingStart = Number((openingSegment?.start ?? 0).toFixed(3))
@@ -27482,14 +27491,12 @@ const processJob = async (
         initialHookSignals.selectionScore < HOOK_NON_VERBAL_MIN_SELECTION_SCORE
       )
       if (fallbackHookUnsafe) {
-        optimizationNotes.push('Fallback hook failed non-verbal quality floor; preserving chronological opener instead of forced relocation.')
+        optimizationNotes.push('Fallback hook missed non-verbal quality floor; hook-first export will still pin the best available opener.')
       }
       const forceLongFormHookMove =
         durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
-        selectedHookSelectionSource !== 'user_selected' &&
-        !fallbackHookUnsafe
+        selectedHookSelectionSource !== 'user_selected'
       const shouldMoveHookForRender =
-        !fallbackHookUnsafe &&
         (options.autoHookMove || selectedHookSelectionSource === 'user_selected' || forceLongFormHookMove)
       if (preferredHookCandidate) {
         optimizationNotes.push(
