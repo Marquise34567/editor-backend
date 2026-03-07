@@ -12,10 +12,10 @@ import {
   isSubtitlePresetAllowed
 } from '../lib/planFeatures'
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
-import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
 
 const router = express.Router()
+const CAPTIONS_PIPELINE_ENABLED = false
 
 const DEFAULT_SETTINGS = {
   userId: null,
@@ -47,13 +47,12 @@ const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message:
 }
 
 const getCaptionCapabilities = () => {
-  const captionEngine = getCaptionEngineStatus()
   return {
     captions: {
-      available: captionEngine.available,
-      provider: captionEngine.provider,
-      mode: captionEngine.mode,
-      reason: captionEngine.reason
+      available: false,
+      provider: null,
+      mode: 'disabled',
+      reason: CAPTIONS_PIPELINE_ENABLED ? null : 'Captions are disabled in the editor pipeline.'
     }
   }
 }
@@ -120,7 +119,7 @@ router.get('/', async (req: any, res) => {
       userId,
       watermarkEnabled: features.watermark,
       exportQuality: normalizedQuality,
-      autoCaptions: subtitlesEnabled ? (settings?.autoCaptions ?? false) : false,
+      autoCaptions: false,
       autoHookMove: settings?.autoHookMove ?? true,
       removeBoring: settings?.removeBoring ?? true,
       onlyCuts: settings?.onlyCuts ?? false,
@@ -189,9 +188,7 @@ router.patch('/', async (req: any, res) => {
     const sanitized = {
       watermarkEnabled: features.watermark,
       exportQuality: clampQualityForTier(requestedQuality, effectiveTier),
-      autoCaptions: subtitlesEnabled
-        ? (payload.autoCaptions ?? existing?.autoCaptions ?? false)
-        : false,
+      autoCaptions: false,
       autoHookMove: payload.autoHookMove ?? existing?.autoHookMove ?? true,
       removeBoring: payload.removeBoring ?? existing?.removeBoring ?? true,
       onlyCuts: payload.onlyCuts ?? existing?.onlyCuts ?? false,

@@ -2122,6 +2122,7 @@ const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
   return Number.isFinite(envValue) && envValue > 2 ? Math.round(envValue) : 24
 })()
 const HOOK_CALIBRATION_MIN_SAMPLES = 3
+const CAPTIONS_PIPELINE_ENABLED = false
 const OUTCOME_AUTOMATION_LOOKBACK_JOBS = (() => {
   const envValue = Number(process.env.OUTCOME_AUTOMATION_LOOKBACK_JOBS || 90)
   return Number.isFinite(envValue) && envValue > 8 ? Math.round(envValue) : 90
@@ -24752,7 +24753,9 @@ const getEditOptionsForUser = async (
   const normalizedSubtitle = normalizeSubtitlePreset(rawSubtitle) ?? DEFAULT_SUBTITLE_PRESET
   const subtitleStyle =
     subtitlesEnabled && isSubtitlePresetAllowed(normalizedSubtitle, effectiveTier) ? rawSubtitle : DEFAULT_SUBTITLE_PRESET
-  const autoCaptionsOverride = typeof overrides?.autoCaptions === 'boolean' ? overrides.autoCaptions : null
+  const autoCaptionsOverride = CAPTIONS_PIPELINE_ENABLED && typeof overrides?.autoCaptions === 'boolean'
+    ? overrides.autoCaptions
+    : null
   const smartZoomOverride = typeof overrides?.smartZoom === 'boolean' ? overrides.smartZoom : null
   const transitionsOverride = typeof overrides?.transitions === 'boolean' ? overrides.transitions : null
   const soundFxOverride = typeof overrides?.soundFx === 'boolean' ? overrides.soundFx : null
@@ -24933,7 +24936,7 @@ const getEditOptionsForUser = async (
           : false
       ),
     aggressiveMode,
-    autoCaptions: subtitlesEnabled
+    autoCaptions: CAPTIONS_PIPELINE_ENABLED && subtitlesEnabled
       ? (autoCaptionsOverride ?? settings?.autoCaptions ?? DEFAULT_EDIT_OPTIONS.autoCaptions)
       : false,
     musicDuck: onlyCuts ? false : (settings?.musicDuck ?? DEFAULT_EDIT_OPTIONS.musicDuck),
@@ -25694,6 +25697,7 @@ const processJob = async (
   const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
   const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
   const renderSubtitlesEnabled = Boolean(
+    CAPTIONS_PIPELINE_ENABLED &&
     renderConfig.mode === 'vertical' &&
     options.autoCaptions &&
     !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
@@ -25912,7 +25916,7 @@ const processJob = async (
         : []
       const verticalAudioFilters = [...verticalBaseAudioFilters, ...verticalVoiceFilters]
       const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
-      const shouldApplyVerticalCaptionOverlays = Boolean(verticalCaptionConfig.enabled)
+      const shouldApplyVerticalCaptionOverlays = CAPTIONS_PIPELINE_ENABLED && Boolean(verticalCaptionConfig.enabled)
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
         preset: verticalCaptionConfig.preset,
         animationEnabled: verticalCaptionConfig.animationEnabled,
