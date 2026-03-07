@@ -54,6 +54,19 @@ const runPipInstall = (extraArgs) => {
   return result.status === 0
 }
 
+const isCaptionRuntimeAlreadyInstalled = () => {
+  const probe = spawnSync(
+    pythonCommand,
+    ['-c', 'import faster_whisper;print("ok")'],
+    {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      windowsHide: true
+    }
+  )
+  return !probe.error && probe.status === 0
+}
+
 const installWithFallback = (extraArgs) => {
   if (runPipInstall(extraArgs)) return true
   return runPipInstall(['--break-system-packages', ...extraArgs])
@@ -70,6 +83,11 @@ if (!packages.length) {
 }
 
 console.log(`[caption-runtime] using ${pythonCommand}`)
+
+if (packages.length === 1 && packages[0] === 'faster-whisper' && isCaptionRuntimeAlreadyInstalled()) {
+  console.log('[caption-runtime] faster-whisper already available')
+  process.exit(0)
+}
 
 if (!installWithFallback(['--upgrade', 'pip'])) {
   console.error('[caption-runtime] failed to upgrade pip')

@@ -22,6 +22,7 @@ const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
 
 run('Building backend', 'npm run build')
 run('Generating Prisma client', 'prisma generate')
+run('Installing caption runtime', 'node scripts/install-caption-runtime.js')
 
 if (!hasDatabaseUrl) {
   console.warn('[startup] DATABASE_URL is empty, skipping prisma migrate deploy')
