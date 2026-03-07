@@ -10440,6 +10440,47 @@ const selectRenderableHookCandidate = ({
       b.candidate.score - a.candidate.score ||
       a.candidate.start - b.candidate.start
     ))
+  const selectionDurationSeconds = Math.max(
+    1,
+    windows.length
+      ? Number((windows[windows.length - 1]?.time ?? 0) + 1)
+      : 0,
+    ...ranked.map((entry) => Number(entry.candidate.start + entry.candidate.duration || 0))
+  )
+  const maybeUpgradeSelectionToInterestingMoment = (selected: HookSelectionRankedEntry) => {
+    const upgradedCandidate = pickMostInterestingFallbackCandidateFromRanked({
+      ranked,
+      durationSeconds: selectionDurationSeconds,
+      hasTranscript,
+      current: selected.candidate,
+      minStartSeconds: hasTranscript ? 2.2 : 1.6
+    })
+    if (!upgradedCandidate) {
+      return {
+        selected,
+        reason: null as string | null,
+        usedFallback: false
+      }
+    }
+    const upgradedEntry = ranked.find((entry) => (
+      Math.abs(entry.candidate.start - upgradedCandidate.start) < 0.01 &&
+      Math.abs(entry.candidate.duration - upgradedCandidate.duration) < 0.01
+    )) || null
+    if (!upgradedEntry || upgradedEntry === selected) {
+      return {
+        selected,
+        reason: null as string | null,
+        usedFallback: false
+      }
+    }
+    return {
+      selected: upgradedEntry,
+      reason: hasTranscript
+        ? 'Hook interestingness upgrade: replaced a safe opener with a more interesting curiosity/drama moment from this video.'
+        : 'Hook interestingness upgrade: replaced a safe opener with a more interesting visual/chaos moment from this video.',
+      usedFallback: true
+    }
+  }
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
     hasTranscript,
@@ -10562,9 +10603,10 @@ const selectRenderableHookCandidate = ({
   ))
   const strict = strictWithInstantHold || strictWithQualityFloor
   if (strict) {
+    const strictUpgrade = maybeUpgradeSelectionToInterestingMoment(strict)
     const debug = buildHookSelectionDebugPayload({
       ranked,
-      selected: strict,
+      selected: strictUpgrade.selected,
       threshold,
       relaxedThreshold,
       relaxedInstantHoldFloor,
@@ -10574,15 +10616,15 @@ const selectRenderableHookCandidate = ({
       selectionMode: 'strict',
       hasTranscript,
       signalStrength,
-      reason: null,
-      usedFallback: false
+      reason: strictUpgrade.reason,
+      usedFallback: strictUpgrade.usedFallback
     })
     return {
-      candidate: strict.candidate,
-      confidence: strict.confidence,
+      candidate: strictUpgrade.selected.candidate,
+      confidence: strictUpgrade.selected.confidence,
       threshold,
-      usedFallback: false,
-      reason: null,
+      usedFallback: strictUpgrade.usedFallback,
+      reason: strictUpgrade.reason,
       debug
     }
   }
@@ -10603,12 +10645,13 @@ const selectRenderableHookCandidate = ({
     passesNonVerbalSafety(entry)
   ))
   if (relaxed) {
-    const fallbackReason = hasTranscript
+    const relaxedUpgrade = maybeUpgradeSelectionToInterestingMoment(relaxed)
+    const fallbackReason = relaxedUpgrade.reason || (hasTranscript
       ? 'Hook fallback selected after strict audit miss, using this video\'s strongest near-threshold moment with better first-3-second hold (no fixed timestamp).'
-      : 'Hook fallback selected from this video\'s strongest non-verbal peak with higher first-3-second hold due missing transcript context (no fixed timestamp).'
+      : 'Hook fallback selected from this video\'s strongest non-verbal peak with higher first-3-second hold due missing transcript context (no fixed timestamp).')
     const debug = buildHookSelectionDebugPayload({
       ranked,
-      selected: relaxed,
+      selected: relaxedUpgrade.selected,
       threshold,
       relaxedThreshold,
       relaxedInstantHoldFloor,
@@ -10622,8 +10665,8 @@ const selectRenderableHookCandidate = ({
       usedFallback: true
     })
     return {
-      candidate: relaxed.candidate,
-      confidence: relaxed.confidence,
+      candidate: relaxedUpgrade.selected.candidate,
+      confidence: relaxedUpgrade.selected.confidence,
       threshold,
       usedFallback: true,
       reason: fallbackReason,
@@ -27520,19 +27563,57 @@ const processJob = async (
           maxStartSeconds: 45
         })
         if (auditedOpeningFromPool && !preserveCurrentLateHook) {
-          const auditedThreshold = resolveHookScoreThreshold({
-            aggressionLevel,
-            hasTranscript: hasTranscriptSignals,
-            signalStrength: contentSignalStrength,
-            thresholdOffset: hookThresholdOffset
-          })
-          resolvedHookDecision = {
+          const currentCandidate = resolvedHookDecision?.candidate || null
+          const currentRenderableSignals = currentCandidate
+            ? scoreRenderableHookCandidateSignals({
+                candidate: currentCandidate,
+                windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+              })
+            : null
+          const openingRenderableSignals = scoreRenderableHookCandidateSignals({
             candidate: auditedOpeningFromPool,
-            confidence: getHookCandidateConfidence(auditedOpeningFromPool),
-            threshold: auditedThreshold,
-            usedFallback: true,
-            reason: 'Hook retry: selected audited opening candidate from first 45s candidate pool.',
-            debug: resolvedHookDecision?.debug || null
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          const currentInterestingPriority = currentCandidate && currentRenderableSignals
+            ? computeInterestingHookPriorityFromSignals({
+                candidate: currentCandidate,
+                scored: currentRenderableSignals,
+                durationSeconds,
+                hasTranscript: true
+              }).priority
+            : 0
+          const openingInterestingPriority = computeInterestingHookPriorityFromSignals({
+            candidate: auditedOpeningFromPool,
+            scored: openingRenderableSignals,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+          const shouldUseAuditedOpening = (
+            !currentCandidate ||
+            openingInterestingPriority >= currentInterestingPriority + 0.06 ||
+            (
+              currentCandidate.start < 4 &&
+              currentInterestingPriority < 0.58 &&
+              openingInterestingPriority >= currentInterestingPriority - 0.02
+            )
+          )
+          if (shouldUseAuditedOpening) {
+            const auditedThreshold = resolveHookScoreThreshold({
+              aggressionLevel,
+              hasTranscript: hasTranscriptSignals,
+              signalStrength: contentSignalStrength,
+              thresholdOffset: hookThresholdOffset
+            })
+            resolvedHookDecision = {
+              candidate: auditedOpeningFromPool,
+              confidence: getHookCandidateConfidence(auditedOpeningFromPool),
+              threshold: auditedThreshold,
+              usedFallback: true,
+              reason: 'Hook retry: selected audited opening candidate from first 45s candidate pool.',
+              debug: resolvedHookDecision?.debug || null
+            }
+          } else {
+            optimizationNotes.push('Hook transcript guard rejected a safe audited opening because a more interesting moment already won.')
           }
         } else if (auditedOpeningFromPool && preserveCurrentLateHook) {
           optimizationNotes.push('Hook transcript guard kept a credible late opener instead of collapsing back to the chronological start.')
@@ -34967,7 +35048,42 @@ const buildEditPlanForTest = async ({
       maxStartSeconds: 45
     })
     if (auditedOpeningFromPool) {
-      resolvedHook = auditedOpeningFromPool
+      const currentRenderableSignals = resolvedHook
+        ? scoreRenderableHookCandidateSignals({
+            candidate: resolvedHook,
+            windows: planWindows
+          })
+        : null
+      const openingRenderableSignals = scoreRenderableHookCandidateSignals({
+        candidate: auditedOpeningFromPool,
+        windows: planWindows
+      })
+      const currentInterestingPriority = resolvedHook && currentRenderableSignals
+        ? computeInterestingHookPriorityFromSignals({
+            candidate: resolvedHook,
+            scored: currentRenderableSignals,
+            durationSeconds,
+            hasTranscript: true
+          }).priority
+        : 0
+      const openingInterestingPriority = computeInterestingHookPriorityFromSignals({
+        candidate: auditedOpeningFromPool,
+        scored: openingRenderableSignals,
+        durationSeconds,
+        hasTranscript: true
+      }).priority
+      const shouldUseAuditedOpening = (
+        !resolvedHook ||
+        openingInterestingPriority >= currentInterestingPriority + 0.06 ||
+        (
+          resolvedHook.start < 4 &&
+          currentInterestingPriority < 0.58 &&
+          openingInterestingPriority >= currentInterestingPriority - 0.02
+        )
+      )
+      if (shouldUseAuditedOpening) {
+        resolvedHook = auditedOpeningFromPool
+      }
     }
   }
   if (hasTranscriptSignals) {
