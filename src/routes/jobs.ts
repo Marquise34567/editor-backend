@@ -2035,6 +2035,39 @@ const RENDER_FAST_HORIZONTAL_SKIP_WATERMARK = /^(1|true|yes)$/i.test(
 const RENDER_FAST_HORIZONTAL_FORCE_CONCAT = !/^(0|false|no)$/i.test(
   String(process.env.RENDER_FAST_HORIZONTAL_FORCE_CONCAT || 'true').trim()
 )
+const HEAVY_LONG_FORM_TRANSCRIPT_THRESHOLD_SECONDS = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_TRANSCRIPT_THRESHOLD_SECONDS || 8 * 60)
+  if (!Number.isFinite(envValue) || envValue < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return 8 * 60
+  return Math.round(envValue)
+})()
+const HEAVY_LONG_FORM_TRANSCRIPT_INPUT_BYTES = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_TRANSCRIPT_INPUT_BYTES || 220 * 1024 * 1024)
+  if (!Number.isFinite(envValue) || envValue < 64 * 1024 * 1024) return 220 * 1024 * 1024
+  return Math.round(envValue)
+})()
+const HEAVY_LONG_FORM_TRANSCRIPT_LIGHT_BEAM_SIZE = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_TRANSCRIPT_LIGHT_BEAM_SIZE || 1)
+  if (!Number.isFinite(envValue)) return 1
+  return Math.max(1, Math.min(3, Math.round(envValue)))
+})()
+const HEAVY_LONG_FORM_TRANSCRIPT_DISABLE_WORD_TIMESTAMPS = !/^(0|false|no)$/i.test(
+  String(process.env.HEAVY_LONG_FORM_TRANSCRIPT_DISABLE_WORD_TIMESTAMPS || 'true').trim()
+)
+const HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_DURATION_SECONDS = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_DURATION_SECONDS || 8 * 60)
+  if (!Number.isFinite(envValue) || envValue < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return 8 * 60
+  return Math.round(envValue)
+})()
+const HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_INPUT_BYTES = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_INPUT_BYTES || 220 * 1024 * 1024)
+  if (!Number.isFinite(envValue) || envValue < 64 * 1024 * 1024) return 220 * 1024 * 1024
+  return Math.round(envValue)
+})()
+const HEAVY_LONG_FORM_SEGMENT_FALLBACK_SEEK_PAD_SECONDS = (() => {
+  const envValue = Number(process.env.HEAVY_LONG_FORM_SEGMENT_FALLBACK_SEEK_PAD_SECONDS || 0.9)
+  if (!Number.isFinite(envValue)) return 0.9
+  return Number(Math.min(SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS, Math.max(0.2, envValue)).toFixed(2))
+})()
 const SCENE_THRESHOLD = 0.45
 const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
@@ -21278,6 +21311,81 @@ const splitWhisperArgs = (raw?: string | null) => {
     .filter(Boolean)
 }
 
+type SubtitleGenerationPurpose = 'analysis' | 'captions' | 'hook_rescue' | 'test'
+
+type SubtitleGenerationProfile = {
+  durationSeconds?: number | null
+  renderMode?: RenderMode | null
+  fastMode?: boolean | null
+  purpose?: SubtitleGenerationPurpose | null
+  inputBytes?: number | null
+}
+
+const shouldUseLightweightTranscriptProfile = (profile?: SubtitleGenerationProfile | null) => {
+  if (!profile) return false
+  if (profile.renderMode !== 'horizontal') return false
+  if (profile.purpose === 'captions') return false
+  const durationSeconds = Number(profile.durationSeconds || 0)
+  const inputBytes = Number(profile.inputBytes || 0)
+  const longDuration = Number.isFinite(durationSeconds) && durationSeconds >= HEAVY_LONG_FORM_TRANSCRIPT_THRESHOLD_SECONDS
+  const heavyInput = Number.isFinite(inputBytes) && inputBytes >= HEAVY_LONG_FORM_TRANSCRIPT_INPUT_BYTES
+  return longDuration || (Boolean(profile.fastMode) && (durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS || heavyInput))
+}
+
+const resolveTranscriptWordTimestampsEnabled = (profile?: SubtitleGenerationProfile | null) => {
+  if (!HEAVY_LONG_FORM_TRANSCRIPT_DISABLE_WORD_TIMESTAMPS) return true
+  return !shouldUseLightweightTranscriptProfile(profile)
+}
+
+const resolveFasterWhisperBeamSize = (profile?: SubtitleGenerationProfile | null) => {
+  const configuredBeamSize = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 2)
+  const defaultBeamSize = Number.isFinite(configuredBeamSize)
+    ? Math.max(1, Math.min(5, Math.round(configuredBeamSize)))
+    : 2
+  if (!shouldUseLightweightTranscriptProfile(profile)) return defaultBeamSize
+  return Math.min(defaultBeamSize, HEAVY_LONG_FORM_TRANSCRIPT_LIGHT_BEAM_SIZE)
+}
+
+const shouldPreferHeavyLongFormSegmentFallback = ({
+  renderMode,
+  durationSeconds,
+  inputBytes,
+  fastMode,
+  segmentCount
+}: {
+  renderMode: RenderMode
+  durationSeconds: number
+  inputBytes: number
+  fastMode: boolean
+  segmentCount: number
+}) => {
+  if (renderMode !== 'horizontal') return false
+  if (segmentCount < SEGMENT_FILE_FALLBACK_MIN_SEGMENTS) return false
+  const heavyDuration = durationSeconds >= HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_DURATION_SECONDS
+  const heavyInput = inputBytes >= HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_INPUT_BYTES
+  const denseCutPlan = segmentCount > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
+  return (heavyDuration || heavyInput) && (fastMode || denseCutPlan)
+}
+
+const resolveSegmentFileFallbackSeekPadSeconds = ({
+  renderMode,
+  durationSeconds,
+  inputBytes,
+  fastMode
+}: {
+  renderMode: RenderMode
+  durationSeconds: number
+  inputBytes: number
+  fastMode: boolean
+}) => {
+  const heavyDuration = durationSeconds >= HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_DURATION_SECONDS
+  const heavyInput = inputBytes >= HEAVY_LONG_FORM_SEGMENT_FALLBACK_MIN_INPUT_BYTES
+  if (renderMode !== 'horizontal' || !fastMode || (!heavyDuration && !heavyInput)) {
+    return SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS
+  }
+  return HEAVY_LONG_FORM_SEGMENT_FALLBACK_SEEK_PAD_SECONDS
+}
+
 const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => {
   const baseName = path.basename(inputPath, path.extname(inputPath))
   const exact = path.join(workingDir, `${baseName}.srt`)
@@ -21420,16 +21528,34 @@ const parseFasterWhisperResult = (stdout: string): { srtPath?: string | null } =
   }
 }
 
-const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: string) => {
+const generateSubtitlesViaFasterWhisper = async (
+  inputPath: string,
+  workingDir: string,
+  profile?: SubtitleGenerationProfile | null
+) => {
   if (!fs.existsSync(FASTER_WHISPER_SCRIPT_PATH)) return null
-  const model = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'base').trim() || 'base'
+  const defaultModel = String(process.env.FASTER_WHISPER_MODEL || process.env.WHISPER_MODEL || 'base').trim() || 'base'
+  const lightweightProfile = shouldUseLightweightTranscriptProfile(profile)
+  const lightweightModelOverride = String(process.env.FASTER_WHISPER_LONG_FORM_MODEL || '').trim()
+  const model = lightweightProfile && lightweightModelOverride ? lightweightModelOverride : defaultModel
   const language = String(process.env.FASTER_WHISPER_LANGUAGE || process.env.CAPTION_LANGUAGE || process.env.WHISPER_LANGUAGE || '').trim()
   const device = String(process.env.FASTER_WHISPER_DEVICE || '').trim()
   const computeType = String(process.env.FASTER_WHISPER_COMPUTE_TYPE || 'int8').trim() || 'int8'
-  const beamSizeRaw = Number(process.env.FASTER_WHISPER_BEAM_SIZE || 2)
-  const beamSize = Number.isFinite(beamSizeRaw) ? Math.max(1, Math.min(5, Math.round(beamSizeRaw))) : 2
+  const beamSize = resolveFasterWhisperBeamSize(profile)
+  const wordTimestampsEnabled = resolveTranscriptWordTimestampsEnabled(profile)
   const extraArgs = splitWhisperArgs(process.env.FASTER_WHISPER_ARGS)
   const baseName = path.basename(inputPath, path.extname(inputPath))
+
+  if (lightweightProfile) {
+    console.log('[caption-runtime] using lightweight long-form transcript profile', {
+      purpose: profile?.purpose || 'analysis',
+      durationSeconds: Number(profile?.durationSeconds || 0),
+      inputBytes: Number(profile?.inputBytes || 0),
+      beamSize,
+      wordTimestamps: wordTimestampsEnabled,
+      model
+    })
+  }
 
   const attempts = buildFasterWhisperAttempts().slice(0, FASTER_WHISPER_MAX_ATTEMPTS)
   for (const attempt of attempts) {
@@ -21446,6 +21572,7 @@ const generateSubtitlesViaFasterWhisper = async (inputPath: string, workingDir: 
       String(beamSize),
       '--vad-filter'
     ]
+    if (!wordTimestampsEnabled) args.push('--no-word-timestamps')
     if (language) args.push('--language', language)
     if (device) args.push('--device', device)
     if (computeType) args.push('--compute-type', computeType)
@@ -21649,7 +21776,11 @@ const runWhisperTranscribe = async ({
   })
 }
 
-const generateSubtitles = async (inputPath: string, workingDir: string) => {
+const generateSubtitles = async (
+  inputPath: string,
+  workingDir: string,
+  profile?: SubtitleGenerationProfile | null
+) => {
   const captionEngine = getCaptionEngineStatus()
   if (!captionEngine.available && !ALLOW_OPENAI_TRANSCRIPTION_FALLBACK) {
     const embeddedOutput = await extractEmbeddedSubtitlesAsSrt(inputPath, workingDir)
@@ -21657,14 +21788,23 @@ const generateSubtitles = async (inputPath: string, workingDir: string) => {
     console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
     return null
   }
-  const fasterWhisperOutput = await generateSubtitlesViaFasterWhisper(inputPath, workingDir)
+  const fasterWhisperOutput = await generateSubtitlesViaFasterWhisper(inputPath, workingDir, profile)
   if (fasterWhisperOutput) return fasterWhisperOutput
 
   const model = process.env.WHISPER_MODEL || 'base'
+  const wordTimestampsEnabled = resolveTranscriptWordTimestampsEnabled(profile)
   const configuredArgs = splitWhisperArgs(process.env.WHISPER_ARGS)
   const baseArgs = configuredArgs.length
     ? configuredArgs
-    : ['--model', model, '--output_format', 'srt', '--output_dir', workingDir, '--word_timestamps', 'True']
+    : [
+        '--model',
+        model,
+        '--output_format',
+        'srt',
+        '--output_dir',
+        workingDir,
+        ...(wordTimestampsEnabled ? ['--word_timestamps', 'True'] : [])
+      ]
 
   const attempts: Array<{ command: string; args: string[]; label: string }> = []
   const addAttempt = (command: string | undefined, args: string[], label: string) => {
@@ -25905,7 +26045,13 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
           maxRetries: 1,
           statusUpdate: { status: 'analyzing', progress: 18 },
           run: async () => {
-            const transcriptSrt = await generateSubtitles(tmpIn, analysisWorkDir).catch(() => null)
+            const transcriptSrt = await generateSubtitles(tmpIn, analysisWorkDir, {
+              durationSeconds: duration,
+              renderMode: initialRenderConfig.mode,
+              fastMode: options.fastMode,
+              purpose: 'analysis',
+              inputBytes: inStats.size
+            }).catch(() => null)
             if (!transcriptSrt) return [] as TranscriptCue[]
             return parseTranscriptCues(transcriptSrt)
           },
@@ -26740,7 +26886,13 @@ const processJob = async (
         (shouldApplyVerticalCaptionOverlays && verticalCaptionConfig.autoGenerate)
       )
       if (shouldGenerateVerticalTranscript) {
-        const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir)
+        const generatedVerticalSubtitlePath = await generateSubtitles(tmpIn, workDir, {
+          durationSeconds,
+          renderMode: renderConfig.mode,
+          fastMode: options.fastMode,
+          purpose: 'captions',
+          inputBytes: inStats.size
+        })
         if (generatedVerticalSubtitlePath) {
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
         }
@@ -27415,7 +27567,13 @@ const processJob = async (
       const transcriptRescueDir = path.join(workDir, 'hook-transcript-rescue')
       try {
         fs.mkdirSync(transcriptRescueDir, { recursive: true })
-        const rescuedTranscriptSrt = await generateSubtitles(tmpIn, transcriptRescueDir)
+        const rescuedTranscriptSrt = await generateSubtitles(tmpIn, transcriptRescueDir, {
+          durationSeconds,
+          renderMode: renderConfig.mode,
+          fastMode: options.fastMode,
+          purpose: 'hook_rescue',
+          inputBytes: inStats.size
+        })
         if (rescuedTranscriptSrt) {
           const rescuedTranscriptCues = parseTranscriptCues(rescuedTranscriptSrt).slice(0, 1200)
           if (rescuedTranscriptCues.length) {
@@ -29859,7 +30017,13 @@ const processJob = async (
           }
         }
         if (!subtitlePath) {
-          subtitlePath = await generateSubtitles(tmpIn, workDir)
+          subtitlePath = await generateSubtitles(tmpIn, workDir, {
+            durationSeconds,
+            renderMode: renderConfig.mode,
+            fastMode: options.fastMode,
+            purpose: 'captions',
+            inputBytes: inStats.size
+          })
         }
         if (!subtitlePath) {
           const captionEngine = getCaptionEngineStatus()
@@ -30378,6 +30542,19 @@ const processJob = async (
       await updateJob(jobId, { status: 'rendering', progress: 80 })
 
       const hasSegments = finalSegments.length >= 1
+      const heavyLongFormSegmentFallback = shouldPreferHeavyLongFormSegmentFallback({
+        renderMode: renderConfig.mode,
+        durationSeconds,
+        inputBytes: inStats.size,
+        fastMode: renderFastHorizontalMode,
+        segmentCount: finalSegments.length
+      })
+      const segmentFileFallbackSeekPadSeconds = resolveSegmentFileFallbackSeekPadSeconds({
+        renderMode: renderConfig.mode,
+        durationSeconds,
+        inputBytes: inStats.size,
+        fastMode: renderFastHorizontalMode
+      })
       const argsBase = [
         '-y',
         '-nostdin',
@@ -30566,10 +30743,10 @@ const processJob = async (
             const seg = segments[idx]
             const speed = seg.speed && seg.speed > 0 ? seg.speed : 1
             const segmentSourceStart = Number(
-              Math.max(0, seg.start - SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS).toFixed(3)
+              Math.max(0, seg.start - segmentFileFallbackSeekPadSeconds).toFixed(3)
             )
             const segmentSourceEnd = Number(
-              Math.min(durationSeconds, seg.end + SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS).toFixed(3)
+              Math.min(durationSeconds, seg.end + segmentFileFallbackSeekPadSeconds).toFixed(3)
             )
             const segmentSourceDuration = Number(
               Math.max(0.16, segmentSourceEnd - segmentSourceStart).toFixed(3)
@@ -30795,10 +30972,15 @@ const processJob = async (
           )
           const preferSegmentFileFallback = (
             segmentFileFallbackEligible &&
-            !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_FORCE_CONCAT) &&
             (
-              RENDER_PREFER_SEGMENT_FILE_FALLBACK ||
-              finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
+              heavyLongFormSegmentFallback ||
+              (
+                !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_FORCE_CONCAT) &&
+                (
+                  RENDER_PREFER_SEGMENT_FILE_FALLBACK ||
+                  finalSegments.length > SEGMENT_FILE_FALLBACK_CONCAT_FIRST_MAX_SEGMENTS
+                )
+              )
             )
           )
           const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
@@ -30850,7 +31032,9 @@ const processJob = async (
               await runSegmentFileFallback(finalSegments)
               ran = true
               optimizationNotes.push(
-                'Render strategy: segment-file stitch selected for long/heavy source to reduce memory pressure.'
+                heavyLongFormSegmentFallback
+                  ? 'Render strategy: heavy long-form fast path used segment-file stitch to reduce memory pressure and unblock faster completion.'
+                  : 'Render strategy: segment-file stitch selected for long/heavy source to reduce memory pressure.'
               )
             } catch (segmentFirstErr) {
               lastErr = segmentFirstErr
@@ -35128,7 +35312,14 @@ const buildEditPlanForTest = async ({
   if (!normalizedTranscriptCues.length && shouldAutoTranscribe) {
     const transcriptWorkDir = fs.mkdtempSync(path.join(os.tmpdir(), 'retention-test-transcribe-'))
     try {
-      const generatedSrt = await generateSubtitles(absolutePath, transcriptWorkDir)
+      const absoluteStats = fs.statSync(absolutePath)
+      const generatedSrt = await generateSubtitles(absolutePath, transcriptWorkDir, {
+        durationSeconds,
+        renderMode: 'horizontal',
+        fastMode: options.fastMode,
+        purpose: 'test',
+        inputBytes: absoluteStats.size
+      })
       if (generatedSrt) {
         normalizedTranscriptCues = parseTranscriptCues(generatedSrt)
       }

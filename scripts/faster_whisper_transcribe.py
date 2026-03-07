@@ -216,6 +216,11 @@ def main() -> int:
     parser.add_argument("--compute-type", default="", help="Compute type override (int8, float16, etc.).")
     parser.add_argument("--beam-size", default=5, type=int, help="Beam size for decoding.")
     parser.add_argument("--vad-filter", action="store_true", help="Enable VAD filter.")
+    parser.add_argument(
+        "--no-word-timestamps",
+        action="store_true",
+        help="Disable word-level timestamps for faster, lower-memory transcription.",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input).expanduser().resolve()
@@ -236,6 +241,7 @@ def main() -> int:
     device = _resolve_device(str(args.device or "").strip().lower())
     compute_type = _resolve_compute_type(device, str(args.compute_type or "").strip())
     beam_size = max(1, min(10, int(args.beam_size or 5)))
+    word_timestamps = not bool(args.no_word_timestamps)
 
     try:
         model = WhisperModel(args.model, device=device, compute_type=compute_type)
@@ -244,7 +250,7 @@ def main() -> int:
             language=(str(args.language).strip() or None),
             vad_filter=bool(args.vad_filter),
             beam_size=beam_size,
-            word_timestamps=True,
+            word_timestamps=word_timestamps,
         )
     except Exception as exc:
         sys.stderr.write(f"Failed to transcribe with faster-whisper: {exc}\n")
@@ -260,7 +266,7 @@ def main() -> int:
             continue
         if end <= start + 0.01:
             continue
-        raw_words = _normalize_word_rows(getattr(segment, "words", None), start, end)
+        raw_words = _normalize_word_rows(getattr(segment, "words", None), start, end) if word_timestamps else []
         words = _annotate_words(raw_words)
         cues.append(
             {
@@ -284,7 +290,7 @@ def main() -> int:
                 "model": args.model,
                 "device": device,
                 "computeType": compute_type,
-                "wordLevelTimestamps": True,
+                "wordLevelTimestamps": word_timestamps,
                 "segments": cues,
             },
             ensure_ascii=False,
@@ -301,6 +307,7 @@ def main() -> int:
         "device": device,
         "computeType": compute_type,
         "model": args.model,
+        "wordLevelTimestamps": word_timestamps,
     }
     sys.stdout.write(json.dumps(result) + "\n")
     return 0
