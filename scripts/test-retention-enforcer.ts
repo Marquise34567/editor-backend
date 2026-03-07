@@ -39,6 +39,7 @@ const makeWindow = (time: number, overrides: Record<string, any> = {}) => ({
   facePresence: 0.35,
   textDensity: 0.12,
   sceneChangeRate: 0.16,
+  actionSpike: 0,
   emotionalSpike: 0,
   vocalExcitement: 0.24,
   emotionIntensity: 0.26,
@@ -383,11 +384,24 @@ const run = () => {
     vocalExcitement: Math.max(window.vocalExcitement, 0.78),
     emotionalSpike: 1,
     score: Math.max(window.score, 0.84),
-    hookScore: Math.max(window.hookScore ?? 0, 0.88)
+    hookScore: Math.max(window.hookScore ?? 0, 0.88),
+    actionSpike: Math.max(window.actionSpike ?? 0, 0.72),
+    curiosityTrigger: Math.max(window.curiosityTrigger ?? 0, 0.66),
+    motionScore: Math.max(window.motionScore, 0.7),
+    textDensity: Math.max(window.textDensity, 0.22),
+    sceneChangeRate: Math.max(window.sceneChangeRate, 0.34),
+    audioVariance: Math.max(window.audioVariance ?? 0, 0.55)
   }))
   const strongJudge = buildRetentionJudgeReport({
     retentionScore: strongRetention,
-    hook: { ...pickA.selected, score: 0.9, auditScore: 0.92, auditPassed: true, reason: 'strong', text: 'strong hook' },
+    hook: {
+      ...pickA.selected,
+      score: 0.9,
+      auditScore: 0.92,
+      auditPassed: true,
+      reason: 'strong',
+      text: "They said this was impossible... so why did this one mistake almost ruin it?"
+    },
     windows: strongWindows,
     clarityPenalty: 0.05,
     captionsEnabled: true,
@@ -481,7 +495,7 @@ const run = () => {
     hook_strength: 56,
     pacing_score: 52,
     clarity_score: 58,
-    emotional_pull: 49,
+    emotional_pull: 53,
     why_keep_watching: [],
     what_is_generic: ['low emotional pull'],
     required_fixes: {

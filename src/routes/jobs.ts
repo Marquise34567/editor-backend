@@ -2208,7 +2208,8 @@ const QUALITY_GATE_THRESHOLD_FLOORS: QualityGateThresholds = {
 const RESCUE_RENDER_MINIMUMS = {
   retention_score: 44,
   hook_strength: 52,
-  pacing_score: 50
+  pacing_score: 50,
+  emotional_pull: 52
 }
 const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floor: number }> = {
   auto: { target: 70, floor: 60 },
@@ -2557,6 +2558,7 @@ const RETENTION_PIPELINE_STEPS: RetentionPipelineStep[] = [
 const RETENTION_KEYWORDS = [
   'crazy',
   'insane',
+  'scam',
   'secret',
   'money',
   'profit',
@@ -2570,6 +2572,11 @@ const RETENTION_KEYWORDS = [
   'warning',
   'proof',
   'trick',
+  'impossible',
+  'zero',
+  'pov',
+  'exactly how',
+  'what actually works',
   'changed everything',
   'messed up',
   'watch this'
@@ -2586,7 +2593,13 @@ const CURIOSITY_PHRASES = [
   'the truth is',
   'this changed everything',
   'what happens next',
-  'wait for it'
+  'wait for it',
+  'this one mistake',
+  "don't do it",
+  'what actually works',
+  'this is what happens when',
+  'they said it was impossible',
+  'went from 0 to'
 ]
 const HOOK_UNRESOLVED_PHRASES = [
   'but then',
@@ -9885,15 +9898,18 @@ const maybeAllowQualityGateOverride = ({
   thresholds,
   hasTranscript,
   signalStrength,
-  minimumRetentionScore
+  minimumRetentionScore,
+  hook
 }: {
   judge: RetentionJudgeReport
   thresholds: QualityGateThresholds
   hasTranscript: boolean
   signalStrength: number
   minimumRetentionScore?: number
+  hook?: HookCandidate | null
 }) => {
   if (hasTranscript && signalStrength >= 0.5) return null
+  if (hasTranscript && hook && !hook.auditPassed) return null
   const requiredRetentionFloor = Math.round(clamp(
     Number(minimumRetentionScore ?? RETENTION_RENDER_THRESHOLD),
     QUALITY_GATE_THRESHOLD_FLOORS.retention_score,
@@ -9920,8 +9936,13 @@ const maybeAllowQualityGateOverride = ({
 
 const shouldForceRescueRender = (
   judge: RetentionJudgeReport,
-  minimumRetentionScore = RESCUE_RENDER_MINIMUMS.retention_score
+  minimumRetentionScore = RESCUE_RENDER_MINIMUMS.retention_score,
+  options?: {
+    hook?: HookCandidate | null
+    hasTranscript?: boolean
+  }
 ) => {
+  if (options?.hasTranscript && options.hook && !options.hook.auditPassed) return false
   const requiredRetentionFloor = Math.max(
     RESCUE_RENDER_MINIMUMS.retention_score,
     Math.round(clamp(Number(minimumRetentionScore || RESCUE_RENDER_MINIMUMS.retention_score), 45, 95))
@@ -9929,7 +9950,8 @@ const shouldForceRescueRender = (
   return (
     judge.retention_score >= requiredRetentionFloor &&
     judge.hook_strength >= RESCUE_RENDER_MINIMUMS.hook_strength &&
-    judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score
+    judge.pacing_score >= RESCUE_RENDER_MINIMUMS.pacing_score &&
+    judge.emotional_pull >= RESCUE_RENDER_MINIMUMS.emotional_pull
   )
 }
 
@@ -10061,14 +10083,33 @@ const scoreRenderableHookCandidateSignals = ({
   const authenticity = introText
     ? textSignals.authenticity
     : clamp01(0.58 * curiosityWindow + 0.42 * instantHold)
+  const emotionalTrigger = introText
+    ? textSignals.emotionalTrigger
+    : clamp01(0.46 * curiosityPressure + 0.28 * teaserTension + 0.26 * visualImpact)
+  const relatability = introText
+    ? textSignals.relatability
+    : clamp01(0.52 * authenticity + 0.26 * curiosityPressure + 0.22 * valuePromise)
+  const conversational = introText
+    ? textSignals.conversational
+    : clamp01(0.62 * authenticity + 0.38 * instantHold)
+  const patternInterrupt = introText
+    ? textSignals.patternInterrupt
+    : clamp01(0.54 * instantHold + 0.24 * visualImpact + 0.22 * teaserTension)
+  const mutedClarity = introText
+    ? textSignals.mutedClarity
+    : clamp01(0.46 * overlayReadiness + 0.28 * visualImpact + 0.26 * valuePromise)
   const openerQuality = clamp01(
-    0.29 * instantHold +
-    0.12 * introClarity +
-    0.15 * teaserTension +
-    0.12 * curiosityPressure +
-    0.09 * visualNovelty +
-    0.13 * visualImpact +
-    0.06 * overlayReadiness +
+    0.23 * instantHold +
+    0.11 * introClarity +
+    0.12 * teaserTension +
+    0.1 * curiosityPressure +
+    0.1 * patternInterrupt +
+    0.08 * emotionalTrigger +
+    0.06 * relatability +
+    0.06 * mutedClarity +
+    0.07 * visualNovelty +
+    0.09 * visualImpact +
+    0.04 * overlayReadiness +
     0.04 * urgency
   )
   const totalTimelineSeconds = windows.length
@@ -10083,15 +10124,22 @@ const scoreRenderableHookCandidateSignals = ({
     )
     : 0
   const selectionScore = clamp01(
-    0.24 * confidence +
-    0.21 * openerQuality +
-    0.22 * curiosityPressure +
-    0.12 * teaserTension +
+    0.19 * confidence +
+    0.19 * openerQuality +
+    0.16 * curiosityPressure +
+    0.1 * teaserTension +
+    0.09 * patternInterrupt +
+    0.07 * emotionalTrigger +
     0.08 * valuePromise +
-    0.05 * urgency +
+    0.04 * urgency +
+    0.03 * mutedClarity +
     0.05 * openerTimingScore +
     0.02 * contrarianTrigger +
+    0.02 * relatability +
+    0.02 * conversational +
+    0.02 * textSignals.hookTypeStrength +
     0.01 * authenticity -
+    0.05 * textSignals.weakIntroPenalty -
     0.06 * lateSourcePenalty
   )
   return {
@@ -10609,10 +10657,14 @@ const pickAuditedOpeningCandidateFromPool = ({
       const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
       const auditScore = clamp01(Number(candidate.auditScore || 0))
       const qualityScore = clamp01(
-        0.5 * auditScore +
-        0.18 * clamp01(Number(candidate.score || 0)) +
-        0.2 * textSignals.curiosityBlend +
-        0.12 * textSignals.specificity -
+        0.36 * auditScore +
+        0.16 * clamp01(Number(candidate.score || 0)) +
+        0.14 * textSignals.curiosityBlend +
+        0.1 * textSignals.patternInterrupt +
+        0.08 * textSignals.valuePromise +
+        0.08 * textSignals.emotionalTrigger +
+        0.08 * textSignals.hookTypeStrength -
+        0.08 * textSignals.weakIntroPenalty -
         (textSignals.isGenericUtterance ? 0.22 : 0)
       )
       return {
@@ -10643,6 +10695,7 @@ const pickAuditedOpeningCandidateFromPool = ({
     entry.auditScore >= 0.58 &&
     entry.textSignals.curiosityBlend >= 0.34 &&
     entry.textSignals.specificity >= 0.26 &&
+    entry.textSignals.patternInterrupt >= 0.28 &&
     !entry.textSignals.isGenericUtterance
   ))
   if (curiosityNearPass) {
@@ -10688,11 +10741,15 @@ const pickCuriosityDifferentPartCandidateFromPool = ({
       const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
       const questionBoost = clamp01(textSignals.questionCount / 2)
       const curiosityScore = clamp01(
-        0.34 * textSignals.curiosityBlend +
-        0.24 * textSignals.specificity +
-        0.2 * clamp01(Number(candidate.auditScore || 0)) +
+        0.26 * textSignals.curiosityBlend +
+        0.18 * textSignals.specificity +
+        0.16 * textSignals.patternInterrupt +
+        0.12 * textSignals.valuePromise +
+        0.1 * textSignals.emotionalTrigger +
+        0.18 * clamp01(Number(candidate.auditScore || 0)) +
         0.1 * clamp01(Number(candidate.score || 0)) +
         0.12 * questionBoost -
+        0.08 * textSignals.weakIntroPenalty -
         (textSignals.isGenericUtterance ? 0.24 : 0)
       )
       return {
@@ -10705,6 +10762,7 @@ const pickCuriosityDifferentPartCandidateFromPool = ({
       !entry.textSignals.isGenericUtterance &&
       entry.textSignals.curiosityBlend >= 0.3 &&
       entry.textSignals.specificity >= 0.26 &&
+      entry.textSignals.patternInterrupt >= 0.24 &&
       (
         entry.textSignals.valuePromise >= 0.12 ||
         entry.textSignals.overlayReadiness >= 0.42 ||
@@ -10734,13 +10792,15 @@ const evaluateTranscriptHookQuality = ({
   })
   const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
   const qualityScore = clamp01(
-    0.22 * clamp01(Number(candidate.auditScore || 0)) +
-    0.22 * scored.selectionScore +
-    0.22 * scored.curiosityPressure +
-    0.16 * scored.teaserTension +
-    0.08 * scored.introClarity +
-    0.05 * scored.visualImpact +
-    0.05 * textSignals.specificity
+    0.18 * clamp01(Number(candidate.auditScore || 0)) +
+    0.2 * scored.selectionScore +
+    0.16 * scored.curiosityPressure +
+    0.12 * scored.teaserTension +
+    0.1 * scored.introClarity +
+    0.08 * scored.visualImpact +
+    0.06 * textSignals.specificity +
+    0.05 * textSignals.patternInterrupt +
+    0.05 * textSignals.valuePromise
   )
   return {
     scored,
@@ -13199,14 +13259,27 @@ const analyzeHookTextQualitySignals = (text: string) => {
       contradiction: 0,
       overlayReadiness: 0,
       authenticity: 0,
+      patternInterrupt: 0,
+      emotionalTrigger: 0,
+      relatability: 0,
+      conversational: 0,
+      mutedClarity: 0,
+      brevityFit: 0,
+      hookTypeStrength: 0,
+      primaryHookType: null as string | null,
+      weakIntroPenalty: 0,
       isGenericUtterance: true
     }
   }
   const words = normalized.split(/\s+/).filter(Boolean)
+  const firstClause = normalized.split(/[.!?;:,\-]+/)[0]?.trim() || normalized
+  const firstWords = words.slice(0, 6).join(' ')
   const lexicalTokens = words.filter((token) => (
     token.length > 2 &&
     !REDUNDANCY_STOP_WORDS.has(token)
   ))
+  const countPatternHits = (patterns: RegExp[]) => patterns.reduce((sum, pattern) => sum + (pattern.test(normalized) ? 1 : 0), 0)
+  const countLeadPatternHits = (patterns: RegExp[]) => patterns.reduce((sum, pattern) => sum + (pattern.test(firstWords) ? 1 : 0), 0)
   const transcriptSignals = scoreTranscriptSignals(normalized)
   const openLoop = scoreHookOpenLoopSignal(normalized)
   const unresolved = scoreHookEndingUnresolvedSignal(normalized)
@@ -13242,12 +13315,90 @@ const analyzeHookTextQualitySignals = (text: string) => {
   const firstPersonHit = /\b(i|my|me|we|our)\b/.test(normalized)
   const secondPersonHit = /\b(you|your)\b/.test(normalized)
   const adLikePhraseHit = /\b(our product|subscribe for more|link in bio|official|sponsored)\b/.test(normalized)
+  const contractionCount = (normalized.match(/\b[a-z]+('[a-z]+)+\b/g) || []).length
+  const weakIntroHits = countPatternHits([
+    /\bhey guys\b/,
+    /\bwelcome back\b/,
+    /\bwhat(?:'s| is) up guys\b/,
+    /\bin this video\b/,
+    /\btoday (?:i['’]?m|we(?:'re| are)) going to\b/,
+    /\blet me show you\b/,
+    /^\s*(so|okay|alright|all right)\b.*\btoday\b/
+  ])
+  const patternInterruptLeadHits = countLeadPatternHits([
+    /\bwait\b/,
+    /\bstop\b/,
+    /\bwatch this\b/,
+    /\blook at this\b/,
+    /\bno way\b/,
+    /\bpov\b/,
+    /\bimagine\b/,
+    /\bthey said\b/,
+    /\bi spent\b/,
+    /\bthis one\b/,
+    /\bdon'?t\b/
+  ])
+  const emotionalTriggerHits = countPatternHits([
+    /\bscam\b/,
+    /\bmistake\b/,
+    /\bwarning\b/,
+    /\bimpossible\b/,
+    /\bcrazy\b/,
+    /\binsane\b/,
+    /\bshocking\b/,
+    /\bzero\b/,
+    /\bruined\b/,
+    /\blost\b/,
+    /\bwasted\b/,
+    /\bmillion\b/,
+    /\bexposed\b/,
+    /\btruth\b/,
+    /\bsecret\b/
+  ])
+  const painPointHits = countPatternHits([
+    /\btired of\b/,
+    /\bwasting\b/,
+    /\bzero (?:sales|views|results)\b/,
+    /\bno one\b/,
+    /\bdon'?t do this\b/,
+    /\bcost me\b/,
+    /\bdo not\b/
+  ])
+  const explicitPromiseHits = countPatternHits([
+    /\bi(?:'ll| will) show you\b/,
+    /\bhere(?:'s| is) exactly\b/,
+    /\bhere(?:'s| is) how\b/,
+    /\bwhat actually works\b/,
+    /\bthis is what happens when\b/,
+    /\bhere(?:'s| is) why\b/,
+    /\bwent from\b/,
+    /\bdon'?t do this\b/
+  ])
+  const scenarioHits = countPatternHits([
+    /\bpov\b/,
+    /\byou just\b/,
+    /\bwhen you\b/,
+    /\bif you\b/,
+    /\bimagine\b/,
+    /\byour\b/
+  ])
+  const guruPhraseHit = /\b(masterclass|blueprint|game changer|hack your|secret sauce|10x|guru)\b/.test(normalized)
+  const timeframePromiseHit = /\b\d+\s*(day|days|week|weeks|month|months|minute|minutes|hour|hours|year|years)\b/.test(normalized)
+  const beforeAfterHit = /\b(before(?:\/| and )after|after this|this is what happens when)\b/.test(normalized)
+  const weakIntroPenalty = clamp01(
+    0.72 * clamp01(weakIntroHits / 2) +
+    0.16 * Number(startsGenericBridge && words.length >= 6) +
+    0.12 * Number(/^((hey|yo|alright|all right)\b)/.test(firstClause))
+  )
   const valuePromise = clamp01(
-    0.34 * Number(valueKeywordHit) +
-    0.24 * Number(hasNumericSpecificity) +
+    0.28 * Number(valueKeywordHit) +
+    0.22 * clamp01(explicitPromiseHits / 2) +
+    0.16 * Number(hasNumericSpecificity) +
+    0.12 * Number(timeframePromiseHit) +
     0.18 * transcriptSignals.keywordIntensity +
     0.16 * curiosityBlend +
-    0.08 * Number(hasQuestion)
+    0.08 * Number(hasQuestion) -
+    0.12 * weakIntroPenalty
   )
   const urgency = clamp01(
     0.46 * Number(urgencyKeywordHit) +
@@ -13260,20 +13411,115 @@ const analyzeHookTextQualitySignals = (text: string) => {
     0.22 * curiosityBlend +
     0.2 * Number(/\bnot\b/.test(normalized))
   )
+  const authenticity = clamp01(
+    0.42 * Number(firstPersonHit) +
+    0.24 * Number(secondPersonHit) +
+    0.14 * clamp01(contractionCount / 3) +
+    0.18 * clamp01(1 - transcriptSignals.fillerDensity) -
+    0.26 * Number(adLikePhraseHit)
+  )
+  const patternInterrupt = clamp01(
+    0.3 * clamp01(patternInterruptLeadHits / 2) +
+    0.18 * Number(hasNumericSpecificity && /\d/.test(firstWords)) +
+    0.18 * clamp01(emotionalTriggerHits / 3) +
+    0.16 * curiosityBlend +
+    0.1 * Number(questionCount > 0) +
+    0.08 * Number(words.length <= 14) -
+    0.34 * weakIntroPenalty
+  )
+  const emotionalTrigger = clamp01(
+    0.28 * clamp01(emotionalTriggerHits / 3) +
+    0.22 * clamp01(painPointHits / 2) +
+    0.18 * contradiction +
+    0.16 * curiosityBlend +
+    0.08 * Number(hasNumericSpecificity) +
+    0.08 * Number(firstPersonHit || secondPersonHit) -
+    0.16 * weakIntroPenalty
+  )
+  const relatability = clamp01(
+    0.28 * Number(secondPersonHit) +
+    0.2 * clamp01(scenarioHits / 2) +
+    0.18 * clamp01(painPointHits / 2) +
+    0.16 * specificity +
+    0.1 * Number(firstPersonHit) +
+    0.08 * Number(hasQuestion)
+  )
+  const conversational = clamp01(
+    0.34 * authenticity +
+    0.18 * Number(firstPersonHit) +
+    0.16 * Number(secondPersonHit) +
+    0.14 * clamp01(contractionCount / 3) +
+    0.1 * clamp01(1 - transcriptSignals.fillerDensity) -
+    0.16 * Number(guruPhraseHit) -
+    0.12 * Number(adLikePhraseHit)
+  )
   const compactOverlayBand = words.length >= 3 && words.length <= 11
     ? 1
     : clamp01(1 - Math.abs(words.length - 7) / 10)
   const overlayReadiness = clamp01(
-    0.5 * compactOverlayBand +
-    0.28 * Number(punchyOverlayHit) +
-    0.22 * Number(hasNumericSpecificity)
+    0.46 * compactOverlayBand +
+    0.24 * Number(punchyOverlayHit) +
+    0.18 * Number(hasNumericSpecificity) +
+    0.12 * patternInterrupt
   )
-  const authenticity = clamp01(
-    0.42 * Number(firstPersonHit) +
-    0.24 * Number(secondPersonHit) +
-    0.18 * clamp01(1 - transcriptSignals.fillerDensity) -
-    0.26 * Number(adLikePhraseHit)
+  const mutedClarity = clamp01(
+    0.36 * overlayReadiness +
+    0.22 * specificity +
+    0.2 * valuePromise +
+    0.12 * patternInterrupt +
+    0.1 * Number(hasNumericSpecificity) -
+    0.16 * Number(words.length > 22)
   )
+  const brevityFit = words.length >= 5 && words.length <= 18
+    ? 1
+    : clamp01(1 - Math.abs(words.length - 10) / 14)
+  const hookTypeScores = {
+    boldShock: clamp01(
+      0.42 * clamp01(emotionalTriggerHits / 3) +
+      0.2 * Number(hasNumericSpecificity) +
+      0.2 * patternInterrupt +
+      0.18 * curiosityBlend
+    ),
+    questionPain: clamp01(
+      0.34 * Number(hasQuestion) +
+      0.28 * clamp01(painPointHits / 2) +
+      0.2 * relatability +
+      0.18 * curiosityBlend
+    ),
+    contradictionTension: clamp01(
+      0.44 * contradiction +
+      0.2 * Number(/\b(impossible|wrong|instead|but)\b/.test(normalized)) +
+      0.18 * curiosityBlend +
+      0.18 * emotionalTrigger
+    ),
+    scenarioPov: clamp01(
+      0.42 * clamp01(scenarioHits / 2) +
+      0.28 * relatability +
+      0.16 * specificity +
+      0.14 * conversational
+    ),
+    timeframePromise: clamp01(
+      0.34 * Number(timeframePromiseHit) +
+      0.28 * valuePromise +
+      0.2 * Number(hasNumericSpecificity) +
+      0.18 * specificity
+    ),
+    teaserReveal: clamp01(
+      0.32 * Number(beforeAfterHit) +
+      0.24 * patternInterrupt +
+      0.24 * curiosityBlend +
+      0.2 * valuePromise
+    ),
+    curiosityLoop: clamp01(
+      0.34 * curiosityBlend +
+      0.24 * valuePromise +
+      0.22 * emotionalTrigger +
+      0.2 * Number(/\b(cost me|don't do it|what happens|secret|mistake)\b/.test(normalized))
+    )
+  }
+  const hookTypeEntries = Object.entries(hookTypeScores).sort((a, b) => b[1] - a[1])
+  const primaryHookType = hookTypeEntries[0]?.[0] || null
+  const hookTypeStrength = Number(clamp01(hookTypeEntries[0]?.[1] ?? 0).toFixed(4))
   return {
     wordCount: words.length,
     lexicalTokenCount: lexicalTokens.length,
@@ -13285,6 +13531,15 @@ const analyzeHookTextQualitySignals = (text: string) => {
     contradiction: Number(contradiction.toFixed(4)),
     overlayReadiness: Number(overlayReadiness.toFixed(4)),
     authenticity: Number(authenticity.toFixed(4)),
+    patternInterrupt: Number(patternInterrupt.toFixed(4)),
+    emotionalTrigger: Number(emotionalTrigger.toFixed(4)),
+    relatability: Number(relatability.toFixed(4)),
+    conversational: Number(conversational.toFixed(4)),
+    mutedClarity: Number(mutedClarity.toFixed(4)),
+    brevityFit: Number(brevityFit.toFixed(4)),
+    hookTypeStrength,
+    primaryHookType,
+    weakIntroPenalty: Number(weakIntroPenalty.toFixed(4)),
     isGenericUtterance
   }
 }
@@ -13309,6 +13564,12 @@ const computeHookInstantHoldScore = ({
   const introVocal = averageWindowMetric(windows, start, introEnd, (window) => window.vocalExcitement)
   const introAction = averageWindowMetric(windows, start, introEnd, (window) => window.actionSpike ?? 0)
   const introSpeech = averageWindowMetric(windows, start, introEnd, (window) => window.speechIntensity)
+  const introVisual = averageWindowMetric(windows, start, introEnd, (window) => (
+    0.34 * window.motionScore +
+    0.26 * window.sceneChangeRate +
+    0.2 * (window.visualImpact ?? window.score) +
+    0.2 * window.textDensity
+  ))
   const firstBeatEnd = Math.min(introEnd, start + Math.min(1.2, Math.max(0.4, introWindowSeconds * 0.45)))
   const firstBeatSignal = averageWindowMetric(windows, start, firstBeatEnd, (window) => (
     0.45 * (window.hookScore ?? window.score) +
@@ -13316,6 +13577,14 @@ const computeHookInstantHoldScore = ({
     0.14 * window.emotionIntensity +
     0.12 * window.vocalExcitement +
     0.09 * (window.actionSpike ?? 0)
+  ))
+  const firstBeatPatternInterrupt = averageWindowMetric(windows, start, firstBeatEnd, (window) => (
+    0.26 * (window.actionSpike ?? 0) +
+    0.22 * window.sceneChangeRate +
+    0.18 * window.motionScore +
+    0.14 * (window.visualImpact ?? window.score) +
+    0.12 * (window.audioVariance ?? 0) +
+    0.08 * window.textDensity
   ))
   const secondBeatSignal = firstBeatEnd < introEnd
     ? averageWindowMetric(windows, firstBeatEnd, introEnd, (window) => (
@@ -13328,13 +13597,15 @@ const computeHookInstantHoldScore = ({
     : firstBeatSignal
   const momentum = clamp01(0.5 + (secondBeatSignal - firstBeatSignal) * 1.45)
   return Number(clamp01(
-    0.3 * introHook +
-    0.2 * introCuriosity +
-    0.16 * introEmotion +
-    0.12 * introVocal +
-    0.1 * introAction +
+    0.24 * introHook +
+    0.18 * introCuriosity +
+    0.14 * introEmotion +
+    0.1 * introVocal +
+    0.08 * introAction +
     0.06 * introSpeech +
-    0.06 * momentum
+    0.08 * introVisual +
+    0.07 * firstBeatPatternInterrupt +
+    0.05 * momentum
   ).toFixed(4))
 }
 
@@ -13353,6 +13624,7 @@ const computeHookIntroClarityScore = ({
   const words = introText.split(/\s+/).filter(Boolean)
   if (!words.length) return 0.46
   const signals = scoreTranscriptSignals(introText.toLowerCase())
+  const textSignals = analyzeHookTextQualitySignals(introText)
   const contextPenalty = evaluateHookContextDependency(start, introEnd, transcriptCues)
   const leadWordPenalty = /^(and|but|so|then|because|this|that|it|they|we)\b/i.test(words[0] || '')
     ? 0.12
@@ -13360,13 +13632,18 @@ const computeHookIntroClarityScore = ({
   const wordDensity = clamp01(words.length / 8)
   const openLoop = scoreHookOpenLoopSignal(introText)
   return Number(clamp01(
-    0.32 * wordDensity +
+    0.24 * wordDensity +
     0.24 * signals.keywordIntensity +
-    0.18 * signals.curiosityTrigger +
-    0.14 * openLoop +
-    0.12 * (1 - signals.fillerDensity) -
+    0.12 * signals.curiosityTrigger +
+    0.12 * openLoop +
+    0.12 * textSignals.valuePromise +
+    0.08 * textSignals.patternInterrupt +
+    0.08 * textSignals.specificity +
+    0.06 * textSignals.conversational +
+    0.08 * (1 - signals.fillerDensity) -
     0.34 * contextPenalty -
-    leadWordPenalty
+    leadWordPenalty -
+    0.14 * textSignals.weakIntroPenalty
   ).toFixed(4))
 }
 
@@ -13386,6 +13663,16 @@ const runHookAudit = ({
   const contextPenalty = evaluateHookContextDependency(start, end, transcriptCues)
   const transcriptSignals = scoreTranscriptSignals(text)
   const textQualitySignals = analyzeHookTextQualitySignals(text)
+  const instantHold = computeHookInstantHoldScore({
+    start,
+    end,
+    windows
+  })
+  const introClarity = computeHookIntroClarityScore({
+    start,
+    end,
+    transcriptCues
+  })
   const curiositySignal = clamp01(
     averageWindowMetric(windows, start, end, (window) => (window.curiosityTrigger ?? 0)) * 0.55 +
     transcriptSignals.curiosityTrigger * 0.45
@@ -13412,6 +13699,41 @@ const runHookAudit = ({
       textQualitySignals.specificity < 0.2 &&
       textQualitySignals.curiosityBlend < 0.24
     )
+  )
+  const instantAttentionSignal = clamp01(
+    0.42 * instantHold +
+    0.26 * textQualitySignals.patternInterrupt +
+    0.16 * nonVerbalClarity +
+    0.16 * textQualitySignals.brevityFit -
+    0.24 * textQualitySignals.weakIntroPenalty
+  )
+  const valueGapSignal = clamp01(
+    0.34 * textQualitySignals.valuePromise +
+    0.24 * textQualitySignals.curiosityBlend +
+    0.18 * scoreHookOpenLoopSignal(text) +
+    0.14 * textQualitySignals.hookTypeStrength +
+    0.1 * introClarity
+  )
+  const emotionalPsychSignal = clamp01(
+    0.36 * emotionalSignal +
+    0.18 * textQualitySignals.emotionalTrigger +
+    0.16 * textQualitySignals.contradiction +
+    0.16 * textQualitySignals.relatability +
+    0.14 * textQualitySignals.authenticity
+  )
+  const mutedViewerSignal = clamp01(
+    0.38 * textQualitySignals.mutedClarity +
+    0.26 * nonVerbalClarity +
+    0.18 * averageWindowMetric(windows, start, end, (window) => window.textDensity) +
+    0.18 * averageWindowMetric(windows, start, end, (window) => window.motionScore)
+  )
+  const specificitySignal = clamp01(
+    0.56 * textQualitySignals.specificity +
+    0.44 * textQualitySignals.relatability
+  )
+  const conversationalSignal = clamp01(
+    0.58 * textQualitySignals.conversational +
+    0.42 * textQualitySignals.authenticity
   )
   const understandableByTranscript = words.length >= 5 && contextPenalty <= 0.34
   const understandableBySignal = nonVerbalClarity >= 0.52 && contextPenalty <= 0.55
@@ -13445,37 +13767,78 @@ const runHookAudit = ({
   const endingTensionPass = endingUnresolved >= (hasTranscriptSupport ? 0.24 : 0.18) || highIntensityTeaserBySignal
   const spoilerLimit = hasTranscriptSupport ? 0.52 : 0.62
   const noOverReveal = spoilerRisk <= spoilerLimit
+  const attentionGrabPass = instantAttentionSignal >= (hasTranscriptSupport ? 0.42 : 0.46)
+  const valuePromisePass = valueGapSignal >= (hasTranscriptSupport ? 0.3 : 0.28)
+  const emotionalTriggerPass = emotionalPsychSignal >= (hasTranscriptSupport ? 0.28 : 0.34)
+  const specificityPass = !hasTranscriptSupport || specificitySignal >= 0.22 || textQualitySignals.hookTypeStrength >= 0.34
+  const conversationalPass = !hasTranscriptSupport || conversationalSignal >= 0.22
+  const mutedSynergyPass = mutedViewerSignal >= (hasTranscriptSupport ? 0.26 : 0.3)
+  const weakIntroPass = textQualitySignals.weakIntroPenalty < 0.44
   const auditScore = hasTranscriptSupport
     ? clamp01(
-        0.24 * (understandable ? 1 : 0) +
-        0.2 * (curiosity ? 1 : 0) +
-        0.16 * (payoff ? 1 : 0) +
-        0.2 * teaserStrength +
-        0.1 * endingUnresolved +
-        0.06 * (1 - contextPenalty) +
-        0.04 * (1 - spoilerRisk)
+        0.14 * (understandable ? 1 : 0) +
+        0.1 * (curiosity ? 1 : 0) +
+        0.08 * (payoff ? 1 : 0) +
+        0.12 * instantAttentionSignal +
+        0.12 * valueGapSignal +
+        0.1 * emotionalPsychSignal +
+        0.08 * specificitySignal +
+        0.07 * conversationalSignal +
+        0.06 * mutedViewerSignal +
+        0.08 * teaserStrength +
+        0.06 * endingUnresolved +
+        0.04 * introClarity +
+        0.03 * textQualitySignals.hookTypeStrength +
+        0.04 * (1 - contextPenalty) +
+        0.02 * (1 - spoilerRisk) -
+        0.05 * textQualitySignals.weakIntroPenalty
       )
     : clamp01(
-        0.24 * (understandable ? 1 : 0) +
-        0.2 * (curiosity ? 1 : 0) +
-        0.18 * (payoff ? 1 : 0) +
-        0.2 * teaserStrength +
-        0.1 * endingUnresolved +
+        0.18 * (understandable ? 1 : 0) +
+        0.12 * instantAttentionSignal +
+        0.1 * (curiosity ? 1 : 0) +
+        0.1 * (payoff ? 1 : 0) +
+        0.1 * emotionalPsychSignal +
+        0.08 * teaserStrength +
+        0.08 * mutedViewerSignal +
+        0.08 * endingUnresolved +
+        0.06 * introClarity +
         0.05 * (1 - contextPenalty) +
-        0.03 * (1 - spoilerRisk)
+        0.05 * (1 - spoilerRisk)
       )
-  const passThreshold = hasTranscriptSupport ? 0.7 : 0.58
+  const passThreshold = hasTranscriptSupport ? 0.72 : 0.6
   const reasons: string[] = []
   if (!understandable) reasons.push(hasTranscriptSupport ? 'Not understandable in isolation' : 'Non-verbal hook beat is too context-dependent')
   if (!curiosity) reasons.push(hasTranscriptSupport ? 'Does not trigger curiosity strongly enough' : 'Visual/audio peak does not trigger enough curiosity')
   if (!payoff) reasons.push(hasTranscriptSupport ? 'Payoff signal is weak' : 'Peak moment does not imply a clear payoff')
+  if (!attentionGrabPass) reasons.push('First 1-3 seconds do not create a strong enough pattern interrupt')
+  if (!valuePromisePass) reasons.push('Value promise or curiosity gap is too weak too early')
+  if (!emotionalTriggerPass) reasons.push('Emotional or psychological trigger is too soft')
+  if (!specificityPass) reasons.push('Hook is too generic; needs more specificity or relatability')
+  if (!conversationalPass) reasons.push('Delivery feels too scripted; opener should sound more human and direct')
+  if (!mutedSynergyPass) reasons.push('Muted-view clarity is weak; opener needs stronger text/visual support')
   if (!teaserPass) reasons.push('Hook reveals too much or has weak teaser pressure')
   if (!endingTensionPass) reasons.push('Ending resolves too cleanly; opener should end with stronger unresolved tension')
   if (!noOverReveal) reasons.push('Reveals too much too early; keep the opener as a curiosity teaser')
+  if (!weakIntroPass) reasons.push('Opener starts like a slow intro instead of the strongest line or moment')
   if (contextPenalty > (hasTranscriptSupport ? 0.34 : 0.55)) reasons.push('Requires too much prior context')
   if (lowInformationTranscriptText) reasons.push('Opener transcript is too generic; select a more specific curiosity line')
   return {
-    passed: understandable && curiosity && payoff && teaserPass && endingTensionPass && noOverReveal && !lowInformationTranscriptText && auditScore >= passThreshold,
+    passed: understandable &&
+      curiosity &&
+      payoff &&
+      attentionGrabPass &&
+      valuePromisePass &&
+      emotionalTriggerPass &&
+      specificityPass &&
+      conversationalPass &&
+      mutedSynergyPass &&
+      teaserPass &&
+      endingTensionPass &&
+      noOverReveal &&
+      weakIntroPass &&
+      !lowInformationTranscriptText &&
+      auditScore >= passThreshold,
     auditScore: Number(auditScore.toFixed(4)),
     understandable,
     curiosity,
@@ -13762,9 +14125,10 @@ const pickTopHookCandidates = ({
         baseline: dynamicBaseline
       })
       const durationSecondsActual = aligned.end - aligned.start
-      const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 8) / 3))
+      const durationAlignment = clamp01(1 - (Math.abs(durationSecondsActual - 7) / 3))
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
       const hookText = extractHookText(aligned.start, aligned.end, transcriptCues)
+      const textSignals = analyzeHookTextQualitySignals(hookText)
       const openLoopSignal = clamp01(scoreHookOpenLoopSignal(hookText) * emotionalTuning.openLoopBoost)
       const unresolvedEndingSignal = scoreHookEndingUnresolvedSignal(hookText)
       const curiosityAcceleration = clamp01(
@@ -13789,6 +14153,40 @@ const pickTopHookCandidates = ({
         transcriptCues,
         windows
       })
+      const firstThreeSecondGrab = clamp01(
+        0.44 * instantHoldScore +
+        0.24 * textSignals.patternInterrupt +
+        0.18 * visualImpact +
+        0.14 * introClarityScore -
+        0.22 * textSignals.weakIntroPenalty
+      )
+      const promiseOrGap = clamp01(
+        0.34 * textSignals.valuePromise +
+        0.24 * audit.teaserStrength +
+        0.2 * boostedCuriosityAcceleration +
+        0.12 * openLoopSignal +
+        0.1 * textSignals.hookTypeStrength
+      )
+      const emotionalTrigger = clamp01(
+        0.28 * emotionImpact +
+        0.22 * emotionalHookPull +
+        0.18 * textSignals.emotionalTrigger +
+        0.16 * textSignals.contradiction +
+        0.16 * textSignals.relatability
+      )
+      const specificityRelatability = clamp01(
+        0.56 * textSignals.specificity +
+        0.44 * textSignals.relatability
+      )
+      const casualDelivery = clamp01(
+        0.58 * textSignals.conversational +
+        0.42 * textSignals.authenticity
+      )
+      const mutedViewerFit = clamp01(
+        0.42 * textSignals.mutedClarity +
+        0.34 * textSignals.overlayReadiness +
+        0.24 * visualImpact
+      )
       const teaserReserve = clamp01(1 - audit.spoilerRisk)
       const longFormStartPenalty = longFormMinHookSourceStart > 0
         ? clamp01((longFormMinHookSourceStart - aligned.start) / Math.max(0.5, longFormMinHookSourceStart))
@@ -13810,28 +14208,36 @@ const pickTopHookCandidates = ({
         )
         : 0
       const totalScore = clamp01(
-        0.14 * baseHookScore +
-        0.11 * speechImpact +
-        0.09 * transcriptImpact +
-        0.08 * visualImpact +
-        0.1 * emotionImpact +
-        0.09 * emotionalHookPull +
-        0.08 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier +
-        0.05 * openLoopSignal +
+        0.1 * baseHookScore +
+        0.07 * speechImpact +
+        0.05 * transcriptImpact +
+        0.07 * visualImpact +
+        0.07 * emotionImpact +
+        0.06 * emotionalHookPull +
+        0.09 * firstThreeSecondGrab +
+        0.09 * promiseOrGap +
+        0.08 * emotionalTrigger +
+        0.05 * specificityRelatability +
+        0.04 * casualDelivery +
+        0.04 * mutedViewerFit +
+        0.04 * textSignals.hookTypeStrength +
+        0.06 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier +
+        0.04 * openLoopSignal +
         0.03 * unresolvedEndingSignal +
         0.05 * teaserReserve * modeHookProfile.teaserReserveMultiplier +
         0.03 * audit.teaserStrength +
-        0.1 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
-        0.09 * introClarityScore +
+        0.08 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
+        0.07 * introClarityScore +
         0.04 * durationAlignment +
         0.06 * clamp01(beatRoleScore + 0.5) +
-        0.11 * audit.auditScore * modeHookProfile.auditMultiplier +
-        0.06 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
-        0.04 * dynamicLift.peakDensity -
+        0.08 * audit.auditScore * modeHookProfile.auditMultiplier +
+        0.05 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
+        0.03 * dynamicLift.peakDensity -
         0.1 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
-        0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier +
+        0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier -
+        0.05 * textSignals.weakIntroPenalty +
         modeHookProfile.baseBias
       )
       evaluated.push({
@@ -24253,6 +24659,11 @@ const buildRetentionJudgeReport = ({
 }): RetentionJudgeReport => {
   const appliedThresholds = normalizeQualityGateThresholds(thresholds)
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
+  const hookSignals = scoreRenderableHookCandidateSignals({
+    candidate: hook,
+    windows
+  })
+  const hookTextSignals = analyzeHookTextQualitySignals(String(hook.text || ''))
   const resolvedContentFormat = contentFormat || (retentionScore?.details?.contentFormat as RetentionContentFormat) || 'youtube_long'
   const resolvedTargetPlatform = parseRetentionTargetPlatform(
     targetPlatform || (retentionScore?.details as any)?.targetPlatform || 'auto'
@@ -24270,14 +24681,42 @@ const buildRetentionJudgeReport = ({
       : resolvedContentFormat === 'youtube_long'
         ? 0.86
         : 0.92
+  const earlyHookWindowEnd = Math.min(runtimeSeconds, 15)
+  const firstMinuteWindowEnd = Math.min(runtimeSeconds, 60)
+  const earlyEmotion = averageWindowMetric(windows, 0, earlyHookWindowEnd, (window) => (
+    0.46 * window.emotionIntensity +
+    0.22 * window.vocalExcitement +
+    0.18 * (window.actionSpike ?? 0) +
+    0.14 * (window.curiosityTrigger ?? 0)
+  ))
+  const firstMinuteRetentionSignal = averageWindowMetric(windows, 0, firstMinuteWindowEnd, (window) => (
+    0.38 * (window.hookScore ?? window.score) +
+    0.22 * window.emotionIntensity +
+    0.18 * (window.curiosityTrigger ?? 0) +
+    0.12 * window.vocalExcitement +
+    0.1 * (window.actionSpike ?? 0)
+  ))
   const emotionalPull = Math.round(100 * clamp01(
-    0.45 * averageWindowMetric(windows, 0, Math.max(1, windows.length), (window) => window.emotionIntensity) +
-    0.22 * averageWindowMetric(windows, 0, Math.max(1, windows.length), (window) => window.vocalExcitement) +
-    0.21 * retentionScore.details.emotionalSpikeDensity +
-    0.12 * hook.auditScore
+    0.12 * averageWindowMetric(windows, 0, Math.max(1, runtimeSeconds), (window) => window.emotionIntensity) +
+    0.08 * averageWindowMetric(windows, 0, Math.max(1, runtimeSeconds), (window) => window.vocalExcitement) +
+    0.16 * retentionScore.details.emotionalSpikeDensity +
+    0.22 * earlyEmotion +
+    0.14 * firstMinuteRetentionSignal +
+    0.16 * hookSignals.instantHold +
+    0.08 * hookSignals.teaserTension +
+    0.03 * hookTextSignals.emotionalTrigger +
+    0.01 * hookSignals.authenticity
   ))
   const hookStrength = Math.round(100 * clamp01(
-    0.65 * hook.score + 0.35 * hook.auditScore
+    0.5 * hook.score +
+    0.24 * hook.auditScore +
+    0.08 * hookSignals.instantHold +
+    0.05 * hookSignals.curiosityPressure +
+    0.04 * hookSignals.valuePromise +
+    0.03 * hookSignals.visualImpact +
+    0.02 * hookTextSignals.patternInterrupt +
+    0.02 * hookTextSignals.hookTypeStrength +
+    0.02 * hookTextSignals.relatability
   ))
   const pacing = Math.round(100 * clamp01(
     0.7 * retentionScore.details.pacingScore + 0.3 * interruptCoverage
@@ -24293,6 +24732,7 @@ const buildRetentionJudgeReport = ({
   if (hookStrength >= 80) whyKeepWatching.push('Hook opens with a high-impact moment that promises payoff.')
   if (emotionalPull >= 70) whyKeepWatching.push('Emotional intensity rises quickly and stays above baseline.')
   if (pacing >= 70) whyKeepWatching.push('Frequent editorial interrupts keep momentum and reduce drop-off risk.')
+  if (hookSignals.instantHold >= 0.7) whyKeepWatching.push('First 1-3 seconds create a strong scroll-stopping pattern interrupt.')
   if (whyKeepWatching.length === 0) whyKeepWatching.push('Retention signals are mixed; stronger setup/payoff needed.')
 
   const whatIsGeneric: string[] = []
@@ -24301,6 +24741,9 @@ const buildRetentionJudgeReport = ({
   }
   if (retentionScore.details.boredomRemovalRatio < 0.07) whatIsGeneric.push('Too much low-arousal material remains.')
   if (!hook.auditPassed) whatIsGeneric.push('Hook is not fully understandable without prior context.')
+  if (hookSignals.instantHold < 0.48) whatIsGeneric.push('First 3 seconds are not stopping the scroll hard enough.')
+  if (hookTextSignals.valuePromise < 0.28 && hookTextSignals.curiosityBlend < 0.28) whatIsGeneric.push('Opener does not make the reason to keep watching clear enough.')
+  if (hookTextSignals.weakIntroPenalty >= 0.44) whatIsGeneric.push('Opener starts too slowly instead of leading with the strongest moment.')
   if (whatIsGeneric.length === 0) whatIsGeneric.push('Generic signals are low for this attempt.')
 
   return {
@@ -28440,7 +28883,8 @@ const processJob = async (
             thresholds: qualityGateThresholds,
             hasTranscript: hasTranscriptSignals,
             signalStrength: contentSignalStrength,
-            minimumRetentionScore: modeRetentionTargets.floor
+            minimumRetentionScore: modeRetentionTargets.floor,
+            hook: selectedHook
           })
         if (!overrideReason) {
           const rescueHookCandidate = preferredHookCandidate || orderedHookCandidates.find((candidate) => candidate.auditPassed) || initialHook
@@ -28533,7 +28977,10 @@ const processJob = async (
           )
           if (rescueJudge.passed) {
             overrideReason = 'Rescue edit pass raised quality enough to render.'
-          } else if (!options.topHumanGuardMode && shouldForceRescueRender(rescueJudge, modeRetentionTargets.floor)) {
+          } else if (!options.topHumanGuardMode && shouldForceRescueRender(rescueJudge, modeRetentionTargets.floor, {
+            hook: rescueHookCandidate,
+            hasTranscript: hasTranscriptSignals
+          })) {
             overrideReason = 'Rescue render forced at adaptive floor to avoid hard-failing low-signal uploads.'
           }
         }
