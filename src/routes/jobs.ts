@@ -10592,12 +10592,46 @@ const selectAuthoritativeAutoHookDecision = ({
     windows
   })
   if (!ranked.length) return null
+  const buildCandidateAuditKey = (candidate: HookCandidate) => (
+    `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
+  )
+  const verifiedAuditByKey = new Map<string, HookAuditResult>()
+  const getVerifiedAudit = (candidate: HookCandidate): HookAuditResult => {
+    const key = buildCandidateAuditKey(candidate)
+    const cached = verifiedAuditByKey.get(key)
+    if (cached) return cached
+    const verified = (
+      transcriptCues.length || windows.length
+        ? runHookAudit({
+            start: candidate.start,
+            end: candidate.start + candidate.duration,
+            transcriptCues,
+            windows
+          })
+        : {
+            passed: candidate.auditPassed,
+            auditScore: candidate.auditScore,
+            understandable: candidate.auditPassed,
+            curiosity: candidate.auditPassed,
+            payoff: candidate.auditPassed,
+            teaserStrength: clamp01(candidate.auditScore),
+            spoilerRisk: 0,
+            reasons: candidate.auditPassed ? [] : ['Hook audit unavailable for source verification']
+          }
+    )
+    verifiedAuditByKey.set(key, verified)
+    return verified
+  }
+  const hasCriticalSourceWeakness = (audit: HookAuditResult) => (
+    audit.reasons.some((reason) => /curiosity strongly enough|payoff signal is weak|pattern interrupt|value promise or curiosity gap/i.test(reason))
+  )
   const passesRelaxedAuditGate = (entry: HookSelectionRankedEntry) => {
-    if (entry.candidate.auditPassed) return true
+    const verifiedAudit = getVerifiedAudit(entry.candidate)
+    if (entry.candidate.auditPassed && verifiedAudit.passed) return true
     if (!hasTranscript) return signalStrength < 0.48
     if (signalStrength >= 0.48) return false
     return (
-      entry.candidate.auditScore >= relaxedTranscriptAuditFloor &&
+      verifiedAudit.auditScore >= relaxedTranscriptAuditFloor &&
       entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_TEASER) &&
       entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.02, HOOK_FALLBACK_TRANSCRIPT_MIN_CURIOSITY)
     )
@@ -10644,8 +10678,9 @@ const selectAuthoritativeAutoHookDecision = ({
   })
   const strictRow = interestingRows.find((row) => {
     const entry = row.entry
+    const verifiedAudit = getVerifiedAudit(entry.candidate)
     return (
-      entry.candidate.auditPassed &&
+      verifiedAudit.passed &&
       entry.confidence >= threshold &&
       entry.openerQuality >= strictFallbackInstantFloor &&
       entry.teaserTension >= strictFallbackTeaserFloor &&
@@ -10684,6 +10719,7 @@ const selectAuthoritativeAutoHookDecision = ({
       ? 'relaxed'
       : 'fallback'
   let usedFallback = selectionMode !== 'strict'
+  let lockedAuthoritativeFallback = false
   let reason: string | null = selectionMode === 'strict'
     ? null
     : selectionMode === 'relaxed'
@@ -10708,6 +10744,134 @@ const selectAuthoritativeAutoHookDecision = ({
     selectionMode = 'fallback'
     usedFallback = true
     reason = relocated.reason
+  }
+  const selectedVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
+  const selectedRepeatPenalty = computeHookRepeatPenalty({
+    candidate: selectedEntry.candidate,
+    recentHooks
+  })
+  const computeWeakHookRescueScore = (
+    row: InterestingFallbackRankedRow,
+    verifiedAudit: HookAuditResult
+  ) => Number(clamp01(
+    0.36 * verifiedAudit.auditScore +
+    0.16 * row.entry.openerQuality +
+    0.14 * row.entry.visualImpact +
+    0.12 * row.entry.curiosityPressure +
+    0.1 * row.entry.teaserTension +
+    0.04 * row.entry.selectionScore +
+    0.04 * row.evaluated.textSignals.interestingness +
+    0.02 * row.evaluated.textSignals.dramaticInterest +
+    0.02 * row.evaluated.textSignals.humorInterest +
+    0.02 * row.evaluated.textSignals.specificity -
+    0.14 * row.repeatPenalty
+  ).toFixed(4))
+  const hasDeadLeadWeakness = (audit: HookAuditResult) => (
+    audit.reasons.some((reason) => /dead visual lead-in|visible story content/i.test(reason))
+  )
+  const currentRow = interestingRows.find((row) => (
+    Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) < 0.01 &&
+    Math.abs(row.entry.candidate.duration - selectedEntry.candidate.duration) < 0.01
+  )) || null
+  const selectedRescueScore = currentRow
+    ? computeWeakHookRescueScore(currentRow, selectedVerifiedAudit)
+    : Number(clamp01(selectedVerifiedAudit.auditScore).toFixed(4))
+  const needsWeakHookRescue = (
+    selectionMode !== 'strict' ||
+    hasCriticalSourceWeakness(selectedVerifiedAudit) ||
+    hasDeadLeadWeakness(selectedVerifiedAudit) ||
+    selectedVerifiedAudit.auditScore < 0.52 ||
+    selectedRepeatPenalty >= 0.08
+  )
+  if (needsWeakHookRescue) {
+    const alternativeRows = interestingRows
+      .filter((row) => Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) >= 12)
+      .map((row) => {
+        const verifiedAudit = getVerifiedAudit(row.entry.candidate)
+        return {
+          row,
+          verifiedAudit,
+          rescueScore: computeWeakHookRescueScore(row, verifiedAudit)
+        }
+      })
+      .filter(({ row, verifiedAudit }) => (
+        row.entry.openerQuality >= Math.max(relaxedInstantHoldFloor - 0.08, 0.28) &&
+        row.entry.visualImpact >= Math.max(relaxedVisualImpactFloor - 0.08, 0.22) &&
+        (
+          verifiedAudit.auditScore >= Math.max(0.42, selectedVerifiedAudit.auditScore - 0.04) ||
+          row.entry.curiosityPressure >= selectedEntry.curiosityPressure + 0.06 ||
+          row.entry.teaserTension >= selectedEntry.teaserTension + 0.06 ||
+          row.entry.visualImpact >= selectedEntry.visualImpact + 0.06
+        )
+      ))
+      .sort((a, b) => (
+        b.rescueScore - a.rescueScore ||
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.row.entry.curiosityPressure - a.row.entry.curiosityPressure ||
+        b.row.entry.teaserTension - a.row.entry.teaserTension ||
+        b.row.entry.visualImpact - a.row.entry.visualImpact ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))
+    const preferredAlternative = alternativeRows.find(({ row, verifiedAudit, rescueScore }) => (
+      rescueScore >= selectedRescueScore + (selectedRepeatPenalty >= 0.08 ? -0.02 : 0.015) &&
+      (
+        verifiedAudit.auditScore >= selectedVerifiedAudit.auditScore + 0.045 ||
+        verifiedAudit.passed ||
+        !hasCriticalSourceWeakness(verifiedAudit) ||
+        row.entry.curiosityPressure >= selectedEntry.curiosityPressure + 0.06 ||
+        row.entry.visualImpact >= selectedEntry.visualImpact + 0.06
+      )
+    )) || alternativeRows[0] || null
+    if (preferredAlternative) {
+      const shouldForceAlternative = (
+        preferredAlternative.verifiedAudit.auditScore >= selectedVerifiedAudit.auditScore + 0.045 ||
+        preferredAlternative.rescueScore >= selectedRescueScore + 0.02 ||
+        selectedRepeatPenalty >= 0.08 ||
+        hasDeadLeadWeakness(selectedVerifiedAudit)
+      )
+      if (shouldForceAlternative) {
+        selectedEntry = preferredAlternative.row.entry
+        selectionMode = 'fallback'
+        usedFallback = true
+        lockedAuthoritativeFallback = true
+        reason = selectedRepeatPenalty >= 0.08
+          ? 'Recent reruns already reused the same weak opener cluster, so a different hook cluster was forced.'
+          : 'Weak default hook cluster was replaced by a stronger alternate opener cluster using source-truth audit and opener quality.'
+      }
+    }
+  }
+  const postRescueVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
+  if (!lockedAuthoritativeFallback && hasTranscript && hasCriticalSourceWeakness(postRescueVerifiedAudit)) {
+    const currentRow = interestingRows.find((row) => (
+      Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) < 0.01 &&
+      Math.abs(row.entry.candidate.duration - selectedEntry.candidate.duration) < 0.01
+    )) || null
+    const currentPriority = currentRow?.evaluated.priority ?? 0
+    const alternativeRow = interestingRows.find((row) => {
+      if (Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) < 12) return false
+      const verifiedAudit = getVerifiedAudit(row.entry.candidate)
+      if (
+        !verifiedAudit.passed &&
+        verifiedAudit.auditScore < Math.max(0.48, postRescueVerifiedAudit.auditScore + 0.04)
+      ) {
+        return false
+      }
+      return (
+        row.evaluated.priority >= currentPriority - 0.04 &&
+        (
+          verifiedAudit.passed ||
+          !hasCriticalSourceWeakness(verifiedAudit) ||
+          verifiedAudit.auditScore >= postRescueVerifiedAudit.auditScore + 0.06 ||
+          row.entry.curiosityPressure >= selectedEntry.curiosityPressure + 0.04
+        )
+      )
+    }) || null
+    if (alternativeRow) {
+      selectedEntry = alternativeRow.entry
+      selectionMode = 'fallback'
+      usedFallback = true
+      reason = 'Source-truth hook audit rejected the default winner as too weak on real curiosity/payoff, so a different hook cluster was forced.'
+    }
   }
   const debug = buildHookSelectionDebugPayload({
     ranked: interestingRows.length ? interestingRows.map((row) => row.entry) : ranked,
@@ -35366,7 +35530,8 @@ export const __retentionTestUtils = {
   summarizePlayerTelemetry,
   buildUniquenessSignatureForTest,
   buildEditPlanForTest,
-  shouldAutoTranscribeDuringAnalyze
+  shouldAutoTranscribeDuringAnalyze,
+  selectAuthoritativeAutoHookDecision
 }
 
 export default router

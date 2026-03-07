@@ -1,4 +1,6 @@
 import assert from 'assert'
+import fs from 'fs'
+import path from 'path'
 import { __retentionTestUtils } from '../src/routes/jobs'
 import { normalizeAnalysisPayload } from '../src/lib/analysisNormalizer'
 import { isJobStatusTransitionAllowed } from '../src/lib/editorConfig'
@@ -31,7 +33,8 @@ const {
   applyEliteCutRefinementForTest,
   summarizeBoundaryPathologyForTest,
   evaluateHardQualityBar,
-  shouldAutoTranscribeDuringAnalyze
+  shouldAutoTranscribeDuringAnalyze,
+  selectAuthoritativeAutoHookDecision
 } = __retentionTestUtils
 
 const makeWindow = (time: number, overrides: Record<string, any> = {}) => ({
@@ -129,6 +132,41 @@ const run = () => {
     transcriptCues: deadLeadCues
   })
   assert.ok(deadLeadPick.selected.start >= 1.8, 'hook should skip dead visual lead-in and start on the actual moment')
+
+  // 1aa) On repeated renders of the same weak source, the authoritative selector must move off the stale opener cluster.
+  const repeatFixture = JSON.parse(
+    fs.readFileSync(path.resolve(__dirname, 'fixtures', 'authoritative-hook-repeat-case.json'), 'utf8')
+  )
+  const repeatFixtureBaseArgs = {
+    candidates: repeatFixture.hookCandidates,
+    aggressionLevel: 'medium' as any,
+    hasTranscript: Boolean(repeatFixture.hasTranscript),
+    signalStrength: computeContentSignalStrength(repeatFixture.engagementWindows),
+    windows: repeatFixture.engagementWindows,
+    transcriptCues: [] as any[],
+    segments: repeatFixture.segments,
+    silences: repeatFixture.silences,
+    durationSeconds: repeatFixture.durationSeconds
+  }
+  const firstPassSelection = selectAuthoritativeAutoHookDecision({
+    ...repeatFixtureBaseArgs,
+    recentHooks: null
+  })
+  const repeatedSelection = selectAuthoritativeAutoHookDecision({
+    ...repeatFixtureBaseArgs,
+    recentHooks: [{ start: 85, duration: 8, count: 3 }]
+  })
+  assert.ok(firstPassSelection && repeatedSelection, 'selector should produce hook decisions for the repeat fixture')
+  assert.strictEqual(
+    Number(firstPassSelection!.candidate.start.toFixed(2)),
+    85.14,
+    'first pass should still mirror the original weak hook cluster before rerun penalties apply'
+  )
+  assert.strictEqual(
+    Number(repeatedSelection!.candidate.start.toFixed(2)),
+    51.06,
+    'repeat renders should move off the stale weak opener cluster onto a different cluster'
+  )
 
   // 1b) Partition-first hooking should pick one strong 8s candidate from each section, then choose best.
   const longWindows = new Array(96).fill(null).map((_, idx) => makeWindow(idx))
