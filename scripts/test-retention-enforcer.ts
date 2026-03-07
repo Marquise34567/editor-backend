@@ -133,6 +133,68 @@ const run = () => {
   })
   assert.ok(deadLeadPick.selected.start >= 1.8, 'hook should skip dead visual lead-in and start on the actual moment')
 
+  // 1a2) Audio over a black/loading screen must not count as a valid opener lead-in.
+  const audioOnlyLeadWindows = new Array(24).fill(null).map((_, idx) => makeWindow(idx, {
+    score: 0.18,
+    hookScore: 0.16,
+    audioEnergy: 0.2,
+    speechIntensity: 0.18,
+    motionScore: 0.02,
+    facePresence: 0.01,
+    textDensity: 0.01,
+    sceneChangeRate: 0.02,
+    emotionIntensity: 0.18,
+    vocalExcitement: 0.16,
+    curiosityTrigger: 0.04,
+    keywordIntensity: 0.04
+  }))
+  for (let second = 0; second <= 1; second += 1) {
+    audioOnlyLeadWindows[second] = makeWindow(second, {
+      score: 0.74,
+      hookScore: 0.78,
+      audioEnergy: 0.76,
+      speechIntensity: 0.84,
+      motionScore: 0,
+      facePresence: 0,
+      textDensity: 0,
+      sceneChangeRate: 0,
+      emotionIntensity: 0.62,
+      vocalExcitement: 0.68,
+      curiosityTrigger: 0.28,
+      keywordIntensity: 0.26
+    })
+  }
+  for (let second = 2; second <= 8; second += 1) {
+    audioOnlyLeadWindows[second] = makeWindow(second, {
+      score: 0.88,
+      hookScore: 0.9,
+      audioEnergy: 0.72,
+      speechIntensity: 0.76,
+      motionScore: 0.66,
+      facePresence: 0.42,
+      textDensity: 0.14,
+      sceneChangeRate: 0.38,
+      emotionIntensity: 0.7,
+      vocalExcitement: 0.72,
+      curiosityTrigger: 0.78,
+      keywordIntensity: 0.74
+    })
+  }
+  const audioOnlyLeadCues = [
+    { start: 0.0, end: 1.8, text: 'Listen, this gets crazy in a second.', keywordIntensity: 0.52, curiosityTrigger: 0.44, fillerDensity: 0 },
+    { start: 2.0, end: 5.8, text: 'There they go, the police are pulling up to the U-Haul right now.', keywordIntensity: 0.82, curiosityTrigger: 0.88, fillerDensity: 0 }
+  ]
+  const audioOnlyLeadPick = pickTopHookCandidates({
+    durationSeconds: 24,
+    segments: [{ start: 0, end: 24 }],
+    windows: audioOnlyLeadWindows,
+    transcriptCues: audioOnlyLeadCues
+  })
+  assert.ok(
+    audioOnlyLeadPick.selected.start >= 1.8,
+    'hook should trim past audio-over-black/loading lead-ins and start when visible story content appears'
+  )
+
   // 1aa) On repeated renders of the same weak source, the authoritative selector must move off the stale opener cluster.
   const repeatFixture = JSON.parse(
     fs.readFileSync(path.resolve(__dirname, 'fixtures', 'authoritative-hook-repeat-case.json'), 'utf8')

@@ -12251,13 +12251,18 @@ const computeHookDeadLeadPenalty = ({
   const delayedLift = clamp01(Math.max(0, laterImpact - leadNarrative) * 1.55)
   const deadVisual = clamp01(1 - leadVisibility * 1.7)
   const deadNarrative = clamp01(1 - leadNarrative * 1.55)
-  const penalty = clamp01(
+  let penalty = clamp01(
     0.4 * deadVisual +
     0.28 * deadNarrative +
     0.2 * delayedLift +
     0.12 * Number(leadVisibility < 0.2 && laterImpact > leadNarrative + 0.14)
   )
-  if (leadVisibility >= 0.34 || leadNarrative >= 0.48) {
+  if (leadVisibility < 0.12 && laterImpact >= leadNarrative + 0.08) {
+    penalty = Math.max(penalty, 0.62)
+  } else if (leadVisibility < 0.16 && leadNarrative >= 0.5) {
+    penalty = Math.max(penalty, 0.54)
+  }
+  if (leadVisibility >= 0.34 || (leadNarrative >= 0.48 && leadVisibility >= 0.22)) {
     return Number((penalty * 0.45).toFixed(4))
   }
   return Number(penalty.toFixed(4))
@@ -12310,7 +12315,9 @@ const tightenHookRangeForRetention = ({
     const silenceRatio = getSilenceCoverageRatio(probeRange, silences)
     const weakLead = (
       silenceRatio >= 0.28 ||
+      visibleLead < 0.12 ||
       deadLeadPenalty >= 0.46 ||
+      (visibleLead < 0.16 && deadLeadPenalty >= 0.3) ||
       (hookSignal < 0.44 && speech < 0.5 && energy < 0.46) ||
       (visibleLead < 0.18 && speech < 0.42 && hookSignal < 0.5) ||
       (visibleLead < 0.24 && deadLeadPenalty >= 0.38)
