@@ -22,6 +22,7 @@ const {
   enforceSegmentLengthsForTest,
   selectRenderableHookCandidate,
   computeInterestingHookPriorityFromSignals,
+  shouldLockInterestingFallbackHookAcrossVariants,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
   predictVariantRetention,
@@ -554,6 +555,74 @@ const run = () => {
   assert.ok(
     dramaticHookPriority.priority > safeHookPriority.priority,
     'dramatic curiosity hooks should score above safer openers when renderability is otherwise close'
+  )
+  assert.ok(
+    shouldLockInterestingFallbackHookAcrossVariants({
+      candidate: {
+        start: 95,
+        duration: 7,
+        score: 0.74,
+        auditScore: 0.58,
+        auditPassed: false,
+        text: "I fucking knew it. Oh my god. You're fucked.",
+        reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
+      },
+      scored: {
+        confidence: 0.61,
+        instantHold: 0.63,
+        introClarity: 0.55,
+        teaserTension: 0.58,
+        curiosityPressure: 0.59,
+        visualNovelty: 0.42,
+        visualImpact: 0.46,
+        valuePromise: 0.33,
+        urgency: 0.42,
+        contrarianTrigger: 0.44,
+        overlayReadiness: 0.43,
+        authenticity: 0.48,
+        openerQuality: 0.57,
+        selectionScore: 0.58
+      },
+      durationSeconds: 220,
+      hasTranscript: true,
+      selectionSource: 'fallback',
+      reason: 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
+    }),
+    'forced-interest fallback hooks should stay pinned across variant retries'
+  )
+  assert.ok(
+    !shouldLockInterestingFallbackHookAcrossVariants({
+      candidate: {
+        start: 0,
+        duration: 7.2,
+        score: 0.78,
+        auditScore: 0.66,
+        auditPassed: false,
+        text: '700 pounds of weed was found in a U-Haul. How do you even?',
+        reason: 'early opener'
+      },
+      scored: {
+        confidence: 0.62,
+        instantHold: 0.64,
+        introClarity: 0.58,
+        teaserTension: 0.56,
+        curiosityPressure: 0.6,
+        visualNovelty: 0.42,
+        visualImpact: 0.46,
+        valuePromise: 0.38,
+        urgency: 0.34,
+        contrarianTrigger: 0.3,
+        overlayReadiness: 0.44,
+        authenticity: 0.46,
+        openerQuality: 0.58,
+        selectionScore: 0.6
+      },
+      durationSeconds: 220,
+      hasTranscript: true,
+      selectionSource: 'fallback',
+      reason: 'generic fallback opener'
+    }),
+    'weak early fallback openers should not be locked across variant retries'
   )
 
   // 2c) Adaptive thresholds should relax in no-transcript/low-signal mode.

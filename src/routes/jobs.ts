@@ -11039,6 +11039,60 @@ const computeInterestingHookPriorityFromSignals = ({
   }
 }
 
+const shouldLockInterestingFallbackHookAcrossVariants = ({
+  candidate,
+  scored,
+  durationSeconds,
+  hasTranscript,
+  selectionSource,
+  reason
+}: {
+  candidate: HookCandidate | null | undefined
+  scored: ReturnType<typeof scoreRenderableHookCandidateSignals>
+  durationSeconds: number
+  hasTranscript: boolean
+  selectionSource: 'auto' | 'user_selected' | 'fallback'
+  reason?: string | null
+}) => {
+  if (!candidate || selectionSource !== 'fallback') return false
+  const interesting = computeInterestingHookPriorityFromSignals({
+    candidate,
+    scored,
+    durationSeconds,
+    hasTranscript
+  })
+  const reasonText = `${String(reason || '')} ${String(candidate.reason || '')}`.toLowerCase()
+  const forcedInterestingReason = (
+    reasonText.includes('most interesting') ||
+    reasonText.includes('highest-impact timeline peak') ||
+    reasonText.includes('curiosity/drama moment') ||
+    reasonText.includes('visual/chaos moment')
+  )
+  const strongInterestSignals = (
+    interesting.textSignals.interestingness >= 0.62 ||
+    interesting.textSignals.dramaticInterest >= 0.54 ||
+    interesting.textSignals.humorInterest >= 0.54 ||
+    scored.curiosityPressure >= 0.48 ||
+    scored.visualImpact >= 0.46 ||
+    scored.contrarianTrigger >= 0.36
+  )
+  const lateEnoughToProtect = (
+    candidate.start >= 24 ||
+    (candidate.start >= 12 && interesting.priority >= 0.56) ||
+    (candidate.start >= 6 && interesting.priority >= 0.64)
+  )
+  const weakEarlySafeFallback = (
+    candidate.start < 6 &&
+    interesting.priority < 0.62 &&
+    interesting.textSignals.interestingness < 0.64 &&
+    scored.curiosityPressure < 0.46 &&
+    scored.visualImpact < 0.44 &&
+    scored.teaserTension < 0.46
+  )
+  if (weakEarlySafeFallback) return false
+  return forcedInterestingReason || (strongInterestSignals && lateEnoughToProtect)
+}
+
 const normalizeHookSourceBasename = (inputPath: unknown) => {
   const raw = path.basename(String(inputPath || '').split('?')[0] || '').trim().toLowerCase()
   if (!raw) return ''
@@ -29123,6 +29177,14 @@ const processJob = async (
           )}).`
         )
       }
+      const stickyInterestingFallbackHookAcrossVariants = shouldLockInterestingFallbackHookAcrossVariants({
+        candidate: initialHook,
+        scored: initialHookSignals,
+        durationSeconds,
+        hasTranscript: hasTranscriptSignals,
+        selectionSource: selectedHookSelectionSource,
+        reason: resolvedHookDecision.reason
+      })
       // User-selected hooks must always be stitched to the opening so the
       // chosen intro is guaranteed to lead the final edit.
       const fallbackHookUnsafe = selectedHookSelectionSource === 'fallback' && (
@@ -29546,11 +29608,17 @@ const processJob = async (
         ? FAST_MODE_QUALITY_GATE_RETRIES
         : MAX_QUALITY_GATE_RETRIES
       const lockPrimaryHookAcrossVariants =
-        durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
-        selectedContentFormat !== 'tiktok_short' &&
-        (forceLongFormHookMove || options.onlyCuts)
+        (
+          durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
+          selectedContentFormat !== 'tiktok_short' &&
+          (forceLongFormHookMove || options.onlyCuts)
+        ) ||
+        stickyInterestingFallbackHookAcrossVariants
       if (lockPrimaryHookAcrossVariants) {
-        optimizationNotes.push('Long-form hook lock active: retaining primary opener candidate across variant retries.')
+        optimizationNotes.push('Primary hook lock active: retaining the selected opener candidate across variant retries.')
+      }
+      if (stickyInterestingFallbackHookAcrossVariants) {
+        optimizationNotes.push('Interesting fallback hook lock active: variant retries may change pacing/cuts, but not replace the forced opener with a safer default.')
       }
       const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
@@ -36263,6 +36331,7 @@ export const __retentionTestUtils = {
   enforceSegmentLengthsForTest: enforceSegmentLengths,
   selectRenderableHookCandidate,
   computeInterestingHookPriorityFromSignals,
+  shouldLockInterestingFallbackHookAcrossVariants,
   selectLongFormDisplacedHookCandidate,
   shouldForceRescueRender,
   executeQualityGateRetriesForTest,
