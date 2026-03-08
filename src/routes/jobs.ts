@@ -20926,6 +20926,69 @@ const applyHardQualityGateGraceOverrides = ({
   }
 }
 
+const maybeAllowImprovementBasedHardQualityOverride = ({
+  audit,
+  retentionScoreBefore,
+  retentionScoreAfter,
+  hasTranscriptSignals,
+  contentSignalStrength,
+  topHumanGuardMode
+}: {
+  audit: HardQualityGateAudit
+  retentionScoreBefore: number | null
+  retentionScoreAfter: number | null
+  hasTranscriptSignals: boolean
+  contentSignalStrength: number
+  topHumanGuardMode: boolean
+}) => {
+  if (!audit || audit.passed || topHumanGuardMode) return null
+  const before = Number(retentionScoreBefore)
+  const after = Number(retentionScoreAfter)
+  if (!Number.isFinite(before) || !Number.isFinite(after)) return null
+  const unresolvedFailures = audit.checks.filter((check) => !check.passed)
+  if (!unresolvedFailures.length) return null
+  if (unresolvedFailures.some((check) => check.key === 'boundary_pathology')) return null
+  const severeLowEditDelta = unresolvedFailures.some((check) => (
+    check.key === 'edit_delta' &&
+    check.score < Math.max(0.12, check.threshold * 0.55)
+  ))
+  if (severeLowEditDelta) return null
+  const improvementDelta = after - before
+  const minimumImprovement = hasTranscriptSignals
+    ? (contentSignalStrength >= 0.55 ? 3.0 : 2.0)
+    : (contentSignalStrength >= 0.45 ? 1.5 : 1.0)
+  const minimumAfterScore = hasTranscriptSignals ? 48 : 45
+  if (after < minimumAfterScore || improvementDelta < minimumImprovement) return null
+  return {
+    reason: `Improvement override: edited retention improved from ${before.toFixed(1)}% to ${after.toFixed(1)}% and remaining hard-gate misses were treated as soft.`
+  }
+}
+
+const applyHardQualityPassOverride = ({
+  audit,
+  reason
+}: {
+  audit: HardQualityGateAudit
+  reason: string
+}): HardQualityGateAudit => {
+  if (!audit || audit.passed) return audit
+  return {
+    ...audit,
+    passed: true,
+    checks: audit.checks.map((check) => (
+      check.passed
+        ? check
+        : {
+            ...check,
+            passed: true,
+            reason: `${check.reason} Passed via improvement-over-source override.`
+          }
+    )),
+    summary: `Hard quality bar passed via override. ${reason}`,
+    generatedAt: toIsoNow()
+  }
+}
+
 const buildGuaranteedFallbackSegments = (durationSeconds: number, options: EditOptions) => {
   const total = Number.isFinite(durationSeconds) ? Math.max(0, durationSeconds) : 0
   if (total <= 0.25) return [{ start: 0, end: total, speed: 1 } as Segment]
@@ -32675,6 +32738,31 @@ const processJob = async (
       }
       selectedBoundaryPathologySummary = hardQualityAudit.boundaryPathologySummary || selectedBoundaryPathologySummary
       hardQualityGateForAnalysis = hardQualityAudit
+      const improvementBasedHardQualityOverride = maybeAllowImprovementBasedHardQualityOverride({
+        audit: hardQualityAudit,
+        retentionScoreBefore: retentionScoreBeforeEdit,
+        retentionScoreAfter: retentionScoreAfterEdit,
+        hasTranscriptSignals,
+        contentSignalStrength,
+        topHumanGuardMode: options.topHumanGuardMode
+      })
+      if (improvementBasedHardQualityOverride) {
+        hardQualityAudit = applyHardQualityPassOverride({
+          audit: hardQualityAudit,
+          reason: improvementBasedHardQualityOverride.reason
+        })
+        hardQualityGateForAnalysis = hardQualityAudit
+        qualityGateOverride = qualityGateOverride
+          ? {
+              applied: true,
+              reason: `${qualityGateOverride.reason} ${improvementBasedHardQualityOverride.reason}`
+            }
+          : {
+              applied: true,
+              reason: improvementBasedHardQualityOverride.reason
+            }
+        optimizationNotes.push(improvementBasedHardQualityOverride.reason)
+      }
       if (!hardQualityAudit.passed) {
         const failureReason = `Hard quality bar failed: ${hardQualityAudit.checks.filter((check) => !check.passed).map((check) => check.key).join(', ')}`
         await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
