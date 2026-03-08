@@ -11397,6 +11397,302 @@ const selectAuthoritativeAutoHookDecision = ({
     hasTranscript,
     recentHooks
   })
+  const computeStandoutOpeningProfile = (row: InterestingFallbackRankedRow) => {
+    const textSignals = row.evaluated.textSignals
+    const curiosity = clamp01(
+      0.3 * row.entry.curiosityPressure +
+      0.18 * row.entry.teaserTension +
+      0.14 * textSignals.curiosityBlend +
+      0.12 * row.entry.valuePromise +
+      0.08 * row.entry.contrarianTrigger +
+      0.08 * textSignals.specificity +
+      0.1 * textSignals.interestingness
+    )
+    const crazy = clamp01(
+      0.24 * textSignals.dramaticInterest +
+      0.16 * textSignals.emotionalTrigger +
+      0.14 * row.entry.visualImpact +
+      0.12 * row.entry.contrarianTrigger +
+      0.12 * row.entry.teaserTension +
+      0.08 * row.entry.urgency +
+      0.08 * row.entry.selectionScore +
+      0.06 * textSignals.interestingness
+    )
+    const funny = clamp01(
+      0.42 * textSignals.humorInterest +
+      0.12 * textSignals.conversational +
+      0.12 * row.entry.authenticity +
+      0.1 * row.entry.selectionScore +
+      0.08 * row.entry.instantHold +
+      0.08 * row.entry.curiosityPressure +
+      0.08 * textSignals.interestingness
+    )
+    const bestMoment = clamp01(
+      0.22 * row.entry.selectionScore +
+      0.18 * clamp01(Number(row.entry.candidate.score || 0)) +
+      0.16 * row.entry.visualImpact +
+      0.14 * row.entry.openerQuality +
+      0.12 * row.entry.instantHold +
+      0.1 * row.entry.confidence +
+      0.08 * textSignals.interestingness
+    )
+    const rankedKinds = [
+      { kind: 'curiosity' as const, score: curiosity },
+      { kind: 'crazy' as const, score: crazy },
+      { kind: 'funny' as const, score: funny },
+      { kind: 'best_moment' as const, score: bestMoment }
+    ].sort((a, b) => b.score - a.score)
+    return {
+      kind: rankedKinds[0]?.kind || 'best_moment',
+      score: Number((rankedKinds[0]?.score ?? 0).toFixed(4)),
+      curiosity: Number(curiosity.toFixed(4)),
+      crazy: Number(crazy.toFixed(4)),
+      funny: Number(funny.toFixed(4)),
+      bestMoment: Number(bestMoment.toFixed(4))
+    }
+  }
+  const selectStandoutOpeningAlternative = (current: HookSelectionRankedEntry) => {
+    const currentRow = interestingRows.find((row) => (
+      Math.abs(row.entry.candidate.start - current.candidate.start) < 0.01 &&
+      Math.abs(row.entry.candidate.duration - current.candidate.duration) < 0.01
+    )) || null
+    if (!currentRow) return null
+    const currentAudit = getVerifiedAudit(current.candidate)
+    const currentProfile = computeStandoutOpeningProfile(currentRow)
+    const currentLooksSafe = (
+      current.candidate.start < Math.max(4.2, Math.min(6.5, durationSeconds * 0.12)) &&
+      currentRow.adjustedPriority < 0.78 &&
+      currentProfile.score < 0.72 &&
+      currentRow.evaluated.textSignals.interestingness < 0.72 &&
+      current.curiosityPressure < 0.48 &&
+      current.teaserTension < 0.48 &&
+      current.visualImpact < 0.46
+    )
+    const minDisplacementSeconds = durationSeconds >= 180 ? 6 : durationSeconds >= 75 ? 4.5 : 3
+    const standoutRows = interestingRows
+      .filter((row) => (
+        Math.abs(row.entry.candidate.start - current.candidate.start) >= minDisplacementSeconds &&
+        !row.evaluated.textSignals.isGenericUtterance
+      ))
+      .map((row) => {
+        const verifiedAudit = getVerifiedAudit(row.entry.candidate)
+        return {
+          row,
+          verifiedAudit,
+          profile: computeStandoutOpeningProfile(row)
+        }
+      })
+      .filter(({ row, verifiedAudit, profile }) => (
+        !failsSyntheticCredibilityGate(row.entry) &&
+        passesNonVerbalSafety(row.entry) &&
+        row.entry.confidence >= 0.4 &&
+        row.entry.openerQuality >= 0.3 &&
+        (
+          verifiedAudit.passed ||
+          verifiedAudit.auditScore >= Math.max(0.4, currentAudit.auditScore - 0.06) ||
+          (
+            profile.score >= 0.64 &&
+            row.entry.curiosityPressure >= 0.34 &&
+            row.entry.teaserTension >= 0.28
+          )
+        )
+      ))
+      .sort((a, b) => (
+        b.profile.score - a.profile.score ||
+        b.row.adjustedPriority - a.row.adjustedPriority ||
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.row.entry.selectionScore - a.row.entry.selectionScore ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))
+    const standoutAlternative = standoutRows.find(({ row, verifiedAudit, profile }) => {
+      const traitGap = (
+        profile.kind === 'curiosity'
+          ? profile.curiosity >= currentProfile.curiosity + 0.08
+          : profile.kind === 'crazy'
+            ? profile.crazy >= currentProfile.crazy + 0.08
+            : profile.kind === 'funny'
+              ? profile.funny >= currentProfile.funny + 0.08
+              : profile.bestMoment >= currentProfile.bestMoment + 0.08
+      )
+      const clearlyBeatsCurrent = (
+        profile.score >= currentProfile.score + 0.07 ||
+        row.adjustedPriority >= currentRow.adjustedPriority + 0.05 ||
+        row.evaluated.textSignals.interestingness >= currentRow.evaluated.textSignals.interestingness + 0.06 ||
+        traitGap
+      )
+      const safeEnough = (
+        verifiedAudit.passed ||
+        verifiedAudit.auditScore >= currentAudit.auditScore + 0.02 ||
+        !hasCriticalSourceWeakness(verifiedAudit) ||
+        profile.score >= 0.76
+      )
+      return safeEnough && (
+        clearlyBeatsCurrent ||
+        (
+          currentLooksSafe &&
+          profile.score >= Math.max(0.68, currentProfile.score + 0.03)
+        )
+      )
+    }) || null
+    if (!standoutAlternative) return null
+    const reason = standoutAlternative.profile.kind === 'curiosity'
+      ? 'Standout opener upgrade: moved the strongest curiosity-gap moment to the beginning instead of keeping a safer default opener.'
+      : standoutAlternative.profile.kind === 'crazy'
+        ? 'Standout opener upgrade: moved the craziest higher-shock moment to the beginning instead of keeping a safer default opener.'
+        : standoutAlternative.profile.kind === 'funny'
+          ? 'Standout opener upgrade: moved the funniest beat to the beginning instead of keeping a safer default opener.'
+          : 'Standout opener upgrade: moved the best standout moment to the beginning instead of keeping a safer default opener.'
+    return {
+      row: standoutAlternative.row,
+      reason
+    }
+  }
+  const selectAggressiveNaturalStandoutFallback = (current?: HookSelectionRankedEntry | null) => {
+    const currentRow = current
+      ? interestingRows.find((row) => (
+          Math.abs(row.entry.candidate.start - current.candidate.start) < 0.01 &&
+          Math.abs(row.entry.candidate.duration - current.candidate.duration) < 0.01
+        )) || null
+      : null
+    const currentProfile = currentRow ? computeStandoutOpeningProfile(currentRow) : null
+    const currentAudit = current ? getVerifiedAudit(current.candidate) : null
+    const minDisplacementSeconds = durationSeconds >= 180 ? 6 : durationSeconds >= 75 ? 4 : 2.6
+    const naturalStandoutRows = interestingRows
+      .filter((row) => (
+        !row.entry.candidate.synthetic &&
+        !row.evaluated.textSignals.isGenericUtterance &&
+        (!current || Math.abs(row.entry.candidate.start - current.candidate.start) >= minDisplacementSeconds)
+      ))
+      .map((row) => ({
+        row,
+        verifiedAudit: getVerifiedAudit(row.entry.candidate),
+        profile: computeStandoutOpeningProfile(row)
+      }))
+      .filter(({ row, verifiedAudit, profile }) => (
+        passesNonVerbalSafety(row.entry) &&
+        row.entry.confidence >= 0.34 &&
+        row.entry.openerQuality >= 0.24 &&
+        (
+          profile.score >= 0.62 ||
+          row.adjustedPriority >= 0.62 ||
+          row.evaluated.textSignals.interestingness >= 0.68 ||
+          row.evaluated.textSignals.dramaticInterest >= 0.5 ||
+          row.evaluated.textSignals.humorInterest >= 0.48 ||
+          row.entry.curiosityPressure >= 0.46 ||
+          row.entry.visualImpact >= 0.48
+        ) &&
+        (
+          verifiedAudit.passed ||
+          verifiedAudit.auditScore >= 0.34 ||
+          !hasCriticalSourceWeakness(verifiedAudit) ||
+          profile.score >= 0.72
+        )
+      ))
+      .sort((a, b) => (
+        b.profile.score - a.profile.score ||
+        b.row.adjustedPriority - a.row.adjustedPriority ||
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.row.entry.selectionScore - a.row.entry.selectionScore ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))
+    const standout = naturalStandoutRows.find(({ row, verifiedAudit, profile }) => {
+      if (!currentRow || !currentProfile || !currentAudit) return true
+      const traitGap = Math.max(
+        profile.curiosity - currentProfile.curiosity,
+        profile.crazy - currentProfile.crazy,
+        profile.funny - currentProfile.funny,
+        profile.bestMoment - currentProfile.bestMoment
+      )
+      const clearlyBeatsCurrent = (
+        profile.score >= currentProfile.score + 0.04 ||
+        row.adjustedPriority >= currentRow.adjustedPriority + 0.03 ||
+        row.evaluated.textSignals.interestingness >= currentRow.evaluated.textSignals.interestingness + 0.05 ||
+        traitGap >= 0.07
+      )
+      const safeEnough = (
+        verifiedAudit.passed ||
+        verifiedAudit.auditScore >= currentAudit.auditScore - 0.04 ||
+        !hasCriticalSourceWeakness(verifiedAudit) ||
+        profile.score >= 0.74
+      )
+      return safeEnough && clearlyBeatsCurrent
+    }) || null
+    if (!standout) return null
+    const reason = standout.profile.kind === 'curiosity'
+      ? 'Aggressive natural standout rescue: promoted the strongest real curiosity-gap moment instead of falling back to a safe chronological opener.'
+      : standout.profile.kind === 'crazy'
+        ? 'Aggressive natural standout rescue: promoted the strongest real shock/crazy moment instead of falling back to a safe chronological opener.'
+        : standout.profile.kind === 'funny'
+          ? 'Aggressive natural standout rescue: promoted the strongest real funny beat instead of falling back to a safe chronological opener.'
+          : 'Aggressive natural standout rescue: promoted the strongest real standout moment instead of falling back to a safe chronological opener.'
+    return {
+      row: standout.row,
+      reason
+    }
+  }
+  const selectLeastBadNaturalOpeningRescue = () => {
+    const candidates = interestingRows
+      .filter((row) => (
+        !row.entry.candidate.synthetic &&
+        !row.evaluated.textSignals.isGenericUtterance &&
+        passesNonVerbalSafety(row.entry) &&
+        String(row.entry.candidate.text || '').trim().length >= 12
+      ))
+      .map((row) => {
+        const verifiedAudit = getVerifiedAudit(row.entry.candidate)
+        const profile = computeStandoutOpeningProfile(row)
+        const aggressionScore = clamp01(
+          0.28 * verifiedAudit.auditScore +
+          0.18 * row.entry.selectionScore +
+          0.16 * row.adjustedPriority +
+          0.12 * profile.score +
+          0.1 * row.entry.curiosityPressure +
+          0.08 * row.entry.teaserTension +
+          0.08 * row.evaluated.textSignals.interestingness
+        )
+        return {
+          row,
+          verifiedAudit,
+          profile,
+          aggressionScore: Number(aggressionScore.toFixed(4))
+        }
+      })
+      .filter(({ row, verifiedAudit, profile, aggressionScore }) => (
+        row.entry.confidence >= 0.28 &&
+        row.entry.openerQuality >= 0.2 &&
+        (
+          aggressionScore >= 0.42 ||
+          verifiedAudit.auditScore >= 0.48 ||
+          profile.score >= 0.58 ||
+          row.entry.curiosityPressure >= 0.42
+        )
+      ))
+      .sort((a, b) => (
+        b.aggressionScore - a.aggressionScore ||
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.profile.score - a.profile.score ||
+        b.row.adjustedPriority - a.row.adjustedPriority ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))
+    const pick = candidates[0] || null
+    if (!pick) return null
+    return {
+      row: pick.row,
+      reason: 'Aggressive natural fallback: promoted the strongest available real opener even though it only near-passed audit, to avoid a flat chronological opening.'
+    }
+  }
+  const selectLastChanceNaturalOpening = () => {
+    const naturalRow = interestingRows.find((row) => (
+      !row.entry.candidate.synthetic &&
+      passesNonVerbalSafety(row.entry) &&
+      String(row.entry.candidate.text || '').trim().length >= 6
+    )) || null
+    if (!naturalRow) return null
+    return {
+      row: naturalRow,
+      reason: 'Last-chance natural fallback: forced the strongest real timeline beat into the opener instead of keeping a flat chronological opening.'
+    }
+  }
   const strictRow = interestingRows.find((row) => {
     const entry = row.entry
     const verifiedAudit = getVerifiedAudit(entry.candidate)
@@ -11467,6 +11763,14 @@ const selectAuthoritativeAutoHookDecision = ({
     selectionMode = 'fallback'
     usedFallback = true
     reason = relocated.reason
+  }
+  const standoutAlternative = selectStandoutOpeningAlternative(selectedEntry)
+  if (standoutAlternative) {
+    selectedEntry = standoutAlternative.row.entry
+    selectionMode = 'fallback'
+    usedFallback = true
+    lockedAuthoritativeFallback = true
+    reason = standoutAlternative.reason
   }
   const selectedVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
   const selectedRepeatPenalty = computeHookRepeatPenalty({
@@ -11676,7 +11980,13 @@ const selectAuthoritativeAutoHookDecision = ({
       passesNonVerbalSafety(row.entry) &&
       getVerifiedAudit(row.entry.candidate).passed
     )) || null
+    const aggressiveNaturalStandout = selectAggressiveNaturalStandoutFallback(selectedEntry)
+    const leastBadNaturalOpening = selectLeastBadNaturalOpeningRescue()
+    const lastChanceNaturalOpening = selectLastChanceNaturalOpening()
     const credibleNaturalOpening = strongestAuditedNaturalRow?.entry.candidate ||
+      aggressiveNaturalStandout?.row.entry.candidate ||
+      leastBadNaturalOpening?.row.entry.candidate ||
+      lastChanceNaturalOpening?.row.entry.candidate ||
       pickAuditedOpeningCandidateFromPool({
         candidates,
         durationSeconds,
@@ -11694,6 +12004,12 @@ const selectAuthoritativeAutoHookDecision = ({
       lockedAuthoritativeFallback = true
       reason = strongestAuditedNaturalRow
         ? 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
+        : aggressiveNaturalStandout
+          ? aggressiveNaturalStandout.reason
+        : leastBadNaturalOpening
+          ? leastBadNaturalOpening.reason
+        : lastChanceNaturalOpening
+          ? lastChanceNaturalOpening.reason
         : 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest near-pass natural beat instead of falling straight back to the chronological opening.'
     } else {
       const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
@@ -16714,6 +17030,37 @@ const pickTopHookCandidates = ({
         starts.add(Math.max(0, Number((cueStart - 0.25).toFixed(2))))
         starts.add(Number(cueStart.toFixed(2)))
       })
+    transcriptCues
+      .slice()
+      .map((cue) => {
+        const textSignals = analyzeHookTextQualitySignals(String(cue.text || ''))
+        const standoutScore = clamp01(
+          0.24 * textSignals.interestingness +
+          0.22 * textSignals.dramaticInterest +
+          0.18 * textSignals.humorInterest +
+          0.18 * textSignals.curiosityBlend +
+          0.1 * Number(cue.interestingness ?? 0) +
+          0.08 * Number(cue.emotionalIntensity ?? 0)
+        )
+        return {
+          cue,
+          standoutScore
+        }
+      })
+      .sort((a, b) => b.standoutScore - a.standoutScore || a.cue.start - b.cue.start)
+      .slice(0, Math.max(20, hookCandidateTarget * 3))
+      .forEach(({ cue, standoutScore }) => {
+        if (standoutScore < 0.32) return
+        const cueStart = Number(cue.start || 0)
+        const cueSpan = Math.max(0.35, Number(cue.end || cueStart) - cueStart)
+        const leadIn = Math.min(2.2, 0.7 + cueSpan * 0.48 + standoutScore * 0.6)
+        starts.add(Math.max(0, Number((cueStart - leadIn).toFixed(2))))
+        starts.add(Math.max(0, Number((cueStart - 0.45).toFixed(2))))
+        starts.add(Number(cueStart.toFixed(2)))
+        if (standoutScore >= 0.58) {
+          starts.add(Math.max(0, Number((cueStart - 1.15).toFixed(2))))
+        }
+      })
     for (let second = 0; second <= Math.max(0, Math.floor(durationSeconds - HOOK_MIN)); second += 2) {
       starts.add(second)
     }
@@ -16875,6 +17222,24 @@ const pickTopHookCandidates = ({
         0.1 * visualLeadScore
       )
       const teaserReserve = clamp01(1 - audit.spoilerRisk)
+      const standoutMomentLift = clamp01(
+        0.24 * textSignals.interestingness +
+        0.18 * textSignals.dramaticInterest +
+        0.16 * textSignals.humorInterest +
+        0.14 * boostedCuriosityAcceleration +
+        0.12 * emotionalTrigger +
+        0.08 * transcriptDrivenPriority +
+        0.08 * dynamicLift.score
+      )
+      const standoutMomentKind = (
+        textSignals.humorInterest >= Math.max(textSignals.dramaticInterest + 0.06, 0.52)
+          ? 'funny'
+          : textSignals.dramaticInterest >= Math.max(textSignals.humorInterest + 0.04, 0.5)
+            ? 'crazy'
+            : textSignals.curiosityBlend >= 0.42 || boostedCuriosityAcceleration >= 0.46
+              ? 'curiosity'
+              : 'best moment'
+      )
       const longFormStartPenalty = longFormMinHookSourceStart > 0
         ? clamp01((longFormMinHookSourceStart - aligned.start) / Math.max(0.5, longFormMinHookSourceStart))
         : 0
@@ -16929,6 +17294,7 @@ const pickTopHookCandidates = ({
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier * creativeVariantHookProfile.spoilerPenaltyMultiplier -
         0.05 * textSignals.weakIntroPenalty +
+        0.08 * standoutMomentLift +
         0.02 * visualLeadScore * creativeVariantHookProfile.visualLeadMultiplier +
         modeHookProfile.baseBias
       )
@@ -16941,7 +17307,9 @@ const pickTopHookCandidates = ({
         auditPassed: audit.passed,
         text: hookText,
         reason: audit.passed
-          ? 'Best-moment candidate passed hook audit and first-3-second instant-hold scoring from this video timeline.'
+          ? standoutMomentLift >= 0.68
+            ? `Standout ${standoutMomentKind} candidate passed hook audit and first-3-second instant-hold scoring from this video timeline.`
+            : 'Best-moment candidate passed hook audit and first-3-second instant-hold scoring from this video timeline.'
           : `${audit.reasons.join('; ')} First-3-second instant-hold score was too weak for priority selection on this video timeline.`
       })
     }
