@@ -25325,6 +25325,65 @@ const parsePreferredHookCandidateFromPayload = (raw: any): HookCandidate | null 
   return normalized[0] ?? null
 }
 
+const getPreferredHookUpdatedAtFromAnalysis = (analysisRaw: any): string | null => {
+  const rawValue = analysisRaw && typeof analysisRaw === 'object'
+    ? analysisRaw.preferred_hook_updated_at
+    : null
+  return typeof rawValue === 'string' && rawValue.trim()
+    ? rawValue.trim()
+    : null
+}
+
+const hookCandidatesMatchWithinSelectionTolerance = (
+  left: HookCandidate | null | undefined,
+  right: HookCandidate | null | undefined
+): boolean => {
+  if (!left || !right) return false
+  return (
+    Math.abs(left.start - right.start) <= HOOK_SELECTION_MATCH_START_TOLERANCE_SEC &&
+    Math.abs(left.duration - right.duration) <= HOOK_SELECTION_MATCH_DURATION_TOLERANCE_SEC
+  )
+}
+
+const resolvePersistedPreferredHookState = ({
+  hookSelectionMode,
+  analysisRaw,
+  preferredHook,
+  preferredHookUpdatedAt
+}: {
+  hookSelectionMode: HookSelectionMode | null | undefined
+  analysisRaw: any
+  preferredHook?: HookCandidate | null
+  preferredHookUpdatedAt?: string | null
+}) => {
+  if (hookSelectionMode === 'auto') {
+    return {
+      preferredHook: null,
+      preferredHookUpdatedAt: null
+    }
+  }
+  const storedPreferredHook = parsePreferredHookCandidateFromPayload(analysisRaw?.preferred_hook)
+  const storedPreferredHookUpdatedAt = getPreferredHookUpdatedAtFromAnalysis(analysisRaw)
+  const nextPreferredHook = preferredHook ?? storedPreferredHook ?? null
+  if (!nextPreferredHook) {
+    return {
+      preferredHook: null,
+      preferredHookUpdatedAt: null
+    }
+  }
+  const nextPreferredHookUpdatedAt = preferredHookUpdatedAt ??
+    (
+      hookCandidatesMatchWithinSelectionTolerance(nextPreferredHook, storedPreferredHook)
+        ? storedPreferredHookUpdatedAt
+        : toIsoNow()
+    ) ??
+    toIsoNow()
+  return {
+    preferredHook: nextPreferredHook,
+    preferredHookUpdatedAt: nextPreferredHookUpdatedAt
+  }
+}
+
 const enforceAutoHookDurationRange = ({
   candidate,
   durationSeconds
@@ -30625,6 +30684,11 @@ const processJob = async (
     let selectedJudge: RetentionJudgeReport | null = null
     let selectedHook: HookCandidate | null = null
     let selectedHookSelectionSource: 'auto' | 'user_selected' | 'fallback' = 'auto'
+    let latestAnalysisForHook = (((job.analysis as any) || {}) as Record<string, any>)
+    let lockedPreferredHookCandidate: HookCandidate | null =
+      parsePreferredHookCandidateFromPayload(latestAnalysisForHook.preferred_hook)
+    let lockedPreferredHookUpdatedAt: string | null =
+      getPreferredHookUpdatedAtFromAnalysis(latestAnalysisForHook)
     let hookDebugForAnalysis: Record<string, any> | null =
       ((job.analysis as any)?.hook_debug as Record<string, any>) || null
     let selectedPatternInterruptCount = 0
@@ -30861,7 +30925,7 @@ const processJob = async (
         where: { id: jobId },
         select: { analysis: true }
       })
-      const latestAnalysisForHook = (
+      latestAnalysisForHook = (
         (latestJobHookSnapshot?.analysis as any) ||
         (job.analysis as any) ||
         {}
@@ -30911,6 +30975,14 @@ const processJob = async (
         preferredHookCandidate = preferredHookCandidateRaw
         optimizationNotes.push('Preferred hook did not map to regenerated candidates; using user-selected hook directly.')
       }
+      ({
+        preferredHook: lockedPreferredHookCandidate,
+        preferredHookUpdatedAt: lockedPreferredHookUpdatedAt
+      } = resolvePersistedPreferredHookState({
+        hookSelectionMode: hookSelectionModeForRender,
+        analysisRaw: latestAnalysisForHook,
+        preferredHook: preferredHookCandidate
+      }))
       if (hookSelectionModeForRender === 'manual' && !preferredHookCandidate && hookCandidates.length > 1 && HOOK_SELECTION_WAIT_MS > 0) {
         const selectionWindowEndsAt = new Date(Date.now() + HOOK_SELECTION_WAIT_MS).toISOString()
         await updatePipelineStepState(jobId, 'HOOK_SELECT_AND_AUDIT', {
@@ -30936,6 +31008,8 @@ const processJob = async (
         })
         if (waitedPreferredHook) {
           preferredHookCandidate = waitedPreferredHook
+          lockedPreferredHookCandidate = waitedPreferredHook
+          lockedPreferredHookUpdatedAt = toIsoNow()
           optimizationNotes.push(
             `User-selected hook applied during hook stage (${formatHookRange(
               waitedPreferredHook.start,
@@ -31957,6 +32031,10 @@ const processJob = async (
         if (manualHookCandidate) {
           selectedHook = manualHookCandidate
           selectedHookSelectionSource = manualTimelinePlan.hookSource === 'ai-suggested' ? 'auto' : 'user_selected'
+          if (manualTimelinePlan.hookSource !== 'ai-suggested') {
+            lockedPreferredHookCandidate = manualHookCandidate
+            lockedPreferredHookUpdatedAt = toIsoNow()
+          }
           hookVariantsForAnalysis = [
             manualHookCandidate,
             ...hookVariantsForAnalysis.filter((candidate) => (
@@ -33633,6 +33711,12 @@ const processJob = async (
     const editedTranscriptCuesForAnalysis = processTranscriptCues.length && finalSegmentsForAnalysis.length
       ? remapTranscriptCuesToEditedTimeline(processTranscriptCues, finalSegmentsForAnalysis).slice(0, 1200)
       : []
+    const persistedPreferredHookState = resolvePersistedPreferredHookState({
+      hookSelectionMode: hookSelectionModeForRender,
+      analysisRaw: latestAnalysisForHook,
+      preferredHook: lockedPreferredHookCandidate,
+      preferredHookUpdatedAt: lockedPreferredHookUpdatedAt
+    })
 
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
@@ -33656,20 +33740,8 @@ const processJob = async (
         hook_text: selectedHook?.text ?? (job.analysis as any)?.hook_text ?? null,
         hook_reason: selectedHook?.reason ?? (job.analysis as any)?.hook_reason ?? null,
         hook_synthetic: selectedHook?.synthetic ?? (job.analysis as any)?.hook_synthetic ?? false,
-        preferred_hook: hookSelectionModeForRender === 'auto'
-          ? null
-          : (
-              selectedHookSelectionSource === 'user_selected'
-                ? selectedHook
-                : ((job.analysis as any)?.preferred_hook ?? null)
-            ),
-        preferred_hook_updated_at: hookSelectionModeForRender === 'auto'
-          ? null
-          : (
-              selectedHookSelectionSource === 'user_selected'
-                ? toIsoNow()
-                : ((job.analysis as any)?.preferred_hook_updated_at ?? null)
-            ),
+        preferred_hook: persistedPreferredHookState.preferredHook ?? null,
+        preferred_hook_updated_at: persistedPreferredHookState.preferredHookUpdatedAt ?? null,
         hookSelectionMode: hookSelectionModeForRender,
         hook_selection_mode: hookSelectionModeForRender,
         hook_selection_source: selectedHookSelectionSource,
@@ -36537,6 +36609,12 @@ router.post('/:id/reprocess', async (req: any, res) => {
         return res.status(400).json({ error: 'invalid_preferred_hook' })
       }
     }
+    const persistedPreferredHookState = resolvePersistedPreferredHookState({
+      hookSelectionMode: requestedHookSelectionMode,
+      analysisRaw: job.analysis as any,
+      preferredHook: preferredHookCandidate
+    })
+    const resolvedPreferredHook = persistedPreferredHookState.preferredHook
 
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -36668,8 +36746,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
-      preferred_hook: preferredHookCandidate ?? null,
-      preferred_hook_updated_at: preferredHookCandidate ? toIsoNow() : null
+      preferred_hook: resolvedPreferredHook ?? null,
+      preferred_hook_updated_at: persistedPreferredHookState.preferredHookUpdatedAt ?? null
     }
 
     const priorityLevel = Number(job.priorityLevel ?? 2) || 2
@@ -36707,10 +36785,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
           ? Math.max(0, rerenderLimit - rerenderUsage.rerendersUsed)
           : null
       },
-      preferredHook: preferredHookCandidate
+      preferredHook: resolvedPreferredHook
         ? {
-            start: preferredHookCandidate.start,
-            duration: preferredHookCandidate.duration
+            start: resolvedPreferredHook.start,
+            duration: resolvedPreferredHook.duration
           }
         : null
     })
