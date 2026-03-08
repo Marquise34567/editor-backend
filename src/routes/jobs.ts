@@ -1301,6 +1301,7 @@ type AutonomousEditorModeSummary = {
   label: string
   active: boolean
 }
+type HookPlacementStatus = 'moved_to_opening' | 'kept_source_position' | 'no_hook_fallback' | 'unmapped'
 type AutonomousEditorDecisionSummary = {
   atSec: number
   type: string
@@ -1315,6 +1316,12 @@ type AutonomousEditorSummary = {
   selectedHook: {
     start: number
     duration: number
+    sourceStart: number
+    sourceEnd: number
+    outputStart: number | null
+    outputEnd: number | null
+    placementStatus: HookPlacementStatus
+    placementLabel: string | null
     source: 'auto' | 'user_selected' | 'fallback' | 'unknown'
     reason: string | null
   } | null
@@ -1490,16 +1497,58 @@ const buildAutonomousEditorSummary = ({
   const renderSettings = job?.renderSettings && typeof job.renderSettings === 'object'
     ? (job.renderSettings as Record<string, unknown>)
     : null
-  const hookStart = toAutonomousRoundedNumber(analysis?.hook_start_time ?? analysis?.hook?.start, 3)
-  const hookDuration = toAutonomousRoundedNumber(
-    analysis?.hook?.duration ??
+  const hookSourceStart = toAutonomousRoundedNumber(
+    analysis?.hook_source_start_time ??
+    analysis?.hook_start_time ??
+    analysis?.hook?.start,
+    3
+  )
+  const hookSourceEnd = toAutonomousRoundedNumber(
+    analysis?.hook_source_end_time ??
+    analysis?.hook_end_time ??
     (
-      Number.isFinite(Number(analysis?.hook_end_time)) && Number.isFinite(Number(analysis?.hook_start_time))
-        ? Number(analysis.hook_end_time) - Number(analysis.hook_start_time)
+      Number.isFinite(Number(analysis?.hook_source_start_time ?? analysis?.hook_start_time)) &&
+      Number.isFinite(Number(analysis?.hook?.duration))
+        ? Number(analysis?.hook_source_start_time ?? analysis?.hook_start_time) + Number(analysis.hook.duration)
         : null
     ),
     3
   )
+  const hookDuration = toAutonomousRoundedNumber(
+    analysis?.hook?.duration ??
+    (
+      Number.isFinite(Number(analysis?.hook_source_end_time ?? analysis?.hook_end_time)) &&
+      Number.isFinite(Number(analysis?.hook_source_start_time ?? analysis?.hook_start_time))
+        ? Number(analysis?.hook_source_end_time ?? analysis?.hook_end_time) - Number(analysis?.hook_source_start_time ?? analysis?.hook_start_time)
+        : null
+    ),
+    3
+  )
+  const hookOutputStart = toAutonomousRoundedNumber(analysis?.hook_output_start_time, 3)
+  const hookOutputEnd = toAutonomousRoundedNumber(analysis?.hook_output_end_time, 3)
+  const hookPlacementStatusRaw = String(analysis?.hook_placement_status || '').trim()
+  const hookPlacementStatus: HookPlacementStatus =
+    hookPlacementStatusRaw === 'moved_to_opening' ||
+    hookPlacementStatusRaw === 'kept_source_position' ||
+    hookPlacementStatusRaw === 'no_hook_fallback' ||
+    hookPlacementStatusRaw === 'unmapped'
+      ? hookPlacementStatusRaw
+      : (
+        Number.isFinite(Number(analysis?.hook_output_start_time))
+          ? 'kept_source_position'
+          : 'unmapped'
+      )
+  const hookPlacementLabel = typeof analysis?.hook_placement_label === 'string' && analysis.hook_placement_label.trim()
+    ? analysis.hook_placement_label.trim()
+    : (
+      hookPlacementStatus === 'moved_to_opening'
+        ? 'Moved to opening'
+        : hookPlacementStatus === 'no_hook_fallback'
+          ? 'No-hook fallback'
+          : hookPlacementStatus === 'kept_source_position'
+            ? 'Kept source position'
+            : 'Output mapping unavailable'
+    )
   const hookSelectionSourceRaw = String(analysis?.hook_selection_source || '').trim()
   const hookSelectionSource =
     hookSelectionSourceRaw === 'auto' || hookSelectionSourceRaw === 'user_selected' || hookSelectionSourceRaw === 'fallback'
@@ -1601,10 +1650,16 @@ const buildAutonomousEditorSummary = ({
     senses,
     modes,
     selectedHook:
-      hookStart !== null && hookDuration !== null && hookDuration > 0
+      hookSourceStart !== null && hookDuration !== null && hookDuration > 0
         ? {
-            start: hookStart,
+            start: hookSourceStart,
             duration: hookDuration,
+            sourceStart: hookSourceStart,
+            sourceEnd: hookSourceEnd ?? Number((hookSourceStart + hookDuration).toFixed(3)),
+            outputStart: hookOutputStart,
+            outputEnd: hookOutputEnd,
+            placementStatus: hookPlacementStatus,
+            placementLabel: hookPlacementLabel,
             source: hookSelectionSource,
             reason: hookReason || null
           }
@@ -11621,12 +11676,25 @@ const selectAuthoritativeAutoHookDecision = ({
       passesNonVerbalSafety(row.entry) &&
       getVerifiedAudit(row.entry.candidate).passed
     )) || null
-    if (strongestAuditedNaturalRow) {
-      selectedEntry = strongestAuditedNaturalRow.entry
+    const credibleNaturalOpening = strongestAuditedNaturalRow?.entry.candidate ||
+      pickAuditedOpeningCandidateFromPool({
+        candidates,
+        durationSeconds,
+        maxStartSeconds: 45,
+        naturalOnly: true
+      })
+    if (credibleNaturalOpening) {
+      selectedEntry = strongestAuditedNaturalRow?.entry || findHookSelectionRankedEntry({
+        ranked,
+        candidate: credibleNaturalOpening,
+        windows
+      })
       selectionMode = 'fallback'
       usedFallback = true
       lockedAuthoritativeFallback = true
-      reason = 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
+      reason = strongestAuditedNaturalRow
+        ? 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
+        : 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest near-pass natural beat instead of falling straight back to the chronological opening.'
     } else {
       const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
         segments,
@@ -12138,11 +12206,13 @@ const selectRenderableHookCandidate = ({
 const pickAuditedOpeningCandidateFromPool = ({
   candidates,
   durationSeconds,
-  maxStartSeconds = 45
+  maxStartSeconds = 45,
+  naturalOnly = false
 }: {
   candidates: HookCandidate[]
   durationSeconds: number
   maxStartSeconds?: number
+  naturalOnly?: boolean
 }): HookCandidate | null => {
   if (!Array.isArray(candidates) || !candidates.length) return null
   const maxStart = Math.max(0, Math.min(Number(maxStartSeconds || 45), Math.max(0, durationSeconds - HOOK_MIN)))
@@ -12153,7 +12223,8 @@ const pickAuditedOpeningCandidateFromPool = ({
       Number.isFinite(candidate.duration) &&
       candidate.duration >= HOOK_MIN - 0.01 &&
       candidate.start >= 0 &&
-      candidate.start <= maxStart
+      candidate.start <= maxStart &&
+      (!naturalOnly || !candidate.synthetic)
     ))
     .map((candidate) => {
       const textSignals = analyzeHookTextQualitySignals(String(candidate.text || ''))
@@ -12194,16 +12265,25 @@ const pickAuditedOpeningCandidateFromPool = ({
   if (strongPass) return strongPass.candidate
   const curiosityNearPass = ranked.find((entry) => (
     !entry.candidate.auditPassed &&
-    entry.auditScore >= 0.58 &&
-    entry.textSignals.curiosityBlend >= 0.34 &&
-    entry.textSignals.specificity >= 0.26 &&
-    entry.textSignals.patternInterrupt >= 0.28 &&
+    entry.auditScore >= (naturalOnly ? 0.5 : 0.58) &&
+    entry.qualityScore >= (naturalOnly ? 0.42 : 0.48) &&
+    entry.textSignals.curiosityBlend >= (naturalOnly ? 0.24 : 0.34) &&
+    entry.textSignals.specificity >= (naturalOnly ? 0.22 : 0.26) &&
+    entry.textSignals.patternInterrupt >= (naturalOnly ? 0.14 : 0.28) &&
+    (
+      !naturalOnly ||
+      entry.textSignals.valuePromise >= 0.18 ||
+      entry.textSignals.emotionalTrigger >= 0.18 ||
+      entry.textSignals.questionCount > 0
+    ) &&
     !entry.textSignals.isGenericUtterance
   ))
   if (curiosityNearPass) {
     return {
       ...curiosityNearPass.candidate,
-      reason: 'Opening candidate selected from first 45s for stronger curiosity framing despite near-pass audit.'
+      reason: naturalOnly
+        ? 'Natural opening beat promoted from the first 45s because it nearly passed audit and beats a forced chronological opener.'
+        : 'Opening candidate selected from first 45s for stronger curiosity framing despite near-pass audit.'
     } as HookCandidate
   }
   const nonGenericPass = ranked.find((entry) => (
@@ -14016,17 +14096,17 @@ const formatSrtTimestamp = (seconds: number) => {
   return `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')},${String(ms).padStart(3, '0')}`
 }
 
-const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Segment[]) => {
-  if (!cues.length || !segments.length) return [] as TranscriptCue[]
-  type TimelineSegment = {
-    sourceStart: number
-    sourceEnd: number
-    speed: number
-    outputStart: number
-    outputEnd: number
-  }
+type EditedTimelineSegment = {
+  sourceStart: number
+  sourceEnd: number
+  speed: number
+  outputStart: number
+  outputEnd: number
+}
+
+const buildEditedTimelineFromSegments = (segments: Segment[]) => {
   let outputCursor = 0
-  const timeline = segments
+  return segments
     .map((segment) => {
       const sourceStart = Number(segment.start)
       const sourceEnd = Number(segment.end)
@@ -14034,7 +14114,7 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
       if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd) || sourceEnd <= sourceStart) return null
       const outputDuration = (sourceEnd - sourceStart) / speed
       if (!Number.isFinite(outputDuration) || outputDuration <= 0) return null
-      const item: TimelineSegment = {
+      const item: EditedTimelineSegment = {
         sourceStart,
         sourceEnd,
         speed,
@@ -14044,7 +14124,53 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
       outputCursor = item.outputEnd
       return item
     })
-    .filter((item): item is TimelineSegment => Boolean(item))
+    .filter((item): item is EditedTimelineSegment => Boolean(item))
+}
+
+const mapSourceRangeToEditedTimeline = ({
+  start,
+  end,
+  segments
+}: {
+  start: number
+  end: number
+  segments: Segment[]
+}) => {
+  const sourceStart = Number(start)
+  const sourceEnd = Number(end)
+  if (!Number.isFinite(sourceStart) || !Number.isFinite(sourceEnd) || sourceEnd <= sourceStart) return null
+  const timeline = buildEditedTimelineFromSegments(segments)
+  if (!timeline.length) return null
+  let mappedStart: number | null = null
+  let mappedEnd: number | null = null
+  let coveredSourceDuration = 0
+  let coveredOutputDuration = 0
+  for (const segment of timeline) {
+    const overlapStart = Math.max(sourceStart, segment.sourceStart)
+    const overlapEnd = Math.min(sourceEnd, segment.sourceEnd)
+    if (overlapEnd - overlapStart <= 0.01) continue
+    const rangeStart = segment.outputStart + (overlapStart - segment.sourceStart) / segment.speed
+    const rangeEnd = segment.outputStart + (overlapEnd - segment.sourceStart) / segment.speed
+    if (!Number.isFinite(rangeStart) || !Number.isFinite(rangeEnd) || rangeEnd - rangeStart <= 0.01) continue
+    if (mappedStart === null) mappedStart = rangeStart
+    mappedEnd = rangeEnd
+    coveredSourceDuration += overlapEnd - overlapStart
+    coveredOutputDuration += rangeEnd - rangeStart
+  }
+  if (mappedStart === null || mappedEnd === null || mappedEnd <= mappedStart) return null
+  const sourceDuration = Math.max(0.001, sourceEnd - sourceStart)
+  return {
+    outputStart: Number(mappedStart.toFixed(3)),
+    outputEnd: Number(mappedEnd.toFixed(3)),
+    outputDuration: Number(coveredOutputDuration.toFixed(3)),
+    coveredSourceDuration: Number(coveredSourceDuration.toFixed(3)),
+    coverageRatio: Number(clamp01(coveredSourceDuration / sourceDuration).toFixed(4))
+  }
+}
+
+const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Segment[]) => {
+  if (!cues.length || !segments.length) return [] as TranscriptCue[]
+  const timeline = buildEditedTimelineFromSegments(segments)
   if (!timeline.length) return [] as TranscriptCue[]
 
   const remapped: TranscriptCue[] = []
@@ -32853,6 +32979,41 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       editorMode: editorModeForRender
     })
+    const selectedHookSourceEnd = selectedHook
+      ? Number((selectedHook.start + selectedHook.duration).toFixed(3))
+      : null
+    const selectedHookOutputPlacement = selectedHook && finalSegmentsForAnalysis.length
+      ? mapSourceRangeToEditedTimeline({
+          start: selectedHook.start,
+          end: selectedHook.start + selectedHook.duration,
+          segments: finalSegmentsForAnalysis
+        })
+      : null
+    const hookWasRelocatedToOpening = Boolean(
+      selectedHook &&
+      !selectedHook.noRelocate &&
+      selectedHook.start > 0.75 &&
+      selectedHookOutputPlacement &&
+      selectedHookOutputPlacement.outputStart <= 0.15
+    )
+    const hookPlacementStatus: HookPlacementStatus | null = !selectedHook
+      ? null
+      : selectedHook.noRelocate
+        ? 'no_hook_fallback'
+        : hookWasRelocatedToOpening
+          ? 'moved_to_opening'
+          : selectedHookOutputPlacement
+            ? 'kept_source_position'
+            : 'unmapped'
+    const hookPlacementLabel = !selectedHook
+      ? null
+      : hookPlacementStatus === 'moved_to_opening'
+        ? 'Moved to opening'
+        : hookPlacementStatus === 'no_hook_fallback'
+          ? 'No-hook fallback'
+          : hookPlacementStatus === 'kept_source_position'
+            ? 'Kept source position'
+            : 'Output mapping unavailable'
     if (selectedHook) {
       const finalHookSignals = scoreRenderableHookCandidateSignals({
         candidate: selectedHook,
@@ -32893,6 +33054,10 @@ const processJob = async (
         ),
         hookSelectionMode: hookSelectionModeForRender,
         hookSelectionSource: selectedHookSelectionSource,
+        outputStart: selectedHookOutputPlacement?.outputStart ?? null,
+        outputEnd: selectedHookOutputPlacement?.outputEnd ?? null,
+        placementStatus: hookPlacementStatus,
+        placementLabel: hookPlacementLabel,
         finalStrategy: selectedStrategy,
         finalUpdatedAt: toIsoNow()
       }
@@ -32908,8 +33073,17 @@ const processJob = async (
         metadata_version: 2,
         metadata_summary: retentionMetadataSummary,
         long_form_prescan: processPreScan,
+        hook_source_start_time: selectedHook?.start ?? (job.analysis as any)?.hook_source_start_time ?? (job.analysis as any)?.hook_start_time ?? null,
+        hook_source_end_time: selectedHookSourceEnd ?? (job.analysis as any)?.hook_source_end_time ?? (job.analysis as any)?.hook_end_time ?? null,
         hook_start_time: selectedHook?.start ?? (job.analysis as any)?.hook_start_time ?? null,
         hook_end_time: selectedHook ? selectedHook.start + selectedHook.duration : (job.analysis as any)?.hook_end_time ?? null,
+        hook_output_start_time: selectedHookOutputPlacement?.outputStart ?? (job.analysis as any)?.hook_output_start_time ?? null,
+        hook_output_end_time: selectedHookOutputPlacement?.outputEnd ?? (job.analysis as any)?.hook_output_end_time ?? null,
+        hook_output_duration: selectedHookOutputPlacement?.outputDuration ?? (job.analysis as any)?.hook_output_duration ?? null,
+        hook_output_coverage_ratio: selectedHookOutputPlacement?.coverageRatio ?? (job.analysis as any)?.hook_output_coverage_ratio ?? null,
+        hook_moved_to_opening: hookPlacementStatus === 'moved_to_opening',
+        hook_placement_status: hookPlacementStatus ?? (job.analysis as any)?.hook_placement_status ?? null,
+        hook_placement_label: hookPlacementLabel ?? (job.analysis as any)?.hook_placement_label ?? null,
         hook_score: selectedHook?.score ?? (job.analysis as any)?.hook_score ?? null,
         hook_audit_score: selectedHook?.auditScore ?? (job.analysis as any)?.hook_audit_score ?? null,
         hook_text: selectedHook?.text ?? (job.analysis as any)?.hook_text ?? null,
@@ -36974,7 +37148,8 @@ const buildEditPlanForTest = async ({
     pickAuditedOpeningCandidateFromPool({
       candidates: candidatePool,
       durationSeconds,
-      maxStartSeconds: 45
+      maxStartSeconds: 45,
+      naturalOnly: true
     }) ||
     buildSafeNoHookOpeningCandidate({
       segments: planSegments,
