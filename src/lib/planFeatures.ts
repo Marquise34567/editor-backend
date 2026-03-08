@@ -68,6 +68,8 @@ export const getRequiredPlanForSubtitlePreset = (preset?: string | null): PlanTi
 
 export const getRequiredPlanForAdvancedEffects = (): PlanTier => 'studio'
 
+export const getRequiredPlanForEditorInstructions = (): PlanTier => 'creator'
+
 export const getRequiredPlanForRenders = (currentTier: PlanTier): PlanTier => {
   const upgradeOrder: PlanTier[] = ['free', 'starter', 'creator', 'studio']
   const idx = upgradeOrder.indexOf(currentTier)

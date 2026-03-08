@@ -15,7 +15,7 @@ import { getUserPlan } from '../services/plans'
 import { getUsageForMonth, incrementUsageForMonth } from '../services/usage'
 import { getRenderUsageForMonth, incrementRenderUsage } from '../services/renderUsage'
 import { getRerenderUsageForDay, incrementRerenderUsageForDay } from '../services/rerenderUsage'
-import { PLAN_CONFIG, getMonthKey, isPaidTier, type PlanTier } from '../shared/planConfig'
+import { PLAN_CONFIG, PLAN_TIERS, getMonthKey, isPaidTier, type PlanTier } from '../shared/planConfig'
 import { broadcastJobUpdate } from '../realtime'
 import { FFMPEG_PATH, FFPROBE_PATH, formatCommand } from '../lib/ffmpeg'
 import { isDevAccount } from '../lib/devAccounts'
@@ -32,11 +32,18 @@ import {
   getPlanFeatures,
   getRequiredPlanForAdvancedEffects,
   getRequiredPlanForAutoZoom,
+  getRequiredPlanForEditorInstructions,
   getRequiredPlanForQuality,
   getRequiredPlanForSubtitlePreset,
   getRequiredPlanForRenders,
   isSubtitlePresetAllowed
 } from '../lib/planFeatures'
+import {
+  parseEditorInstructionPrompt,
+  normalizeEditorInstructionPrompt,
+  type EditorInstructionMarker,
+  type EditorInstructionPlan
+} from '../lib/editorInstructions'
 import {
   DEFAULT_SUBTITLE_PRESET,
   normalizeSubtitlePreset,
@@ -2026,6 +2033,7 @@ type EditOptions = {
   topHumanGuardMode: boolean
   creatorStyleLock: number
   manualTimestampConfig?: ManualTimestampConfig | null
+  editorInstructionPrompt?: string | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast' | 'ultra' | 'retention-king'
@@ -4010,8 +4018,9 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   coldStartAutopilot: false,
   continuityFirstMode: false,
   exploreX3Mode: false,
-  topHumanGuardMode: false,
-  creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4))
+  topHumanGuardMode: true,
+  creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4)),
+  editorInstructionPrompt: null
 }
 
 const AUTO_MODE_V3_DEFAULTS = {
@@ -5421,6 +5430,140 @@ const getManualTimestampConfigFromPayload = (payload?: any): ManualTimestampConf
   )
   if (!hasInlineSignal) return null
   return parseManualTimestampConfig(payload)
+}
+
+const getEditorInstructionPromptFromPayload = (payload?: any): string | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return normalizeEditorInstructionPrompt(
+    (payload as any).editorInstructionPrompt ??
+    (payload as any).editor_instruction_prompt ??
+    (payload as any).directorNotes ??
+    (payload as any).director_notes ??
+    (payload as any).editingPrompt ??
+    (payload as any).editing_prompt
+  )
+}
+
+const getPlanTierRank = (tier: PlanTier) => {
+  const idx = PLAN_TIERS.indexOf(tier)
+  return idx === -1 ? 0 : idx
+}
+
+const isPlanTierAtLeast = (tier: PlanTier, requiredPlan: PlanTier) => (
+  getPlanTierRank(tier) >= getPlanTierRank(requiredPlan)
+)
+
+const assertEditorInstructionPromptAllowed = (prompt: string | null | undefined, tier: PlanTier) => {
+  const normalized = normalizeEditorInstructionPrompt(prompt)
+  if (!normalized) return null
+  const requiredPlan = getRequiredPlanForEditorInstructions()
+  if (!isPlanTierAtLeast(tier, requiredPlan)) {
+    throw new PlanLimitError(
+      'Upgrade to unlock Director Notes for direct edit instructions.',
+      'editorInstructions',
+      requiredPlan
+    )
+  }
+  return normalized
+}
+
+const buildPromptManualMarker = (marker: EditorInstructionMarker, index: number): ManualTimestampMarker => ({
+  id: `prompt-${marker.type}-${index}-${Math.round(marker.start * 1000)}-${Math.round(marker.end * 1000)}`,
+  type: marker.type,
+  start: marker.start,
+  end: marker.end,
+  source: 'user',
+  rationale: marker.rationale.slice(0, 280)
+})
+
+const mergeEditorInstructionMarkersIntoManualTimestampConfig = (
+  baseConfig: ManualTimestampConfig | null | undefined,
+  plan: EditorInstructionPlan | null
+): ManualTimestampConfig | null => {
+  const parsedBase = parseManualTimestampConfig(baseConfig)
+  if (!plan?.markers?.length) return parsedBase
+  const mergedMarkers = [...(parsedBase?.markers || [])]
+  const seen = new Set(
+    mergedMarkers.map((marker) => `${marker.type}:${Number(marker.start.toFixed(3))}:${Number(marker.end.toFixed(3))}`)
+  )
+  for (let idx = 0; idx < plan.markers.length; idx += 1) {
+    const marker = plan.markers[idx]
+    const key = `${marker.type}:${Number(marker.start.toFixed(3))}:${Number(marker.end.toFixed(3))}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    mergedMarkers.push(buildPromptManualMarker(marker, idx))
+  }
+  mergedMarkers.sort((a, b) => a.start - b.start || a.end - b.end)
+  return {
+    enabled: true,
+    autoAssist: parsedBase?.autoAssist ?? false,
+    markers: mergedMarkers,
+    suggestions: parsedBase?.suggestions || [],
+    requested: parsedBase?.requested ?? false,
+    retentionDeltaEstimate: parsedBase?.retentionDeltaEstimate ?? null,
+    updatedAt: toIsoNow()
+  }
+}
+
+const applyEditorInstructionPlanToDraft = <
+  T extends {
+    retentionStrategyProfile: RetentionStrategyProfile
+    retentionAggressionLevel: RetentionAggressionLevel
+    onlyCuts: boolean | null
+    smartZoom: boolean | null
+    transitions: boolean | null
+    soundFx: boolean | null
+    maxCuts: number | null
+    editorMode: EditorModeSelection | null
+    hookSelectionMode: HookSelectionMode | null
+    longFormPreset: LongFormPreset | null
+    longFormAggression: number | null
+    longFormClarityVsSpeed: number | null
+    tangentKiller: boolean | null
+    continuityFirstMode: boolean | null
+    manualTimestampConfig: ManualTimestampConfig | null
+  }
+>(
+  draft: T,
+  prompt: string | null | undefined
+): T & { editorInstructionPrompt: string | null; editorInstructionPlan: EditorInstructionPlan | null } => {
+  const normalizedPrompt = normalizeEditorInstructionPrompt(prompt)
+  const plan = parseEditorInstructionPrompt(normalizedPrompt)
+  if (!plan) {
+    return {
+      ...draft,
+      editorInstructionPrompt: normalizedPrompt,
+      editorInstructionPlan: null
+    }
+  }
+
+  const next = { ...draft }
+  if (plan.retentionStrategyProfile) {
+    next.retentionStrategyProfile = plan.retentionStrategyProfile
+    next.retentionAggressionLevel = STRATEGY_TO_AGGRESSION[plan.retentionStrategyProfile] || next.retentionAggressionLevel
+  }
+  if (plan.onlyCuts !== null) next.onlyCuts = plan.onlyCuts
+  if (plan.smartZoom !== null) next.smartZoom = plan.smartZoom
+  if (plan.transitions !== null) next.transitions = plan.transitions
+  if (plan.soundFx !== null) next.soundFx = plan.soundFx
+  if (plan.maxCuts !== null) next.maxCuts = plan.maxCuts
+  if (plan.editorMode) {
+    next.editorMode = parseEditorModeSelection(plan.editorMode) ?? next.editorMode
+  }
+  if (plan.longFormPreset) next.longFormPreset = parseLongFormPreset(plan.longFormPreset) ?? next.longFormPreset
+  if (plan.longFormAggression !== null) next.longFormAggression = parseLongFormAggression(plan.longFormAggression)
+  if (plan.longFormClarityVsSpeed !== null) next.longFormClarityVsSpeed = parseLongFormClarityVsSpeed(plan.longFormClarityVsSpeed)
+  if (plan.tangentKiller !== null) next.tangentKiller = plan.tangentKiller
+  if (plan.continuityFirstMode !== null) next.continuityFirstMode = plan.continuityFirstMode
+  next.manualTimestampConfig = mergeEditorInstructionMarkersIntoManualTimestampConfig(next.manualTimestampConfig, plan)
+  if (next.manualTimestampConfig?.enabled) {
+    next.hookSelectionMode = 'manual'
+  }
+  return {
+    ...next,
+    editorInstructionPrompt: normalizedPrompt,
+    editorInstructionPlan: plan
+  }
 }
 
 const getLongFormPresetFromPayload = (payload?: any): LongFormPreset | null => {
@@ -7031,6 +7174,21 @@ const getManualTimestampConfigFromJob = (job?: any): ManualTimestampConfig | nul
   return parseManualTimestampConfig(composite)
 }
 
+const getEditorInstructionPromptFromJob = (job?: any): string | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return normalizeEditorInstructionPrompt(
+    settings?.editorInstructionPrompt ??
+    settings?.editor_instruction_prompt ??
+    settings?.directorNotes ??
+    settings?.director_notes ??
+    analysis?.editorInstructionPrompt ??
+    analysis?.editor_instruction_prompt ??
+    analysis?.directorNotes ??
+    analysis?.director_notes
+  )
+}
+
 const getLongFormAggressionFromJob = (job?: any): number => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -7220,6 +7378,7 @@ const buildPersistedRenderSettings = (
     creatorStyleLockPercent?: number | null
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
+    editorInstructionPrompt?: string | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -7253,6 +7412,7 @@ const buildPersistedRenderSettings = (
   const topHumanGuardMode = typeof opts?.topHumanGuardMode === 'boolean' ? opts.topHumanGuardMode : false
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(opts?.creatorStyleLockPercent) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
+  const editorInstructionPrompt = normalizeEditorInstructionPrompt(opts?.editorInstructionPrompt)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
     ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
     : null
@@ -7309,6 +7469,7 @@ const buildPersistedRenderSettings = (
     top_human_guard_mode: topHumanGuardMode,
     creatorStyleLock: creatorStyleLockPercent,
     creator_style_lock: creatorStyleLockPercent,
+    ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt } : {}),
     ...(fastMode === null ? {} : { fastMode, fast_mode: fastMode }),
     ...(onlyCuts === null ? {} : { onlyCuts, onlyHookAndCut: onlyCuts }),
     ...(smartZoom === null ? {} : { smartZoom }),
@@ -7346,6 +7507,7 @@ const buildPersistedRenderAnalysis = ({
   creatorStyleLockPercent,
   manualTimestampConfig,
   verticalCaptionConfig,
+  editorInstructionPrompt,
   retentionTargetPlatform,
   platformProfile
 }: {
@@ -7373,6 +7535,7 @@ const buildPersistedRenderAnalysis = ({
   creatorStyleLockPercent?: number | null
   manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
+  editorInstructionPrompt?: string | null
   retentionTargetPlatform?: RetentionTargetPlatform | null
   platformProfile?: PlatformProfile | null
 }) => {
@@ -7513,6 +7676,12 @@ const buildPersistedRenderAnalysis = ({
     (existing as any)?.creatorStyleLock ??
     (existing as any)?.creator_style_lock
   ) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
+  const resolvedEditorInstructionPrompt = normalizeEditorInstructionPrompt(
+    editorInstructionPrompt ??
+    (existing as any)?.editorInstructionPrompt ??
+    (existing as any)?.editor_instruction_prompt ??
+    (existing as any)?.directorNotes
+  )
   const resolvedManualTimestampConfig = (
     parseManualTimestampConfig(manualTimestampConfig) ??
     parseManualTimestampConfig((existing as any)?.manualTimestamp ?? (existing as any)?.manual_timestamp) ??
@@ -7646,6 +7815,11 @@ const buildPersistedRenderAnalysis = ({
   payload.top_human_guard_mode = resolvedTopHumanGuardMode
   payload.creatorStyleLock = resolvedCreatorStyleLockPercent
   payload.creator_style_lock = resolvedCreatorStyleLockPercent
+  if (resolvedEditorInstructionPrompt) {
+    payload.editorInstructionPrompt = resolvedEditorInstructionPrompt
+    payload.editor_instruction_prompt = resolvedEditorInstructionPrompt
+    payload.directorNotes = resolvedEditorInstructionPrompt
+  }
   if (resolvedFastMode !== null) {
     payload.fastMode = resolvedFastMode
     payload.fast_mode = resolvedFastMode
@@ -11126,6 +11300,7 @@ const selectAuthoritativeAutoHookDecision = ({
   recentHooks?: HookReuseWindow[] | null
   creativeVariant?: CreativeVariant | null
 }): HookSelectionDecision | null => {
+  const strictHookFailClosed = true
   const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
@@ -11205,66 +11380,68 @@ const selectAuthoritativeAutoHookDecision = ({
   })
   const baseCurrent = baseInterestingRows[0]?.entry.candidate || baseRanked[0]?.candidate || null
   const additionalCandidates: HookCandidate[] = []
-  if (hasTranscript && candidates.length) {
-    const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
-      candidates,
-      durationSeconds,
-      maxStartSeconds: 45
-    })
-    if (auditedOpeningFromPool) additionalCandidates.push(auditedOpeningFromPool)
-    const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
-      candidates,
-      durationSeconds,
-      minStartSeconds: 24,
-      maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
-    })
-    if (differentPartCandidate) additionalCandidates.push(differentPartCandidate)
-    if (baseCurrent && transcriptCues.length) {
-      const rescueCandidate = pickTranscriptHookQualityRescueCandidate({
-        current: baseCurrent,
+  if (!strictHookFailClosed) {
+    if (hasTranscript && candidates.length) {
+      const auditedOpeningFromPool = pickAuditedOpeningCandidateFromPool({
         candidates,
+        durationSeconds,
+        maxStartSeconds: 45
+      })
+      if (auditedOpeningFromPool) additionalCandidates.push(auditedOpeningFromPool)
+      const differentPartCandidate = pickCuriosityDifferentPartCandidateFromPool({
+        candidates,
+        durationSeconds,
+        minStartSeconds: 24,
+        maxStartSeconds: Math.min(170, Math.max(50, durationSeconds * 0.72))
+      })
+      if (differentPartCandidate) additionalCandidates.push(differentPartCandidate)
+      if (baseCurrent && transcriptCues.length) {
+        const rescueCandidate = pickTranscriptHookQualityRescueCandidate({
+          current: baseCurrent,
+          candidates,
+          transcriptCues,
+          windows,
+          durationSeconds,
+          segments
+        })
+        if (rescueCandidate) additionalCandidates.push(rescueCandidate)
+      }
+    }
+    if (hasTranscript && transcriptCues.length) {
+      const transcriptAuditedOpeningFallback = buildAuditedOpeningHookCandidateFromTranscript({
+        transcriptCues,
+        windows,
+        durationSeconds,
+        segments,
+        searchWindowSeconds: 90,
+        targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
+      })
+      if (transcriptAuditedOpeningFallback) additionalCandidates.push(transcriptAuditedOpeningFallback)
+      const transcriptCuriosityFallback = buildCuriosityFallbackHookCandidateFromTranscript({
         transcriptCues,
         windows,
         durationSeconds,
         segments
       })
-      if (rescueCandidate) additionalCandidates.push(rescueCandidate)
+      if (transcriptCuriosityFallback) additionalCandidates.push(transcriptCuriosityFallback)
+      const transcriptSyntheticFallback = buildSyntheticHookCandidate({
+        durationSeconds,
+        segments,
+        windows,
+        transcriptCues
+      })
+      if (transcriptSyntheticFallback) additionalCandidates.push(transcriptSyntheticFallback)
     }
-  }
-  if (hasTranscript && transcriptCues.length) {
-    const transcriptAuditedOpeningFallback = buildAuditedOpeningHookCandidateFromTranscript({
-      transcriptCues,
-      windows,
-      durationSeconds,
-      segments,
-      searchWindowSeconds: 90,
-      targetDurationSeconds: AUTO_HOOK_DURATION_MAX_SECONDS
-    })
-    if (transcriptAuditedOpeningFallback) additionalCandidates.push(transcriptAuditedOpeningFallback)
-    const transcriptCuriosityFallback = buildCuriosityFallbackHookCandidateFromTranscript({
-      transcriptCues,
-      windows,
-      durationSeconds,
-      segments
-    })
-    if (transcriptCuriosityFallback) additionalCandidates.push(transcriptCuriosityFallback)
-    const transcriptSyntheticFallback = buildSyntheticHookCandidate({
-      durationSeconds,
+    const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
       segments,
       windows,
-      transcriptCues
+      silences,
+      durationSeconds
     })
-    if (transcriptSyntheticFallback) additionalCandidates.push(transcriptSyntheticFallback)
+    if (storyFallbackHook) additionalCandidates.push(storyFallbackHook)
   }
-  const storyFallbackHook = buildFallbackHookCandidateFromStorySegments({
-    segments,
-    windows,
-    silences,
-    durationSeconds
-  })
-  if (storyFallbackHook) additionalCandidates.push(storyFallbackHook)
   const ranked = buildHookSelectionRankedEntries({
-    candidates: [...candidates, ...additionalCandidates],
+    candidates: strictHookFailClosed ? candidates : [...candidates, ...additionalCandidates],
     windows
   })
   if (!ranked.length) return null
@@ -11696,9 +11873,18 @@ const selectAuthoritativeAutoHookDecision = ({
   const strictRow = interestingRows.find((row) => {
     const entry = row.entry
     const verifiedAudit = getVerifiedAudit(entry.candidate)
+    const repeatPenalty = computeHookRepeatPenalty({
+      candidate: entry.candidate,
+      recentHooks
+    })
+    const hasVisibleDeadLeadWeakness = verifiedAudit.reasons.some((reason) => /dead visual lead-in|visible story content/i.test(reason))
     return (
+      !entry.candidate.synthetic &&
       !failsSyntheticCredibilityGate(entry) &&
       verifiedAudit.passed &&
+      !hasCriticalSourceWeakness(verifiedAudit) &&
+      !hasVisibleDeadLeadWeakness &&
+      repeatPenalty < 0.08 &&
       entry.confidence >= threshold &&
       entry.openerQuality >= strictFallbackInstantFloor &&
       entry.teaserTension >= strictFallbackTeaserFloor &&
@@ -11708,6 +11894,152 @@ const selectAuthoritativeAutoHookDecision = ({
       passesNonVerbalSafety(entry)
     )
   }) || null
+  const strictTranscriptRow = !strictRow && hasTranscript
+    ? interestingRows.find((row) => {
+      const entry = row.entry
+      const verifiedAudit = getVerifiedAudit(entry.candidate)
+      return (
+        !entry.candidate.synthetic &&
+        !failsSyntheticCredibilityGate(entry) &&
+        verifiedAudit.passed &&
+        entry.confidence >= Math.max(relaxedThreshold, 0.42) &&
+        entry.teaserTension >= Math.max(relaxedTeaserFloor - 0.05, 0.26) &&
+        entry.curiosityPressure >= Math.max(relaxedCuriosityFloor - 0.05, 0.26) &&
+        entry.introClarity >= 0.18 &&
+        (
+          entry.valuePromise >= 0.14 ||
+          row.evaluated.textSignals.interestingness >= 0.68 ||
+          row.evaluated.textSignals.dramaticInterest >= 0.48
+        ) &&
+        passesNonVerbalSafety(entry)
+      )
+    }) || null
+    : null
+  const strictAuditedTranscriptRow = !strictRow && hasTranscript
+    ? interestingRows
+      .map((row) => ({
+        row,
+        verifiedAudit: getVerifiedAudit(row.entry.candidate)
+      }))
+      .filter(({ row, verifiedAudit }) => (
+        !row.entry.candidate.synthetic &&
+        !failsSyntheticCredibilityGate(row.entry) &&
+        verifiedAudit.passed &&
+        passesNonVerbalSafety(row.entry) &&
+        String(row.entry.candidate.text || '').trim().length >= 12
+      ))
+      .sort((a, b) => (
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.row.entry.selectionScore - a.row.entry.selectionScore ||
+        b.row.entry.curiosityPressure - a.row.entry.curiosityPressure ||
+        b.row.entry.teaserTension - a.row.entry.teaserTension ||
+        b.row.entry.candidate.score - a.row.entry.candidate.score ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))[0]?.row || null
+    : null
+  const directAuditedTranscriptEntry = !strictRow && hasTranscript
+    ? ranked
+      .map((entry) => {
+        const signals = analyzeHookTextQualitySignals(String(entry.candidate.text || ''))
+        const sourcePosition = clamp01(
+          (Number(entry.candidate.start || 0) + Number(entry.candidate.duration || 0) * 0.5) /
+          Math.max(1, durationSeconds || 0)
+        )
+        const repeatPenalty = computeHookRepeatPenalty({
+          candidate: entry.candidate,
+          recentHooks
+        })
+        const variantScore = creativeVariant === 'punchy'
+          ? Number(clamp01(
+            0.24 * entry.curiosityPressure +
+            0.2 * signals.patternInterrupt +
+            0.16 * entry.teaserTension +
+            0.14 * entry.openerQuality +
+            0.12 * entry.selectionScore +
+            0.08 * signals.interestingness +
+            0.06 * (1 - sourcePosition) -
+            0.14 * repeatPenalty
+          ).toFixed(4))
+          : creativeVariant === 'dramatic'
+            ? Number(clamp01(
+              0.3 * signals.dramaticInterest +
+              0.22 * signals.emotionalTrigger +
+              0.18 * entry.teaserTension +
+              0.16 * entry.selectionScore +
+              0.14 * entry.introClarity -
+              0.12 * repeatPenalty
+            ).toFixed(4))
+            : creativeVariant === 'curiosity_first'
+              ? Number(clamp01(
+                0.32 * entry.curiosityPressure +
+                0.24 * entry.teaserTension +
+                0.18 * signals.interestingness +
+                0.14 * entry.valuePromise +
+                0.12 * entry.introClarity -
+                0.14 * repeatPenalty
+              ).toFixed(4))
+              : Number(clamp01(
+                0.34 * entry.candidate.auditScore +
+                0.24 * entry.selectionScore +
+                0.18 * entry.curiosityPressure +
+                0.12 * entry.teaserTension +
+                0.12 * entry.introClarity -
+                0.16 * repeatPenalty
+              ).toFixed(4))
+        return {
+          entry,
+          variantScore,
+          repeatPenalty
+        }
+      })
+      .filter((entry) => (
+        !entry.entry.candidate.synthetic &&
+        entry.entry.candidate.auditPassed &&
+        String(entry.entry.candidate.text || '').trim().length >= 12
+      ))
+      .sort((a, b) => (
+        b.variantScore - a.variantScore ||
+        a.repeatPenalty - b.repeatPenalty ||
+        b.entry.candidate.auditScore - a.entry.candidate.auditScore ||
+        b.entry.selectionScore - a.entry.selectionScore ||
+        b.entry.curiosityPressure - a.entry.curiosityPressure ||
+        b.entry.teaserTension - a.entry.teaserTension ||
+        b.entry.candidate.score - a.entry.candidate.score ||
+        a.entry.candidate.start - b.entry.candidate.start
+      ))[0]?.entry || null
+    : null
+  if (strictHookFailClosed) {
+    const lockedStrictEntry =
+      strictRow?.entry ||
+      strictTranscriptRow?.entry ||
+      strictAuditedTranscriptRow?.entry ||
+      directAuditedTranscriptEntry ||
+      null
+    if (!lockedStrictEntry) return null
+    const debug = buildHookSelectionDebugPayload({
+      ranked: interestingRows.length ? interestingRows.map((row) => row.entry) : ranked,
+      selected: lockedStrictEntry,
+      threshold,
+      relaxedThreshold,
+      relaxedInstantHoldFloor,
+      relaxedTeaserFloor,
+      relaxedCuriosityFloor,
+      relaxedTranscriptAuditFloor,
+      selectionMode: 'strict',
+      hasTranscript,
+      signalStrength,
+      reason: null,
+      usedFallback: false
+    })
+    return {
+      candidate: lockedStrictEntry.candidate,
+      confidence: lockedStrictEntry.confidence,
+      threshold,
+      usedFallback: false,
+      reason: null,
+      debug
+    }
+  }
   const relaxedRow = interestingRows.find((row) => {
     const entry = row.entry
     return (
@@ -28915,6 +29247,7 @@ const getEditOptionsForUser = async (
     exploreX3Mode?: boolean | null
     topHumanGuardMode?: boolean | null
     creatorStyleLockPercent?: number | null
+    editorInstructionPrompt?: string | null
   },
   userEmail?: string | null
 ) => {
@@ -28941,7 +29274,7 @@ const getEditOptionsForUser = async (
       ? overrides.coldStartAutopilot
       : parseBooleanFlag((settings as any)?.coldStartAutopilot)
   ) ?? false
-  const continuityFirstMode = (
+  const requestedContinuityFirstMode = (
     typeof overrides?.continuityFirstMode === 'boolean'
       ? overrides.continuityFirstMode
       : parseBooleanFlag((settings as any)?.continuityFirstMode)
@@ -28965,16 +29298,108 @@ const getEditOptionsForUser = async (
     (settings as any)?.creator_style_lock
   ) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const creatorStyleLock = toCreatorStyleLockStrength(creatorStyleLockPercent)
+  const editorInstructionPrompt = assertEditorInstructionPromptAllowed(
+    overrides?.editorInstructionPrompt,
+    effectiveTier
+  )
+  const editorInstructionDraft = applyEditorInstructionPlanToDraft({
+    retentionStrategyProfile: parseRetentionStrategyProfile(
+      overrides?.retentionStrategyProfile ??
+      strategyFromAggressionLevel(
+        parseRetentionAggressionLevel(
+          overrides?.retentionAggressionLevel ??
+          (settings?.aggressiveMode ? 'high' : DEFAULT_EDIT_OPTIONS.retentionAggressionLevel)
+        )
+      )
+    ),
+    retentionAggressionLevel: parseRetentionAggressionLevel(
+      overrides?.retentionAggressionLevel ??
+      STRATEGY_TO_AGGRESSION[
+        parseRetentionStrategyProfile(
+          overrides?.retentionStrategyProfile ??
+          strategyFromAggressionLevel(
+            parseRetentionAggressionLevel(
+              overrides?.retentionAggressionLevel ??
+              (settings?.aggressiveMode ? 'high' : DEFAULT_EDIT_OPTIONS.retentionAggressionLevel)
+            )
+          )
+        )
+      ]
+    ),
+    onlyCuts: typeof overrides?.onlyCuts === 'boolean'
+      ? overrides.onlyCuts
+      : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts),
+    smartZoom: typeof overrides?.smartZoom === 'boolean' ? overrides.smartZoom : null,
+    transitions: typeof overrides?.transitions === 'boolean' ? overrides.transitions : null,
+    soundFx: typeof overrides?.soundFx === 'boolean' ? overrides.soundFx : null,
+    maxCuts: parseMaxCutsPreference(
+      overrides?.maxCuts ??
+      (settings as any)?.maxCuts ??
+      (settings as any)?.max_cuts ??
+      (settings as any)?.maxCutsRequested
+    ),
+    editorMode: parseEditorModeSelection(
+      overrides?.editorMode ??
+      (settings as any)?.editorMode ??
+      (settings as any)?.editor_mode ??
+      (settings as any)?.contentMode
+    ),
+    hookSelectionMode: parseHookSelectionMode(
+      overrides?.hookSelectionMode ??
+      (settings as any)?.hookSelectionMode ??
+      (settings as any)?.hook_selection_mode,
+      'auto'
+    ) || 'auto',
+    longFormPreset: parseLongFormPreset(
+      overrides?.longFormPreset ??
+      (settings as any)?.longFormPreset ??
+      (settings as any)?.longformPreset ??
+      (settings as any)?.longform_preset
+    ),
+    longFormAggression: parseLongFormAggression(
+      overrides?.longFormAggression ??
+      (settings as any)?.longFormAggression ??
+      (settings as any)?.longformAggression ??
+      (settings as any)?.long_form_aggression
+    ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression,
+    longFormClarityVsSpeed: parseLongFormClarityVsSpeed(
+      overrides?.longFormClarityVsSpeed ??
+      (settings as any)?.longFormClarityVsSpeed ??
+      (settings as any)?.longformClarityVsSpeed ??
+      (settings as any)?.long_form_clarity_vs_speed ??
+      (settings as any)?.clarityVsSpeed
+    ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed,
+    tangentKiller: (
+      typeof overrides?.tangentKiller === 'boolean'
+        ? overrides.tangentKiller
+        : (
+          parseBooleanFlag((settings as any)?.tangentKiller) ??
+          parseBooleanFlag((settings as any)?.tangent_killer) ??
+          parseBooleanFlag((settings as any)?.removeTangents)
+        )
+    ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller,
+    continuityFirstMode: (
+      typeof overrides?.continuityFirstMode === 'boolean'
+        ? overrides.continuityFirstMode
+        : parseBooleanFlag((settings as any)?.continuityFirstMode)
+    ) ?? false,
+    manualTimestampConfig: (
+      parseManualTimestampConfig(overrides?.manualTimestampConfig) ??
+      parseManualTimestampConfig((settings as any)?.manualTimestamp ?? (settings as any)?.manual_timestamp)
+    )
+  }, editorInstructionPrompt)
   const onlyCuts = typeof overrides?.onlyCuts === 'boolean'
     ? overrides.onlyCuts
-    : (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts)
+    : (editorInstructionDraft.onlyCuts ?? (settings?.onlyCuts ?? DEFAULT_EDIT_OPTIONS.onlyCuts))
   const maxCutsRequested = parseMaxCutsPreference(
+    editorInstructionDraft.maxCuts ??
     overrides?.maxCuts ??
     (settings as any)?.maxCuts ??
     (settings as any)?.max_cuts ??
     (settings as any)?.maxCutsRequested
   )
   const requestedEditorMode = parseEditorModeSelection(
+    editorInstructionDraft.editorMode ??
     overrides?.editorMode ??
     (settings as any)?.editorMode ??
     (settings as any)?.editor_mode ??
@@ -28998,18 +29423,21 @@ const getEditOptionsForUser = async (
   const retentionKingModeRequested = pipelinePowerMode === 'retention_king'
   const internalEditorMode = resolveInternalEditorModeForPipelinePowerMode(editorMode, pipelinePowerMode)
   const hookSelectionMode = parseHookSelectionMode(
+    editorInstructionDraft.hookSelectionMode ??
     overrides?.hookSelectionMode ??
     (settings as any)?.hookSelectionMode ??
     (settings as any)?.hook_selection_mode,
     'auto'
   ) || 'auto'
   let longFormAggression = parseLongFormAggression(
+    editorInstructionDraft.longFormAggression ??
     overrides?.longFormAggression ??
     (settings as any)?.longFormAggression ??
     (settings as any)?.longformAggression ??
     (settings as any)?.long_form_aggression
   ) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   let longFormClarityVsSpeed = parseLongFormClarityVsSpeed(
+    editorInstructionDraft.longFormClarityVsSpeed ??
     overrides?.longFormClarityVsSpeed ??
     (settings as any)?.longFormClarityVsSpeed ??
     (settings as any)?.longformClarityVsSpeed ??
@@ -29017,6 +29445,7 @@ const getEditOptionsForUser = async (
     (settings as any)?.clarityVsSpeed
   ) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
   let longFormPreset = parseLongFormPreset(
+    editorInstructionDraft.longFormPreset ??
     overrides?.longFormPreset ??
     (settings as any)?.longFormPreset ??
     (settings as any)?.longformPreset ??
@@ -29024,20 +29453,25 @@ const getEditOptionsForUser = async (
     resolveLongFormPresetByAggression(longFormAggression)
   )
   let tangentKiller = (
-    typeof overrides?.tangentKiller === 'boolean'
-      ? overrides.tangentKiller
+    typeof editorInstructionDraft.tangentKiller === 'boolean'
+      ? editorInstructionDraft.tangentKiller
       : (
-        parseBooleanFlag((settings as any)?.tangentKiller) ??
-        parseBooleanFlag((settings as any)?.tangent_killer) ??
-        parseBooleanFlag((settings as any)?.removeTangents)
+        typeof overrides?.tangentKiller === 'boolean'
+          ? overrides.tangentKiller
+          : (
+            parseBooleanFlag((settings as any)?.tangentKiller) ??
+            parseBooleanFlag((settings as any)?.tangent_killer) ??
+            parseBooleanFlag((settings as any)?.removeTangents)
+          )
       )
   ) ?? DEFAULT_EDIT_OPTIONS.tangentKiller
-  const manualTimestampConfig = (
+  const manualTimestampConfig = editorInstructionDraft.manualTimestampConfig ?? (
     parseManualTimestampConfig(overrides?.manualTimestampConfig) ??
     parseManualTimestampConfig((settings as any)?.manualTimestamp ?? (settings as any)?.manual_timestamp)
   )
-  const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
+  const continuityFirstMode = editorInstructionDraft.continuityFirstMode ?? requestedContinuityFirstMode
   let requestedStrategy = parseRetentionStrategyProfile(
+    editorInstructionDraft.retentionStrategyProfile ??
     overrides?.retentionStrategyProfile ??
     strategyFromAggressionLevel(
       parseRetentionAggressionLevel(
@@ -29047,8 +29481,10 @@ const getEditOptionsForUser = async (
     )
   )
   let requestedAggression = parseRetentionAggressionLevel(
+    editorInstructionDraft.retentionAggressionLevel ??
     overrides?.retentionAggressionLevel ?? STRATEGY_TO_AGGRESSION[requestedStrategy]
   )
+  const removeBoring = onlyCuts ? true : settings?.removeBoring ?? DEFAULT_EDIT_OPTIONS.removeBoring
   if (longFormPreset === 'auto' && requestedAggression === 'medium') {
     // Keep Auto long-form aligned with the B baseline profile.
     requestedAggression = 'high'
@@ -29105,10 +29541,10 @@ const getEditOptionsForUser = async (
     autoHookMove: settings?.autoHookMove ?? DEFAULT_EDIT_OPTIONS.autoHookMove,
     removeBoring,
     onlyCuts,
-    smartZoom: onlyCuts ? false : (smartZoomOverride ?? settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
+    smartZoom: onlyCuts ? false : (editorInstructionDraft.smartZoom ?? smartZoomOverride ?? settings?.smartZoom ?? DEFAULT_EDIT_OPTIONS.smartZoom),
     jumpCuts: onlyCuts ? false : (settings?.jumpCuts ?? DEFAULT_EDIT_OPTIONS.jumpCuts),
-    transitions: onlyCuts ? false : (transitionsOverride ?? settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
-    soundFx: onlyCuts ? false : (soundFxOverride ?? settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
+    transitions: onlyCuts ? false : (editorInstructionDraft.transitions ?? transitionsOverride ?? settings?.transitions ?? DEFAULT_EDIT_OPTIONS.transitions),
+    soundFx: onlyCuts ? false : (editorInstructionDraft.soundFx ?? soundFxOverride ?? settings?.soundFx ?? DEFAULT_EDIT_OPTIONS.soundFx),
     emotionalBoost: onlyCuts
       ? false
       : (
@@ -29140,7 +29576,8 @@ const getEditOptionsForUser = async (
     topHumanGuardMode,
     creatorStyleLock,
     manualTimestampConfig,
-    fastMode: resolvedFastMode
+    fastMode: resolvedFastMode,
+    editorInstructionPrompt
   }
   const options = applyRetentionStyleReferencePreset({
     options: baseOptions,
@@ -29490,8 +29927,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         })
       } catch (e) {
         if (e instanceof HookGateError) throw e
-        console.warn(`[${requestId || 'noid'}] buildEditPlan failed during analyze, using deterministic fallback`, e)
-        editPlan = buildDeterministicFallbackEditPlan(duration, options)
+        console.warn(`[${requestId || 'noid'}] buildEditPlan failed during analyze; strict mode rejected fallback`, e)
+        throw e
       }
     }
 
@@ -29679,6 +30116,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       exploreX3Mode: options.exploreX3Mode,
       topHumanGuardMode: options.topHumanGuardMode,
       creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
+      editorInstructionPrompt: options.editorInstructionPrompt,
       verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
@@ -29711,6 +30149,7 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         exploreX3Mode: options.exploreX3Mode,
         topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
+        editorInstructionPrompt: options.editorInstructionPrompt,
         verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
       analysis: analysis
@@ -30630,6 +31069,7 @@ const processJob = async (
         exploreX3Mode: options.exploreX3Mode,
         topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
+        editorInstructionPrompt: options.editorInstructionPrompt,
         verticalCaptionConfig,
         outputPaths
       })
@@ -30700,7 +31140,8 @@ const processJob = async (
           topHumanGuardMode: options.topHumanGuardMode,
           creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
           manualTimestampConfig: requestedManualTimestampConfig,
-          verticalCaptionConfig
+          verticalCaptionConfig,
+          editorInstructionPrompt: options.editorInstructionPrompt
         }),
         analysis: nextAnalysis
       })
@@ -30882,14 +31323,8 @@ const processJob = async (
             renderMode: renderConfig.mode
           })
         } catch (err) {
-          console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process, using deterministic fallback`, err)
-          editPlan = buildDeterministicFallbackEditPlan(durationSeconds, {
-            ...options,
-            retentionAggressionLevel: aggressionLevel,
-            retentionStrategyProfile: strategyProfile,
-            editorMode: editorModeForRender
-          })
-          optimizationNotes.push('AI edit plan fallback: deterministic rescue plan used.')
+          console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process; strict mode rejected fallback`, err)
+          throw err
         }
       }
       if (editPlan?.styleProfile) styleProfileForAnalysis = editPlan.styleProfile
@@ -31546,7 +31981,13 @@ const processJob = async (
       }
 
       let finalSegments: Segment[] = []
-      const qualityGateRetryCount = options.fastMode
+      const strictRenderMatchMode = true
+      if (strictRenderMatchMode) {
+        optimizationNotes.push('Strict render lock active: no hook fallbacks, no winner overrides, no rescue render.')
+      }
+      const qualityGateRetryCount = strictRenderMatchMode
+        ? 0
+        : options.fastMode
         ? FAST_MODE_QUALITY_GATE_RETRIES
         : MAX_QUALITY_GATE_RETRIES
       const lockPrimaryHookAcrossVariants =
@@ -31559,14 +32000,18 @@ const processJob = async (
       if (lockPrimaryHookAcrossVariants) {
         optimizationNotes.push('Primary hook lock active: retaining the selected opener candidate across variant retries.')
       }
-      const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
+      const attemptStrategies = strictRenderMatchMode
+        ? (['BASELINE'] as RetentionRetryStrategy[])
+        : RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
         MANDATORY_VARIANT_MIN +
         (durationSeconds >= 45 * 60 ? 2 : durationSeconds >= 18 * 60 ? 1 : 0),
         MANDATORY_VARIANT_MIN,
         MANDATORY_VARIANT_MAX
       ))
-      const mandatoryVariantTarget = options.exploreX3Mode
+      const mandatoryVariantTarget = strictRenderMatchMode
+        ? 1
+        : options.exploreX3Mode
         ? Math.max(baseMandatoryVariantTarget, 3)
         : baseMandatoryVariantTarget
       const variantPlans: Array<{
@@ -31721,81 +32166,100 @@ const processJob = async (
         })
       }
       if (attemptEvaluations.length) {
-        const passedAttempts = attemptEvaluations.filter((attempt) => attempt.judge.passed)
-        const candidatePool = passedAttempts.length ? passedAttempts : attemptEvaluations
-        const ranked = candidatePool
-          .slice()
-          .sort((a, b) => (
-            b.variantScore - a.variantScore ||
-            b.cutQualityScore - a.cutQualityScore ||
-            b.predictedRetention - a.predictedRetention ||
-            b.judge.retention_score - a.judge.retention_score
-          ))
-        const exploreSeedRaw = crypto
-          .createHash('sha1')
-          .update(`${jobId}:${durationSeconds}:${selectedContentFormat}:${candidatePool.length}`)
-          .digest('hex')
-          .slice(0, 8)
-        const exploreSeed = Number.parseInt(exploreSeedRaw, 16) / 0xffffffff
-        const effectiveExplorationRate = options.exploreX3Mode
-          ? Math.max(BANDIT_POLICY_EXPLORATION_RATE, 0.5)
-          : BANDIT_POLICY_EXPLORATION_RATE
-        const shouldExplorePolicy = ranked.length > 1 && exploreSeed < effectiveExplorationRate
-        let winner = shouldExplorePolicy
-          ? ranked[Math.min(1, ranked.length - 1)]
-          : ranked[0]
-        try {
-          const learnedSelection = await selectPolicyWinnerWithLearning({
-            userId: job.userId,
-            candidates: ranked.map((attempt) => ({
-              policyId: attempt.policyId,
-              variantScore: attempt.variantScore,
-              predictedRetention: attempt.predictedRetention
-            })),
-            explorationRate: effectiveExplorationRate
-          })
-          if (learnedSelection?.selectedPolicyId) {
-            const learnedWinner = ranked.find((attempt) => attempt.policyId === learnedSelection.selectedPolicyId)
-            if (learnedWinner) {
-              winner = learnedWinner
-              optimizationNotes.push(learnedSelection.reason)
+        let winner = attemptEvaluations[0] || null
+        if (!strictRenderMatchMode) {
+          const passedAttempts = attemptEvaluations.filter((attempt) => attempt.judge.passed)
+          const candidatePool = passedAttempts.length ? passedAttempts : attemptEvaluations
+          const ranked = candidatePool
+            .slice()
+            .sort((a, b) => (
+              b.variantScore - a.variantScore ||
+              b.cutQualityScore - a.cutQualityScore ||
+              b.predictedRetention - a.predictedRetention ||
+              b.judge.retention_score - a.judge.retention_score
+            ))
+          const exploreSeedRaw = crypto
+            .createHash('sha1')
+            .update(`${jobId}:${durationSeconds}:${selectedContentFormat}:${candidatePool.length}`)
+            .digest('hex')
+            .slice(0, 8)
+          const exploreSeed = Number.parseInt(exploreSeedRaw, 16) / 0xffffffff
+          const effectiveExplorationRate = options.exploreX3Mode
+            ? Math.max(BANDIT_POLICY_EXPLORATION_RATE, 0.5)
+            : BANDIT_POLICY_EXPLORATION_RATE
+          const shouldExplorePolicy = ranked.length > 1 && exploreSeed < effectiveExplorationRate
+          winner = shouldExplorePolicy
+            ? ranked[Math.min(1, ranked.length - 1)]
+            : ranked[0]
+          try {
+            const learnedSelection = await selectPolicyWinnerWithLearning({
+              userId: job.userId,
+              candidates: ranked.map((attempt) => ({
+                policyId: attempt.policyId,
+                variantScore: attempt.variantScore,
+                predictedRetention: attempt.predictedRetention
+              })),
+              explorationRate: effectiveExplorationRate
+            })
+            if (learnedSelection?.selectedPolicyId) {
+              const learnedWinner = ranked.find((attempt) => attempt.policyId === learnedSelection.selectedPolicyId)
+              if (learnedWinner) {
+                winner = learnedWinner
+                optimizationNotes.push(learnedSelection.reason)
+              }
             }
+          } catch (error) {
+            console.warn('policy learner selection failed, using local winner', error)
           }
-        } catch (error) {
-          console.warn('policy learner selection failed, using local winner', error)
-        }
-        if (winner?.policyId) {
-          await registerPolicyAssignment({
-            userId: job.userId,
-            jobId,
-            policyId: winner.policyId,
-            variantId: winner.strategy
-          }).catch((error) => {
-            console.warn('policy assignment registration failed', error)
+          if (winner?.policyId) {
+            await registerPolicyAssignment({
+              userId: job.userId,
+              jobId,
+              policyId: winner.policyId,
+              variantId: winner.strategy
+            }).catch((error) => {
+              console.warn('policy assignment registration failed', error)
+            })
+          }
+          variantSelectionAuditForAnalysis = buildVariantSelectionAudit({
+            attempts: ranked.map((attempt) => ({
+              strategy: attempt.strategy,
+              variantScore: attempt.variantScore,
+              predictedRetention: attempt.predictedRetention,
+              judgeRetentionScore: attempt.judge.retention_score,
+              cutQualityScore: attempt.cutQualityScore,
+              hookStart: attempt.hookCandidate.start,
+              hookDuration: attempt.hookCandidate.duration,
+              pacingCurve: attempt.pacingCurve,
+              cliffhangerStyle: attempt.cliffhangerStyle
+            })),
+            winnerStrategy: winner?.strategy || null,
+            winnerHookStart: winner?.hookCandidate?.start ?? null
           })
-        }
-        variantSelectionAuditForAnalysis = buildVariantSelectionAudit({
-          attempts: ranked.map((attempt) => ({
-            strategy: attempt.strategy,
-            variantScore: attempt.variantScore,
-            predictedRetention: attempt.predictedRetention,
-            judgeRetentionScore: attempt.judge.retention_score,
-            cutQualityScore: attempt.cutQualityScore,
-            hookStart: attempt.hookCandidate.start,
-            hookDuration: attempt.hookCandidate.duration,
-            pacingCurve: attempt.pacingCurve,
-            cliffhangerStyle: attempt.cliffhangerStyle
-          })),
-          winnerStrategy: winner?.strategy || null,
-          winnerHookStart: winner?.hookCandidate?.start ?? null
-        })
-        if (shouldExplorePolicy && winner) {
-          optimizationNotes.push(
-            `Contextual bandit exploration selected policy ${winner.policyId} (seed ${(exploreSeed * 100).toFixed(1)}).`
-          )
-        }
-        if (options.exploreX3Mode) {
-          optimizationNotes.push('Explore x3 mode enabled: evaluated multiple policy variants and promoted the winner using live outcome learning priors.')
+          if (shouldExplorePolicy && winner) {
+            optimizationNotes.push(
+              `Contextual bandit exploration selected policy ${winner.policyId} (seed ${(exploreSeed * 100).toFixed(1)}).`
+            )
+          }
+          if (options.exploreX3Mode) {
+            optimizationNotes.push('Explore x3 mode enabled: evaluated multiple policy variants and promoted the winner using live outcome learning priors.')
+          }
+        } else {
+          variantSelectionAuditForAnalysis = buildVariantSelectionAudit({
+            attempts: attemptEvaluations.map((attempt) => ({
+              strategy: attempt.strategy,
+              variantScore: attempt.variantScore,
+              predictedRetention: attempt.predictedRetention,
+              judgeRetentionScore: attempt.judge.retention_score,
+              cutQualityScore: attempt.cutQualityScore,
+              hookStart: attempt.hookCandidate.start,
+              hookDuration: attempt.hookCandidate.duration,
+              pacingCurve: attempt.pacingCurve,
+              cliffhangerStyle: attempt.cliffhangerStyle
+            })),
+            winnerStrategy: winner?.strategy || null,
+            winnerHookStart: winner?.hookCandidate?.start ?? null
+          })
         }
         if (winner) {
           finalSegments = winner.segments
@@ -31818,7 +32282,9 @@ const processJob = async (
           optimizationNotes = [
             ...optimizationNotes,
             ...winner.retention.notes,
-            `Variant winner policy: ${winner.policyId} (${winner.strategy}).`,
+            strictRenderMatchMode
+              ? `Strict render lock kept baseline policy ${winner.policyId} (${winner.strategy}).`
+              : `Variant winner policy: ${winner.policyId} (${winner.strategy}).`,
             `Elite cut quality score: ${(winner.cutQualityScore * 100).toFixed(0)}%.`,
             ...winner.judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
           ]
@@ -31868,7 +32334,54 @@ const processJob = async (
       }
       const initialPredictedRetention = Number(selectedJudge.retention_score ?? 0)
       const lowRetentionRecoveryRequested = initialPredictedRetention < modeRetentionTargets.target
+      if (strictRenderMatchMode && (!selectedJudge.passed || lowRetentionRecoveryRequested)) {
+        const strictFailureReason = !selectedJudge.passed
+          ? 'Strict render lock rejected the baseline edit plan after quality gate review.'
+          : 'Strict render lock rejected the baseline edit plan for missing the retention target.'
+        await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+          status: 'failed',
+          completedAt: toIsoNow(),
+          lastError: strictFailureReason,
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            strictRenderLock: true
+          }
+        })
+        await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+          status: 'failed',
+          completedAt: toIsoNow(),
+          lastError: strictFailureReason,
+          meta: {
+            attempts: retentionAttempts,
+            thresholds: qualityGateThresholds,
+            hasTranscriptSignals,
+            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            strictRenderLock: true
+          }
+        })
+        await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${strictFailureReason}` })
+        throw new QualityGateError(strictFailureReason, {
+          attempts: retentionAttempts,
+          thresholds: qualityGateThresholds,
+          hasTranscriptSignals,
+          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          strategyProfile,
+          strictRenderLock: true
+        })
+      }
       if (
+        !strictRenderMatchMode &&
         lowRetentionRecoveryRequested &&
         requestedEditorModeRaw === 'auto' &&
         editorModeForRender === 'auto'
@@ -31895,7 +32408,7 @@ const processJob = async (
           `Mode retention target adjusted to ${modeRetentionTargets.target}% (floor ${modeRetentionTargets.floor}%).`
         )
       }
-      if (!selectedJudge.passed || lowRetentionRecoveryRequested) {
+      if (!strictRenderMatchMode && (!selectedJudge.passed || lowRetentionRecoveryRequested)) {
         let overrideReason = options.topHumanGuardMode
           ? null
           : maybeAllowQualityGateOverride({
@@ -33806,6 +34319,27 @@ const processJob = async (
       preferredHookUpdatedAt: lockedPreferredHookUpdatedAt
     })
 
+    const persistedEditedTimelineSegments = finalSegmentsForAnalysis.map((segment) => ({
+      start: Number(segment.start.toFixed(3)),
+      end: Number(segment.end.toFixed(3)),
+      speed: Number((segment.speed && segment.speed > 0 ? segment.speed : 1).toFixed(3))
+    }))
+    const existingPersistedEditPlan = latestAnalysisForHook?.editPlan && typeof latestAnalysisForHook.editPlan === 'object'
+      ? latestAnalysisForHook.editPlan as Record<string, any>
+      : null
+    const persistedFinalEditPlan = existingPersistedEditPlan || persistedEditedTimelineSegments.length || selectedHook
+      ? {
+          ...(existingPersistedEditPlan || {}),
+          hook: selectedHook ?? existingPersistedEditPlan?.hook ?? null,
+          hookCandidates: hookVariantsForAnalysis.length
+            ? hookVariantsForAnalysis
+            : (Array.isArray(existingPersistedEditPlan?.hookCandidates) ? existingPersistedEditPlan.hookCandidates : []),
+          hookFailureReason: selectedHook ? null : (existingPersistedEditPlan?.hookFailureReason ?? null),
+          segments: persistedEditedTimelineSegments.length
+            ? persistedEditedTimelineSegments
+            : (Array.isArray(existingPersistedEditPlan?.segments) ? existingPersistedEditPlan.segments : [])
+        }
+      : null
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
         ...((job.analysis as any) || {}),
@@ -33880,6 +34414,9 @@ const processJob = async (
         audio_polish_chain: audioFiltersForAnalysis,
         transcript_cues: processTranscriptCues.slice(0, 1200),
         edited_transcript_cues: editedTranscriptCuesForAnalysis,
+        edited_timeline_segments: persistedEditedTimelineSegments,
+        editedTimelineSegments: persistedEditedTimelineSegments,
+        editPlan: persistedFinalEditPlan ?? (job.analysis as any)?.editPlan ?? null,
         output_upload_fallback: outputUploadFallbackUsed
           ? {
               used: true,
@@ -33953,6 +34490,7 @@ const processJob = async (
       creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
+      editorInstructionPrompt: options.editorInstructionPrompt,
       outputPaths
     })
 
@@ -33991,7 +34529,8 @@ const processJob = async (
         topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         manualTimestampConfig: requestedManualTimestampConfig,
-        verticalCaptionConfig: persistedVerticalCaptionConfig
+        verticalCaptionConfig: persistedVerticalCaptionConfig,
+        editorInstructionPrompt: options.editorInstructionPrompt
       }),
       analysis: nextAnalysis
     })
@@ -34093,6 +34632,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         exploreX3Mode: getExploreX3ModeFromJob(existing),
         topHumanGuardMode: getTopHumanGuardModeFromJob(existing),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(existing),
+        editorInstructionPrompt: getEditorInstructionPromptFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       }, user.email)
@@ -34126,6 +34666,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         exploreX3Mode: getExploreX3ModeFromJob(latestBeforeProcess),
         topHumanGuardMode: getTopHumanGuardModeFromJob(latestBeforeProcess),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(latestBeforeProcess),
+        editorInstructionPrompt: getEditorInstructionPromptFromJob(latestBeforeProcess),
         autoCaptions: getAutoCaptionsFromPayload((latestBeforeProcess.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((latestBeforeProcess.analysis as any) || {})
       }, user.email)
@@ -34623,7 +35164,8 @@ const handleCreateJob = async (req: any, res: any) => {
     let longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
     let longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     let tangentKillerOverride = getTangentKillerFromPayload(req.body)
-    const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    let manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body)
     let requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const coldStartAutopilotOverride = getColdStartAutopilotFromPayload(req.body)
     const continuityFirstModeOverride = getContinuityFirstModeFromPayload(req.body)
@@ -34677,8 +35219,40 @@ const handleCreateJob = async (req: any, res: any) => {
       if (autoCaptionsOverride === null) autoCaptionsOverride = defaults.autoCaptions
       if (!subtitleStyleOverride) subtitleStyleOverride = defaults.subtitleStyle
     }
+    const promptAppliedCreate = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile,
+      retentionAggressionLevel,
+      onlyCuts: onlyCutsOverride,
+      smartZoom: smartZoomOverride,
+      transitions: transitionsOverride,
+      soundFx: soundFxOverride,
+      maxCuts: maxCutsOverride,
+      editorMode: editorModeOverride,
+      hookSelectionMode: hookSelectionModeOverride,
+      longFormPreset: longFormPresetOverride,
+      longFormAggression: longFormAggressionOverride,
+      longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
+      tangentKiller: tangentKillerOverride,
+      continuityFirstMode: continuityFirstModeOverride ?? false,
+      manualTimestampConfig: manualTimestampConfigOverride
+    }, requestedEditorInstructionPrompt)
+    retentionStrategyProfile = promptAppliedCreate.retentionStrategyProfile
+    retentionAggressionLevel = promptAppliedCreate.retentionAggressionLevel
+    onlyCutsOverride = promptAppliedCreate.onlyCuts
+    smartZoomOverride = promptAppliedCreate.smartZoom
+    transitionsOverride = promptAppliedCreate.transitions
+    soundFxOverride = promptAppliedCreate.soundFx
+    maxCutsOverride = promptAppliedCreate.maxCuts
+    editorModeOverride = promptAppliedCreate.editorMode
+    hookSelectionModeOverride = promptAppliedCreate.hookSelectionMode
+    longFormPresetOverride = promptAppliedCreate.longFormPreset
+    longFormAggressionOverride = promptAppliedCreate.longFormAggression
+    longFormClarityVsSpeedOverride = promptAppliedCreate.longFormClarityVsSpeed
+    tangentKillerOverride = promptAppliedCreate.tangentKiller
+    manualTimestampConfigOverride = promptAppliedCreate.manualTimestampConfig
+    const editorInstructionPrompt = promptAppliedCreate.editorInstructionPrompt
     const coldStartAutopilot = coldStartAutopilotOverride ?? false
-    const continuityFirstMode = continuityFirstModeOverride ?? false
+    const continuityFirstMode = promptAppliedCreate.continuityFirstMode ?? continuityFirstModeOverride ?? false
     const exploreX3Mode = exploreX3ModeOverride ?? false
     const topHumanGuardMode = topHumanGuardModeOverride ?? false
     const creatorStyleLockPercent = creatorStyleLockPercentOverride ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
@@ -34803,6 +35377,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const devBypass = isDevAccount(userId, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
     const effectivePlan = devBypass ? PLAN_CONFIG.studio : plan
+    assertEditorInstructionPromptAllowed(editorInstructionPrompt, effectiveTier)
     editorModeOverride = resolveEditorModeForTier(editorModeOverride, effectiveTier)
     if (editorModeOverride === 'ultra') {
       retentionAggressionLevel = 'viral'
@@ -34896,7 +35471,8 @@ const handleCreateJob = async (req: any, res: any) => {
             topHumanGuardMode,
             creatorStyleLockPercent,
             manualTimestampConfig: manualTimestampConfigOverride,
-            verticalCaptionConfig: verticalCaptionConfigOverride
+            verticalCaptionConfig: verticalCaptionConfigOverride,
+            editorInstructionPrompt
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
@@ -34956,6 +35532,7 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(longFormAggressionOverride === null ? {} : { longFormAggression: longFormAggressionOverride, longformAggression: longFormAggressionOverride, long_form_aggression: longFormAggressionOverride }),
             ...(longFormClarityVsSpeedOverride === null ? {} : { longFormClarityVsSpeed: longFormClarityVsSpeedOverride, longformClarityVsSpeed: longFormClarityVsSpeedOverride, long_form_clarity_vs_speed: longFormClarityVsSpeedOverride }),
             ...(tangentKillerOverride === null ? {} : { tangentKiller: tangentKillerOverride, tangent_killer: tangentKillerOverride }),
+            ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
             ...(manualTimestampConfigOverride ? buildManualTimestampPersistenceFields(manualTimestampConfigOverride) : {})
           },
           renderConfig,
@@ -34981,6 +35558,7 @@ const handleCreateJob = async (req: any, res: any) => {
           creatorStyleLockPercent,
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
+          editorInstructionPrompt,
           outputPaths: null
         })
       }
@@ -35002,6 +35580,15 @@ const handleCreateJob = async (req: any, res: any) => {
       return res.json({ job, uploadUrl: null, inputPath, bucket: r2.bucket })
     }
   } catch (err: any) {
+    if (err instanceof PlanLimitError) {
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
+    }
     console.error('create job error', err?.stack || err)
     const message = err?.message || String(err) || 'Unknown error'
     res.status(500).json({ error: 'server_error', message, path: '/api/jobs/create' })
@@ -35536,21 +36123,13 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const longFormClarityVsSpeedOverride = getLongFormClarityVsSpeedFromPayload(req.body)
     const tangentKillerOverride = getTangentKillerFromPayload(req.body)
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body)
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
-    const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
-    const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
-    const resolvedEditorModeRaw = editorModeOverride ?? getEditorModeFromJob(job)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { plan, tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
-    const resolvedEditorMode = resolveEditorModeForTier(resolvedEditorModeRaw, effectiveTier)
-    const resolvedHookSelectionMode = hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'auto'
-    let resolvedLongFormPreset = longFormPresetOverride ?? getLongFormPresetFromJob(job)
-    const resolvedLongFormAggression = longFormAggressionOverride ?? getLongFormAggressionFromJob(job)
-    const resolvedLongFormClarityVsSpeed = longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job)
-    const resolvedTangentKiller = tangentKillerOverride ?? getTangentKillerFromJob(job)
-    const resolvedManualTimestampConfig = manualTimestampConfigOverride ?? getManualTimestampConfigFromJob(job)
+    const editorInstructionPrompt = assertEditorInstructionPromptAllowed(requestedEditorInstructionPrompt, effectiveTier)
     const tuning = buildRetentionTuningFromPayload({
       payload: req.body,
       fallbackAggression: getRetentionAggressionFromJob(job),
@@ -35566,6 +36145,35 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const requestedPlatformProfile = hasPlatformProfileOverride(req.body)
       ? getPlatformProfileFromPayload(req.body, getPlatformProfileFromJob(job))
       : parsePlatformProfile(getPlatformProfileFromJob(job), parsePlatformProfile(requestedTargetPlatform, 'auto'))
+    const promptAppliedUpload = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionAggressionLevel: requestedAggressionLevel,
+      onlyCuts: onlyCutsOverride ?? getOnlyCutsFromJob(job),
+      smartZoom: getSmartZoomFromJob(job),
+      transitions: getTransitionsFromJob(job),
+      soundFx: getSoundFxFromJob(job),
+      maxCuts: maxCutsOverride ?? getMaxCutsFromJob(job),
+      editorMode: editorModeOverride ?? getEditorModeFromJob(job),
+      hookSelectionMode: hookSelectionModeOverride ?? getHookSelectionModeFromJob(job) ?? 'auto',
+      longFormPreset: longFormPresetOverride ?? getLongFormPresetFromJob(job),
+      longFormAggression: longFormAggressionOverride ?? getLongFormAggressionFromJob(job),
+      longFormClarityVsSpeed: longFormClarityVsSpeedOverride ?? getLongFormClarityVsSpeedFromJob(job),
+      tangentKiller: tangentKillerOverride ?? getTangentKillerFromJob(job),
+      continuityFirstMode: getContinuityFirstModeFromJob(job),
+      manualTimestampConfig: manualTimestampConfigOverride ?? getManualTimestampConfigFromJob(job)
+    }, editorInstructionPrompt)
+    const resolvedOnlyCuts = promptAppliedUpload.onlyCuts
+    const resolvedMaxCuts = promptAppliedUpload.maxCuts
+    const resolvedEditorModeRaw = promptAppliedUpload.editorMode
+    const resolvedEditorMode = resolveEditorModeForTier(resolvedEditorModeRaw, effectiveTier)
+    const resolvedHookSelectionMode = promptAppliedUpload.hookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    let resolvedLongFormPreset = promptAppliedUpload.longFormPreset ?? getLongFormPresetFromJob(job)
+    const resolvedLongFormAggression = promptAppliedUpload.longFormAggression ?? getLongFormAggressionFromJob(job)
+    const resolvedLongFormClarityVsSpeed = promptAppliedUpload.longFormClarityVsSpeed ?? getLongFormClarityVsSpeedFromJob(job)
+    const resolvedTangentKiller = promptAppliedUpload.tangentKiller ?? getTangentKillerFromJob(job)
+    const resolvedManualTimestampConfig = promptAppliedUpload.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
+    requestedAggressionLevel = promptAppliedUpload.retentionAggressionLevel
+    requestedStrategyProfile = promptAppliedUpload.retentionStrategyProfile
     const existingAutoDetectProfile = parseVideoAutoDetectProfile(
       ((job.analysis as any)?.video_auto_detect) ??
       ((job.analysis as any)?.videoAutoDetect) ??
@@ -35643,6 +36251,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
@@ -35687,6 +36296,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {})
     }
 
@@ -35726,6 +36336,15 @@ const handleCompleteUpload = async (req: any, res: any) => {
       priorityLevel: job.priorityLevel ?? 2
     })
   } catch (err) {
+    if (err instanceof PlanLimitError) {
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
+    }
     res.status(500).json({ error: 'server_error' })
   }
 }
@@ -35769,33 +36388,53 @@ router.post('/:id/analyze', async (req: any, res) => {
       renderSettings: (job as any)?.renderSettings,
       payload: req.body
     })
-    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
-    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
-    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
-    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
-    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
-    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
-    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
-    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body) ?? getEditorInstructionPromptFromJob(job)
+    const editorInstructionPrompt = assertEditorInstructionPromptAllowed(requestedEditorInstructionPrompt, effectiveTier)
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
-    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const promptAppliedAnalyze = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile: tuning.strategy,
+      retentionAggressionLevel: tuning.aggression,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job),
+      smartZoom: getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job),
+      transitions: getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job),
+      soundFx: getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job),
+      maxCuts: getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job),
+      editorMode: requestedEditorModeRaw,
+      hookSelectionMode: getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto',
+      longFormPreset: getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job),
+      longFormAggression: getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job),
+      longFormClarityVsSpeed: getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job),
+      tangentKiller: getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job),
+      continuityFirstMode: requestedContinuityFirstModeBase,
+      manualTimestampConfig: getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    }, editorInstructionPrompt)
+    const requestedOnlyCuts = promptAppliedAnalyze.onlyCuts
+    const requestedMaxCuts = promptAppliedAnalyze.maxCuts
+    const requestedEditorMode = resolveEditorModeForTier(promptAppliedAnalyze.editorMode, effectiveTier)
+    const requestedHookSelectionMode = promptAppliedAnalyze.hookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    const requestedLongFormPreset = promptAppliedAnalyze.longFormPreset ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = promptAppliedAnalyze.longFormAggression ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = promptAppliedAnalyze.longFormClarityVsSpeed ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = promptAppliedAnalyze.tangentKiller ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = promptAppliedAnalyze.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
+    const requestedContinuityFirstMode = promptAppliedAnalyze.continuityFirstMode ?? requestedContinuityFirstModeBase
     const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra' ? true : analyzeRequestedFastMode
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
-      retentionAggressionLevel: tuning.aggression,
-      retentionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
-      retentionStrategy: tuning.strategy,
+      retentionAggressionLevel: promptAppliedAnalyze.retentionAggressionLevel,
+      retentionLevel: promptAppliedAnalyze.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedAnalyze.retentionStrategyProfile,
+      retentionStrategy: promptAppliedAnalyze.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
@@ -35829,16 +36468,17 @@ router.post('/:id/analyze', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
-      retentionAggressionLevel: tuning.aggression,
-      retentionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
-      retentionStrategy: tuning.strategy,
+      retentionAggressionLevel: promptAppliedAnalyze.retentionAggressionLevel,
+      retentionLevel: promptAppliedAnalyze.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedAnalyze.retentionStrategyProfile,
+      retentionStrategy: promptAppliedAnalyze.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       retentionPlatform: requestedTargetPlatform,
@@ -35878,6 +36518,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveAnalyzeFastMode === null ? {} : { fastMode: effectiveAnalyzeFastMode, fast_mode: effectiveAnalyzeFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -35886,8 +36527,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       analysis: nextAnalysis
     })
     const { options } = await getEditOptionsForUser(req.user.id, {
-      retentionAggressionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
+      retentionAggressionLevel: promptAppliedAnalyze.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedAnalyze.retentionStrategyProfile,
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
@@ -35908,12 +36549,13 @@ router.post('/:id/analyze', async (req: any, res) => {
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
+      editorInstructionPrompt,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     }, req.user?.email)
-    options.retentionAggressionLevel = tuning.aggression
-    options.retentionStrategyProfile = tuning.strategy
-    options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
+    options.retentionAggressionLevel = promptAppliedAnalyze.retentionAggressionLevel
+    options.retentionStrategyProfile = promptAppliedAnalyze.retentionStrategyProfile
+    options.aggressiveMode = isAggressiveRetentionLevel(promptAppliedAnalyze.retentionAggressionLevel)
     options.styleArchetypeBlend = styleBlendOverride
     if (requestedEditorMode === 'ultra') {
       options.fastMode = true
@@ -35981,33 +36623,53 @@ router.post('/:id/process', async (req: any, res) => {
       renderSettings: (job as any)?.renderSettings,
       payload: req.body
     })
-    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
-    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
-    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
-    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
-    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
-    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
-    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
-    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body) ?? getEditorInstructionPromptFromJob(job)
+    const editorInstructionPrompt = assertEditorInstructionPromptAllowed(requestedEditorInstructionPrompt, effectiveTier)
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
-    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const promptAppliedProcess = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile: tuning.strategy,
+      retentionAggressionLevel: tuning.aggression,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job),
+      smartZoom: getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job),
+      transitions: getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job),
+      soundFx: getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job),
+      maxCuts: getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job),
+      editorMode: requestedEditorModeRaw,
+      hookSelectionMode: getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto',
+      longFormPreset: getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job),
+      longFormAggression: getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job),
+      longFormClarityVsSpeed: getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job),
+      tangentKiller: getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job),
+      continuityFirstMode: requestedContinuityFirstModeBase,
+      manualTimestampConfig: getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    }, editorInstructionPrompt)
+    const requestedOnlyCuts = promptAppliedProcess.onlyCuts
+    const requestedMaxCuts = promptAppliedProcess.maxCuts
+    const requestedEditorMode = resolveEditorModeForTier(promptAppliedProcess.editorMode, effectiveTier)
+    const requestedHookSelectionMode = promptAppliedProcess.hookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    const requestedLongFormPreset = promptAppliedProcess.longFormPreset ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = promptAppliedProcess.longFormAggression ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = promptAppliedProcess.longFormClarityVsSpeed ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = promptAppliedProcess.tangentKiller ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = promptAppliedProcess.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
+    const requestedContinuityFirstMode = promptAppliedProcess.continuityFirstMode ?? requestedContinuityFirstModeBase
     const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveProcessFastMode = requestedEditorMode === 'ultra' ? true : processRequestedFastMode
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
-      retentionAggressionLevel: tuning.aggression,
-      retentionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
-      retentionStrategy: tuning.strategy,
+      retentionAggressionLevel: promptAppliedProcess.retentionAggressionLevel,
+      retentionLevel: promptAppliedProcess.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedProcess.retentionStrategyProfile,
+      retentionStrategy: promptAppliedProcess.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
@@ -36041,16 +36703,17 @@ router.post('/:id/process', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
     }
     const nextAnalysis = {
       ...((job.analysis as any) || {}),
-      retentionAggressionLevel: tuning.aggression,
-      retentionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
-      retentionStrategy: tuning.strategy,
+      retentionAggressionLevel: promptAppliedProcess.retentionAggressionLevel,
+      retentionLevel: promptAppliedProcess.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedProcess.retentionStrategyProfile,
+      retentionStrategy: promptAppliedProcess.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       retentionPlatform: requestedTargetPlatform,
@@ -36090,6 +36753,7 @@ router.post('/:id/process', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveProcessFastMode === null ? {} : { fastMode: effectiveProcessFastMode, fast_mode: effectiveProcessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -36098,8 +36762,8 @@ router.post('/:id/process', async (req: any, res) => {
       analysis: nextAnalysis
     })
     const { options } = await getEditOptionsForUser(req.user.id, {
-      retentionAggressionLevel: tuning.aggression,
-      retentionStrategyProfile: tuning.strategy,
+      retentionAggressionLevel: promptAppliedProcess.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedProcess.retentionStrategyProfile,
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
@@ -36120,6 +36784,7 @@ router.post('/:id/process', async (req: any, res) => {
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
+      editorInstructionPrompt,
       autoCaptions: autoCaptionsOverride,
       subtitleStyle: subtitleStyleOverride
     }, req.user?.email)
@@ -36144,9 +36809,9 @@ router.post('/:id/process', async (req: any, res) => {
       options.preferredHookCandidate = preferredHookCandidate
     }
     options.hookSelectionMode = requestedHookSelectionMode
-    options.retentionAggressionLevel = tuning.aggression
-    options.retentionStrategyProfile = tuning.strategy
-    options.aggressiveMode = isAggressiveRetentionLevel(tuning.aggression)
+    options.retentionAggressionLevel = promptAppliedProcess.retentionAggressionLevel
+    options.retentionStrategyProfile = promptAppliedProcess.retentionStrategyProfile
+    options.aggressiveMode = isAggressiveRetentionLevel(promptAppliedProcess.retentionAggressionLevel)
     options.styleArchetypeBlend = styleBlendOverride
     // Allow client to override fast-mode for this run.
     if (requestedEditorMode === 'ultra') {
@@ -36284,28 +36949,48 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       renderSettings: (job as any)?.renderSettings,
       payload: req.body
     })
-    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
-    const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
-    const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
-    const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
-    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
-    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
-    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
-    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
-    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
-    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
-    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body) ?? getEditorInstructionPromptFromJob(job)
+    const editorInstructionPrompt = assertEditorInstructionPromptAllowed(requestedEditorInstructionPrompt, effectiveTier)
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
-    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
-    const requestedHookSelectionModeRaw = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    const promptAppliedLive = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionAggressionLevel: requestedAggressionLevel,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job),
+      smartZoom: getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job),
+      transitions: getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job),
+      soundFx: getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job),
+      maxCuts: getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job),
+      editorMode: requestedEditorModeRaw,
+      hookSelectionMode: getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto',
+      longFormPreset: getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job),
+      longFormAggression: getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job),
+      longFormClarityVsSpeed: getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job),
+      tangentKiller: getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job),
+      continuityFirstMode: requestedContinuityFirstModeBase,
+      manualTimestampConfig: getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    }, editorInstructionPrompt)
+    const requestedOnlyCuts = promptAppliedLive.onlyCuts
+    const requestedSmartZoom = promptAppliedLive.smartZoom ?? getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
+    const requestedTransitions = promptAppliedLive.transitions ?? getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
+    const requestedSoundFx = promptAppliedLive.soundFx ?? getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
+    const requestedMaxCuts = promptAppliedLive.maxCuts
+    const requestedEditorMode = resolveEditorModeForTier(promptAppliedLive.editorMode, effectiveTier)
+    const requestedLongFormPreset = promptAppliedLive.longFormPreset ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = promptAppliedLive.longFormAggression ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = promptAppliedLive.longFormClarityVsSpeed ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = promptAppliedLive.tangentKiller ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = promptAppliedLive.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
+    const requestedContinuityFirstMode = promptAppliedLive.continuityFirstMode ?? requestedContinuityFirstModeBase
+    const requestedHookSelectionModeRaw = promptAppliedLive.hookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedHookSelectionMode = requestedManualTimestampConfig?.enabled ? 'manual' : requestedHookSelectionModeRaw
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveRequestedFastMode = requestedEditorMode === 'ultra' ? true : requestedFastMode
@@ -36313,8 +36998,8 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       ...buildPersistedRenderSettings(effectiveRenderConfig, {
-        retentionAggressionLevel: requestedAggressionLevel,
-        retentionStrategyProfile: requestedStrategyProfile,
+        retentionAggressionLevel: promptAppliedLive.retentionAggressionLevel,
+        retentionStrategyProfile: promptAppliedLive.retentionStrategyProfile,
         retentionTargetPlatform: requestedTargetPlatform,
         platformProfile: requestedPlatformProfile,
         onlyCuts: requestedOnlyCuts,
@@ -36339,7 +37024,8 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         topHumanGuardMode: requestedTopHumanGuardMode,
         creatorStyleLockPercent: requestedCreatorStyleLockPercent,
         manualTimestampConfig: requestedManualTimestampConfig,
-        verticalCaptionConfig: verticalCaptionConfigOverride
+        verticalCaptionConfig: verticalCaptionConfigOverride,
+        editorInstructionPrompt
       }),
       ...(autoCaptionsOverride === null ? {} : { autoCaptions: autoCaptionsOverride }),
       ...(subtitleStyleOverride ? { subtitleStyle: subtitleStyleOverride } : {}),
@@ -36350,10 +37036,10 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
         ...((job.analysis as any) || {}),
-        retentionAggressionLevel: requestedAggressionLevel,
-        retentionLevel: requestedAggressionLevel,
-        retentionStrategyProfile: requestedStrategyProfile,
-        retentionStrategy: requestedStrategyProfile,
+        retentionAggressionLevel: promptAppliedLive.retentionAggressionLevel,
+        retentionLevel: promptAppliedLive.retentionAggressionLevel,
+        retentionStrategyProfile: promptAppliedLive.retentionStrategyProfile,
+        retentionStrategy: promptAppliedLive.retentionStrategyProfile,
         retentionTargetPlatform: requestedTargetPlatform,
         retention_target_platform: requestedTargetPlatform,
         retentionPlatform: requestedTargetPlatform,
@@ -36396,7 +37082,8 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       manualTimestampConfig: requestedManualTimestampConfig,
-      verticalCaptionConfig: verticalCaptionConfigOverride
+      verticalCaptionConfig: verticalCaptionConfigOverride,
+      editorInstructionPrompt
     }) as Record<string, any>
     if (autoCaptionsOverride !== null) nextAnalysis.autoCaptions = autoCaptionsOverride
     if (subtitleStyleOverride) nextAnalysis.subtitleStyle = subtitleStyleOverride
@@ -36423,6 +37110,15 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       appliedAt: nowIso
     })
   } catch (err: any) {
+    if (err instanceof PlanLimitError) {
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
+    }
     if (String(err?.code || '').toLowerCase() === 'job_update_conflict' || String(err?.message || '').includes('job_update_conflict')) {
       return res.status(409).json({
         error: 'live_settings_update_conflict',
@@ -36658,25 +37354,45 @@ router.post('/:id/reprocess', async (req: any, res) => {
       renderSettings: (job as any)?.renderSettings,
       payload: req.body
     })
-    const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
-    const requestedSmartZoom = getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
-    const requestedTransitions = getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
-    const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
-    const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
-    const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
-    const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
-    const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
-    const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
-    const requestedLongFormClarityVsSpeed = getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job)
-    const requestedTangentKiller = getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job)
-    const requestedManualTimestampConfig = getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body) ?? getEditorInstructionPromptFromJob(job)
+    const editorInstructionPrompt = assertEditorInstructionPromptAllowed(requestedEditorInstructionPrompt, effectiveTier)
     const requestedColdStartAutopilot = getColdStartAutopilotFromPayload(req.body) ?? getColdStartAutopilotFromJob(job)
-    const requestedContinuityFirstMode = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
+    const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const promptAppliedReprocess = applyEditorInstructionPlanToDraft({
+      retentionStrategyProfile: requestedStrategyProfile,
+      retentionAggressionLevel: requestedAggressionLevel,
+      onlyCuts: getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job),
+      smartZoom: getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job),
+      transitions: getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job),
+      soundFx: getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job),
+      maxCuts: getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job),
+      editorMode: requestedEditorModeRaw,
+      hookSelectionMode: getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto',
+      longFormPreset: getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job),
+      longFormAggression: getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job),
+      longFormClarityVsSpeed: getLongFormClarityVsSpeedFromPayload(req.body) ?? getLongFormClarityVsSpeedFromJob(job),
+      tangentKiller: getTangentKillerFromPayload(req.body) ?? getTangentKillerFromJob(job),
+      continuityFirstMode: requestedContinuityFirstModeBase,
+      manualTimestampConfig: getManualTimestampConfigFromPayload(req.body) ?? getManualTimestampConfigFromJob(job)
+    }, editorInstructionPrompt)
+    const requestedOnlyCuts = promptAppliedReprocess.onlyCuts
+    const requestedSmartZoom = promptAppliedReprocess.smartZoom ?? getSmartZoomFromPayload(req.body) ?? getSmartZoomFromJob(job)
+    const requestedTransitions = promptAppliedReprocess.transitions ?? getTransitionsFromPayload(req.body) ?? getTransitionsFromJob(job)
+    const requestedSoundFx = promptAppliedReprocess.soundFx ?? getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
+    const requestedMaxCuts = promptAppliedReprocess.maxCuts
+    const requestedEditorMode = resolveEditorModeForTier(promptAppliedReprocess.editorMode, effectiveTier)
+    const requestedHookSelectionMode = promptAppliedReprocess.hookSelectionMode ?? getHookSelectionModeFromJob(job) ?? 'auto'
+    const requestedLongFormPreset = promptAppliedReprocess.longFormPreset ?? getLongFormPresetFromJob(job)
+    const requestedLongFormAggression = promptAppliedReprocess.longFormAggression ?? getLongFormAggressionFromJob(job)
+    const requestedLongFormClarityVsSpeed = promptAppliedReprocess.longFormClarityVsSpeed ?? getLongFormClarityVsSpeedFromJob(job)
+    const requestedTangentKiller = promptAppliedReprocess.tangentKiller ?? getTangentKillerFromJob(job)
+    const requestedManualTimestampConfig = promptAppliedReprocess.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
+    const requestedContinuityFirstMode = promptAppliedReprocess.continuityFirstMode ?? requestedContinuityFirstModeBase
     const reprocessRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
     const effectiveReprocessFastMode = requestedEditorMode === 'ultra' ? true : reprocessRequestedFastMode
 
@@ -36722,10 +37438,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
         ? effectiveRenderConfig.verticalClipDurationSeconds
         : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
       verticalMode: effectiveRenderConfig.mode === 'vertical' ? effectiveRenderConfig.verticalMode : null,
-      retentionAggressionLevel: requestedAggressionLevel,
-      retentionLevel: requestedAggressionLevel,
-      retentionStrategyProfile: requestedStrategyProfile,
-      retentionStrategy: requestedStrategyProfile,
+      retentionAggressionLevel: promptAppliedReprocess.retentionAggressionLevel,
+      retentionLevel: promptAppliedReprocess.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedReprocess.retentionStrategyProfile,
+      retentionStrategy: promptAppliedReprocess.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       targetPlatform: requestedTargetPlatform,
@@ -36765,6 +37481,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {})
     }
@@ -36786,10 +37503,10 @@ router.post('/:id/reprocess', async (req: any, res) => {
       vertical_clip_duration: effectiveRenderConfig.mode === 'vertical'
         ? effectiveRenderConfig.verticalClipDurationSeconds
         : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
-      retentionAggressionLevel: requestedAggressionLevel,
-      retentionLevel: requestedAggressionLevel,
-      retentionStrategyProfile: requestedStrategyProfile,
-      retentionStrategy: requestedStrategyProfile,
+      retentionAggressionLevel: promptAppliedReprocess.retentionAggressionLevel,
+      retentionLevel: promptAppliedReprocess.retentionAggressionLevel,
+      retentionStrategyProfile: promptAppliedReprocess.retentionStrategyProfile,
+      retentionStrategy: promptAppliedReprocess.retentionStrategyProfile,
       retentionTargetPlatform: requestedTargetPlatform,
       retention_target_platform: requestedTargetPlatform,
       retentionPlatform: requestedTargetPlatform,
@@ -36832,6 +37549,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
       top_human_guard_mode: requestedTopHumanGuardMode,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
+      ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: resolvedPreferredHook ?? null,
@@ -36881,6 +37599,15 @@ router.post('/:id/reprocess', async (req: any, res) => {
         : null
     })
   } catch (err) {
+    if (err instanceof PlanLimitError) {
+      return res.status(err.status).json({
+        error: err.code,
+        message: err.message,
+        feature: err.feature,
+        requiredPlan: err.requiredPlan,
+        checkoutUrl: err.checkoutUrl ?? null
+      })
+    }
     console.error('reprocess error', err)
     return res.status(500).json({ error: 'server_error' })
   }
@@ -37960,6 +38687,8 @@ const buildEditPlanForTest = async ({
 }
 
 export const __retentionTestUtils = {
+  parseEditorInstructionPromptForTest: parseEditorInstructionPrompt,
+  mergeEditorInstructionMarkersIntoManualTimestampConfigForTest: mergeEditorInstructionMarkersIntoManualTimestampConfig,
   parsePersistedRenderConfigForTest: parsePersistedRenderConfig,
   pickTopHookCandidates,
   computeRetentionScore,

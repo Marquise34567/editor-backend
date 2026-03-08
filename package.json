@@ -21,6 +21,7 @@
     "verify": "ts-node scripts/verify.ts",
     "validate:render-pipelines": "ts-node scripts/validate-render-pipelines.ts",
     "llama:setup-local": "ts-node scripts/setup-llama-local.ts",
+    "test:editor-instructions": "ts-node scripts/test-editor-instructions.ts",
     "test:retention-enforcer": "ts-node scripts/test-retention-enforcer.ts",
     "test:algorithm-control-room": "ts-node scripts/test-algorithm-control-room.ts",
     "test:uniqueness-benchmark": "ts-node scripts/test-uniqueness-benchmark.ts",
