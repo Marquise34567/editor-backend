@@ -52,6 +52,33 @@ type BoundaryBootstrapSummary = {
   totalLabelsGenerated: number
 }
 
+export type LearningCycleSummary = {
+  trigger: string
+  throttled: boolean
+  baselineBootstrap: BoundaryBootstrapSummary
+  userBaseline: {
+    sampleCount: number
+    labeledBoundaryCount: number
+    goodBoundaryCount: number
+    badBoundaryCount: number
+    coveragePercent: number
+  }
+  globalBaseline: {
+    sampleCount: number
+    labeledBoundaryCount: number
+    goodBoundaryCount: number
+    badBoundaryCount: number
+  }
+  boundaryCritic: {
+    trained: boolean
+    reason: string
+    previousVersion: string | null
+    activeVersion: string | null
+    sampleCount: number
+  }
+  policyPromotions: PolicyPromotionCandidate[]
+}
+
 export type BoundaryCriticModel = {
   version: string
   threshold: number
@@ -189,6 +216,11 @@ type PolicyPromotionCandidate = {
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
 const clamp01 = (value: number) => clamp(value, 0, 1)
 const nowIso = () => new Date().toISOString()
+const elapsedMsSince = (iso: string | null | undefined) => {
+  const parsed = iso ? Date.parse(iso) : Number.NaN
+  if (!Number.isFinite(parsed)) return Number.POSITIVE_INFINITY
+  return Date.now() - parsed
+}
 
 const toFiniteNumber = (value: unknown, fallback = 0) => {
   const parsed = Number(value)
@@ -257,6 +289,7 @@ const inMemoryRewardSignals: Array<{
   summary: Record<string, any>
   createdAt: string
 }> = []
+const autoLearningRunByUser = new Map<string, string>()
 
 const DEFAULT_BOUNDARY_MODEL: BoundaryCriticModel = {
   version: 'heuristic-v1',
@@ -1987,6 +2020,43 @@ export const listHumanBaselineSamples = async ({
     .slice(0, take)
 }
 
+const listAllHumanBaselineSamples = async (limit = 5000) => {
+  const take = clamp(Math.round(toFiniteNumber(limit, 5000)), 20, 50_000)
+  if (canRunRawSql()) {
+    try {
+      await ensureEditorIntelligenceInfra()
+      const rows = await (prisma as any).$queryRawUnsafe(
+        `
+          SELECT
+            id,
+            user_id AS "userId",
+            source_type AS "sourceType",
+            source_job_id AS "sourceJobId",
+            video_url AS "videoUrl",
+            duration_seconds AS "durationSeconds",
+            edl,
+            boundary_labels AS "boundaryLabels",
+            metadata,
+            created_at AS "createdAt",
+            updated_at AS "updatedAt"
+          FROM human_baseline_samples
+          ORDER BY created_at DESC
+          LIMIT $1
+        `,
+        take
+      )
+      return (Array.isArray(rows) ? rows : [])
+        .map((row) => rowToBaselineSample(row))
+        .filter((sample): sample is HumanBaselineSample => Boolean(sample))
+    } catch (error) {
+      console.warn('listAllHumanBaselineSamples db read failed, using in-memory fallback', error)
+    }
+  }
+  return Array.from(inMemoryBaselineSamples.values())
+    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
+    .slice(0, take)
+}
+
 export const getHumanBaselineDatasetStats = async (userId: string) => {
   const samples = await listHumanBaselineSamples({ userId, limit: 5000 })
   const labels = samples.flatMap((sample) => sample.boundaryLabels || [])
@@ -2000,6 +2070,19 @@ export const getHumanBaselineDatasetStats = async (userId: string) => {
     coveragePercent: samples.length > 0
       ? Number(clamp((labels.length / samples.length) * 10, 0, 100).toFixed(2))
       : 0
+  }
+}
+
+const getGlobalHumanBaselineDatasetStats = async () => {
+  const samples = await listAllHumanBaselineSamples(20_000)
+  const labels = samples.flatMap((sample) => sample.boundaryLabels || [])
+  const goodCount = labels.filter((label) => label.label === 'good').length
+  const badCount = labels.filter((label) => label.label === 'bad').length
+  return {
+    sampleCount: samples.length,
+    labeledBoundaryCount: labels.length,
+    goodBoundaryCount: goodCount,
+    badBoundaryCount: badCount
   }
 }
 
@@ -2325,20 +2408,15 @@ export const getActiveBoundaryCriticModel = async () => {
   return activeModelCache
 }
 
-export const trainBoundaryCriticModelFromBaseline = async ({
-  userId,
-  minSamples = 60
+const trainBoundaryCriticModelFromRows = async ({
+  rows,
+  minSamples = 60,
+  versionPrefix = 'baseline'
 }: {
-  userId: string
+  rows: Array<{ continuity: number; context: number; motion: number; audio: number; narrative: number; y: number }>
   minSamples?: number
+  versionPrefix?: string
 }) => {
-  const samples = await listHumanBaselineSamples({
-    userId,
-    limit: 5000
-  })
-  const rows = samples
-    .flatMap((sample) => sample.boundaryLabels || [])
-    .map((label) => featureVectorFromLabel(label))
   const required = Math.max(20, Math.round(toFiniteNumber(minSamples, 60)))
   if (rows.length < required) {
     const error = new Error(`not_enough_samples:${rows.length}`)
@@ -2362,7 +2440,7 @@ export const trainBoundaryCriticModelFromBaseline = async ({
     narrative: normalizeWeight(diff.narrative),
     bias: Number((-2.2 - (diff.continuity + diff.context + diff.motion + diff.audio + diff.narrative)).toFixed(4))
   }
-  const version = `baseline-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}`
+  const version = `${String(versionPrefix || 'baseline').replace(/[^a-z0-9_-]/gi, '').toLowerCase() || 'baseline'}-${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}`
   const model: BoundaryCriticModel = {
     version,
     threshold: DEFAULT_BOUNDARY_MODEL.threshold,
@@ -2383,6 +2461,45 @@ export const trainBoundaryCriticModelFromBaseline = async ({
   model.metrics = metrics
   await saveBoundaryModel(model)
   return model
+}
+
+export const trainBoundaryCriticModelFromBaseline = async ({
+  userId,
+  minSamples = 60
+}: {
+  userId: string
+  minSamples?: number
+}) => {
+  const samples = await listHumanBaselineSamples({
+    userId,
+    limit: 5000
+  })
+  const rows = samples
+    .flatMap((sample) => sample.boundaryLabels || [])
+    .map((label) => featureVectorFromLabel(label))
+  return trainBoundaryCriticModelFromRows({
+    rows,
+    minSamples,
+    versionPrefix: 'baseline'
+  })
+}
+
+export const trainBoundaryCriticModelFromGlobalBaseline = async ({
+  minSamples = 180,
+  limit = 20_000
+}: {
+  minSamples?: number
+  limit?: number
+}) => {
+  const samples = await listAllHumanBaselineSamples(limit)
+  const rows = samples
+    .flatMap((sample) => sample.boundaryLabels || [])
+    .map((label) => featureVectorFromLabel(label))
+  return trainBoundaryCriticModelFromRows({
+    rows,
+    minSamples,
+    versionPrefix: 'global-baseline'
+  })
 }
 
 export const scoreBoundarySet = async ({
@@ -3092,4 +3209,161 @@ export const listPolicyPromotionCandidates = async ({
     })
   }
   return winners.sort((left, right) => right.zScore - left.zScore || right.lift - left.lift)
+}
+
+export const runAutomaticEditorLearningCycle = async ({
+  userId,
+  focusJobId = null,
+  trigger = 'feedback',
+  force = false,
+  minSecondsBetweenRuns = 900
+}: {
+  userId: string
+  focusJobId?: string | null
+  trigger?: string
+  force?: boolean
+  minSecondsBetweenRuns?: number
+}): Promise<LearningCycleSummary> => {
+  const safeUserId = String(userId || '').trim()
+  const emptySummary: LearningCycleSummary = {
+    trigger,
+    throttled: false,
+    baselineBootstrap: {
+      scannedJobs: 0,
+      labeledJobs: 0,
+      newSamples: 0,
+      updatedSamples: 0,
+      totalLabelsGenerated: 0
+    },
+    userBaseline: {
+      sampleCount: 0,
+      labeledBoundaryCount: 0,
+      goodBoundaryCount: 0,
+      badBoundaryCount: 0,
+      coveragePercent: 0
+    },
+    globalBaseline: {
+      sampleCount: 0,
+      labeledBoundaryCount: 0,
+      goodBoundaryCount: 0,
+      badBoundaryCount: 0
+    },
+    boundaryCritic: {
+      trained: false,
+      reason: 'missing_user',
+      previousVersion: null,
+      activeVersion: null,
+      sampleCount: 0
+    },
+    policyPromotions: []
+  }
+  if (!safeUserId) return emptySummary
+
+  const throttleKey = safeUserId
+  const lastRunAt = autoLearningRunByUser.get(throttleKey) || null
+  const minGapMs = Math.max(0, Math.round(toFiniteNumber(minSecondsBetweenRuns, 900) * 1000))
+  if (!force && elapsedMsSince(lastRunAt) < minGapMs) {
+    const userBaseline = await getHumanBaselineDatasetStats(safeUserId)
+    const globalBaseline = await getGlobalHumanBaselineDatasetStats()
+    const activeModel = await getActiveBoundaryCriticModel().catch(() => null)
+    const promotions = await listPolicyPromotionCandidates({
+      userId: safeUserId,
+      minSamples: 8,
+      minLift: 1.25,
+      zThreshold: 1.25
+    }).catch(() => [])
+    return {
+      ...emptySummary,
+      throttled: true,
+      userBaseline,
+      globalBaseline,
+      boundaryCritic: {
+        trained: false,
+        reason: 'throttled',
+        previousVersion: activeModel?.version || null,
+        activeVersion: activeModel?.version || null,
+        sampleCount: Number(activeModel?.metrics?.sampleCount || 0)
+      },
+      policyPromotions: promotions
+    }
+  }
+
+  autoLearningRunByUser.set(throttleKey, nowIso())
+  await ensureEditorIntelligenceInfra().catch(() => false)
+  const baselineBootstrap = await bootstrapBoundaryLabelsFromCompletedJobs({
+    userId: safeUserId,
+    focusJobId,
+    maxJobs: trigger === 'player_telemetry' ? 48 : 96,
+    maxLabelsPerJob: 24
+  }).catch(() => ({
+    scannedJobs: 0,
+    labeledJobs: 0,
+    newSamples: 0,
+    updatedSamples: 0,
+    totalLabelsGenerated: 0
+  }))
+
+  const userBaseline = await getHumanBaselineDatasetStats(safeUserId)
+  const globalBaseline = await getGlobalHumanBaselineDatasetStats()
+  const activeBefore = await getActiveBoundaryCriticModel().catch(() => null)
+  let trainedModel: BoundaryCriticModel | null = null
+  let boundaryReason = 'not_enough_global_labels'
+
+  const activeSampleCount = Number(activeBefore?.metrics?.sampleCount || 0)
+  const enoughLabelVolume = globalBaseline.labeledBoundaryCount >= 180
+  const enoughClassBalance = globalBaseline.goodBoundaryCount >= 40 && globalBaseline.badBoundaryCount >= 40
+  const meaningfulDelta =
+    globalBaseline.labeledBoundaryCount >= Math.max(180, activeSampleCount + 40) ||
+    globalBaseline.sampleCount >= Math.max(20, Math.round((activeSampleCount || 0) / 10))
+  const shouldTrainGlobal =
+    enoughLabelVolume &&
+    enoughClassBalance &&
+    (
+      force ||
+      !activeBefore ||
+      activeBefore.version === DEFAULT_BOUNDARY_MODEL.version ||
+      meaningfulDelta
+    )
+
+  if (shouldTrainGlobal) {
+    try {
+      trainedModel = await trainBoundaryCriticModelFromGlobalBaseline({
+        minSamples: 180,
+        limit: 20_000
+      })
+      boundaryReason = 'trained_from_global_baseline'
+    } catch (error: any) {
+      boundaryReason = String(error?.code || error?.message || 'boundary_training_failed')
+    }
+  } else if (!enoughClassBalance) {
+    boundaryReason = 'insufficient_label_balance'
+  } else if (!enoughLabelVolume) {
+    boundaryReason = 'insufficient_global_volume'
+  } else {
+    boundaryReason = 'active_model_already_fresh'
+  }
+
+  const activeAfter = trainedModel || await getActiveBoundaryCriticModel().catch(() => activeBefore)
+  const policyPromotions = await listPolicyPromotionCandidates({
+    userId: safeUserId,
+    minSamples: 8,
+    minLift: 1.25,
+    zThreshold: 1.25
+  }).catch(() => [])
+
+  return {
+    trigger,
+    throttled: false,
+    baselineBootstrap,
+    userBaseline,
+    globalBaseline,
+    boundaryCritic: {
+      trained: Boolean(trainedModel),
+      reason: boundaryReason,
+      previousVersion: activeBefore?.version || null,
+      activeVersion: activeAfter?.version || null,
+      sampleCount: Number(activeAfter?.metrics?.sampleCount || 0)
+    },
+    policyPromotions
+  }
 }

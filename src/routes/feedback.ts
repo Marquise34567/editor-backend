@@ -15,10 +15,11 @@ import {
   getYouTubeOAuthConnectionForUser
 } from '../services/youtubeOAuth'
 import {
-  bootstrapBoundaryLabelsFromCompletedJobs,
   derivePerSecondRewardSignal,
   ingestPlatformRewardSignal,
   registerPolicyOutcomeForJob,
+  runAutomaticEditorLearningCycle,
+  type LearningCycleSummary,
   upsertCreatorStyleProfileFromFeedback
 } from '../services/editorIntelligence'
 
@@ -58,6 +59,31 @@ const asNumber = (value: any, fallback = 0) => {
 }
 
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value))
+
+const persistLatestLearningCycleForJob = async (jobId: string, learning: LearningCycleSummary | null) => {
+  if (!jobId || !learning) return
+  try {
+    const current = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { analysis: true }
+    })
+    const analysis = ((current?.analysis as any) || {}) as Record<string, unknown>
+    await prisma.job.update({
+      where: { id: jobId },
+      data: {
+        analysis: {
+          ...analysis,
+          latest_learning_cycle: {
+            ...learning,
+            recordedAt: new Date().toISOString()
+          }
+        } as any
+      }
+    })
+  } catch (error) {
+    console.warn(`failed to persist latest learning cycle for job ${jobId}`, error)
+  }
+}
 const clamp01 = (value: number) => clamp(value, 0, 1)
 
 const parseBoolean = (value: any) => {
@@ -1684,19 +1710,21 @@ const persistPlatformFeedbackForJob = async ({
   } catch (error) {
     console.warn('feedback loop run failed after youtube platform sync', error)
   }
-  await bootstrapBoundaryLabelsFromCompletedJobs({
+  const learning = await runAutomaticEditorLearningCycle({
     userId,
     focusJobId: jobId,
-    maxJobs: 80,
-    maxLabelsPerJob: 24
+    trigger: 'youtube_platform_sync'
   }).catch((error) => {
-    console.warn('boundary label bootstrap failed after youtube platform sync', error)
+    console.warn('automatic editor learning cycle failed after youtube platform sync', error)
+    return null
   })
+  await persistLatestLearningCycleForJob(jobId, learning)
 
   return {
     jobId,
     feedback,
-    feedbackLoop
+    feedbackLoop,
+    learning
   }
 }
 

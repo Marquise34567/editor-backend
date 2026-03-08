@@ -67,15 +67,16 @@ import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '
 import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
 import { buildFullAutoYoutubePreset, parseFullAutoYoutubeRequest } from '../services/fullAutoYoutube'
 import {
-  bootstrapBoundaryLabelsFromCompletedJobs,
   derivePerSecondRewardSignal,
   getActiveBoundaryCriticModel,
   getCreatorStyleProfile,
   ingestPlatformRewardSignal,
   registerPolicyAssignment,
   registerPolicyOutcomeForJob,
+  runAutomaticEditorLearningCycle,
   runMultiPassRefinementWithModel,
   selectPolicyWinnerWithLearning,
+  type LearningCycleSummary,
   upsertCreatorStyleProfileFromFeedback
 } from '../services/editorIntelligence'
 
@@ -954,6 +955,7 @@ type TranscriptCue = {
   interestingness?: number
   hookTypeStrength?: number
   narrativeScore?: number
+  confidence?: number | null
   words?: TranscriptWord[]
   speaker?: string | null
   language?: string | null
@@ -988,6 +990,7 @@ type HookCandidate = {
   text: string
   reason: string
   synthetic?: boolean
+  noRelocate?: boolean
 }
 type ManualTimestampMarkerType = 'keep' | 'remove' | 'hook' | 'zoom'
 type ManualTimestampMarkerSource = 'user' | 'ai'
@@ -1293,6 +1296,49 @@ type VariantSelectionAudit = {
   winnerReason: string
   entries: VariantSelectionAuditEntry[]
 }
+type AutonomousEditorModeSummary = {
+  id: 'cold_start_autopilot' | 'continuity_first' | 'explore_x3' | 'top_human_guard'
+  label: string
+  active: boolean
+}
+type AutonomousEditorDecisionSummary = {
+  atSec: number
+  type: string
+  label: string
+  detail: string | null
+}
+type AutonomousEditorSummary = {
+  status: string
+  autonomyState: 'self_directed' | 'assisted'
+  senses: string[]
+  modes: AutonomousEditorModeSummary[]
+  selectedHook: {
+    start: number
+    duration: number
+    source: 'auto' | 'user_selected' | 'fallback' | 'unknown'
+    reason: string | null
+  } | null
+  winnerPolicy: {
+    policyId: string
+    reason: string | null
+    strategy: string | null
+    pacingCurve: string | null
+    cliffhangerStyle: string | null
+    predictedRetention: number | null
+    judgeRetentionScore: number | null
+  } | null
+  qualityGate: {
+    passed: boolean | null
+    summary: string | null
+    passedChecks: number
+    totalChecks: number
+    cutQualityScore: number | null
+  }
+  decisions: AutonomousEditorDecisionSummary[]
+  decisionCounts: Record<string, number>
+  notes: string[]
+  learning: (LearningCycleSummary & { recordedAt?: string | null }) | null
+}
 type PlayerTelemetryEventName = 'play' | 'pause' | 'seek' | 'ratechange' | 'ended' | 'heartbeat'
 type PlayerTelemetryEvent = {
   event: PlayerTelemetryEventName
@@ -1324,6 +1370,284 @@ type EditorTasteFeedbackPayload = {
   notes: string | null
   submittedAt: string
 }
+
+const AUTONOMOUS_DECISION_LABELS: Record<string, string> = {
+  hook: 'Hook',
+  cut: 'Cut',
+  zoom: 'Zoom emphasis',
+  caption_emphasis: 'Caption emphasis',
+  pattern_interrupt: 'Pattern interrupt',
+  broll: 'B-roll beat',
+  auto_escalation: 'Auto escalation'
+}
+
+const toAutonomousRoundedNumber = (value: unknown, digits = 2) => {
+  const numeric = Number(value)
+  if (!Number.isFinite(numeric)) return null
+  return Number(numeric.toFixed(digits))
+}
+
+const getAutonomousLearningSummaryFromAnalysis = (analysis: Record<string, any>) => {
+  const raw = analysis?.latest_learning_cycle
+  if (!raw || typeof raw !== 'object') return null
+  return raw as LearningCycleSummary & { recordedAt?: string | null }
+}
+
+const persistLatestLearningCycleForJob = async (jobId: string, learning: LearningCycleSummary | null) => {
+  if (!jobId || !learning) return
+  try {
+    const current = await prisma.job.findUnique({
+      where: { id: jobId },
+      select: { analysis: true }
+    })
+    const analysis = ((current?.analysis as any) || {}) as Record<string, any>
+    await updateJob(jobId, {
+      analysis: {
+        ...analysis,
+        latest_learning_cycle: {
+          ...learning,
+          recordedAt: toIsoNow()
+        }
+      }
+    })
+  } catch (error) {
+    console.warn(`failed to persist learning summary for job ${jobId}`, error)
+  }
+}
+
+const describeAutonomousDecision = (event: { type?: unknown; word?: unknown; meta?: unknown; amount?: unknown }) => {
+  const type = String(event?.type || '').trim().toLowerCase()
+  const word = typeof event?.word === 'string' ? event.word.trim() : ''
+  const meta = event?.meta && typeof event.meta === 'object' ? (event.meta as Record<string, unknown>) : null
+  const metaReason = typeof meta?.reason === 'string' ? meta.reason.trim() : ''
+  const metaAction = typeof meta?.action === 'string' ? meta.action.trim() : ''
+  const amount = toAutonomousRoundedNumber(event?.amount, 2)
+  const label = AUTONOMOUS_DECISION_LABELS[type] || 'Edit decision'
+  if (type === 'hook') {
+    return {
+      label,
+      detail: metaReason || 'Autonomous opener placement chosen to maximize continuation pressure.'
+    }
+  }
+  if (type === 'caption_emphasis' && word) {
+    return {
+      label,
+      detail: `Emphasis placed on "${word}".`
+    }
+  }
+  if (type === 'pattern_interrupt') {
+    const detail = metaReason || metaAction || (amount !== null ? `Interrupt strength ${amount}.` : '')
+    return { label, detail: detail || 'Inserted to refresh viewer attention.' }
+  }
+  if (type === 'auto_escalation') {
+    return {
+      label,
+      detail: metaReason || metaAction || 'System escalated pacing or edit pressure to avoid a retention valley.'
+    }
+  }
+  if (type === 'cut') {
+    return {
+      label,
+      detail: metaReason || 'Trimmed or compressed to preserve flow and remove low-reward drift.'
+    }
+  }
+  if (type === 'zoom') {
+    return {
+      label,
+      detail: metaReason || 'Visual emphasis added to increase focus at a key beat.'
+    }
+  }
+  if (type === 'broll') {
+    return {
+      label,
+      detail: metaReason || 'Supportive visual beat inserted to preserve momentum.'
+    }
+  }
+  return {
+    label,
+    detail: metaReason || metaAction || null
+  }
+}
+
+const buildAutonomousEditorSummary = ({
+  job,
+  analysis,
+  optimizationNotes
+}: {
+  job: any
+  analysis: Record<string, any>
+  optimizationNotes: unknown
+}): AutonomousEditorSummary => {
+  const timeline = analysis?.edit_decision_timeline && typeof analysis.edit_decision_timeline === 'object'
+    ? (analysis.edit_decision_timeline as EditDecisionTimeline)
+    : null
+  const hardQualityGate = analysis?.hard_quality_gate && typeof analysis.hard_quality_gate === 'object'
+    ? (analysis.hard_quality_gate as HardQualityGateAudit)
+    : null
+  const variantSelectionAudit = analysis?.variant_selection_audit && typeof analysis.variant_selection_audit === 'object'
+    ? (analysis.variant_selection_audit as VariantSelectionAudit)
+    : null
+  const renderSettings = job?.renderSettings && typeof job.renderSettings === 'object'
+    ? (job.renderSettings as Record<string, unknown>)
+    : null
+  const hookStart = toAutonomousRoundedNumber(analysis?.hook_start_time ?? analysis?.hook?.start, 3)
+  const hookDuration = toAutonomousRoundedNumber(
+    analysis?.hook?.duration ??
+    (
+      Number.isFinite(Number(analysis?.hook_end_time)) && Number.isFinite(Number(analysis?.hook_start_time))
+        ? Number(analysis.hook_end_time) - Number(analysis.hook_start_time)
+        : null
+    ),
+    3
+  )
+  const hookSelectionSourceRaw = String(analysis?.hook_selection_source || '').trim()
+  const hookSelectionSource =
+    hookSelectionSourceRaw === 'auto' || hookSelectionSourceRaw === 'user_selected' || hookSelectionSourceRaw === 'fallback'
+      ? hookSelectionSourceRaw
+      : 'unknown'
+  const hookReason = typeof analysis?.hook_reason === 'string'
+    ? analysis.hook_reason.trim()
+    : (typeof analysis?.hook_debug?.why === 'string' ? analysis.hook_debug.why.trim() : '')
+  const winnerEntry = Array.isArray(variantSelectionAudit?.entries)
+    ? (
+      variantSelectionAudit?.entries.find((entry) => String(entry?.policyId || '') === String(variantSelectionAudit?.winnerPolicyId || '')) ||
+      variantSelectionAudit?.entries.find((entry) => Number(entry?.rank) === 1) ||
+      variantSelectionAudit?.entries[0] ||
+      null
+    )
+    : null
+  const learning = getAutonomousLearningSummaryFromAnalysis(analysis)
+  const senses: string[] = []
+  if (Array.isArray(analysis?.transcript_cues) && analysis.transcript_cues.length > 0) senses.push('Transcript')
+  else if (typeof analysis?.hook_text === 'string' && analysis.hook_text.trim()) senses.push('Transcript')
+  if (Array.isArray(analysis?.engagement_windows) && analysis.engagement_windows.length > 0) senses.push('Audio')
+  else if (analysis?.audio_profile || (Array.isArray(analysis?.audio_filters) && analysis.audio_filters.length > 0)) senses.push('Audio')
+  if (analysis?.visual_intelligence || analysis?.story_beat_graph || analysis?.cutting_audit) senses.push('Visual')
+  if (
+    (Array.isArray(analysis?.emotional_beat_anchors) && analysis.emotional_beat_anchors.length > 0) ||
+    analysis?.emotional_tuning_profile ||
+    analysis?.emotion_profile
+  ) {
+    senses.push('Emotion')
+  }
+  if (analysis?.youtube_sync || analysis?.retention_feedback || learning) senses.push('Outcome learning')
+  const modes: AutonomousEditorModeSummary[] = [
+    {
+      id: 'cold_start_autopilot',
+      label: 'Cold-Start Autopilot',
+      active: Boolean(
+        parseBooleanFlag(renderSettings?.coldStartAutopilot) ??
+        parseBooleanFlag(renderSettings?.cold_start_autopilot) ??
+        parseBooleanFlag(analysis?.coldStartAutopilot) ??
+        parseBooleanFlag(analysis?.cold_start_autopilot)
+      )
+    },
+    {
+      id: 'continuity_first',
+      label: 'Continuity-First',
+      active: Boolean(
+        parseBooleanFlag(renderSettings?.continuityFirstMode) ??
+        parseBooleanFlag(renderSettings?.continuity_first_mode) ??
+        parseBooleanFlag(analysis?.continuityFirstMode) ??
+        parseBooleanFlag(analysis?.continuity_first_mode)
+      )
+    },
+    {
+      id: 'explore_x3',
+      label: 'Explore x3',
+      active: Boolean(
+        parseBooleanFlag(renderSettings?.exploreX3Mode) ??
+        parseBooleanFlag(renderSettings?.explore_x3_mode) ??
+        parseBooleanFlag(analysis?.exploreX3Mode) ??
+        parseBooleanFlag(analysis?.explore_x3_mode)
+      )
+    },
+    {
+      id: 'top_human_guard',
+      label: 'Top-Human Guard',
+      active: Boolean(
+        parseBooleanFlag(renderSettings?.topHumanGuardMode) ??
+        parseBooleanFlag(renderSettings?.top_human_guard_mode) ??
+        parseBooleanFlag(analysis?.topHumanGuardMode) ??
+        parseBooleanFlag(analysis?.top_human_guard_mode)
+      )
+    }
+  ]
+  const sortedEvents = Array.isArray(timeline?.events)
+    ? timeline.events
+        .filter((event) => Number.isFinite(Number(event?.t)))
+        .slice()
+        .sort((left, right) => Number(left.t) - Number(right.t))
+    : []
+  const decisionCounts = sortedEvents.reduce<Record<string, number>>((acc, event) => {
+    const key = String(event?.type || '').trim().toLowerCase() || 'unknown'
+    acc[key] = (acc[key] || 0) + 1
+    return acc
+  }, {})
+  const notes = Array.isArray(optimizationNotes)
+    ? optimizationNotes
+        .filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0)
+        .slice(0, 6)
+    : []
+  return {
+    status: String(job?.status || 'unknown'),
+    autonomyState:
+      hookSelectionSource === 'auto' ||
+      hookSelectionSource === 'fallback' ||
+      Boolean(winnerEntry) ||
+      Boolean(sortedEvents.length)
+        ? 'self_directed'
+        : 'assisted',
+    senses,
+    modes,
+    selectedHook:
+      hookStart !== null && hookDuration !== null && hookDuration > 0
+        ? {
+            start: hookStart,
+            duration: hookDuration,
+            source: hookSelectionSource,
+            reason: hookReason || null
+          }
+        : null,
+    winnerPolicy: winnerEntry
+      ? {
+          policyId: String(winnerEntry.policyId || '').trim(),
+          reason: typeof variantSelectionAudit?.winnerReason === 'string' && variantSelectionAudit.winnerReason.trim()
+            ? variantSelectionAudit.winnerReason.trim()
+            : null,
+          strategy: typeof winnerEntry.strategy === 'string' ? winnerEntry.strategy : null,
+          pacingCurve: typeof winnerEntry.pacingCurve === 'string' ? winnerEntry.pacingCurve : null,
+          cliffhangerStyle: typeof winnerEntry.cliffhangerStyle === 'string' ? winnerEntry.cliffhangerStyle : null,
+          predictedRetention: toAutonomousRoundedNumber(winnerEntry.predictedRetention, 1),
+          judgeRetentionScore: toAutonomousRoundedNumber(winnerEntry.judgeRetentionScore, 1)
+        }
+      : null,
+    qualityGate: {
+      passed: typeof hardQualityGate?.passed === 'boolean' ? hardQualityGate.passed : null,
+      summary: typeof hardQualityGate?.summary === 'string' && hardQualityGate.summary.trim()
+        ? hardQualityGate.summary.trim()
+        : null,
+      passedChecks: Array.isArray(hardQualityGate?.checks)
+        ? hardQualityGate.checks.filter((check) => Boolean(check?.passed)).length
+        : 0,
+      totalChecks: Array.isArray(hardQualityGate?.checks) ? hardQualityGate.checks.length : 0,
+      cutQualityScore: toAutonomousRoundedNumber(analysis?.cut_quality_score, 3)
+    },
+    decisions: sortedEvents.slice(0, 8).map((event) => {
+      const described = describeAutonomousDecision(event)
+      return {
+        atSec: Number(Number(event.t).toFixed(3)),
+        type: String(event.type || '').trim().toLowerCase() || 'unknown',
+        label: described.label,
+        detail: described.detail
+      }
+    }),
+    decisionCounts,
+    notes,
+    learning
+  }
+}
+
 type VerticalRetentionPredictorBreakdown = {
   hookStrength: number
   interruptDensityQuality: number
@@ -11287,7 +11611,38 @@ const selectAuthoritativeAutoHookDecision = ({
         ? 'Creative variant forced the punchier transcript opener instead of the default safer winner.'
         : creativeVariant === 'dramatic'
           ? 'Creative variant forced the more emotional transcript opener instead of the default safer winner.'
-          : 'Creative variant forced the stronger curiosity-gap transcript opener instead of the default safer winner.'
+        : 'Creative variant forced the stronger curiosity-gap transcript opener instead of the default safer winner.'
+    }
+  }
+  const finalVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
+  if (selectedEntry.candidate.synthetic && !finalVerifiedAudit.passed) {
+    const strongestAuditedNaturalRow = interestingRows.find((row) => (
+      !row.entry.candidate.synthetic &&
+      passesNonVerbalSafety(row.entry) &&
+      getVerifiedAudit(row.entry.candidate).passed
+    )) || null
+    if (strongestAuditedNaturalRow) {
+      selectedEntry = strongestAuditedNaturalRow.entry
+      selectionMode = 'fallback'
+      usedFallback = true
+      lockedAuthoritativeFallback = true
+      reason = 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
+    } else {
+      const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
+        segments,
+        durationSeconds
+      })
+      if (safeNoHookOpening) {
+        selectedEntry = findHookSelectionRankedEntry({
+          ranked,
+          candidate: safeNoHookOpening,
+          windows
+        })
+        selectionMode = 'fallback'
+        usedFallback = true
+        lockedAuthoritativeFallback = true
+        reason = 'Failed synthetic hook was blocked from becoming the opener; keeping the safer chronological opening instead.'
+      }
     }
   }
   const debug = buildHookSelectionDebugPayload({
@@ -12943,6 +13298,44 @@ const buildFallbackHookCandidateFromStorySegments = ({
   } as HookCandidate
 }
 
+const buildSafeNoHookOpeningCandidate = ({
+  segments,
+  durationSeconds
+}: {
+  segments: Segment[]
+  durationSeconds: number
+}): HookCandidate | null => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return null
+  const ordered = (Array.isArray(segments) ? segments : [])
+    .filter((segment) => (
+      segment &&
+      Number.isFinite(segment.start) &&
+      Number.isFinite(segment.end) &&
+      segment.end > segment.start + 0.2
+    ))
+    .slice()
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+  const first = ordered[0]
+  const safeStart = Number(clamp(first?.start ?? 0, 0, Math.max(0, durationSeconds - 0.2)).toFixed(3))
+  const availableSeconds = Math.max(0.2, (first?.end ?? durationSeconds) - safeStart)
+  const duration = Number(clamp(
+    Math.min(AUTO_HOOK_DURATION_MAX_SECONDS, availableSeconds),
+    0.2,
+    Math.max(0.2, Math.min(AUTO_HOOK_DURATION_MIN_SECONDS, Math.max(availableSeconds, 0.2)))
+  ).toFixed(3))
+  return {
+    start: safeStart,
+    duration,
+    score: 0.12,
+    auditScore: 0.12,
+    auditPassed: false,
+    text: '',
+    reason: 'No-hook safety fallback: kept the chronological opening because no audited natural beat was credible enough and failed synthetic hooks are blocked from becoming the opener.',
+    synthetic: false,
+    noRelocate: true
+  }
+}
+
 const buildCuriosityFallbackHookCandidateFromTranscript = ({
   transcriptCues,
   windows,
@@ -13734,7 +14127,11 @@ const toTranscriptCuePreviewRows = (cues: TranscriptCue[], limit = 1200) => (
     .map((cue) => ({
       start: Number(Number(cue.start || 0).toFixed(3)),
       end: Number(Number(cue.end || 0).toFixed(3)),
-      text: String(cue.text || '').trim()
+      text: String(cue.text || '').trim(),
+      confidence: resolveTranscriptCueConfidence({
+        words: cue.words,
+        rawConfidence: cue.confidence
+      })
     }))
     .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start && cue.text.length > 0)
 )
@@ -13935,19 +14332,132 @@ const parseTranscriptWordRows = (value: any, cueStart: number, cueEnd: number): 
   return words
 }
 
+const normalizeTranscriptConfidence = (value: any): number | null => {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && !value.trim()) return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  if (parsed >= 0 && parsed <= 1) return Number(clamp01(parsed).toFixed(4))
+  if (parsed < 0) return Number(clamp01(Math.exp(parsed)).toFixed(4))
+  return Number(clamp01(parsed).toFixed(4))
+}
+
+const computeAverageTranscriptWordConfidence = (words?: TranscriptWord[] | null): number | null => {
+  if (!Array.isArray(words) || !words.length) return null
+  const confidences = words
+    .map((word) => Number(word?.confidence))
+    .filter((confidence) => Number.isFinite(confidence))
+  if (!confidences.length) return null
+  const average = confidences.reduce((sum, confidence) => sum + confidence, 0) / confidences.length
+  return Number(clamp01(average).toFixed(4))
+}
+
+const resolveTranscriptCueConfidence = ({
+  words,
+  rawConfidence
+}: {
+  words?: TranscriptWord[] | null
+  rawConfidence?: any
+}) => {
+  const fromWords = computeAverageTranscriptWordConfidence(words)
+  if (fromWords !== null) return fromWords
+  return normalizeTranscriptConfidence(rawConfidence)
+}
+
+const computeTranscriptCueTrustPenalty = ({
+  text,
+  words,
+  confidence
+}: {
+  text: string
+  words?: TranscriptWord[] | null
+  confidence?: number | null
+}) => {
+  const resolvedConfidence = resolveTranscriptCueConfidence({ words, rawConfidence: confidence })
+  if (resolvedConfidence === null) return 0
+  const normalizedTokens = String(text || '')
+    .toLowerCase()
+    .split(/\s+/)
+    .map((token) => normalizeCaptionToken(token))
+    .filter(Boolean)
+  if (!normalizedTokens.length) return 0
+  const wordsWithConfidence = Array.isArray(words)
+    ? words.filter((word) => Number.isFinite(Number(word?.confidence)))
+    : []
+  const lowWordConfidenceRatio = wordsWithConfidence.length
+    ? wordsWithConfidence.filter((word) => Number(word.confidence) < 0.45).length / wordsWithConfidence.length
+    : 0
+  const oddShortTokenRatio = normalizedTokens.filter((token) => token.length === 1 && token !== 'a' && token !== 'i').length / normalizedTokens.length
+  return Number(clamp01(
+    0.82 * clamp01((0.62 - resolvedConfidence) / 0.32) +
+    0.12 * lowWordConfidenceRatio +
+    0.06 * oddShortTokenRatio
+  ).toFixed(4))
+}
+
+const computeTranscriptRangeConfidence = (
+  start: number,
+  end: number,
+  transcriptCues: TranscriptCue[]
+): number | null => {
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length || end <= start) return null
+  let weightedConfidence = 0
+  let totalOverlap = 0
+  for (const cue of transcriptCues) {
+    const overlapStart = Math.max(start, Number(cue.start || 0))
+    const overlapEnd = Math.min(end, Number(cue.end || 0))
+    const overlap = overlapEnd - overlapStart
+    if (!Number.isFinite(overlap) || overlap <= 0.01) continue
+    const cueConfidence = resolveTranscriptCueConfidence({
+      words: cue.words,
+      rawConfidence: cue.confidence
+    })
+    if (cueConfidence === null) continue
+    weightedConfidence += cueConfidence * overlap
+    totalOverlap += overlap
+  }
+  if (totalOverlap <= 0.01) return null
+  return Number(clamp01(weightedConfidence / totalOverlap).toFixed(4))
+}
+
+const computeTranscriptRangeTrustPenalty = (
+  start: number,
+  end: number,
+  transcriptCues: TranscriptCue[]
+) => {
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length || end <= start) return 0
+  let weightedPenalty = 0
+  let totalOverlap = 0
+  for (const cue of transcriptCues) {
+    const overlapStart = Math.max(start, Number(cue.start || 0))
+    const overlapEnd = Math.min(end, Number(cue.end || 0))
+    const overlap = overlapEnd - overlapStart
+    if (!Number.isFinite(overlap) || overlap <= 0.01) continue
+    const cuePenalty = computeTranscriptCueTrustPenalty({
+      text: cue.text,
+      words: cue.words,
+      confidence: cue.confidence ?? null
+    })
+    weightedPenalty += cuePenalty * overlap
+    totalOverlap += overlap
+  }
+  if (totalOverlap <= 0.01) return 0
+  return Number(clamp01(weightedPenalty / totalOverlap).toFixed(4))
+}
+
 const parseTranscriptSidecar = (srtPath: string, options?: { sidecarPath?: string | null }) => {
   const sidecarPath = resolveTranscriptSidecarPath(srtPath, options?.sidecarPath)
   if (!sidecarPath) {
     return {
       language: null as string | null,
-      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null }>
+      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null; confidence: number | null }>
     }
   }
   try {
     const parsed = JSON.parse(String(fs.readFileSync(sidecarPath, 'utf8') || '{}')) as any
     const language = typeof parsed?.language === 'string' && parsed.language.trim().length ? parsed.language.trim().slice(0, 16) : null
     const segmentsRaw = Array.isArray(parsed?.segments) ? parsed.segments : []
-    const segments = segmentsRaw
+      const segments = segmentsRaw
       .map((segment) => {
         const start = Number(segment?.start)
         const end = Number(segment?.end)
@@ -13962,27 +14472,33 @@ const parseTranscriptSidecar = (srtPath: string, options?: { sidecarPath?: strin
         const speaker = typeof segment?.speaker === 'string' && segment.speaker.trim().length
           ? segment.speaker.trim().slice(0, 24)
           : null
+        const confidence = resolveTranscriptCueConfidence({
+          words,
+          rawConfidence: segment?.confidence
+        })
         return {
           start: Number(start.toFixed(3)),
           end: Number(end.toFixed(3)),
           text,
           words,
-          speaker
+          speaker,
+          confidence
         }
       })
-      .filter((segment: { start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null } | null): segment is {
+      .filter((segment: { start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null; confidence: number | null } | null): segment is {
         start: number
         end: number
         text: string
         words: TranscriptWord[]
         speaker: string | null
+        confidence: number | null
       } => Boolean(segment))
       .sort((left, right) => left.start - right.start || left.end - right.end)
     return { language, segments }
   } catch {
     return {
       language: null as string | null,
-      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null }>
+      segments: [] as Array<{ start: number; end: number; text: string; words: TranscriptWord[]; speaker: string | null; confidence: number | null }>
     }
   }
 }
@@ -14070,6 +14586,7 @@ const parseTranscriptCues = (srtPath: string | null, options?: { sidecarPath?: s
       start,
       end,
       text,
+      confidence: matchedSidecar?.confidence ?? null,
       words: sidecarWords,
       speaker: matchedSidecar?.speaker ?? null,
       language: sidecar.language
@@ -14660,16 +15177,21 @@ const buildTranscriptSignalBuckets = (durationSeconds: number, cues: TranscriptC
     const novelty = previousText && cue.text
       ? (previousText === cue.text ? 0 : 1)
       : 0.6
+    const trustWeight = Number((1 - computeTranscriptCueTrustPenalty({
+      text: cue.text,
+      words: cue.words,
+      confidence: cue.confidence ?? null
+    }) * 0.75).toFixed(4))
     previousText = cue.text
     for (let second = start; second < end && second < buckets.length; second += 1) {
-      buckets[second].keywordIntensity = Math.max(buckets[second].keywordIntensity, cue.keywordIntensity)
-      buckets[second].curiosityTrigger = Math.max(buckets[second].curiosityTrigger, cue.curiosityTrigger)
+      buckets[second].keywordIntensity = Math.max(buckets[second].keywordIntensity, cue.keywordIntensity * trustWeight)
+      buckets[second].curiosityTrigger = Math.max(buckets[second].curiosityTrigger, cue.curiosityTrigger * trustWeight)
       buckets[second].fillerDensity = Math.max(buckets[second].fillerDensity, cue.fillerDensity)
-      buckets[second].novelty = Math.max(buckets[second].novelty, novelty)
-      buckets[second].emotionalIntensity = Math.max(buckets[second].emotionalIntensity, cue.emotionalIntensity ?? 0)
-      buckets[second].interestingness = Math.max(buckets[second].interestingness, cue.interestingness ?? 0)
-      buckets[second].hookTypeStrength = Math.max(buckets[second].hookTypeStrength, cue.hookTypeStrength ?? 0)
-      buckets[second].narrativeScore = Math.max(buckets[second].narrativeScore, cue.narrativeScore ?? 0)
+      buckets[second].novelty = Math.max(buckets[second].novelty, novelty * Math.max(0.4, trustWeight))
+      buckets[second].emotionalIntensity = Math.max(buckets[second].emotionalIntensity, (cue.emotionalIntensity ?? 0) * trustWeight)
+      buckets[second].interestingness = Math.max(buckets[second].interestingness, (cue.interestingness ?? 0) * trustWeight)
+      buckets[second].hookTypeStrength = Math.max(buckets[second].hookTypeStrength, (cue.hookTypeStrength ?? 0) * trustWeight)
+      buckets[second].narrativeScore = Math.max(buckets[second].narrativeScore, (cue.narrativeScore ?? 0) * trustWeight)
     }
   }
   return buckets
@@ -15431,6 +15953,10 @@ const normalizeTranscriptCue = (cue: any): TranscriptCue | null => {
   if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start + 0.01 || !text) return null
   const derivedSignals = scoreTranscriptCueSignals(text)
   const words = parseTranscriptWordRows(cue?.words, start, end)
+  const confidence = resolveTranscriptCueConfidence({
+    words,
+    rawConfidence: cue?.confidence
+  })
   return {
     start: Number(start.toFixed(3)),
     end: Number(end.toFixed(3)),
@@ -15442,6 +15968,7 @@ const normalizeTranscriptCue = (cue: any): TranscriptCue | null => {
     interestingness: Number(clamp01(Number(cue?.interestingness ?? derivedSignals.interestingness)).toFixed(4)),
     hookTypeStrength: Number(clamp01(Number(cue?.hookTypeStrength ?? cue?.hook_type_strength ?? derivedSignals.hookTypeStrength)).toFixed(4)),
     narrativeScore: Number(clamp01(Number(cue?.narrativeScore ?? cue?.narrative_score ?? derivedSignals.narrativeScore)).toFixed(4)),
+    confidence,
     words: words.length ? words : undefined,
     speaker: typeof cue?.speaker === 'string' && cue.speaker.trim().length ? cue.speaker.trim().slice(0, 24) : null,
     language: typeof cue?.language === 'string' && cue.language.trim().length ? cue.language.trim().slice(0, 16) : null
@@ -15982,6 +16509,7 @@ const scoreHookFaceoffCandidate = ({
   const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
   const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const contextPenalty = evaluateHookContextDependency(start, end, Array.isArray(transcriptCues) ? transcriptCues : [])
+  const transcriptTrustPenalty = computeTranscriptRangeTrustPenalty(start, end, Array.isArray(transcriptCues) ? transcriptCues : [])
   const spoilerRisk = scoreHookSpoilerRisk(candidate.text || '')
   const faceoffScore = clamp01(
     weights.candidateScore * candidate.score +
@@ -15995,6 +16523,7 @@ const scoreHookFaceoffCandidate = ({
     0.04 * visualLeadScore * creativeVariantHookProfile.faceoffVisualLeadMultiplier +
     0.06 * introClarity -
     0.08 * deadLeadPenalty -
+    0.1 * transcriptTrustPenalty -
     0.06 * contextPenalty * modeHookProfile.faceoffContextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
     0.05 * spoilerRisk * modeHookProfile.faceoffSpoilerPenaltyMultiplier * creativeVariantHookProfile.spoilerPenaltyMultiplier +
     modeHookProfile.baseBias
@@ -16176,6 +16705,7 @@ const pickTopHookCandidates = ({
         end: aligned.end,
         transcriptCues
       })
+      const transcriptRangeTrustPenalty = computeTranscriptRangeTrustPenalty(aligned.start, aligned.end, transcriptCues)
       const audit = runHookAudit({
         start: aligned.start,
         end: aligned.end,
@@ -16267,6 +16797,7 @@ const pickTopHookCandidates = ({
         0.05 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier * creativeVariantHookProfile.dynamicLiftMultiplier +
         0.03 * dynamicLift.peakDensity -
         0.1 * deadLeadPenalty -
+        0.14 * transcriptRangeTrustPenalty -
         0.1 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
@@ -16327,6 +16858,13 @@ const pickTopHookCandidates = ({
     1.3,
     Math.max(hookCandidateTarget * 3, 24)
   )
+  const transcriptCandidatePool = transcriptCues.length
+    ? dedupeByStartSpacing(
+      rankedEvaluated.filter((candidate) => String(candidate.text || '').trim().length >= 12),
+      0.9,
+      Math.max(hookCandidateTarget * 6, 48)
+    )
+    : []
   if (!uniqueTop.length) {
     const synthetic = buildSyntheticHookCandidate({ durationSeconds, segments, windows, transcriptCues })
     if (synthetic) {
@@ -16394,23 +16932,67 @@ const pickTopHookCandidates = ({
   ))
   let selected = (highConfidencePreferred || faceoffRanked.find((entry) => entry.candidate.auditPassed) || faceoffRanked[0]).candidate
   if (transcriptCues.length) {
+    if (!String(selected.text || '').trim()) {
+      const transcriptRescue = transcriptCandidatePool
+        .map((candidate) => ({
+          candidate,
+          transcriptTrustPenalty: computeTranscriptRangeTrustPenalty(
+            candidate.start,
+            candidate.start + candidate.duration,
+            transcriptCues
+          )
+        }))
+        .filter(({ candidate, transcriptTrustPenalty }) => (
+          String(candidate.text || '').trim().length >= 12 &&
+          transcriptTrustPenalty <= 0.46 &&
+          (
+            candidate.auditPassed ||
+            candidate.auditScore >= 0.52 ||
+            candidate.score >= Math.max(0.28, selected.score - 0.05)
+          )
+        ))
+        .sort((a, b) => (
+          (b.candidate.auditScore + b.candidate.score * 0.55 - b.transcriptTrustPenalty * 0.22) -
+            (a.candidate.auditScore + a.candidate.score * 0.55 - a.transcriptTrustPenalty * 0.22) ||
+          b.candidate.auditScore - a.candidate.auditScore ||
+          b.candidate.score - a.candidate.score ||
+          a.candidate.start - b.candidate.start
+        ))[0]
+      if (transcriptRescue) {
+        selected = {
+          ...transcriptRescue.candidate,
+          reason: `${transcriptRescue.candidate.reason} Transcript-first rescue replaced a non-verbal provisional winner with a readable transcript hook.`
+        }
+      }
+    }
     const selectedTranscriptQuality = evaluateTranscriptHookQuality({
       candidate: selected,
       windows
     })
-    const transcriptPreferred = uniqueTop
+    const selectedTranscriptTrustPenalty = computeTranscriptRangeTrustPenalty(
+      selected.start,
+      selected.start + selected.duration,
+      transcriptCues
+    )
+    const transcriptPreferred = transcriptCandidatePool
       .map((candidate) => ({
         candidate,
         evaluated: evaluateTranscriptHookQuality({
           candidate,
           windows
-        })
+        }),
+        transcriptTrustPenalty: computeTranscriptRangeTrustPenalty(
+          candidate.start,
+          candidate.start + candidate.duration,
+          transcriptCues
+        )
       }))
-      .filter(({ candidate, evaluated }) => (
+      .filter(({ candidate, evaluated, transcriptTrustPenalty }) => (
         String(candidate.text || '').trim().length >= 12 &&
         !evaluated.textSignals.isGenericUtterance &&
+        transcriptTrustPenalty <= Math.max(0.42, selectedTranscriptTrustPenalty + 0.12) &&
         (
-          evaluated.qualityScore >= Math.max(0.52, selectedTranscriptQuality.qualityScore + creativeVariantHookProfile.transcriptOverrideDelta) ||
+          evaluated.qualityScore - transcriptTrustPenalty * 0.22 >= Math.max(0.52, selectedTranscriptQuality.qualityScore + creativeVariantHookProfile.transcriptOverrideDelta - selectedTranscriptTrustPenalty * 0.18) ||
           evaluated.textSignals.interestingness >= selectedTranscriptQuality.textSignals.interestingness + 0.18
         ) &&
         (
@@ -16420,7 +17002,7 @@ const pickTopHookCandidates = ({
         )
       ))
       .sort((a, b) => (
-        b.evaluated.qualityScore - a.evaluated.qualityScore ||
+        (b.evaluated.qualityScore - b.transcriptTrustPenalty * 0.22) - (a.evaluated.qualityScore - a.transcriptTrustPenalty * 0.22) ||
         b.candidate.auditScore - a.candidate.auditScore ||
         b.candidate.score - a.candidate.score ||
         a.candidate.start - b.candidate.start
@@ -16447,6 +17029,91 @@ const pickTopHookCandidates = ({
     } else {
       hookFailureReason = synthetic?.reason || `No hook candidate passed audit. Best candidate reason: ${selected.reason}`
       if (synthetic) uniqueTop.push(synthetic)
+    }
+  }
+  if (transcriptCues.length) {
+    const finalSelectedText = String(selected.text || '').trim()
+    const finalSelectedTrustPenalty = computeTranscriptRangeTrustPenalty(
+      selected.start,
+      selected.start + selected.duration,
+      transcriptCues
+    )
+    const finalSelectedSignals = analyzeHookTextQualitySignals(finalSelectedText)
+    const finalSelectedTranscriptScore = clamp01(
+      0.34 * clamp01(Number(selected.auditScore || 0)) +
+      0.22 * clamp01(Number(selected.score || 0)) +
+      0.16 * finalSelectedSignals.interestingness +
+      0.1 * finalSelectedSignals.patternInterrupt +
+      0.08 * finalSelectedSignals.valuePromise +
+      0.06 * finalSelectedSignals.specificity +
+      0.04 * finalSelectedSignals.hookTypeStrength -
+      0.32 * finalSelectedTrustPenalty -
+      0.12 * finalSelectedSignals.weakIntroPenalty -
+      (finalSelectedSignals.isGenericUtterance ? 0.14 : 0)
+    )
+    const finalTranscriptScored = rankedEvaluated
+      .map((candidate) => {
+        const text = String(candidate.text || '').trim()
+        const textSignals = analyzeHookTextQualitySignals(text)
+        const transcriptTrustPenalty = computeTranscriptRangeTrustPenalty(
+          candidate.start,
+          candidate.start + candidate.duration,
+          transcriptCues
+        )
+        return {
+          candidate,
+          transcriptTrustPenalty,
+          textSignals,
+          transcriptScore: clamp01(
+            0.34 * clamp01(Number(candidate.auditScore || 0)) +
+            0.22 * clamp01(Number(candidate.score || 0)) +
+            0.16 * textSignals.interestingness +
+            0.1 * textSignals.patternInterrupt +
+            0.08 * textSignals.valuePromise +
+            0.06 * textSignals.specificity +
+            0.04 * textSignals.hookTypeStrength -
+            0.32 * transcriptTrustPenalty -
+            0.12 * textSignals.weakIntroPenalty -
+            (textSignals.isGenericUtterance ? 0.14 : 0)
+          )
+        }
+      })
+    const finalTranscriptPreferred = finalTranscriptScored
+      .filter(({ candidate, textSignals, transcriptTrustPenalty, transcriptScore }) => (
+        String(candidate.text || '').trim().length >= 12 &&
+        !textSignals.isGenericUtterance &&
+        transcriptTrustPenalty <= (finalSelectedText ? Math.max(0.52, finalSelectedTrustPenalty + 0.18) : 0.62) &&
+        (
+          candidate.auditPassed ||
+          candidate.auditScore >= (finalSelectedText ? Math.max(0.5, selected.auditScore - 0.02) : 0.42) ||
+          transcriptScore >= 0.34
+        ) &&
+        (
+          !finalSelectedText ||
+          transcriptTrustPenalty + 0.18 < finalSelectedTrustPenalty ||
+          transcriptScore >= finalSelectedTranscriptScore + creativeVariantHookProfile.transcriptOverrideDelta * 0.8 ||
+          candidate.auditScore >= Math.max(0.58, selected.auditScore + 0.08) ||
+          textSignals.interestingness >= finalSelectedSignals.interestingness + 0.12
+        )
+      ))
+      .sort((a, b) => (
+        b.transcriptScore - a.transcriptScore ||
+        b.candidate.auditScore - a.candidate.auditScore ||
+        b.candidate.score - a.candidate.score ||
+        a.candidate.start - b.candidate.start
+      ))[0]
+    if (
+      finalTranscriptPreferred &&
+      (
+        !finalSelectedText ||
+        finalTranscriptPreferred.transcriptScore >= finalSelectedTranscriptScore + 0.02 ||
+        finalTranscriptPreferred.transcriptTrustPenalty + 0.08 < finalSelectedTrustPenalty
+      )
+    ) {
+      selected = {
+        ...finalTranscriptPreferred.candidate,
+        reason: `${finalTranscriptPreferred.candidate.reason} Final transcript-first override kept the hook anchored to the clearest readable transcript moment.`
+      }
     }
   }
   const timelineCoverageCandidates = dedupeByStartSpacing(
@@ -20616,6 +21283,17 @@ const buildEditPlan = async (
       frameScan: plannerFrameScan,
       transcriptSegments: plannerTranscriptSegments,
       transcriptExcerpt: plannerTranscriptExcerpt,
+      engagementWindows: windows.map((window) => ({
+        start: Number(window.time || 0),
+        end: Number((Number(window.time || 0) + 1).toFixed(3)),
+        score: Number(window.score || 0),
+        speechIntensity: Number(window.speechIntensity || 0),
+        vocalExcitement: Number(window.vocalExcitement || 0),
+        emotionIntensity: Number(window.emotionIntensity || 0),
+        motionScore: Number(window.motionScore || 0),
+        sceneChangeRate: Number(window.sceneChangeRate || 0),
+        actionSpike: Number(window.actionSpike || 0)
+      })),
       editorMode: options.editorMode ?? null,
       modePlaybookPrompt: plannerModePlaybook.prompt || null
     })
@@ -27034,6 +27712,7 @@ const executeQualityGateRetriesForTest = (judgeOutcomes: boolean[], maxRetries =
 }
 
 const buildTimelineWithHookAtStartForTest = (segments: Segment[], hook: HookCandidate) => {
+  if (hook?.noRelocate) return segments.map((segment) => ({ ...segment }))
   const hookRange: TimeRange = { start: hook.start, end: hook.start + hook.duration }
   const withoutHook = subtractRange(segments.map((segment) => ({ ...segment })), hookRange)
   return [{ ...hookRange, speed: 1 }, ...withoutHook]
@@ -29627,6 +30306,7 @@ const processJob = async (
         durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
         selectedHookSelectionSource !== 'user_selected'
       const shouldMoveHookForRender =
+        !initialHook.noRelocate &&
         (options.autoHookMove || selectedHookSelectionSource === 'user_selected' || forceLongFormHookMove)
       if (preferredHookCandidate) {
         optimizationNotes.push(
@@ -29635,6 +30315,8 @@ const processJob = async (
             preferredHookCandidate.start + preferredHookCandidate.duration
           )}).`
         )
+      } else if (initialHook.noRelocate) {
+        optimizationNotes.push('Safe no-hook fallback active: failed synthetic opener was blocked, so the edit keeps the chronological opening.')
       } else if (authoritativeAutoHookLock) {
         optimizationNotes.push('Authoritative auto hook lock active: retry variants may adjust pacing and cuts, but they cannot replace the chosen opener.')
       }
@@ -33698,10 +34380,16 @@ router.get('/:id', async (req: any, res) => {
     jobPayload.hookWhy = jobAnalysis?.hook_debug?.why ?? null
     jobPayload.hardQualityGate = jobAnalysis?.hard_quality_gate ?? null
     jobPayload.variantSelectionAudit = jobAnalysis?.variant_selection_audit ?? null
+    jobPayload.editDecisionTimeline = jobAnalysis?.edit_decision_timeline ?? null
     jobPayload.cutQualityScore = jobAnalysis?.cut_quality_score ?? null
     jobPayload.cuttingAudit = jobAnalysis?.cutting_audit ?? null
     jobPayload.storyBeatGraph = jobAnalysis?.story_beat_graph ?? null
     jobPayload.visualIntelligence = jobAnalysis?.visual_intelligence ?? null
+    jobPayload.autonomousEditor = buildAutonomousEditorSummary({
+      job,
+      analysis: jobAnalysis,
+      optimizationNotes: (job as any)?.optimizationNotes ?? null
+    })
     const outputPaths = getOutputPathsForJob(job)
     if (job.status === 'completed' && outputPaths.length > 0) {
       const resolvedUrls: string[] = []
@@ -35291,16 +35979,33 @@ router.post('/:id/reprocess', async (req: any, res) => {
   }
 })
 
-const runBoundaryBaselineBootstrapForJob = (userId: string, jobId: string) => {
+const runBackgroundLearningCycleForJob = (userId: string, jobId: string, trigger: string) => {
   if (!userId || !jobId) return
-  void bootstrapBoundaryLabelsFromCompletedJobs({
+  void runAutomaticEditorLearningCycle({
     userId,
     focusJobId: jobId,
-    maxJobs: 80,
-    maxLabelsPerJob: 24
-  }).catch((error) => {
-    console.warn('boundary label bootstrap failed after feedback ingest', error)
+    trigger
+  }).then((learning) => (
+    persistLatestLearningCycleForJob(jobId, learning)
+  )).catch((error) => {
+    console.warn(`automatic editor learning cycle failed after ${trigger}`, error)
   })
+}
+
+const runForegroundLearningCycleForJob = async (userId: string, jobId: string, trigger: string) => {
+  if (!userId || !jobId) return null
+  try {
+    const learning = await runAutomaticEditorLearningCycle({
+      userId,
+      focusJobId: jobId,
+      trigger
+    })
+    await persistLatestLearningCycleForJob(jobId, learning)
+    return learning
+  } catch (error) {
+    console.warn(`automatic editor learning cycle failed after ${trigger}`, error)
+    return null
+  }
 }
 
 router.post('/:id/retention-feedback', async (req: any, res) => {
@@ -35356,12 +36061,13 @@ router.post('/:id/retention-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after retention feedback', error)
     }
-    runBoundaryBaselineBootstrapForJob(job.userId, id)
+    const learning = await runForegroundLearningCycleForJob(job.userId, id, 'retention_feedback')
     return res.json({
       ok: true,
       feedback,
       hookCalibration,
-      feedbackLoop
+      feedbackLoop,
+      learning
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -35462,12 +36168,13 @@ router.post('/:id/platform-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after platform feedback', error)
     }
-    runBoundaryBaselineBootstrapForJob(job.userId, id)
+    const learning = await runForegroundLearningCycleForJob(job.userId, id, 'platform_feedback')
     return res.json({
       ok: true,
       feedback,
       hookCalibration,
-      feedbackLoop
+      feedbackLoop,
+      learning
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -35558,13 +36265,14 @@ router.post('/:id/creator-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after creator feedback', error)
     }
-    runBoundaryBaselineBootstrapForJob(job.userId, id)
+    const learning = await runForegroundLearningCycleForJob(job.userId, id, 'creator_feedback')
     return res.json({
       ok: true,
       creatorFeedback,
       feedback,
       hookCalibration,
-      feedbackLoop
+      feedbackLoop,
+      learning
     })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
@@ -35657,6 +36365,33 @@ router.post('/:id/player-events', async (req: any, res) => {
       }).catch((error) => {
         console.warn('policy outcome registration failed after player telemetry', error)
       })
+      const durationForReward = Number(job.inputDurationSeconds || 0)
+      if (Number.isFinite(durationForReward) && durationForReward > 0.1) {
+        const rewardSignal = derivePerSecondRewardSignal({
+          durationSeconds: durationForReward,
+          retentionPoints: [
+            { timestamp: 0, watchedPct: Number((summary.completion_rate ?? summary.effective_watch_ratio ?? 0) * 100) },
+            { timestamp: durationForReward * 0.35, watchedPct: Number((summary.effective_watch_ratio ?? 0) * 100) },
+            { timestamp: durationForReward * 0.98, watchedPct: Number((summary.completion_rate ?? 0) * 100) }
+          ],
+          skipHotspots: Array.isArray(summary.skip_hotspots) ? summary.skip_hotspots : [],
+          rewatchHotspots: Array.isArray(summary.rewatch_hotspots) ? summary.rewatch_hotspots : []
+        })
+        await ingestPlatformRewardSignal({
+          userId: job.userId,
+          jobId: id,
+          source: 'player_telemetry',
+          videoId: null,
+          perSecondRewards: rewardSignal.perSecondRewards,
+          summary: {
+            ...rewardSignal.summary,
+            sessionCount: sessions.length,
+            sourceRoute: 'jobs/:id/player-events'
+          }
+        }).catch((error) => {
+          console.warn('platform reward ingest failed after player telemetry', error)
+        })
+      }
       try {
         await runFeedbackLoop({
           trigger: 'feedback_submission',
@@ -35665,7 +36400,7 @@ router.post('/:id/player-events', async (req: any, res) => {
       } catch (error) {
         console.warn('feedback loop run failed after player telemetry', error)
       }
-      runBoundaryBaselineBootstrapForJob(job.userId, id)
+      runBackgroundLearningCycleForJob(job.userId, id, 'player_telemetry')
       return res.json({
         ok: true,
         ingested: events.length,
@@ -35796,11 +36531,12 @@ router.post('/:id/editor-taste-feedback', async (req: any, res) => {
     } catch (error) {
       console.warn('feedback loop run failed after editor taste feedback', error)
     }
-    runBoundaryBaselineBootstrapForJob(job.userId, id)
+    const learning = await runForegroundLearningCycleForJob(job.userId, id, 'editor_taste_feedback')
     return res.json({
       ok: true,
       feedback: payload,
-      mappedRetentionFeedback: mappedFeedback
+      mappedRetentionFeedback: mappedFeedback,
+      learning
     })
   } catch (err) {
     console.error('editor taste feedback failed', err)
@@ -36234,12 +36970,22 @@ const buildEditPlanForTest = async ({
     recentHooks: null,
     creativeVariant: options.creativeVariant
   })
-  const resolvedHook = hookDecision?.candidate || buildFallbackHookCandidateFromStorySegments({
-    segments: planSegments,
-    windows: planWindows,
-    silences: planSilences,
-    durationSeconds
-  })
+  const resolvedHook = hookDecision?.candidate ||
+    pickAuditedOpeningCandidateFromPool({
+      candidates: candidatePool,
+      durationSeconds,
+      maxStartSeconds: 45
+    }) ||
+    buildSafeNoHookOpeningCandidate({
+      segments: planSegments,
+      durationSeconds
+    }) ||
+    buildFallbackHookCandidateFromStorySegments({
+      segments: planSegments,
+      windows: planWindows,
+      silences: planSilences,
+      durationSeconds
+    })
   if (resolvedHook) {
     const enforcedHook = enforceAutoHookDurationRange({
       candidate: resolvedHook,

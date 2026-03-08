@@ -25,6 +25,36 @@ export type PlannerTranscriptSegment = {
   confidence: number | null
 }
 
+export type PlannerEngagementWindow = {
+  start?: number
+  end?: number
+  time?: number
+  score?: number
+  speechIntensity?: number
+  vocalExcitement?: number
+  emotionIntensity?: number
+  motionScore?: number
+  sceneChangeRate?: number
+  actionSpike?: number
+}
+
+type HookCandidatePsychology = {
+  curiosity: number
+  tension: number
+  clarity: number
+  novelty: number
+  payoffDeferral: number
+  emotionalPull: number
+  continuationPressure: number
+  revealRisk: number
+}
+
+type HookCandidateGate = {
+  eligible: boolean
+  reason: string
+  pairwiseScore?: number
+}
+
 export type HookCandidateSource = 'motion_peak' | 'transcript' | 'intro_fallback' | 'hybrid'
 
 export type HookCandidate = {
@@ -42,6 +72,8 @@ export type HookCandidate = {
     llm: number
     combined: number
   }
+  psychology?: HookCandidatePsychology
+  gate?: HookCandidateGate
 }
 
 export type PacingAdjustmentAction = 'trim' | 'speed_up' | 'transition_boost'
@@ -128,6 +160,7 @@ type PlannerInput = {
   frameScan: PlannerFrameScan
   transcriptSegments: PlannerTranscriptSegment[]
   transcriptExcerpt: string
+  engagementWindows?: PlannerEngagementWindow[]
   editorMode?: string | null
   modePlaybookPrompt?: string | null
 }
@@ -180,6 +213,59 @@ const NEGATIVE_WORDS = [
   'problem',
   'annoying',
   'worse'
+]
+
+const OPEN_LOOP_WORDS = [
+  'wait',
+  'watch',
+  'why',
+  'how',
+  'what',
+  'question',
+  'mystery',
+  'secret',
+  'almost',
+  'later',
+  'next',
+  'before',
+  'until',
+  'but',
+  'coming up',
+  'not yet'
+]
+
+const REVEAL_WORDS = [
+  'because',
+  'the answer',
+  'here is why',
+  'turns out',
+  'finally',
+  'done',
+  'finished',
+  'solved',
+  'fixed',
+  'revealed',
+  'reveal',
+  'we did it',
+  'i did it',
+  'that is why',
+  'this is how'
+]
+
+const STAKES_WORDS = [
+  'risk',
+  'lose',
+  'lost',
+  'deadline',
+  'danger',
+  'problem',
+  'challenge',
+  'threat',
+  'before',
+  'or else',
+  'if not',
+  'fail',
+  'failure'
 ]
 
 const FILLER_PHRASES = [
@@ -492,6 +578,26 @@ type TimelineWindow = {
   motionScore: number
   confidenceScore: number
   fillerDensity: number
+  engagementScore: number
+  speechIntensity: number
+  emotionIntensity: number
+  vocalExcitement: number
+  rewardDensity: number
+  storyPressure: number
+}
+
+type PlannerAttentionWindow = {
+  start: number
+  end: number
+  score: number
+  speechIntensity: number
+  vocalExcitement: number
+  emotionIntensity: number
+  motionScore: number
+  sceneChangeRate: number
+  actionSpike: number
+  rewardDensity: number
+  storyPressure: number
 }
 
 type TranscriptSignalSegment = PlannerTranscriptSegment & {
@@ -504,6 +610,304 @@ type TranscriptSignalSegment = PlannerTranscriptSegment & {
   hesitationScore: number
   repetitionScore: number
   sentenceTerminal: boolean
+}
+
+const normalizeEngagementWindows = ({
+  windows,
+  duration
+}: {
+  windows: PlannerEngagementWindow[] | undefined
+  duration: number
+}): PlannerAttentionWindow[] =>
+  (windows || [])
+    .map((window) => {
+      const rawStart = Number.isFinite(Number(window?.start))
+        ? Number(window?.start)
+        : Number.isFinite(Number(window?.time))
+          ? Number(window?.time)
+          : 0
+      const rawEnd = Number.isFinite(Number(window?.end))
+        ? Number(window?.end)
+        : rawStart + 1
+      const start = clamp(rawStart, 0, Math.max(0, duration - 0.05))
+      const end = clamp(rawEnd, start + 0.05, duration)
+      const score = clamp(Number(window?.score ?? 0.55), 0, 1)
+      const speechIntensity = clamp(Number(window?.speechIntensity ?? score), 0, 1)
+      const vocalExcitement = clamp(Number(window?.vocalExcitement ?? speechIntensity * 0.72), 0, 1)
+      const motionScore = clamp(
+        Number(window?.motionScore ?? window?.sceneChangeRate ?? window?.actionSpike ?? 0.35),
+        0,
+        1
+      )
+      const sceneChangeRate = clamp(Number(window?.sceneChangeRate ?? motionScore), 0, 1)
+      const actionSpike = clamp(Number(window?.actionSpike ?? (motionScore * 0.58 + vocalExcitement * 0.42)), 0, 1)
+      const emotionIntensity = clamp(
+        Number(window?.emotionIntensity ?? (speechIntensity * 0.38 + vocalExcitement * 0.32 + score * 0.3)),
+        0,
+        1
+      )
+      const rewardDensity = clamp(
+        0.34 * score +
+          0.18 * speechIntensity +
+          0.18 * emotionIntensity +
+          0.14 * vocalExcitement +
+          0.16 * motionScore,
+        0,
+        1
+      )
+      const storyPressure = clamp(
+        0.24 * score +
+          0.2 * speechIntensity +
+          0.18 * emotionIntensity +
+          0.16 * vocalExcitement +
+          0.12 * motionScore +
+          0.1 * actionSpike,
+        0,
+        1
+      )
+      return {
+        start: Number(start.toFixed(3)),
+        end: Number(end.toFixed(3)),
+        score: Number(score.toFixed(4)),
+        speechIntensity: Number(speechIntensity.toFixed(4)),
+        vocalExcitement: Number(vocalExcitement.toFixed(4)),
+        emotionIntensity: Number(emotionIntensity.toFixed(4)),
+        motionScore: Number(motionScore.toFixed(4)),
+        sceneChangeRate: Number(sceneChangeRate.toFixed(4)),
+        actionSpike: Number(actionSpike.toFixed(4)),
+        rewardDensity: Number(rewardDensity.toFixed(4)),
+        storyPressure: Number(storyPressure.toFixed(4))
+      }
+    })
+    .filter((window) => window.end > window.start)
+    .sort((left, right) => left.start - right.start || left.end - right.end)
+
+const rangeOverlapSeconds = (
+  left: { start: number; end: number },
+  right: { start: number; end: number }
+) => Math.max(0, Math.min(left.end, right.end) - Math.max(left.start, right.start))
+
+const collectEngagementRangeStats = ({
+  windows,
+  start,
+  end
+}: {
+  windows: PlannerAttentionWindow[]
+  start: number
+  end: number
+}) => {
+  const safeEnd = Math.max(start + 0.05, end)
+  let totalWeight = 0
+  let score = 0
+  let speech = 0
+  let emotion = 0
+  let vocal = 0
+  let motion = 0
+  let action = 0
+  let reward = 0
+  let pressure = 0
+  let peakReward = 0
+  let valleyReward = 1
+
+  for (const window of windows) {
+    const weight = rangeOverlapSeconds({ start, end: safeEnd }, window)
+    if (weight <= 0) continue
+    totalWeight += weight
+    score += window.score * weight
+    speech += window.speechIntensity * weight
+    emotion += window.emotionIntensity * weight
+    vocal += window.vocalExcitement * weight
+    motion += window.motionScore * weight
+    action += window.actionSpike * weight
+    reward += window.rewardDensity * weight
+    pressure += window.storyPressure * weight
+    peakReward = Math.max(peakReward, window.rewardDensity)
+    valleyReward = Math.min(valleyReward, window.rewardDensity)
+  }
+
+  if (totalWeight <= 0) {
+    return {
+      score: 0.55,
+      speechIntensity: 0.5,
+      emotionIntensity: 0.46,
+      vocalExcitement: 0.42,
+      motionScore: 0.35,
+      actionSpike: 0.3,
+      rewardDensity: 0.48,
+      storyPressure: 0.48,
+      peakRewardDensity: 0.48,
+      valleyRewardDensity: 0.48
+    }
+  }
+
+  return {
+    score: Number(clamp(score / totalWeight, 0, 1).toFixed(4)),
+    speechIntensity: Number(clamp(speech / totalWeight, 0, 1).toFixed(4)),
+    emotionIntensity: Number(clamp(emotion / totalWeight, 0, 1).toFixed(4)),
+    vocalExcitement: Number(clamp(vocal / totalWeight, 0, 1).toFixed(4)),
+    motionScore: Number(clamp(motion / totalWeight, 0, 1).toFixed(4)),
+    actionSpike: Number(clamp(action / totalWeight, 0, 1).toFixed(4)),
+    rewardDensity: Number(clamp(reward / totalWeight, 0, 1).toFixed(4)),
+    storyPressure: Number(clamp(pressure / totalWeight, 0, 1).toFixed(4)),
+    peakRewardDensity: Number(clamp(peakReward, 0, 1).toFixed(4)),
+    valleyRewardDensity: Number(clamp(valleyReward, 0, 1).toFixed(4))
+  }
+}
+
+const computePaceFit = (wordsPerSecond: number) => {
+  const ideal = 2.1
+  const distance = Math.abs(wordsPerSecond - ideal)
+  return clamp(1 - distance / 2.1, 0, 1)
+}
+
+const computeRevealRisk = ({
+  text,
+  transcriptSignals,
+  engagement
+}: {
+  text: string
+  transcriptSignals: TranscriptSignalSegment[]
+  engagement: ReturnType<typeof collectEngagementRangeStats>
+}) => {
+  const normalized = normalizeText(text)
+  if (!normalized) return 0.24
+  const revealHits = countKeywordHits(normalized, REVEAL_WORDS)
+  const openLoopHits = countKeywordHits(normalized, OPEN_LOOP_WORDS)
+  const questionBoost = normalized.includes('?') ? 0.18 : 0
+  const conclusiveEnding = /(?:because|so we|so i|therefore|the answer|turns out)\b/.test(normalized) ? 0.14 : 0
+  const sentenceTerminalRatio = avg(
+    transcriptSignals.map((segment) => (segment.sentenceTerminal ? 1 : 0)),
+    0.5
+  )
+  return clamp(
+    revealHits * 0.18 +
+      conclusiveEnding +
+      sentenceTerminalRatio * 0.08 +
+      Math.max(0, engagement.rewardDensity - engagement.storyPressure) * 0.12 -
+      openLoopHits * 0.1 -
+      questionBoost,
+    0,
+    1
+  )
+}
+
+const computeCandidatePsychology = ({
+  candidate,
+  transcriptSignals,
+  engagementWindows,
+  duration
+}: {
+  candidate: HookCandidate
+  transcriptSignals: TranscriptSignalSegment[]
+  engagementWindows: PlannerAttentionWindow[]
+  duration: number
+}): HookCandidatePsychology => {
+  const text = candidate.transcript || ''
+  const normalized = normalizeText(text)
+  const overlappingSignals = transcriptSignals.filter(
+    (segment) => segment.end > candidate.start && segment.start < candidate.end
+  )
+  const wordsPerSecond = avg(
+    overlappingSignals.map((segment) => segment.wordsPerSecond),
+    countWords(text) / Math.max(0.8, candidate.end - candidate.start)
+  )
+  const paceFit = computePaceFit(wordsPerSecond)
+  const confidenceScore = avg(overlappingSignals.map((segment) => segment.confidenceNorm), 0.72)
+  const fillerDensity = avg(overlappingSignals.map((segment) => segment.fillerDensity), 0)
+  const hesitation = avg(overlappingSignals.map((segment) => segment.hesitationScore), 0)
+  const repetition = avg(overlappingSignals.map((segment) => segment.repetitionScore), 0)
+  const engagement = collectEngagementRangeStats({
+    windows: engagementWindows,
+    start: candidate.start,
+    end: candidate.end
+  })
+  const transcriptEnergy = computeTranscriptEnergy(text)
+  const openLoopHits = countKeywordHits(normalized, OPEN_LOOP_WORDS)
+  const stakesHits = countKeywordHits(normalized, STAKES_WORDS)
+  const questionBoost = normalized.includes('?') ? 0.16 : 0
+  const revealRisk = computeRevealRisk({
+    text,
+    transcriptSignals: overlappingSignals,
+    engagement
+  })
+  const curiosity = clamp(
+    transcriptEnergy * 0.28 +
+      openLoopHits * 0.08 +
+      stakesHits * 0.06 +
+      questionBoost +
+      engagement.storyPressure * 0.18 +
+      engagement.score * 0.12 +
+      Math.max(0, 1 - revealRisk) * 0.12,
+    0,
+    1
+  )
+  const tension = clamp(
+    engagement.emotionIntensity * 0.28 +
+      engagement.vocalExcitement * 0.22 +
+      engagement.actionSpike * 0.18 +
+      engagement.motionScore * 0.12 +
+      stakesHits * 0.07 +
+      transcriptEnergy * 0.13,
+    0,
+    1
+  )
+  const clarity = clamp(
+    confidenceScore * 0.46 +
+      (1 - fillerDensity) * 0.18 +
+      (1 - hesitation) * 0.12 +
+      (1 - repetition) * 0.08 +
+      paceFit * 0.1 +
+      engagement.speechIntensity * 0.06,
+    0,
+    1
+  )
+  const novelty = clamp(
+    engagement.motionScore * 0.3 +
+      engagement.actionSpike * 0.22 +
+      engagement.rewardDensity * 0.14 +
+      transcriptEnergy * 0.14 +
+      (candidate.source === 'motion_peak' ? 0.1 : 0.04) +
+      Math.max(0, 1 - Math.min(1, candidate.start / Math.max(1, duration))) * 0.1,
+    0,
+    1
+  )
+  const payoffDeferral = clamp(
+    (1 - revealRisk) * 0.64 +
+      Math.min(1, openLoopHits * 0.12) +
+      questionBoost +
+      stakesHits * 0.05 +
+      Math.max(0, engagement.storyPressure - engagement.rewardDensity) * 0.08,
+    0,
+    1
+  )
+  const emotionalPull = clamp(
+    engagement.emotionIntensity * 0.42 +
+      engagement.vocalExcitement * 0.28 +
+      engagement.score * 0.18 +
+      engagement.speechIntensity * 0.12,
+    0,
+    1
+  )
+  const continuationPressure = clamp(
+    curiosity * 0.34 +
+      payoffDeferral * 0.18 +
+      tension * 0.16 +
+      clarity * 0.12 +
+      emotionalPull * 0.1 +
+      novelty * 0.1,
+    0,
+    1
+  )
+  return {
+    curiosity: Number(curiosity.toFixed(4)),
+    tension: Number(tension.toFixed(4)),
+    clarity: Number(clarity.toFixed(4)),
+    novelty: Number(novelty.toFixed(4)),
+    payoffDeferral: Number(payoffDeferral.toFixed(4)),
+    emotionalPull: Number(emotionalPull.toFixed(4)),
+    continuationPressure: Number(continuationPressure.toFixed(4)),
+    revealRisk: Number(revealRisk.toFixed(4))
+  }
 }
 
 const dedupeCandidates = (candidates: HookCandidate[]) => {
@@ -625,11 +1029,13 @@ const computeAudioDensityForWindow = (
 const buildTimelineWindows = ({
   duration,
   transcriptSignals,
-  motionPeaks
+  motionPeaks,
+  engagementWindows
 }: {
   duration: number
   transcriptSignals: TranscriptSignalSegment[]
   motionPeaks: number[]
+  engagementWindows: PlannerAttentionWindow[]
 }): TimelineWindow[] => {
   const safeDuration = Math.max(1, Number(duration || 0))
   const span = clamp(safeDuration / 18, 8, 20)
@@ -645,7 +1051,16 @@ const buildTimelineWindows = ({
     const transcriptEnergy = computeTranscriptEnergy(transcript)
     const words = transcript ? transcript.split(/\s+/).filter(Boolean).length : 0
     const wordsPerSecond = words / Math.max(0.6, end - start)
-    const motionScore = computeMotionScoreForWindow(start, end, motionPeaks)
+    const engagement = collectEngagementRangeStats({
+      windows: engagementWindows,
+      start,
+      end
+    })
+    const motionScore = clamp(
+      computeMotionScoreForWindow(start, end, motionPeaks) * 0.64 + engagement.motionScore * 0.36,
+      0,
+      1
+    )
     const confidenceScore = avg(overlappingSignals.map((segment) => segment.confidenceNorm), 0.72)
     const fillerDensity = avg(overlappingSignals.map((segment) => segment.fillerDensity), 0)
     windows.push({
@@ -657,7 +1072,13 @@ const buildTimelineWindows = ({
       transcriptEnergy: Number(transcriptEnergy.toFixed(3)),
       motionScore: Number(motionScore.toFixed(3)),
       confidenceScore: Number(confidenceScore.toFixed(3)),
-      fillerDensity: Number(fillerDensity.toFixed(4))
+      fillerDensity: Number(fillerDensity.toFixed(4)),
+      engagementScore: Number(engagement.score.toFixed(4)),
+      speechIntensity: Number(engagement.speechIntensity.toFixed(4)),
+      emotionIntensity: Number(engagement.emotionIntensity.toFixed(4)),
+      vocalExcitement: Number(engagement.vocalExcitement.toFixed(4)),
+      rewardDensity: Number(engagement.rewardDensity.toFixed(4)),
+      storyPressure: Number(engagement.storyPressure.toFixed(4))
     })
     cursor += span * 0.88
     index += 1
@@ -669,30 +1090,69 @@ const buildTimelineWindows = ({
 const buildScoredCandidates = ({
   candidates,
   frameScan,
-  transcriptSignals
+  transcriptSignals,
+  engagementWindows,
+  duration
 }: {
   candidates: HookCandidate[]
   frameScan: PlannerFrameScan
   transcriptSignals: TranscriptSignalSegment[]
+  engagementWindows: PlannerAttentionWindow[]
+  duration: number
 }) => {
   const peaks = Array.isArray(frameScan.motionPeaks) ? frameScan.motionPeaks : []
   return candidates.map((candidate) => {
-    const motionScore = computeMotionScoreForWindow(candidate.start, candidate.end, peaks)
-    const audioScore = Math.max(candidate.scores.audio, computeAudioDensityForWindow(candidate.start, candidate.end, transcriptSignals))
+    const engagement = collectEngagementRangeStats({
+      windows: engagementWindows,
+      start: candidate.start,
+      end: candidate.end
+    })
+    const motionScore = clamp(
+      computeMotionScoreForWindow(candidate.start, candidate.end, peaks) * 0.62 + engagement.motionScore * 0.38,
+      0,
+      1
+    )
+    const audioScore = clamp(
+      Math.max(
+        candidate.scores.audio,
+        computeAudioDensityForWindow(candidate.start, candidate.end, transcriptSignals) * 0.56 +
+          engagement.speechIntensity * 0.24 +
+          engagement.vocalExcitement * 0.2
+      ),
+      0,
+      1
+    )
     const overlappingSignals = transcriptSignals.filter((segment) => segment.end > candidate.start && segment.start < candidate.end)
     const confidenceScore = avg(overlappingSignals.map((segment) => segment.confidenceNorm), 0.72)
     const fillerPenalty = clamp(avg(overlappingSignals.map((segment) => segment.fillerDensity), 0) * 0.45, 0, 0.25)
-    const sentimentScore = candidate.scores.sentiment || computeLexiconSentiment(candidate.transcript)
+    const sentimentScore = clamp(
+      (candidate.scores.sentiment || computeLexiconSentiment(candidate.transcript)) * 0.62 +
+        engagement.emotionIntensity * 0.22 +
+        engagement.score * 0.16,
+      0.05,
+      0.98
+    )
+    const psychology = computeCandidatePsychology({
+      candidate,
+      transcriptSignals,
+      engagementWindows,
+      duration
+    })
     const faceCenterBoost = clamp(frameScan.centeredFaceVerticalSignal, 0, 1) * 0.08
-    // Do not force the start of the video; let strongest curiosity/motion win.
-    const openerBias = 0
+    const psychologyBoost =
+      psychology.continuationPressure * 0.22 +
+      psychology.clarity * 0.08 +
+      psychology.payoffDeferral * 0.08 +
+      psychology.emotionalPull * 0.06
     const heuristicScore = clamp(
-      motionScore * 0.36 +
-        audioScore * 0.28 +
-        sentimentScore * 0.16 +
-        confidenceScore * 0.18 +
+      motionScore * 0.24 +
+        audioScore * 0.18 +
+        sentimentScore * 0.1 +
+        confidenceScore * 0.12 +
+        engagement.score * 0.08 +
+        engagement.storyPressure * 0.06 +
         faceCenterBoost +
-        openerBias -
+        psychologyBoost -
         fillerPenalty,
       0,
       1
@@ -705,7 +1165,8 @@ const buildScoredCandidates = ({
         audio: Number(audioScore.toFixed(4)),
         sentiment: Number(sentimentScore.toFixed(4)),
         combined: Number(heuristicScore.toFixed(4))
-      }
+      },
+      psychology
     }
   })
 }
@@ -720,8 +1181,299 @@ const buildCandidateContext = (candidates: HookCandidate[]) =>
     audio_score: Number(candidate.scores.audio.toFixed(3)),
     sentiment_score: Number(candidate.scores.sentiment.toFixed(3)),
     heuristic_score: Number(candidate.scores.combined.toFixed(3)),
+    continuation_pressure: Number((candidate.psychology?.continuationPressure ?? 0.5).toFixed(3)),
+    curiosity_score: Number((candidate.psychology?.curiosity ?? 0.5).toFixed(3)),
+    clarity_score: Number((candidate.psychology?.clarity ?? 0.5).toFixed(3)),
+    payoff_deferral: Number((candidate.psychology?.payoffDeferral ?? 0.5).toFixed(3)),
+    reveal_risk: Number((candidate.psychology?.revealRisk ?? 0.25).toFixed(3)),
     reason: candidate.reason
   }))
+
+const computeIntroSuitability = ({
+  candidate,
+  duration
+}: {
+  candidate: HookCandidate
+  duration: number
+}) => {
+  const position = clamp(candidate.start / Math.max(1, duration), 0, 1)
+  if (position > 0.96) return 0.18
+  if (position > 0.92) return clamp(1 - (position - 0.92) * 7.5, 0.32, 1)
+  return 1
+}
+
+const gateHookCandidate = ({
+  candidate,
+  duration
+}: {
+  candidate: HookCandidate
+  duration: number
+}): HookCandidateGate => {
+  const psychology = candidate.psychology
+  if (!psychology) {
+    return {
+      eligible: candidate.scores.combined >= 0.32,
+      reason: 'Fallback gate used because psychology features were unavailable.'
+    }
+  }
+  if (candidate.start / Math.max(1, duration) > 0.96) {
+    return { eligible: false, reason: 'Too close to the ending to function as a strong opener.' }
+  }
+  if (psychology.clarity < 0.32 && psychology.continuationPressure < 0.58) {
+    return { eligible: false, reason: 'Too muddy to sell the hook quickly.' }
+  }
+  if (psychology.revealRisk > 0.62 && psychology.payoffDeferral < 0.48) {
+    return { eligible: false, reason: 'Reveals too much too early without enough suspense.' }
+  }
+  if (psychology.continuationPressure < 0.44) {
+    return { eligible: false, reason: 'Does not create enough forward pressure.' }
+  }
+  if (psychology.curiosity < 0.34 && psychology.tension < 0.34 && candidate.scores.combined < 0.44) {
+    return { eligible: false, reason: 'Lacks both curiosity gap and emotional tension.' }
+  }
+  return { eligible: true, reason: 'Passed curiosity, clarity, and payoff-deferral gates.' }
+}
+
+const describePairwiseHookReason = ({
+  winner,
+  loser,
+  duration
+}: {
+  winner: HookCandidate
+  loser: HookCandidate
+  duration: number
+}) => {
+  const winnerPsychology = winner.psychology
+  const loserPsychology = loser.psychology
+  if (!winnerPsychology || !loserPsychology) {
+    return 'Stronger overall retention pressure in the opener faceoff.'
+  }
+  const metricDiffs = [
+    {
+      label: 'continuation pressure',
+      diff: winnerPsychology.continuationPressure - loserPsychology.continuationPressure
+    },
+    {
+      label: 'payoff deferral',
+      diff: winnerPsychology.payoffDeferral - loserPsychology.payoffDeferral
+    },
+    {
+      label: 'clarity',
+      diff: winnerPsychology.clarity - loserPsychology.clarity
+    },
+    {
+      label: 'emotional pull',
+      diff: winnerPsychology.emotionalPull - loserPsychology.emotionalPull
+    },
+    {
+      label: 'novelty',
+      diff: winnerPsychology.novelty - loserPsychology.novelty
+    },
+    {
+      label: 'lower reveal risk',
+      diff: loserPsychology.revealRisk - winnerPsychology.revealRisk
+    },
+    {
+      label: 'intro suitability',
+      diff: computeIntroSuitability({ candidate: winner, duration }) - computeIntroSuitability({ candidate: loser, duration })
+    }
+  ].sort((left, right) => right.diff - left.diff)
+
+  const strongest = metricDiffs[0]
+  const backup = metricDiffs[1]
+  if (!strongest || strongest.diff <= 0.03) {
+    return 'Won the faceoff on a more balanced suspense-to-clarity tradeoff.'
+  }
+  if (!backup || backup.diff <= 0.03) {
+    return `Won the faceoff on stronger ${strongest.label}.`
+  }
+  return `Won the faceoff on stronger ${strongest.label} and ${backup.label}.`
+}
+
+const runHookFaceoffTournament = ({
+  candidates,
+  duration
+}: {
+  candidates: HookCandidate[]
+  duration: number
+}) => {
+  const gated = candidates.map((candidate) => ({
+    ...candidate,
+    gate: gateHookCandidate({ candidate, duration })
+  }))
+  const eligible = gated.filter((candidate) => candidate.gate?.eligible)
+  const fallbackPool = gated
+    .slice()
+    .sort((left, right) => right.scores.combined - left.scores.combined || left.start - right.start)
+    .slice(0, Math.min(6, gated.length))
+  const pool = (eligible.length >= 3 ? eligible : fallbackPool)
+    .slice()
+    .sort((left, right) => right.scores.combined - left.scores.combined || left.start - right.start)
+    .slice(0, Math.min(6, Math.max(3, gated.length)))
+
+  const stats = new Map(
+    gated.map((candidate) => [candidate.id, { wins: 0, margin: 0 }])
+  )
+
+  for (let leftIndex = 0; leftIndex < pool.length; leftIndex += 1) {
+    for (let rightIndex = leftIndex + 1; rightIndex < pool.length; rightIndex += 1) {
+      const left = pool[leftIndex]
+      const right = pool[rightIndex]
+      if (!left || !right) continue
+      const leftPsychology = left.psychology
+      const rightPsychology = right.psychology
+      const leftIntro = computeIntroSuitability({ candidate: left, duration })
+      const rightIntro = computeIntroSuitability({ candidate: right, duration })
+
+      let winner = left
+      let loser = right
+      let margin = 0.08
+
+      if (
+        leftPsychology &&
+        rightPsychology &&
+        leftPsychology.clarity >= 0.5 &&
+        rightPsychology.clarity < 0.34
+      ) {
+        winner = left
+        loser = right
+        margin = 0.18
+      } else if (
+        leftPsychology &&
+        rightPsychology &&
+        rightPsychology.clarity >= 0.5 &&
+        leftPsychology.clarity < 0.34
+      ) {
+        winner = right
+        loser = left
+        margin = 0.18
+      } else if (
+        leftPsychology &&
+        rightPsychology &&
+        leftPsychology.revealRisk + 0.18 < rightPsychology.revealRisk &&
+        leftPsychology.curiosity >= rightPsychology.curiosity - 0.06
+      ) {
+        winner = left
+        loser = right
+        margin = 0.12
+      } else if (
+        leftPsychology &&
+        rightPsychology &&
+        rightPsychology.revealRisk + 0.18 < leftPsychology.revealRisk &&
+        rightPsychology.curiosity >= leftPsychology.curiosity - 0.06
+      ) {
+        winner = right
+        loser = left
+        margin = 0.12
+      } else {
+        const leftScore =
+          (leftPsychology?.continuationPressure ?? left.scores.combined) * 0.38 +
+          (leftPsychology?.payoffDeferral ?? 0.5) * 0.16 +
+          (leftPsychology?.tension ?? 0.5) * 0.14 +
+          (leftPsychology?.clarity ?? 0.5) * 0.12 +
+          (leftPsychology?.emotionalPull ?? 0.5) * 0.1 +
+          (leftPsychology?.novelty ?? 0.5) * 0.06 +
+          leftIntro * 0.04
+        const rightScore =
+          (rightPsychology?.continuationPressure ?? right.scores.combined) * 0.38 +
+          (rightPsychology?.payoffDeferral ?? 0.5) * 0.16 +
+          (rightPsychology?.tension ?? 0.5) * 0.14 +
+          (rightPsychology?.clarity ?? 0.5) * 0.12 +
+          (rightPsychology?.emotionalPull ?? 0.5) * 0.1 +
+          (rightPsychology?.novelty ?? 0.5) * 0.06 +
+          rightIntro * 0.04
+        if (rightScore > leftScore) {
+          winner = right
+          loser = left
+          margin = rightScore - leftScore
+        } else {
+          winner = left
+          loser = right
+          margin = leftScore - rightScore
+        }
+      }
+
+      const winnerStats = stats.get(winner.id)
+      if (winnerStats) {
+        winnerStats.wins += 1
+        winnerStats.margin += margin
+      }
+    }
+  }
+
+  const maxPairs = Math.max(1, pool.length - 1)
+  const ranked: HookCandidate[] = gated
+    .map((candidate) => {
+      const candidateStats = stats.get(candidate.id) || { wins: 0, margin: 0 }
+      const pairwiseScore = clamp(
+        (candidateStats.wins + candidateStats.margin) / (2 * maxPairs),
+        0,
+        1
+      )
+      const pairwiseBlend = clamp(
+        candidate.scores.combined * 0.62 +
+          (candidate.psychology?.continuationPressure ?? 0.5) * 0.22 +
+          pairwiseScore * 0.16,
+        0,
+        1
+      )
+      return {
+        ...candidate,
+        gate: {
+          ...(candidate.gate || { eligible: true, reason: 'No gate applied.' }),
+          pairwiseScore: Number(pairwiseScore.toFixed(4))
+        },
+        scores: {
+          ...candidate.scores,
+          llm: Number(pairwiseScore.toFixed(4)),
+          combined: Number(pairwiseBlend.toFixed(4))
+        }
+      }
+    })
+    .sort((left, right) => {
+      const leftEligible = left.gate?.eligible ? 1 : 0
+      const rightEligible = right.gate?.eligible ? 1 : 0
+      return (
+        rightEligible - leftEligible ||
+        right.scores.combined - left.scores.combined ||
+        (right.gate?.pairwiseScore ?? 0) - (left.gate?.pairwiseScore ?? 0) ||
+        left.start - right.start
+      )
+    })
+
+  const selected = ranked[0] || null
+  const hookComparison = selected
+    ? ranked
+        .filter((candidate) => candidate.id !== selected.id)
+        .slice(0, 3)
+        .map((candidate) => ({
+          id: candidate.id,
+          start: candidate.start,
+          end: candidate.end,
+          predictedRetentionLift: Number(clamp(candidate.scores.combined * 100, 18, 99).toFixed(1)),
+          reason: describePairwiseHookReason({
+            winner: selected,
+            loser: candidate,
+            duration
+          })
+        }))
+    : []
+
+  const selectedReason = selected
+    ? hookComparison[0]?.reason || 'Selected after hook faceoff tournament on stronger continuation pressure.'
+    : null
+
+  return {
+    ranked,
+    selected,
+    hookComparison,
+    notes: [
+      `hook_gate_pass:${eligible.length}/${candidates.length}`,
+      `hook_faceoff_pool:${pool.length}`
+    ],
+    selectedReason
+  }
+}
 
 const parsePacingAdjustments = ({
   payload,
@@ -968,14 +1720,21 @@ const deriveLowEnergyCompressionAdjustments = ({
       const lowMotion = window.motionScore < 0.62
       const weakNarrativeEnergy = window.transcriptEnergy < 0.4
       const softConfidence = window.confidenceScore < 0.84 || window.fillerDensity > 0.06
-      return window.end - window.start >= 6.5 && lowInfoDensity && (lowMotion || weakNarrativeEnergy || softConfidence)
+      const lowRewardDensity = window.rewardDensity < 0.5 || window.storyPressure < 0.5
+      return (
+        window.end - window.start >= 6.5 &&
+        lowInfoDensity &&
+        (lowRewardDensity || lowMotion || weakNarrativeEnergy || softConfidence)
+      )
     })
     .map((window) => ({
       window,
       weakness:
-        (1 - window.motionScore) * 0.38 +
-        (1 - window.transcriptEnergy) * 0.34 +
-        (1 - window.confidenceScore) * 0.2 +
+        (1 - window.rewardDensity) * 0.32 +
+        (1 - window.storyPressure) * 0.22 +
+        (1 - window.motionScore) * 0.18 +
+        (1 - window.transcriptEnergy) * 0.16 +
+        (1 - window.confidenceScore) * 0.08 +
         clamp(0.22 - window.wordsPerSecond / 10, 0, 0.22)
     }))
     .sort((left, right) => right.weakness - left.weakness || left.window.start - right.window.start)
@@ -984,12 +1743,18 @@ const deriveLowEnergyCompressionAdjustments = ({
 
   const direct = lowEnergy.map((window) => {
     const intensity = clamp(
-      0.38 + (1 - window.motionScore) * 0.32 + (1 - window.confidenceScore) * 0.16,
+      0.34 +
+        (1 - window.rewardDensity) * 0.28 +
+        (1 - window.storyPressure) * 0.16 +
+        (1 - window.motionScore) * 0.12,
       0.28,
       0.92
     )
     const speedMultiplier = clamp(
-      1.24 + (1 - window.motionScore) * 0.28 + (1 - Math.min(1.6, window.wordsPerSecond) / 1.6) * 0.2,
+      1.22 +
+        (1 - window.rewardDensity) * 0.24 +
+        (1 - window.storyPressure) * 0.16 +
+        (1 - Math.min(1.6, window.wordsPerSecond) / 1.6) * 0.18,
       1.2,
       1.8
     )
@@ -999,7 +1764,7 @@ const deriveLowEnergyCompressionAdjustments = ({
       action: 'speed_up' as const,
       intensity: Number(intensity.toFixed(3)),
       speedMultiplier: Number(speedMultiplier.toFixed(3)),
-      reason: 'Low-energy valley detected; compress section to restore pacing momentum.'
+      reason: 'Low reward-density valley detected; compress section to restore momentum and perceived progress.'
     }
   })
 
@@ -1009,8 +1774,8 @@ const deriveLowEnergyCompressionAdjustments = ({
     .slice()
     .sort(
       (left, right) =>
-        (left.transcriptEnergy + left.motionScore + left.confidenceScore) -
-        (right.transcriptEnergy + right.motionScore + right.confidenceScore)
+        (left.rewardDensity + left.storyPressure + left.motionScore + left.confidenceScore) -
+        (right.rewardDensity + right.storyPressure + right.motionScore + right.confidenceScore)
     )[0]
 
   if (!fallbackWindow || duration < 22) return []
@@ -1024,7 +1789,7 @@ const deriveLowEnergyCompressionAdjustments = ({
       action: 'speed_up' as const,
       intensity: 0.44,
       speedMultiplier: 1.32,
-      reason: 'Fallback compression on weakest timeline window to avoid pacing valley.'
+      reason: 'Fallback compression on weakest reward window to avoid a storytelling valley.'
     }
   ]
 }
@@ -1076,14 +1841,18 @@ const derivePatternInterruptAdjustments = ({
   let cursor = Math.max(6, spacingTarget * 0.72)
   while (cursor < duration - 1.2 && timelineInterrupts.length < maxInterrupts) {
     const match = windows.find((window) => cursor >= window.start && cursor <= window.end) || null
-    const lowPulse = !match || (match.transcriptEnergy < 0.35 && match.motionScore < 0.58)
+    const lowPulse = !match || (
+      match.rewardDensity < 0.5 &&
+      match.storyPressure < 0.52 &&
+      match.transcriptEnergy < 0.42
+    )
     const start = clamp(cursor - 0.26, 0, Math.max(0, duration - 0.65))
     const end = clamp(start + 0.58, start + 0.3, duration)
     const intensity = match
       ? (
           lowPulse
-            ? clamp(0.34 + (1 - match.motionScore) * 0.27, 0.28, 0.82)
-            : clamp(0.24 + (1 - match.transcriptEnergy) * 0.16, 0.18, 0.54)
+            ? clamp(0.3 + (1 - match.rewardDensity) * 0.3 + (1 - match.storyPressure) * 0.12, 0.28, 0.82)
+            : clamp(0.22 + (1 - match.transcriptEnergy) * 0.1 + (1 - match.rewardDensity) * 0.08, 0.18, 0.54)
         )
       : 0.38
     timelineInterrupts.push({
@@ -1092,12 +1861,90 @@ const derivePatternInterruptAdjustments = ({
       action: 'transition_boost',
       intensity: Number(intensity.toFixed(3)),
       reason: lowPulse
-        ? 'Pattern interrupt inserted at predicted boredom point (10-15s cadence).'
+        ? 'Pattern interrupt inserted at predicted boredom point (10-15s cadence) to refresh attention.'
         : 'Cadence interrupt added to maintain attention rhythm.'
     })
     cursor += spacingTarget
   }
   return timelineInterrupts
+}
+
+const deriveStoryValleyRehookAdjustments = ({
+  windows,
+  duration
+}: {
+  windows: TimelineWindow[]
+  duration: number
+}) => {
+  if (windows.length < 3 || duration < 24) return []
+  const adjustments: PacingAdjustment[] = []
+  for (let index = 1; index < windows.length - 1; index += 1) {
+    const previous = windows[index - 1]
+    const current = windows[index]
+    const next = windows[index + 1]
+    if (!previous || !current || !next) continue
+    const valley =
+      current.rewardDensity < 0.48 &&
+      current.storyPressure < 0.5 &&
+      current.wordsPerSecond < 1.45
+    const recoveryStrength =
+      next.rewardDensity - current.rewardDensity > 0.14 ||
+      next.storyPressure - current.storyPressure > 0.16 ||
+      next.emotionIntensity - current.emotionIntensity > 0.18
+    if (!valley || !recoveryStrength) continue
+    const start = clamp(Math.max(current.end - 0.34, next.start - 0.26), 0, Math.max(0, duration - 0.6))
+    const end = clamp(start + 0.62, start + 0.3, duration)
+    adjustments.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      action: 'transition_boost',
+      intensity: Number(clamp(0.34 + (next.rewardDensity - current.rewardDensity) * 0.8, 0.24, 0.86).toFixed(3)),
+      reason: 'Psychology re-hook inserted before the next recovery beat to restart curiosity and perceived progress.'
+    })
+    if (adjustments.length >= 5) break
+  }
+  return adjustments
+}
+
+const protectPsychologyMoments = ({
+  adjustments,
+  windows,
+  selectedHook
+}: {
+  adjustments: PacingAdjustment[]
+  windows: TimelineWindow[]
+  selectedHook?: HookCandidate | null
+}) => {
+  if (!adjustments.length) return adjustments
+  const protectedRanges = [
+    ...(selectedHook
+      ? [{ start: selectedHook.start, end: selectedHook.end }]
+      : []),
+    ...windows
+      .filter((window) => (
+        window.rewardDensity >= 0.74 ||
+        window.storyPressure >= 0.78 ||
+        window.emotionIntensity >= 0.72
+      ))
+      .slice(0, 6)
+      .map((window) => ({ start: window.start, end: window.end }))
+  ]
+
+  return adjustments.filter((adjustment) => {
+    const reason = adjustment.reason.toLowerCase()
+    const alwaysAllowed =
+      reason.includes('pause') ||
+      reason.includes('hesitation') ||
+      reason.includes('filler')
+    if (alwaysAllowed) return true
+    const protectedOverlap = protectedRanges.some((range) => {
+      const overlap = rangeOverlapSeconds(adjustment, range)
+      if (overlap <= 0) return false
+      const shortest = Math.max(0.3, Math.min(adjustment.end - adjustment.start, range.end - range.start))
+      return overlap / shortest >= 0.34
+    })
+    return !protectedOverlap
+  })
 }
 
 const preserveMotionContinuity = ({
@@ -1177,8 +2024,8 @@ const ensureMinimumCompressionCoverage = ({
     .slice()
     .sort(
       (left, right) =>
-        (left.transcriptEnergy + left.motionScore + left.confidenceScore) -
-        (right.transcriptEnergy + right.motionScore + right.confidenceScore)
+        (left.rewardDensity + left.storyPressure + left.motionScore + left.confidenceScore) -
+        (right.rewardDensity + right.storyPressure + right.motionScore + right.confidenceScore)
     )
     .slice(0, 2)
   if (!weakest.length) return adjustments
@@ -1191,7 +2038,7 @@ const ensureMinimumCompressionCoverage = ({
       action: 'speed_up' as const,
       intensity: 0.4,
       speedMultiplier: 1.3,
-      reason: 'Guarantee compression coverage in at least one low-energy window.'
+      reason: 'Guarantee compression coverage in at least one low reward-density window.'
     }
   })
   return [...adjustments, ...supplements]
@@ -1228,13 +2075,15 @@ const buildHeuristicPacingAdjustments = ({
   transcriptSignals,
   windows,
   motionPeaks,
-  fps
+  fps,
+  selectedHook
 }: {
   duration: number
   transcriptSignals: TranscriptSignalSegment[]
   windows: TimelineWindow[]
   motionPeaks: number[]
   fps: number
+  selectedHook?: HookCandidate | null
 }): PacingAdjustment[] => {
   const anchors = buildBeatAndBoundaryAnchors({
     transcriptSignals,
@@ -1248,6 +2097,7 @@ const buildHeuristicPacingAdjustments = ({
   const lowEnergyCompressions = deriveLowEnergyCompressionAdjustments({ windows, duration })
   const motionGapCompressions = deriveMotionGapCompressionAdjustments({ motionPeaks, duration })
   const interrupts = derivePatternInterruptAdjustments({ windows, duration })
+  const valleyRehooks = deriveStoryValleyRehookAdjustments({ windows, duration })
 
   const preliminary = dedupeAdjustmentsByWindow([
     ...pauseGapAdjustments,
@@ -1255,7 +2105,8 @@ const buildHeuristicPacingAdjustments = ({
     ...fillerTrims,
     ...lowEnergyCompressions,
     ...motionGapCompressions,
-    ...interrupts
+    ...interrupts,
+    ...valleyRehooks
   ])
   const motionSafe = preserveMotionContinuity({
     adjustments: preliminary,
@@ -1271,8 +2122,13 @@ const buildHeuristicPacingAdjustments = ({
     windows,
     duration
   })
-  const finalList = alignAndLimitAdjustments({
+  const payoffSafe = protectPsychologyMoments({
     adjustments: withCompressionGuarantee,
+    windows,
+    selectedHook
+  })
+  const finalList = alignAndLimitAdjustments({
+    adjustments: payoffSafe,
     duration,
     anchors,
     fps
@@ -1467,17 +2323,30 @@ const buildHeuristicWeakSegments = ({
   pacingAdjustments: PacingAdjustment[]
 }): SegmentRetentionInsight[] => {
   const fromWindows = windows
-    .filter((window) => window.end - window.start >= 8 && window.wordsPerSecond < 1.1 && window.motionScore < 0.45)
+    .filter((window) => (
+      window.end - window.start >= 8 &&
+      window.rewardDensity < 0.48 &&
+      window.storyPressure < 0.5 &&
+      window.wordsPerSecond < 1.2
+    ))
     .map((window, index) => {
-      const predictedRetention = Number(clamp(46 - (1 - window.motionScore) * 13, 20, 62).toFixed(1))
+      const predictedRetention = Number(clamp(
+        44 +
+          window.rewardDensity * 12 +
+          window.storyPressure * 8 +
+          window.motionScore * 5 -
+          (1 - window.confidenceScore) * 10,
+        20,
+        64
+      ).toFixed(1))
       const predictedDrop = Number((100 - predictedRetention).toFixed(1))
       return {
         id: `weak_${String(index + 1).padStart(2, '0')}`,
         start: window.start,
         end: window.end,
         predictedRetention,
-        reason: `Danger zone - predicted ${predictedDrop}% drop-off because motion and information density are both weak. Fix: speed 1.4x + text tease.`,
-        fix: 'Speed 1.4x plus text tease to force forward momentum.'
+        reason: `Danger zone - predicted ${predictedDrop}% drop-off because reward density, perceived progress, and novelty all sag here. Fix: speed 1.4x + text tease or re-hook before the next beat.`,
+        fix: 'Speed 1.4x plus text tease or insert a re-hook before the next payoff beat.'
       }
     })
 
@@ -1512,12 +2381,14 @@ const buildHeuristicStrongSegments = ({
     .slice(0, 3)
     .map((candidate, index) => {
       const predictedRetention = Number(clamp(candidate.scores.combined * 100, 55, 99).toFixed(1))
+      const continuation = Math.round((candidate.psychology?.continuationPressure ?? candidate.scores.combined) * 100)
+      const payoffDeferral = Math.round((candidate.psychology?.payoffDeferral ?? 0.5) * 100)
       return {
         id: `strong_${String(index + 1).padStart(2, '0')}`,
         start: candidate.start,
         end: candidate.end,
         predictedRetention,
-        reason: `Excellent - ${predictedRetention}% retention hold here due to high motion, emotional spike, and curiosity pressure. This keeps viewers locked in.`,
+        reason: `Excellent - ${predictedRetention}% retention hold here due to continuation pressure (${continuation}%), payoff deferral (${payoffDeferral}%), and emotional pull. This keeps viewers locked in.`,
         fix: undefined
       }
     })
@@ -1526,16 +2397,27 @@ const buildHeuristicStrongSegments = ({
 
   const fromWindows = windows
     .slice()
-    .sort((left, right) => (right.transcriptEnergy + right.motionScore) - (left.transcriptEnergy + left.motionScore))
+    .sort(
+      (left, right) =>
+        (right.rewardDensity + right.storyPressure + right.emotionIntensity) -
+        (left.rewardDensity + left.storyPressure + left.emotionIntensity)
+    )
     .slice(0, 2)
     .map((window, index) => {
-      const predictedRetention = Number(clamp(68 + window.motionScore * 22 + window.transcriptEnergy * 10, 55, 99).toFixed(1))
+      const predictedRetention = Number(clamp(
+        66 +
+          window.rewardDensity * 18 +
+          window.storyPressure * 10 +
+          window.emotionIntensity * 7,
+        55,
+        99
+      ).toFixed(1))
       return {
         id: `strong_${String(fromHooks.length + index + 1).padStart(2, '0')}`,
         start: window.start,
         end: window.end,
         predictedRetention,
-        reason: `Excellent - ${predictedRetention}% retention hold here due to sustained novelty and momentum. This keeps viewers locked in.`,
+        reason: `Excellent - ${predictedRetention}% retention hold here due to sustained reward density, emotional lift, and story momentum. This keeps viewers locked in.`,
         fix: undefined
       }
     })
@@ -1759,8 +2641,10 @@ const buildSelectedPeakMoment = (candidate: HookCandidate | null): SelectedPeakM
       `High-intensity moment around ${candidate.start.toFixed(1)}s-${candidate.end.toFixed(1)}s.`,
     220
   )
+  const continuation = Math.round((candidate.psychology?.continuationPressure ?? candidate.scores.combined) * 100)
+  const payoffDeferral = Math.round((candidate.psychology?.payoffDeferral ?? 0.5) * 100)
   const reason = clipText(
-    `Chosen because it scored highest on early hook pressure: motion ${Math.round(candidate.scores.motion * 100)}%, audio ${Math.round(candidate.scores.audio * 100)}%, curiosity ${Math.round(candidate.scores.sentiment * 100)}%.`,
+    `Chosen because it won on continuation pressure (${continuation}%), payoff deferral (${payoffDeferral}%), motion ${Math.round(candidate.scores.motion * 100)}%, and audio/speech drive ${Math.round(candidate.scores.audio * 100)}%.`,
     220
   )
   return { description, rating, trait, reason }
@@ -1956,23 +2840,43 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     segments: transcriptSegments,
     duration
   })
+  const engagementWindows = normalizeEngagementWindows({
+    windows: input.engagementWindows,
+    duration
+  })
   const candidatesSeed = buildInitialCandidates({
     mode,
     duration,
     frameScan: input.frameScan,
     transcriptSegments: transcriptSignals
   })
-  let candidates = buildScoredCandidates({
+  let candidates: HookCandidate[] = buildScoredCandidates({
     candidates: candidatesSeed,
     frameScan: input.frameScan,
-    transcriptSignals
+    transcriptSignals,
+    engagementWindows,
+    duration
   })
   const windows = buildTimelineWindows({
     duration,
     transcriptSignals,
-    motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : []
+    motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : [],
+    engagementWindows
   })
 
+  const notes: string[] = ['ruthless_retention_prompt:deterministic_local_planner']
+  notes.push(`hook_format:${format}`)
+  if (input.editorMode) notes.push(`editor_mode:${String(input.editorMode).toLowerCase()}`)
+  if (engagementWindows.length > 0) notes.push('psychology_signals:engagement_windows_enabled')
+  const provider: FreeAiHookPlan['provider'] = 'ruthless_retention_prompt'
+  const model: string | null = null
+
+  const hookTournament = runHookFaceoffTournament({
+    candidates,
+    duration
+  })
+  candidates = hookTournament.ranked
+  notes.push(...hookTournament.notes)
   const prompts = buildPrompts({
     mode,
     duration,
@@ -1983,60 +2887,9 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     candidates,
     windows
   })
-
-  const notes: string[] = ['ruthless_retention_prompt:deterministic_local_planner']
-  notes.push(`hook_format:${format}`)
-  if (input.editorMode) notes.push(`editor_mode:${String(input.editorMode).toLowerCase()}`)
-  const provider: FreeAiHookPlan['provider'] = 'ruthless_retention_prompt'
-  const model: string | null = null
-
-  candidates = candidates
-    .sort((left, right) => right.scores.combined - left.scores.combined)
-    .map((candidate, index) => ({
-      ...candidate,
-      scores: {
-        ...candidate.scores,
-        llm: Number(clamp(1 - index * 0.08, 0.2, 1).toFixed(4))
-      }
-    }))
   const transcriptSignalCount = Array.isArray(input.transcriptSegments) ? input.transcriptSegments.length : 0
   const hasTranscriptSignals = transcriptSignalCount > 0
-  const rankedWithoutIntroFallback = candidates.filter((candidate) => candidate.source !== 'intro_fallback')
-  const baseRankingPool = rankedWithoutIntroFallback.length ? rankedWithoutIntroFallback : candidates
-  const strongest = baseRankingPool[0] || null
-  const curiosityRanked = baseRankingPool
-    .map((candidate) => {
-      const timelinePosition = clamp(candidate.start / Math.max(1, duration), 0, 1)
-      const extremeTailPenalty = timelinePosition > 0.92 ? clamp((timelinePosition - 0.92) * 1.4, 0, 0.12) : 0
-      const curiosityScore = clamp(
-        0.5 * candidate.scores.combined +
-        0.26 * candidate.scores.motion +
-        0.24 * candidate.scores.sentiment -
-        extremeTailPenalty,
-        0,
-        1
-      )
-      return { candidate, curiosityScore }
-    })
-    .sort((left, right) => (
-      right.curiosityScore - left.curiosityScore ||
-      right.candidate.scores.combined - left.candidate.scores.combined ||
-      left.candidate.start - right.candidate.start
-    ))
-  const strongestCuriosity = curiosityRanked[0] || null
-  let finalSelectedCandidate = strongestCuriosity?.candidate || strongest
-  if (!hasTranscriptSignals && finalSelectedCandidate) {
-    const finalCuriosityScore = strongestCuriosity?.curiosityScore ?? finalSelectedCandidate.scores.combined
-    const lateStartFloor = Math.max(4.5, duration * 0.04)
-    const nonEarlyAlternative = curiosityRanked.find((entry) => entry.candidate.start >= lateStartFloor) || null
-    if (
-      finalSelectedCandidate.start <= 3.2 &&
-      nonEarlyAlternative &&
-      nonEarlyAlternative.curiosityScore >= finalCuriosityScore - 0.015
-    ) {
-      finalSelectedCandidate = nonEarlyAlternative.candidate
-    }
-  }
+  const finalSelectedCandidate = hookTournament.selected
   const selected = finalSelectedCandidate ? toAIDurationHook(finalSelectedCandidate, duration, 8) : null
   const selectedPeakMoment = buildSelectedPeakMoment(selected)
   const hookBlueprint = buildHookBlueprint({
@@ -2049,7 +2902,8 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     transcriptSignals,
     windows,
     motionPeaks: Array.isArray(input.frameScan.motionPeaks) ? input.frameScan.motionPeaks : [],
-    fps: safeFps
+    fps: safeFps,
+    selectedHook: selected
   })
   const weakSegments = buildHeuristicWeakSegments({ duration, windows, pacingAdjustments })
   const strongSegments = buildHeuristicStrongSegments({ rankedHooks: candidates, windows })
@@ -2059,16 +2913,7 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
     strongSegments
   })
   const predictionConfidenceLevel = deriveConfidenceLevel(fallbackRetention.predictionConfidence)
-  const hookComparison = candidates
-    .filter((candidate) => candidate.id !== finalSelectedCandidate?.id)
-    .slice(0, 3)
-    .map((candidate) => ({
-      id: candidate.id,
-      start: candidate.start,
-      end: candidate.end,
-      predictedRetentionLift: Number(clamp(candidate.scores.combined * 100, 18, 99).toFixed(1)),
-      reason: 'Runner-up had lower surprise/curiosity signal than selected opener.'
-    }))
+  const hookComparison = hookTournament.hookComparison
   const retentionProtectionChanges = parseRetentionProtectionChanges({
     payload: null,
     selectedHook: selected,
@@ -2086,8 +2931,8 @@ export const planRetentionEditsWithFreeAi = async (input: PlannerInput): Promise
       ? {
           ...selected,
           reason: hasTranscriptSignals
-            ? `Selected this 8-second opener over alternatives because it delivers the strongest retention pressure (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s) under the ruthless retention prompt rules.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
-            : `Selected this 8-second opener over alternatives because it scored highest on full-timeline curiosity + motion pressure without transcript cues (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s), instead of defaulting to the beginning.`
+            ? `Selected this 8-second opener over alternatives because it won the hook faceoff on human-attention psychology: ${hookTournament.selectedReason || 'stronger continuation pressure and payoff deferral'}. Window: ${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s.${selectedPeakMoment ? ` Peak moment rated ${selectedPeakMoment.rating}/10 for ${selectedPeakMoment.trait}.` : ''}`
+            : `Selected this 8-second opener over alternatives because it won the hook faceoff on attention pressure and visual/audio momentum without relying on a default intro pick (${selected.start.toFixed(1)}s-${selected.end.toFixed(1)}s).`
         }
       : null,
     rankedHooks: candidates.slice(0, 8),
