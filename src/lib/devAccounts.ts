@@ -1,4 +1,5 @@
 import { resolveProfileAdminFlags } from '../services/adminTelemetry'
+import { getLocalhostBypassUser } from './localhostAuthBypass'
 
 export const CONTROL_PANEL_OWNER_EMAIL = 'fyequise03@gmail.com'
 
@@ -23,6 +24,7 @@ const ALLOWED_DEV_ADMIN_EMAILS = new Set([
   ...parseCsvValues(process.env.DEV_ACCOUNT_EMAILS)
 ])
 const ALLOWED_DEV_ACCOUNT_USER_IDS = new Set(parseCsvValues(process.env.DEV_ACCOUNT_USER_IDS))
+const LOCALHOST_BYPASS_USER = getLocalhostBypassUser()
 
 const normalizeEmail = (email?: string | null) => String(email || '').trim().toLowerCase()
 const normalizeUserId = (userId?: string | null) => String(userId || '').trim().toLowerCase()
@@ -37,7 +39,10 @@ export const isControlPanelOwnerEmail = (email?: string | null) => {
 export const isDevAccount = (userId?: string | null, email?: string | null) => {
   if (GLOBAL_DEV_ACCOUNT_BYPASS) return true
   if (isControlPanelOwnerEmail(email)) return true
+  const normalizedEmail = normalizeEmail(email)
+  if (normalizedEmail && normalizedEmail === normalizeEmail(LOCALHOST_BYPASS_USER.email)) return true
   const normalizedUserId = normalizeUserId(userId)
+  if (normalizedUserId && normalizedUserId === normalizeUserId(LOCALHOST_BYPASS_USER.id)) return true
   if (normalizedUserId && ALLOWED_DEV_ACCOUNT_USER_IDS.has('*')) return true
   return Boolean(normalizedUserId && ALLOWED_DEV_ACCOUNT_USER_IDS.has(normalizedUserId))
 }
