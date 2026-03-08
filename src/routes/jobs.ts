@@ -11869,6 +11869,67 @@ const selectAuthoritativeAutoHookDecision = ({
       }
     }
   }
+  const hasFlatReadableHookPathology = (
+    hasTranscript &&
+    !selectedVerifiedAudit.passed &&
+    selectedEntry.visualImpact < 0.08 &&
+    selectedEntry.openerQuality < 0.24 &&
+    selectedEntry.instantHold < 0.05 &&
+    selectedEntry.curiosityPressure >= 0.32 &&
+    selectedEntry.teaserTension >= 0.42
+  )
+  if (hasFlatReadableHookPathology) {
+    const visibleBeatAlternative = interestingRows
+      .filter((row) => (
+        Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) >= 12 &&
+        !failsSyntheticCredibilityGate(row.entry) &&
+        passesNonVerbalSafety(row.entry) &&
+        !row.evaluated.textSignals.isGenericUtterance
+      ))
+      .map((row) => {
+        const verifiedAudit = getVerifiedAudit(row.entry.candidate)
+        const standoutProfile = computeStandoutOpeningProfile(row)
+        const visibleBeatScore = clamp01(
+          0.3 * row.entry.visualImpact +
+          0.2 * row.entry.openerQuality +
+          0.14 * row.entry.instantHold +
+          0.1 * row.entry.confidence +
+          0.1 * verifiedAudit.auditScore +
+          0.08 * row.evaluated.textSignals.dramaticInterest +
+          0.04 * row.evaluated.textSignals.humorInterest +
+          0.04 * standoutProfile.score
+        )
+        return {
+          row,
+          verifiedAudit,
+          standoutProfile,
+          visibleBeatScore: Number(visibleBeatScore.toFixed(4))
+        }
+      })
+      .filter(({ row, verifiedAudit, standoutProfile, visibleBeatScore }) => (
+        row.entry.visualImpact >= 0.24 &&
+        row.entry.openerQuality >= 0.2 &&
+        (
+          visibleBeatScore >= 0.28 ||
+          verifiedAudit.auditScore >= selectedVerifiedAudit.auditScore - 0.03 ||
+          standoutProfile.score >= 0.54
+        )
+      ))
+      .sort((a, b) => (
+        b.visibleBeatScore - a.visibleBeatScore ||
+        b.verifiedAudit.auditScore - a.verifiedAudit.auditScore ||
+        b.row.entry.visualImpact - a.row.entry.visualImpact ||
+        b.row.entry.openerQuality - a.row.entry.openerQuality ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))[0]
+    if (visibleBeatAlternative) {
+      selectedEntry = visibleBeatAlternative.row.entry
+      selectionMode = 'fallback'
+      usedFallback = true
+      lockedAuthoritativeFallback = true
+      reason = 'Readable transcript-only opener was rejected because its first-frame visual grip was too weak; promoted a stronger visible beat instead.'
+    }
+  }
   const postRescueVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
   if (!lockedAuthoritativeFallback && hasTranscript && hasCriticalSourceWeakness(postRescueVerifiedAudit)) {
     const currentRow = interestingRows.find((row) => (
@@ -16358,6 +16419,56 @@ const analyzeHookTextQualitySignals = (text: string) => {
   }
 }
 
+const computeWeakConversationalTranscriptPenalty = (textSignals: ReturnType<typeof analyzeHookTextQualitySignals>) => {
+  const questionLoopPressure = clamp01(
+    0.38 * Number(textSignals.questionCount >= 2) +
+    0.16 * Number(textSignals.questionCount >= 4) +
+    0.14 * textSignals.conversational +
+    0.1 * Number(textSignals.wordCount >= 12) +
+    0.1 * Number(textSignals.valuePromise < 0.24) +
+    0.08 * Number(textSignals.overlayReadiness < 0.32) +
+    0.08 * Number(textSignals.patternInterrupt < 0.34) +
+    0.08 * Number(textSignals.dramaticInterest < 0.42) +
+    0.06 * Number(textSignals.humorInterest < 0.36) -
+    0.26 * textSignals.dramaticInterest -
+    0.2 * textSignals.humorInterest -
+    0.16 * textSignals.valuePromise -
+    0.12 * textSignals.patternInterrupt -
+    0.12 * textSignals.specificity -
+    0.08 * textSignals.curiosityBlend -
+    0.08 * textSignals.overlayReadiness
+  )
+  return Number(questionLoopPressure.toFixed(4))
+}
+
+const isWeakConversationalTranscriptHook = ({
+  candidate,
+  textSignals,
+  weakConversationalPenalty
+}: {
+  candidate: HookCandidate
+  textSignals: ReturnType<typeof analyzeHookTextQualitySignals>
+  weakConversationalPenalty?: number
+}) => {
+  const penalty = Number.isFinite(Number(weakConversationalPenalty))
+    ? Number(weakConversationalPenalty)
+    : computeWeakConversationalTranscriptPenalty(textSignals)
+  if (candidate.auditPassed) return false
+  if (Number(candidate.auditScore || 0) >= 0.64) return false
+  const lowStakes = (
+    textSignals.dramaticInterest < 0.48 &&
+    textSignals.humorInterest < 0.46 &&
+    textSignals.valuePromise < 0.3 &&
+    textSignals.patternInterrupt < 0.42
+  )
+  const lowClarity = (
+    textSignals.overlayReadiness < 0.38 &&
+    textSignals.mutedClarity < 0.42 &&
+    textSignals.specificity < 0.44
+  )
+  return penalty >= 0.52 && lowStakes && lowClarity
+}
+
 const scoreTranscriptCueSignals = (text: string) => {
   const transcriptSignals = scoreTranscriptSignals(text)
   const textSignals = analyzeHookTextQualitySignals(text)
@@ -17221,6 +17332,7 @@ const pickTopHookCandidates = ({
         0.14 * visualImpact +
         0.1 * visualLeadScore
       )
+      const weakConversationalPenalty = computeWeakConversationalTranscriptPenalty(textSignals)
       const teaserReserve = clamp01(1 - audit.spoilerRisk)
       const standoutMomentLift = clamp01(
         0.24 * textSignals.interestingness +
@@ -17229,7 +17341,8 @@ const pickTopHookCandidates = ({
         0.14 * boostedCuriosityAcceleration +
         0.12 * emotionalTrigger +
         0.08 * transcriptDrivenPriority +
-        0.08 * dynamicLift.score
+        0.08 * dynamicLift.score -
+        0.12 * weakConversationalPenalty
       )
       const standoutMomentKind = (
         textSignals.humorInterest >= Math.max(textSignals.dramaticInterest + 0.06, 0.52)
@@ -17291,6 +17404,7 @@ const pickTopHookCandidates = ({
         0.14 * transcriptRangeTrustPenalty -
         0.1 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
+        0.08 * weakConversationalPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
         0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier * creativeVariantHookProfile.spoilerPenaltyMultiplier -
         0.05 * textSignals.weakIntroPenalty +
@@ -17475,15 +17589,28 @@ const pickTopHookCandidates = ({
           candidate,
           windows
         }),
+        weakConversationalPenalty: computeWeakConversationalTranscriptPenalty(
+          analyzeHookTextQualitySignals(String(candidate.text || ''))
+        ),
         transcriptTrustPenalty: computeTranscriptRangeTrustPenalty(
           candidate.start,
           candidate.start + candidate.duration,
           transcriptCues
         )
       }))
-      .filter(({ candidate, evaluated, transcriptTrustPenalty }) => (
+      .filter(({ candidate, evaluated, transcriptTrustPenalty, weakConversationalPenalty }) => (
         String(candidate.text || '').trim().length >= 12 &&
         !evaluated.textSignals.isGenericUtterance &&
+        (
+          !isWeakConversationalTranscriptHook({
+            candidate,
+            textSignals: evaluated.textSignals,
+            weakConversationalPenalty
+          }) ||
+          evaluated.textSignals.dramaticInterest >= 0.52 ||
+          evaluated.textSignals.humorInterest >= 0.5 ||
+          evaluated.textSignals.patternInterrupt >= 0.54
+        ) &&
         transcriptTrustPenalty <= Math.max(0.42, selectedTranscriptTrustPenalty + 0.12) &&
         (
           evaluated.qualityScore - transcriptTrustPenalty * 0.22 >= Math.max(0.52, selectedTranscriptQuality.qualityScore + creativeVariantHookProfile.transcriptOverrideDelta - selectedTranscriptTrustPenalty * 0.18) ||
@@ -17554,9 +17681,11 @@ const pickTopHookCandidates = ({
           candidate.start + candidate.duration,
           transcriptCues
         )
+        const weakConversationalPenalty = computeWeakConversationalTranscriptPenalty(textSignals)
         return {
           candidate,
           transcriptTrustPenalty,
+          weakConversationalPenalty,
           textSignals,
           transcriptScore: clamp01(
             0.34 * clamp01(Number(candidate.auditScore || 0)) +
@@ -17567,15 +17696,26 @@ const pickTopHookCandidates = ({
             0.06 * textSignals.specificity +
             0.04 * textSignals.hookTypeStrength -
             0.32 * transcriptTrustPenalty -
+            0.18 * weakConversationalPenalty -
             0.12 * textSignals.weakIntroPenalty -
             (textSignals.isGenericUtterance ? 0.14 : 0)
           )
         }
       })
     const finalTranscriptPreferred = finalTranscriptScored
-      .filter(({ candidate, textSignals, transcriptTrustPenalty, transcriptScore }) => (
+      .filter(({ candidate, textSignals, transcriptTrustPenalty, transcriptScore, weakConversationalPenalty }) => (
         String(candidate.text || '').trim().length >= 12 &&
         !textSignals.isGenericUtterance &&
+        (
+          !isWeakConversationalTranscriptHook({
+            candidate,
+            textSignals,
+            weakConversationalPenalty
+          }) ||
+          textSignals.dramaticInterest >= 0.52 ||
+          textSignals.humorInterest >= 0.5 ||
+          textSignals.patternInterrupt >= 0.54
+        ) &&
         transcriptTrustPenalty <= (finalSelectedText ? Math.max(0.52, finalSelectedTrustPenalty + 0.18) : 0.62) &&
         (
           candidate.auditPassed ||
@@ -17607,6 +17747,65 @@ const pickTopHookCandidates = ({
       selected = {
         ...finalTranscriptPreferred.candidate,
         reason: `${finalTranscriptPreferred.candidate.reason} Final transcript-first override kept the hook anchored to the clearest readable transcript moment.`
+      }
+    }
+    const currentSelectedText = String(selected.text || '').trim()
+    const currentSelectedSignals = analyzeHookTextQualitySignals(currentSelectedText)
+    const currentSelectedTrustPenalty = computeTranscriptRangeTrustPenalty(
+      selected.start,
+      selected.start + selected.duration,
+      transcriptCues
+    )
+    const currentSelectedTranscriptScore = clamp01(
+      0.34 * clamp01(Number(selected.auditScore || 0)) +
+      0.22 * clamp01(Number(selected.score || 0)) +
+      0.16 * currentSelectedSignals.interestingness +
+      0.1 * currentSelectedSignals.patternInterrupt +
+      0.08 * currentSelectedSignals.valuePromise +
+      0.06 * currentSelectedSignals.specificity +
+      0.04 * currentSelectedSignals.hookTypeStrength -
+      0.32 * currentSelectedTrustPenalty -
+      0.18 * computeWeakConversationalTranscriptPenalty(currentSelectedSignals) -
+      0.12 * currentSelectedSignals.weakIntroPenalty -
+      (currentSelectedSignals.isGenericUtterance ? 0.14 : 0)
+    )
+    const finalSelectedWeakConversational = isWeakConversationalTranscriptHook({
+      candidate: selected,
+      textSignals: currentSelectedSignals,
+      weakConversationalPenalty: computeWeakConversationalTranscriptPenalty(currentSelectedSignals)
+    })
+    if (finalSelectedWeakConversational) {
+      const standoutTranscriptRescue = finalTranscriptScored
+        .filter(({ candidate, textSignals, weakConversationalPenalty, transcriptScore }) => (
+          (
+            Math.abs(candidate.start - selected.start) >= 12 ||
+            Math.abs(candidate.duration - selected.duration) >= 0.5
+          ) &&
+          !isWeakConversationalTranscriptHook({
+            candidate,
+            textSignals,
+            weakConversationalPenalty
+          }) &&
+          (
+            transcriptScore >= currentSelectedTranscriptScore - 0.04 ||
+            candidate.auditScore >= selected.auditScore + 0.01 ||
+            textSignals.dramaticInterest >= currentSelectedSignals.dramaticInterest + 0.06 ||
+            textSignals.humorInterest >= currentSelectedSignals.humorInterest + 0.06 ||
+            textSignals.patternInterrupt >= currentSelectedSignals.patternInterrupt + 0.08
+          )
+        ))
+        .sort((a, b) => (
+          b.transcriptScore - a.transcriptScore ||
+          b.candidate.auditScore - a.candidate.auditScore ||
+          b.textSignals.dramaticInterest - a.textSignals.dramaticInterest ||
+          b.textSignals.humorInterest - a.textSignals.humorInterest ||
+          a.candidate.start - b.candidate.start
+        ))[0]
+      if (standoutTranscriptRescue) {
+        selected = {
+          ...standoutTranscriptRescue.candidate,
+          reason: `${standoutTranscriptRescue.candidate.reason} Weak conversational transcript opener was rejected in favor of a stronger standout beat.`
+        }
       }
     }
   }
