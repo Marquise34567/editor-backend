@@ -10625,7 +10625,52 @@ const selectAuthoritativeAutoHookDecision = ({
   const hasCriticalSourceWeakness = (audit: HookAuditResult) => (
     audit.reasons.some((reason) => /curiosity strongly enough|payoff signal is weak|pattern interrupt|value promise or curiosity gap/i.test(reason))
   )
+  const hasCriticalHookReasonText = (reason: string | null | undefined) => (
+    /curiosity strongly enough|payoff signal is weak|pattern interrupt|value promise or curiosity gap|weak teaser pressure|reveals too much/i
+      .test(String(reason || ''))
+  )
+  const findNearbySourceRows = (candidate: HookCandidate) => ranked.filter((row) => {
+    if (row.candidate.synthetic) return false
+    const startDistance = Math.abs(Number(row.candidate.start || 0) - Number(candidate.start || 0))
+    const candidateRange = {
+      start: Number(candidate.start || 0),
+      end: Number((candidate.start || 0) + (candidate.duration || 0))
+    }
+    const sourceRange = {
+      start: Number(row.candidate.start || 0),
+      end: Number((row.candidate.start || 0) + (row.candidate.duration || 0))
+    }
+    const overlapSeconds = getRangeOverlapSeconds(candidateRange, sourceRange)
+    return startDistance <= 4.2 || overlapSeconds >= Math.min(4, Math.max(2.4, candidate.duration * 0.45))
+  })
+  const failsSyntheticCredibilityGate = (entry: HookSelectionRankedEntry) => {
+    if (!hasTranscript || !entry.candidate.synthetic) return false
+    const nearbySourceRows = findNearbySourceRows(entry.candidate)
+    if (!nearbySourceRows.length) return false
+    const sourceAudits = nearbySourceRows.map((row) => ({
+      row,
+      audit: getVerifiedAudit(row.candidate),
+      storedAuditScore: clamp01(Number(row.candidate.auditScore || 0))
+    }))
+    const strongestSourceAuditScore = sourceAudits.reduce((max, current) => Math.max(max, Math.max(current.audit.auditScore, current.storedAuditScore)), 0)
+    const weakCluster = sourceAudits.every(({ row, audit }) => (
+      Math.min(audit.auditScore, clamp01(Number(row.candidate.auditScore || 0))) < 0.58 ||
+      hasCriticalSourceWeakness(audit) ||
+      hasCriticalHookReasonText(row.candidate.reason) ||
+      row.curiosityPressure < 0.34 ||
+      row.teaserTension < 0.3 ||
+      row.valuePromise < 0.12
+    ))
+    if (!weakCluster) return false
+    return (
+      entry.curiosityPressure < Math.max(relaxedCuriosityFloor, 0.34) ||
+      entry.teaserTension < Math.max(relaxedTeaserFloor, 0.3) ||
+      entry.valuePromise < 0.14 ||
+      clamp01(Number(entry.candidate.auditScore || 0)) >= strongestSourceAuditScore + 0.14
+    )
+  }
   const passesRelaxedAuditGate = (entry: HookSelectionRankedEntry) => {
+    if (failsSyntheticCredibilityGate(entry)) return false
     const verifiedAudit = getVerifiedAudit(entry.candidate)
     if (entry.candidate.auditPassed && verifiedAudit.passed) return true
     if (!hasTranscript) return signalStrength < 0.48
@@ -10680,6 +10725,7 @@ const selectAuthoritativeAutoHookDecision = ({
     const entry = row.entry
     const verifiedAudit = getVerifiedAudit(entry.candidate)
     return (
+      !failsSyntheticCredibilityGate(entry) &&
       verifiedAudit.passed &&
       entry.confidence >= threshold &&
       entry.openerQuality >= strictFallbackInstantFloor &&
@@ -10712,7 +10758,8 @@ const selectAuthoritativeAutoHookDecision = ({
       passesNonVerbalSafety(entry)
     )
   }) || null
-  let selectedEntry = strictRow?.entry || relaxedRow?.entry || interestingRows[0]?.entry || ranked[0]
+  const fallbackInterestingRow = interestingRows.find((row) => !failsSyntheticCredibilityGate(row.entry)) || interestingRows[0] || null
+  let selectedEntry = strictRow?.entry || relaxedRow?.entry || fallbackInterestingRow?.entry || ranked[0]
   let selectionMode: 'strict' | 'relaxed' | 'fallback' = strictRow
     ? 'strict'
     : relaxedRow
@@ -10778,6 +10825,7 @@ const selectAuthoritativeAutoHookDecision = ({
     : Number(clamp01(selectedVerifiedAudit.auditScore).toFixed(4))
   const needsWeakHookRescue = (
     selectionMode !== 'strict' ||
+    failsSyntheticCredibilityGate(selectedEntry) ||
     hasCriticalSourceWeakness(selectedVerifiedAudit) ||
     hasDeadLeadWeakness(selectedVerifiedAudit) ||
     selectedVerifiedAudit.auditScore < 0.52 ||
@@ -10795,6 +10843,7 @@ const selectAuthoritativeAutoHookDecision = ({
         }
       })
       .filter(({ row, verifiedAudit }) => (
+        !failsSyntheticCredibilityGate(row.entry) &&
         row.entry.openerQuality >= Math.max(relaxedInstantHoldFloor - 0.08, 0.28) &&
         row.entry.visualImpact >= Math.max(relaxedVisualImpactFloor - 0.08, 0.22) &&
         (
@@ -11576,28 +11625,49 @@ const computeInterestingHookPriorityFromSignals = ({
         0.2 * textSignals.weakIntroPenalty
       )
     : 0
+  const reasonText = String(candidate.reason || '').toLowerCase()
+  const criticalReasonPenalty = clamp01(
+    0.28 * Number(/curiosity strongly enough|value promise or curiosity gap/i.test(reasonText)) +
+    0.22 * Number(/payoff signal is weak|reveals too much|weak teaser pressure/i.test(reasonText)) +
+    0.16 * Number(/pattern interrupt/i.test(reasonText)) +
+    0.1 * Number(/ending resolves too cleanly|unresolved tension/i.test(reasonText)) +
+    0.08 * Number(/emotional or psychological trigger is too soft/i.test(reasonText))
+  )
+  const visualOnlyPenalty = hasTranscript
+    ? clamp01(
+        0.56 * Math.max(0, scored.visualImpact - (scored.curiosityPressure + 0.08)) +
+        0.22 * Math.max(0, scored.contrarianTrigger - (scored.teaserTension + 0.08)) +
+        0.22 * Math.max(0, 0.22 - textSignals.curiosityBlend)
+      )
+    : 0
   const priority = clamp01(
-    0.14 * scored.selectionScore +
-    0.15 * scored.curiosityPressure +
-    0.1 * scored.visualImpact +
-    0.09 * scored.teaserTension +
+    0.12 * scored.selectionScore +
+    0.18 * scored.curiosityPressure +
+    0.14 * scored.teaserTension +
     0.08 * scored.urgency +
-    0.08 * scored.contrarianTrigger +
-    0.06 * scored.valuePromise +
-    0.06 * scored.visualNovelty +
-    0.06 * scored.instantHold +
-    0.05 * scored.openerQuality +
-    0.05 * clamp01(Number(candidate.score || 0)) +
+    0.04 * scored.contrarianTrigger +
+    0.08 * scored.valuePromise +
+    0.05 * scored.visualImpact +
+    0.04 * scored.visualNovelty +
+    0.08 * scored.instantHold +
+    0.04 * scored.openerQuality +
+    0.04 * clamp01(Number(candidate.score || 0)) +
     0.03 * scored.confidence +
-    0.03 * scored.authenticity +
-    0.09 * textSignals.interestingness +
-    0.06 * textSignals.dramaticInterest +
+    0.02 * scored.authenticity +
+    0.1 * textSignals.interestingness +
+    0.08 * textSignals.curiosityBlend +
+    0.07 * textSignals.patternInterrupt +
+    0.06 * textSignals.specificity +
+    0.05 * textSignals.valuePromise +
+    0.05 * textSignals.dramaticInterest +
     0.03 * textSignals.humorInterest +
-    (hasTranscript ? 0.02 * clamp01(Number(candidate.auditScore || 0)) : 0) +
+    (hasTranscript ? 0.04 * clamp01(Number(candidate.auditScore || 0)) : 0) +
     postIntroBonus +
     midTimelineBonus -
-    0.12 * safeIntroPenalty -
-    0.08 * textSignals.weakIntroPenalty -
+    0.14 * safeIntroPenalty -
+    0.1 * textSignals.weakIntroPenalty -
+    0.14 * criticalReasonPenalty -
+    0.12 * visualOnlyPenalty -
     genericPenalty
   )
   return {

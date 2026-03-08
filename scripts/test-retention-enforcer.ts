@@ -221,13 +221,13 @@ const run = () => {
   assert.ok(firstPassSelection && repeatedSelection, 'selector should produce hook decisions for the repeat fixture')
   assert.strictEqual(
     Number(firstPassSelection!.candidate.start.toFixed(2)),
-    85.14,
-    'first pass should still mirror the original weak hook cluster before rerun penalties apply'
+    51.06,
+    'first pass should already reject the weak repeated hook cluster and choose the stronger alternate cluster'
   )
   assert.strictEqual(
     Number(repeatedSelection!.candidate.start.toFixed(2)),
     51.06,
-    'repeat renders should move off the stale weak opener cluster onto a different cluster'
+    'repeat renders should stay off the stale weak opener cluster as well'
   )
 
   // 1b) Partition-first hooking should pick one strong 8s candidate from each section, then choose best.
