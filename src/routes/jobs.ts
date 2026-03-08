@@ -4018,7 +4018,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   coldStartAutopilot: false,
   continuityFirstMode: false,
   exploreX3Mode: false,
-  topHumanGuardMode: true,
+  topHumanGuardMode: false,
   creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4)),
   editorInstructionPrompt: null
 }
