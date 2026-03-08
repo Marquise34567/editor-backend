@@ -6,6 +6,7 @@ import { normalizeAnalysisPayload } from '../src/lib/analysisNormalizer'
 import { isJobStatusTransitionAllowed } from '../src/lib/editorConfig'
 
 const {
+  parsePersistedRenderConfigForTest,
   pickTopHookCandidates,
   buildRetentionJudgeReport,
   resolveQualityGateThresholds,
@@ -89,6 +90,24 @@ const run = () => {
   assert.ok(timelineWithHookFirst.length >= 1, 'timeline should include hook segment')
   assert.strictEqual(Number(timelineWithHookFirst[0].start.toFixed(3)), Number(pickA.selected.start.toFixed(3)), 'hook must be first in timeline order')
   assert.strictEqual(Number((timelineWithHookFirst[0].end - timelineWithHookFirst[0].start).toFixed(3)), Number(pickA.selected.duration.toFixed(3)), 'first segment must match selected hook length')
+
+  // 1aa) Persisted job config parsing must tolerate legacy string JSON and malformed rows.
+  const parsedPersistedVerticalConfig = parsePersistedRenderConfigForTest({
+    analysis: '{"renderMode":"vertical","verticalClipCount":3,"verticalMode":{"selectionMode":"best_moments","output":{"width":1080,"height":1920}}}',
+    renderSettings: '{"horizontalMode":{"fit":"cover"}}',
+    jobId: 'legacy-vertical',
+    context: 'test'
+  })
+  assert.strictEqual(parsedPersistedVerticalConfig.mode, 'vertical', 'stringified persisted config should still recover vertical mode')
+  assert.strictEqual(parsedPersistedVerticalConfig.verticalClipCount, 3, 'stringified persisted config should preserve vertical clip count')
+
+  const parsedMalformedConfig = parsePersistedRenderConfigForTest({
+    analysis: '"bad-analysis-shape"',
+    renderSettings: 'not-json',
+    jobId: 'legacy-bad',
+    context: 'test'
+  })
+  assert.strictEqual(parsedMalformedConfig.mode, 'horizontal', 'malformed persisted config should fall back instead of throwing')
 
   // 1a) Hooks should trim dead visual/setup lead-ins instead of opening on black/loading frames.
   const deadLeadWindows = new Array(24).fill(null).map((_, idx) => makeWindow(idx, {

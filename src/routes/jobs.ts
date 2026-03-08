@@ -4600,6 +4600,50 @@ const parseRenderConfigFromAnalysis = (analysis?: any, renderSettings?: any): Re
   }
 }
 
+const readPersistedJsonObject = (value?: unknown): Record<string, any> | null => {
+  if (!value) return null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    try {
+      const parsed = JSON.parse(trimmed)
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? (parsed as Record<string, any>)
+        : null
+    } catch {
+      return null
+    }
+  }
+  return typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, any>)
+    : null
+}
+
+const parsePersistedRenderConfig = ({
+  analysis,
+  renderSettings,
+  jobId,
+  context
+}: {
+  analysis?: unknown
+  renderSettings?: unknown
+  jobId?: string | null
+  context?: string | null
+}): RenderConfig => {
+  const normalizedAnalysis = readPersistedJsonObject(analysis) || {}
+  const normalizedRenderSettings = readPersistedJsonObject(renderSettings) || {}
+  try {
+    return parseRenderConfigFromAnalysis(normalizedAnalysis, normalizedRenderSettings)
+  } catch (error) {
+    console.warn('[jobs] failed to parse persisted render config', {
+      jobId: jobId || null,
+      context: context || null,
+      error: (error as any)?.message || error
+    })
+    return parseRenderConfigFromAnalysis({}, {})
+  }
+}
+
 const hasRenderConfigOverrideInPayload = (payload?: any) => Boolean(
   payload &&
   (
@@ -7392,7 +7436,12 @@ const buildLocalOutputVersionToken = (outputPath: string) => {
 
 const resolveLocalOutputPathForJob = (job: any, clipIndex = 0) => {
   const localOutDir = path.join(process.cwd(), 'outputs', job.userId, job.id)
-  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+  const renderConfig = parsePersistedRenderConfig({
+    analysis: job.analysis as any,
+    renderSettings: (job as any)?.renderSettings,
+    jobId: job.id,
+    context: 'buildRerenderDisplayContext'
+  })
   if (renderConfig.mode === 'vertical') {
     return path.join(localOutDir, `vertical-clip-${clipIndex + 1}.mp4`)
   }
@@ -27711,7 +27760,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       })
     }
 
-    const initialRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const initialRenderConfig = parsePersistedRenderConfig({
+      analysis: job.analysis as any,
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'analyze:initial'
+    })
     const pipelinePowerMode = resolvePipelinePowerMode(options.pipelinePowerMode, options.editorMode ?? null)
     const requestedStrategyProfile = parseRetentionStrategyProfile(
       options.retentionStrategyProfile ?? getRetentionStrategyFromJob(job)
@@ -27952,7 +28006,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const existingAnalysis = (freshJob?.analysis as any) || (job.analysis as any) || {}
     const existingProxyPath = existingAnalysis?.proxyPath ?? null
     const latestRenderSettings = (freshJob as any)?.renderSettings ?? (job as any)?.renderSettings
-    const renderConfig = parseRenderConfigFromAnalysis(existingAnalysis, latestRenderSettings)
+    const renderConfig = parsePersistedRenderConfig({
+      analysis: existingAnalysis,
+      renderSettings: latestRenderSettings,
+      jobId: job.id,
+      context: 'analyze:latest'
+    })
     const verticalCaptionConfigForAnalysis = resolveVerticalCaptionConfigForState({
       analysis: existingAnalysis,
       renderSettings: latestRenderSettings
@@ -28205,7 +28264,12 @@ const processJob = async (
     const requiredPlan = getRequiredPlanForQuality(desiredQuality)
     throw new PlanLimitError('Upgrade to export at this resolution.', 'quality', requiredPlan)
   }
-  const renderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+  const renderConfig = parsePersistedRenderConfig({
+    analysis: job.analysis as any,
+    renderSettings: (job as any)?.renderSettings,
+    jobId: job.id,
+    context: 'process'
+  })
   const persistedVerticalCaptionConfig = resolveVerticalCaptionConfigForState({
     analysis: job.analysis as any,
     renderSettings: (job as any)?.renderSettings
@@ -33500,7 +33564,12 @@ router.get('/', async (req: any, res) => {
         progress: job.progress,
         queuePosition: queueEta?.queuePosition ?? null,
         queueEtaSeconds: queueEta?.queueEtaSeconds ?? null,
-        renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
+        renderMode: parsePersistedRenderConfig({
+          analysis: job.analysis as any,
+          renderSettings: (job as any)?.renderSettings,
+          jobId: job.id,
+          context: 'list'
+        }).mode
       }
     })
     res.json({ jobs: payload })
@@ -33609,7 +33678,12 @@ router.get('/:id', async (req: any, res) => {
       watermark: job.watermarkApplied,
       queuePosition: queueEta?.queuePosition ?? null,
       queueEtaSeconds: queueEta?.queueEtaSeconds ?? null,
-      renderMode: parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode,
+      renderMode: parsePersistedRenderConfig({
+        analysis: job.analysis as any,
+        renderSettings: (job as any)?.renderSettings,
+        jobId: job.id,
+        context: 'detail'
+      }).mode,
       steps: [
         { key: 'uploading', label: 'Upload' },
         { key: 'analyzing', label: 'Analyze' },
@@ -33908,7 +33982,12 @@ const handleCompleteUpload = async (req: any, res: any) => {
       ((job.analysis as any)?.videoAutoDetect) ??
       ((job.analysis as any)?.metadata_summary?.retention?.autoDetect)
     )
-    const persistedRenderConfig = parseRenderConfigFromAnalysis((job.analysis as any) || {}, (job as any)?.renderSettings)
+    const persistedRenderConfig = parsePersistedRenderConfig({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'preferred-hook'
+    })
     const uploadAutoDetectProfile = await buildUploadAutoDetectProfileFromInput({
       inputPath,
       targetPlatform: requestedTargetPlatform,
@@ -34022,7 +34101,12 @@ const handleCompleteUpload = async (req: any, res: any) => {
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {})
     }
 
-    const renderMode = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings).mode
+    const renderMode = parsePersistedRenderConfig({
+      analysis: job.analysis as any,
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'preferred-hook:render-mode'
+    }).mode
     const renderLimitViolation = await getRenderLimitViolation({
       userId: req.user.id,
       email: req.user?.email,
@@ -34545,7 +34629,12 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       })
     }
 
-    const persistedRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const persistedRenderConfig = parsePersistedRenderConfig({
+      analysis: job.analysis as any,
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'choose-hook'
+    })
     const requestedVerticalModeOverride = (
       req.body?.verticalMode && typeof req.body.verticalMode === 'object'
     )
@@ -34915,7 +35004,12 @@ router.post('/:id/reprocess', async (req: any, res) => {
       return res.status(403).json(rerenderLimitViolation.payload)
     }
     const requestedQuality = req.body?.requestedQuality ? normalizeQuality(req.body.requestedQuality) : job.requestedQuality
-    const persistedRenderConfig = parseRenderConfigFromAnalysis(job.analysis as any, (job as any)?.renderSettings)
+    const persistedRenderConfig = parsePersistedRenderConfig({
+      analysis: job.analysis as any,
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'manual-hook'
+    })
     const requestedVerticalModeOverride = (
       req.body?.verticalMode && typeof req.body.verticalMode === 'object'
     )
@@ -36212,6 +36306,7 @@ const buildEditPlanForTest = async ({
 }
 
 export const __retentionTestUtils = {
+  parsePersistedRenderConfigForTest: parsePersistedRenderConfig,
   pickTopHookCandidates,
   computeRetentionScore,
   buildRetentionJudgeReport,
