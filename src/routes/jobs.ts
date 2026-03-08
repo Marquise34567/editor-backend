@@ -11699,6 +11699,18 @@ const selectAuthoritativeAutoHookDecision = ({
       current.teaserTension < 0.5 &&
       current.visualImpact < 0.5
     )
+    const currentText = String(current.candidate.text || '').trim().toLowerCase()
+    const currentPunchyCuriosityAnchor = (
+      creativeVariant === 'punchy' &&
+      current.candidate.start <= Math.max(4.8, Math.min(7, durationSeconds * 0.16)) &&
+      current.curiosityPressure >= 0.24 &&
+      currentRow.entry.instantHold >= 0.58 &&
+      (
+        currentRow.evaluated.textSignals.patternInterrupt >= 0.32 ||
+        currentRow.evaluated.textSignals.curiosityBlend >= 0.28 ||
+        /\b(wait|watch|what happens|next|before|right now|don't blink)\b/.test(currentText)
+      )
+    )
     const minDisplacementSeconds = durationSeconds >= 180 ? 6 : durationSeconds >= 75 ? 4.5 : 3
     const standoutRows = interestingRows
       .filter((row) => (
@@ -11757,6 +11769,17 @@ const selectAuthoritativeAutoHookDecision = ({
         !hasCriticalSourceWeakness(verifiedAudit) ||
         profile.score >= 0.72
       )
+      const blocksPunchyMismatch = (
+        currentPunchyCuriosityAnchor &&
+        profile.kind !== 'curiosity' &&
+        profile.kind !== 'funny' &&
+        (
+          row.entry.curiosityPressure < current.curiosityPressure + 0.12 ||
+          row.evaluated.textSignals.patternInterrupt < currentRow.evaluated.textSignals.patternInterrupt + 0.08 ||
+          row.entry.instantHold < currentRow.entry.instantHold - 0.01
+        )
+      )
+      if (blocksPunchyMismatch) return false
       return safeEnough && (
         clearlyBeatsCurrent ||
         (
@@ -12109,12 +12132,36 @@ const selectAuthoritativeAutoHookDecision = ({
                 Math.abs(strictInterestingUpgradeEntry.candidate.duration - strictSelectedEntry.candidate.duration) >= 0.01
               )
             ) {
-              strictSelectedEntry = strictInterestingUpgradeEntry
-              strictReason = hasTranscript
-                ? 'Taste-first opener upgrade: replaced a safe strict opener with a more curious, funny, dramatic, or standout moment from the full-video scan.'
-                : 'Taste-first opener upgrade: replaced a safe strict opener with a more visually interesting moment from the full-video scan.'
-              strictUsedFallback = true
-              strictSelectionMode = 'fallback'
+              const strictCurrentText = String(strictSelectedEntry.candidate.text || '').trim().toLowerCase()
+              const strictCurrentSignals = analyzeHookTextQualitySignals(strictCurrentText)
+              const strictUpgradeSignals = analyzeHookTextQualitySignals(String(strictInterestingUpgradeEntry.candidate.text || ''))
+              const strictPunchyCuriosityAnchor = (
+                creativeVariant === 'punchy' &&
+                strictSelectedEntry.candidate.start <= Math.max(4.8, Math.min(7, durationSeconds * 0.16)) &&
+                strictSelectedEntry.curiosityPressure >= 0.24 &&
+                strictSelectedEntry.instantHold >= 0.58 &&
+                (
+                  strictCurrentSignals.patternInterrupt >= 0.32 ||
+                  strictCurrentSignals.curiosityBlend >= 0.28 ||
+                  /\b(wait|watch|what happens|next|before|right now|don't blink)\b/.test(strictCurrentText)
+                )
+              )
+              const blocksStrictPunchyUpgrade = (
+                strictPunchyCuriosityAnchor &&
+                (
+                  strictInterestingUpgradeEntry.curiosityPressure < strictSelectedEntry.curiosityPressure + 0.14 ||
+                  strictUpgradeSignals.patternInterrupt < strictCurrentSignals.patternInterrupt + 0.08 ||
+                  strictInterestingUpgradeEntry.instantHold < strictSelectedEntry.instantHold + 0.02
+                )
+              )
+              if (!blocksStrictPunchyUpgrade) {
+                strictSelectedEntry = strictInterestingUpgradeEntry
+                strictReason = hasTranscript
+                  ? 'Taste-first opener upgrade: replaced a safe strict opener with a more curious, funny, dramatic, or standout moment from the full-video scan.'
+                  : 'Taste-first opener upgrade: replaced a safe strict opener with a more visually interesting moment from the full-video scan.'
+                strictUsedFallback = true
+                strictSelectionMode = 'fallback'
+              }
             }
           }
         }
@@ -12184,6 +12231,26 @@ const selectAuthoritativeAutoHookDecision = ({
       : (hasTranscript
           ? 'Transcript fallback missed quality floor; forced the most interesting curiosity/drama moment into the opener instead of defaulting to the chronological start.'
           : 'Fallback hook quality floor not met without transcript support; forcing the most interesting visual/chaos moment into the opener instead of the chronological start.')
+  const initialSelectedVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
+  const tooWeakToForceFallback = (
+    strictHookFailClosed &&
+    selectionMode === 'fallback' &&
+    selectedEntry.confidence < Math.max(0.34, relaxedThreshold - 0.12) &&
+    selectedEntry.selectionScore < 0.34 &&
+    selectedEntry.openerQuality < 0.18 &&
+    selectedEntry.visualImpact < 0.08 &&
+    selectedEntry.instantHold < 0.08 &&
+    selectedEntry.curiosityPressure < 0.32 &&
+    initialSelectedVerifiedAudit.auditScore < 0.52 &&
+    (
+      selectedEntry.candidate.synthetic ||
+      hasCriticalSourceWeakness(initialSelectedVerifiedAudit) ||
+      hasCriticalHookReasonText(selectedEntry.candidate.reason)
+    )
+  )
+  if (tooWeakToForceFallback) {
+    return null
+  }
   const relocated = selectLongFormDisplacedHookCandidate({
     primary: selectedEntry.candidate,
     candidates: ranked.map((entry) => entry.candidate),
@@ -12406,14 +12473,22 @@ const selectAuthoritativeAutoHookDecision = ({
     )) || null
     const scoreVariantRow = (row: InterestingFallbackRankedRow) => {
       const signals = row.evaluated.textSignals
+      const sourcePosition = clamp01(
+        (Number(row.entry.candidate.start || 0) + Number(row.entry.candidate.duration || 0) * 0.5) /
+        Math.max(1, durationSeconds || 0)
+      )
       if (creativeVariant === 'punchy') {
         return Number(clamp01(
-          0.3 * row.entry.openerQuality +
-          0.22 * row.entry.curiosityPressure +
-          0.16 * row.entry.visualImpact +
-          0.12 * row.entry.selectionScore +
-          0.1 * signals.patternInterrupt +
-          0.1 * row.entry.teaserTension
+          0.24 * row.entry.curiosityPressure +
+          0.18 * signals.patternInterrupt +
+          0.14 * row.entry.instantHold +
+          0.12 * row.entry.openerQuality +
+          0.1 * row.entry.teaserTension +
+          0.08 * row.entry.selectionScore +
+          0.06 * row.entry.visualImpact +
+          0.05 * signals.interestingness +
+          0.05 * signals.valuePromise +
+          0.04 * (1 - sourcePosition)
         ).toFixed(4))
       }
       if (creativeVariant === 'dramatic') {
