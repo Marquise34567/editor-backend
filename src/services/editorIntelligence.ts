@@ -416,12 +416,24 @@ const normalizeSegment = (segment: SegmentLike, durationSeconds: number): Segmen
   }
 }
 
+const hasIntentionalTimelineReorder = (segments: Array<Pick<SegmentLike, 'start'>>) => (
+  segments.some((segment, index) => (
+    index > 0 &&
+    Number.isFinite(Number(segment.start)) &&
+    Number.isFinite(Number(segments[index - 1]?.start)) &&
+    Number(segment.start) < Number(segments[index - 1].start) - 0.01
+  ))
+)
+
 const normalizeSegments = (segments: SegmentLike[], durationSeconds: number) => {
   const safeDuration = Math.max(0.5, toFiniteNumber(durationSeconds, 0))
-  const normalized = (segments || [])
+  const normalizedInput = (segments || [])
     .map((segment) => normalizeSegment(segment, safeDuration))
     .filter((segment): segment is SegmentLike => Boolean(segment))
-    .sort((left, right) => left.start - right.start)
+  const preserveTimelineOrder = hasIntentionalTimelineReorder(normalizedInput)
+  const normalized = preserveTimelineOrder
+    ? normalizedInput
+    : normalizedInput.sort((left, right) => left.start - right.start)
   if (!normalized.length) return []
   const out: SegmentLike[] = []
   for (const segment of normalized) {
@@ -434,7 +446,10 @@ const normalizeSegments = (segments: SegmentLike[], durationSeconds: number) => 
       out.push({ ...segment })
       continue
     }
-    if (segment.start <= previous.end + 0.02) {
+    if (
+      segment.start >= previous.start - 0.01 &&
+      segment.start <= previous.end + 0.02
+    ) {
       previous.end = Number(Math.max(previous.end, segment.end).toFixed(3))
       previous.speed = Number((((previous.speed || 1) + (segment.speed || 1)) / 2).toFixed(3))
       continue
