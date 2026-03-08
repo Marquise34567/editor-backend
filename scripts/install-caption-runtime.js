@@ -3,11 +3,15 @@ const { spawnSync } = require('child_process')
 const ENABLED_PATTERN = /^(1|true|yes|on)$/i
 const DISABLED_PATTERN = /^(0|false|no|off)$/i
 
-const rawInstallToggle = String(process.env.INSTALL_CAPTION_RUNTIME || '').trim()
+const rawInstallToggle = String(
+  process.env.INSTALL_CAPTION_RUNTIME ??
+  process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
+  ''
+).trim()
 const shouldInstallCaptionRuntime = (() => {
   if (ENABLED_PATTERN.test(rawInstallToggle)) return true
   if (DISABLED_PATTERN.test(rawInstallToggle)) return false
-  return Boolean(String(process.env.RAILWAY_ENVIRONMENT || '').trim())
+  return false
 })()
 
 if (!shouldInstallCaptionRuntime) {

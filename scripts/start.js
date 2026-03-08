@@ -1,4 +1,6 @@
 const { execSync } = require('child_process')
+const { existsSync } = require('fs')
+const path = require('path')
 
 const parseBool = (value) => /^(1|true|yes)$/i.test(String(value || '').trim())
 
@@ -19,10 +21,28 @@ const run = (label, command, options = {}) => {
 
 const hasDatabaseUrl = Boolean(String(process.env.DATABASE_URL || '').trim())
 const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
+const shouldBuildOnStartup = parseBool(process.env.BUILD_ON_STARTUP)
+const shouldGeneratePrismaOnStartup = parseBool(process.env.PRISMA_GENERATE_ON_STARTUP)
+const shouldInstallCaptionRuntimeOnStartup = parseBool(process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP)
+const distEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
 
-run('Building backend', 'npm run build')
-run('Generating Prisma client', 'prisma generate')
-run('Installing caption runtime', 'node scripts/install-caption-runtime.js')
+if (shouldBuildOnStartup || !existsSync(distEntryPath)) {
+  run('Building backend', 'npm run build')
+} else {
+  console.log('[startup] Skipping startup build; dist/index.js already exists')
+}
+
+if (shouldGeneratePrismaOnStartup) {
+  run('Generating Prisma client', 'prisma generate')
+} else {
+  console.log('[startup] Skipping prisma generate on startup')
+}
+
+if (shouldInstallCaptionRuntimeOnStartup) {
+  run('Installing caption runtime', 'node scripts/install-caption-runtime.js')
+} else {
+  console.log('[startup] Skipping caption runtime install on startup')
+}
 
 if (!hasDatabaseUrl) {
   console.warn('[startup] DATABASE_URL is empty, skipping prisma migrate deploy')

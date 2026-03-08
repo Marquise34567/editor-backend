@@ -1,5 +1,5 @@
 import { createServer } from 'http'
-import { exec, spawnSync } from 'child_process'
+import { exec, spawn } from 'child_process'
 import path from 'path'
 import app from './app'
 import { initRealtime } from './realtime'
@@ -10,12 +10,17 @@ import { warmIpBanCache } from './services/ipBan'
 
 const PORT = Number(process.env.PORT || 4000)
 const STARTUP_LOG_LIMIT = 64 * 1024
+const STARTUP_CHECK_TIMEOUT_MS = 5_000
 const REQUIRE_FFMPEG_ON_STARTUP = /^(1|true|yes)$/i.test(
   String(process.env.REQUIRE_FFMPEG_ON_STARTUP || '').trim()
 )
 const SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP = /^(1|true|yes|on)$/i.test(
-  String(process.env.INSTALL_CAPTION_RUNTIME || '').trim()
-) || Boolean(String(process.env.RAILWAY_ENVIRONMENT || '').trim())
+  String(
+    process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
+    process.env.INSTALL_CAPTION_RUNTIME ??
+    ''
+  ).trim()
+)
 
 const server = createServer(app)
 initRealtime(server)
@@ -40,7 +45,7 @@ const verifyFfmpegOnStartup = async () => {
   const args = ['-version']
   const cmd = formatCommand(FFMPEG_PATH, args)
   return new Promise<boolean>((resolve) => {
-    exec(cmd, { maxBuffer: STARTUP_LOG_LIMIT }, (error, stdout, stderr) => {
+    exec(cmd, { maxBuffer: STARTUP_LOG_LIMIT, timeout: STARTUP_CHECK_TIMEOUT_MS }, (error, stdout, stderr) => {
       const output = `${stdout || ''}${stderr || ''}`.trim()
       if (error) {
         return resolve(reportFfmpegStartupIssue('[startup] FFmpeg check failed', cmd, output))
@@ -58,24 +63,42 @@ const verifyFfmpegOnStartup = async () => {
 }
 
 const ensureCaptionRuntimeOnStartup = () => {
-  if (!SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP) return
+  if (!SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP) return Promise.resolve(true)
   const installerPath = path.resolve(process.cwd(), 'scripts/install-caption-runtime.js')
-  console.log('[startup] Ensuring caption runtime')
-  const result = spawnSync(process.execPath, [installerPath], {
-    env: process.env,
-    stdio: 'inherit',
-    windowsHide: true
+  console.log('[startup] Ensuring caption runtime in background')
+  return new Promise<boolean>((resolve) => {
+    const child = spawn(process.execPath, [installerPath], {
+      env: process.env,
+      stdio: 'inherit',
+      windowsHide: true
+    })
+    child.once('error', (error) => {
+      console.error('[startup] caption runtime installer failed to start', error)
+      resolve(false)
+    })
+    child.once('exit', (code) => {
+      if (code !== 0) {
+        console.error(`[startup] caption runtime installer exited with status ${code}`)
+        return resolve(false)
+      }
+      resolve(true)
+    })
   })
-  if (result.error) throw result.error
-  if (result.status !== 0) {
-    throw new Error(`caption_runtime_install_failed:${result.status}`)
-  }
 }
 
-const start = async () => {
+const runStartupWarmups = async () => {
   const ffmpegOk = await verifyFfmpegOnStartup()
-  if (!ffmpegOk) process.exit(1)
-  ensureCaptionRuntimeOnStartup()
+  if (!ffmpegOk) {
+    if (REQUIRE_FFMPEG_ON_STARTUP) {
+      console.error('[startup] FFmpeg is required; shutting down after failed startup check')
+      server.close(() => process.exit(1))
+    }
+    return
+  }
+  await ensureCaptionRuntimeOnStartup().catch((error) => {
+    console.error('[startup] caption runtime warmup failed', error)
+    return false
+  })
   const captions = getCaptionEngineStatus({ force: true })
   if (captions.available) {
     console.log(`[startup] Caption engine ready: ${captions.provider} (${captions.command})`)
@@ -84,8 +107,12 @@ const start = async () => {
   }
   await warmIpBanCache().catch(() => null)
   initWeeklyReportScheduler()
+}
+
+const start = async () => {
   server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`)
+    void runStartupWarmups()
   })
 }
 
