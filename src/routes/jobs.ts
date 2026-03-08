@@ -13360,6 +13360,28 @@ const remapTranscriptCuesToEditedTimeline = (cues: TranscriptCue[], segments: Se
   return merged
 }
 
+const toTranscriptCuePreviewRows = (cues: TranscriptCue[], limit = 1200) => (
+  cues
+    .slice(0, Math.max(0, limit))
+    .map((cue) => ({
+      start: Number(Number(cue.start || 0).toFixed(3)),
+      end: Number(Number(cue.end || 0).toFixed(3)),
+      text: String(cue.text || '').trim()
+    }))
+    .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start && cue.text.length > 0)
+)
+
+const toSegmentPreviewRows = (segments: Segment[], limit = 1200) => (
+  segments
+    .slice(0, Math.max(0, limit))
+    .map((segment) => ({
+      start: Number(Number(segment.start || 0).toFixed(3)),
+      end: Number(Number(segment.end || 0).toFixed(3)),
+      speed: Number(Number(segment.speed || 1).toFixed(4))
+    }))
+    .filter((segment) => Number.isFinite(segment.start) && Number.isFinite(segment.end) && segment.end > segment.start)
+)
+
 const writeTranscriptCuesToSrt = (cues: TranscriptCue[], outputPath: string) => {
   if (!cues.length) return null
   const blocks: string[] = []
@@ -27122,7 +27144,11 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
             if (!transcriptSrt) return [] as TranscriptCue[]
             return parseTranscriptCues(transcriptSrt)
           },
-          summarize: (cues) => ({ cueCount: cues.length, hasTranscript: cues.length > 0 })
+          summarize: (cues) => ({
+            cueCount: cues.length,
+            hasTranscript: cues.length > 0,
+            transcriptCues: toTranscriptCuePreviewRows(cues)
+          })
         })
       : ([] as TranscriptCue[])
 
@@ -27227,7 +27253,12 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
             hookScore: Number(plan.hook.score.toFixed(3)),
             hookAuditScore: Number(plan.hook.auditScore.toFixed(3)),
             hookAuditPassed: Boolean(plan.hook.auditPassed),
-            segmentCount: plan.segments.length
+            segmentCount: plan.segments.length,
+            hook: plan.hook,
+            segments: toSegmentPreviewRows(plan.segments),
+            editedTranscriptCues: toTranscriptCuePreviewRows(
+              remapTranscriptCuesToEditedTimeline(transcriptCues, plan.segments)
+            )
           })
         })
         await updatePipelineStepState(jobId, 'BEST_MOMENT_SCORING', {
@@ -31540,6 +31571,10 @@ const processJob = async (
       }
     }
 
+    const editedTranscriptCuesForAnalysis = processTranscriptCues.length && finalSegmentsForAnalysis.length
+      ? remapTranscriptCuesToEditedTimeline(processTranscriptCues, finalSegmentsForAnalysis).slice(0, 1200)
+      : []
+
     const nextAnalysis = buildPersistedRenderAnalysis({
       existing: {
         ...((job.analysis as any) || {}),
@@ -31615,6 +31650,7 @@ const processJob = async (
             }
           : null,
         audio_polish_chain: audioFiltersForAnalysis,
+        edited_transcript_cues: editedTranscriptCuesForAnalysis,
         output_upload_fallback: outputUploadFallbackUsed
           ? {
               used: true,
