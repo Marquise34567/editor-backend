@@ -3,7 +3,11 @@ import crypto from 'crypto'
 import { WebSocketServer, WebSocket } from 'ws'
 import { supabaseAdmin } from './supabaseClient'
 import { buildPublicLivePulse } from './services/liveStats'
-import { getLocalhostBypassUser, shouldBypassAuthForLocalhost } from './lib/localhostAuthBypass'
+import {
+  getLocalhostBypassUser,
+  isLocalhostBypassToken,
+  shouldBypassAuthForLocalhost
+} from './lib/localhostAuthBypass'
 
 type SocketWithMeta = WebSocket & { userId?: string; sessionId?: string; userEmail?: string }
 
@@ -110,15 +114,7 @@ export const initRealtime = (server: Server) => {
       let userId = ''
       let userEmail: string | null = null
 
-      if (shouldBypassAuthForLocalhost(req as any)) {
-        const bypassUser = getLocalhostBypassUser()
-        userId = bypassUser.id
-        userEmail = bypassUser.email || null
-      } else {
-        if (!token) {
-          socket.close(1008, 'missing_token')
-          return
-        }
+      if (token && !(shouldBypassAuthForLocalhost(req as any) && isLocalhostBypassToken(token))) {
         const { data, error } = await supabaseAdmin.auth.getUser(token)
         if (error || !data?.user) {
           socket.close(1008, 'invalid_token')
@@ -126,6 +122,13 @@ export const initRealtime = (server: Server) => {
         }
         userId = data.user.id
         userEmail = data.user.email ?? null
+      } else if (shouldBypassAuthForLocalhost(req as any)) {
+        const bypassUser = getLocalhostBypassUser()
+        userId = bypassUser.id
+        userEmail = bypassUser.email || null
+      } else {
+        socket.close(1008, 'missing_token')
+        return
       }
 
       const sessionId = crypto.randomUUID()

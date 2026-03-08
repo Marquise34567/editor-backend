@@ -93,3 +93,8 @@ export const getLocalhostBypassUser = () => ({
   email: normalize(process.env.LOCALHOST_BYPASS_EMAIL) || 'localhost-dev@autoeditor.local'
 })
 
+export const getLocalhostBypassToken = () =>
+  normalize(process.env.LOCALHOST_BYPASS_TOKEN) || 'localhost-dev-token'
+
+export const isLocalhostBypassToken = (token?: string | null) =>
+  normalize(token) === getLocalhostBypassToken()

@@ -19,8 +19,12 @@ const GLOBAL_DEV_ACCOUNT_BYPASS = parseBooleanEnv(process.env.DEV_ACCOUNT_BYPASS
   || parseBooleanEnv(process.env.BILLING_BYPASS_ALL)
   || parseBooleanEnv(process.env.PLAN_LIMIT_BYPASS_ALL)
 
-const ALLOWED_DEV_ADMIN_EMAILS = new Set([
+const CONTROL_PANEL_OWNER_EMAILS = new Set([
   CONTROL_PANEL_OWNER_EMAIL,
+  ...parseCsvValues(process.env.CONTROL_PANEL_OWNER_EMAILS)
+])
+const ALLOWED_DEV_ADMIN_EMAILS = new Set([
+  ...CONTROL_PANEL_OWNER_EMAILS,
   ...parseCsvValues(process.env.DEV_ACCOUNT_EMAILS)
 ])
 const ALLOWED_DEV_ACCOUNT_USER_IDS = new Set(parseCsvValues(process.env.DEV_ACCOUNT_USER_IDS))
@@ -30,10 +34,8 @@ const normalizeEmail = (email?: string | null) => String(email || '').trim().toL
 const normalizeUserId = (userId?: string | null) => String(userId || '').trim().toLowerCase()
 
 export const isControlPanelOwnerEmail = (email?: string | null) => {
-  if (GLOBAL_DEV_ACCOUNT_BYPASS) return true
   const normalized = normalizeEmail(email)
-  if (normalized && ALLOWED_DEV_ADMIN_EMAILS.has('*')) return true
-  return Boolean(normalized && ALLOWED_DEV_ADMIN_EMAILS.has(normalized))
+  return Boolean(normalized && CONTROL_PANEL_OWNER_EMAILS.has(normalized))
 }
 
 export const isDevAccount = (userId?: string | null, email?: string | null) => {

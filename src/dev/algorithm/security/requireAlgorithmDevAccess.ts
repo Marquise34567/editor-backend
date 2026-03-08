@@ -2,7 +2,11 @@ import { NextFunction, Request, Response } from 'express'
 import { supabaseAdmin } from '../../../supabaseClient'
 import { recordSecurityEvent } from './securityEvents'
 import { isControlPanelOwnerEmail } from '../../../lib/devAccounts'
-import { getLocalhostBypassUser, shouldBypassAuthForLocalhost } from '../../../lib/localhostAuthBypass'
+import {
+  getLocalhostBypassUser,
+  isLocalhostBypassToken,
+  shouldBypassAuthForLocalhost
+} from '../../../lib/localhostAuthBypass'
 
 const unauthorized = (res: Response, reason: 'password_required' | 'invalid_password' | 'unauthorized') =>
   res.status(401).json({ error: reason })
@@ -35,10 +39,18 @@ const resolveAuthUser = async (req: Request): Promise<{ id: string; email?: stri
   if (req.user?.id) return req.user
 
   const authHeader = String(req.headers.authorization || '').trim()
-  if (!authHeader.toLowerCase().startsWith('bearer ')) return null
+  if (!authHeader.toLowerCase().startsWith('bearer ')) {
+    if (shouldBypassAuthForLocalhost(req)) {
+      return getLocalhostBypassUser()
+    }
+    return null
+  }
 
   const token = authHeader.slice(7).trim()
   if (!token) return null
+  if (shouldBypassAuthForLocalhost(req) && isLocalhostBypassToken(token)) {
+    return getLocalhostBypassUser()
+  }
 
   try {
     const { data, error } = await supabaseAdmin.auth.getUser(token)
@@ -53,23 +65,6 @@ const resolveAuthUser = async (req: Request): Promise<{ id: string; email?: stri
 }
 
 export const requireAlgorithmDevAccess = async (req: Request, res: Response, next: NextFunction) => {
-  if (shouldBypassAuthForLocalhost(req)) {
-    const bypassUser = getLocalhostBypassUser()
-    req.user = bypassUser
-    await recordSecurityEvent({
-      type: 'dev_algorithm_access_granted',
-      meta: {
-        path: req.originalUrl,
-        method: req.method,
-        ip: getClientIp(req),
-        user_id: bypassUser.id,
-        allowed: true,
-        reason: 'localhost_bypass'
-      }
-    })
-    return next()
-  }
-
   const authUser = await resolveAuthUser(req)
   if (!authUser) {
     await recordSecurityEvent({
@@ -117,7 +112,9 @@ export const requireAlgorithmDevAccess = async (req: Request, res: Response, nex
       ip: getClientIp(req),
       user_id: userId,
       allowed,
-      reason: allowed ? 'password_ok' : failureReason
+      reason: allowed
+        ? (shouldBypassAuthForLocalhost(req) && authUser.id === getLocalhostBypassUser().id ? 'localhost_bypass_password_ok' : 'password_ok')
+        : failureReason
     }
   })
 

@@ -2,7 +2,11 @@ import { Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient'
 import { prisma } from '../db/prisma'
 import { isControlPanelOwnerEmail } from '../lib/devAccounts'
-import { getLocalhostBypassUser, shouldBypassAuthForLocalhost } from '../lib/localhostAuthBypass'
+import {
+  getLocalhostBypassUser,
+  isLocalhostBypassToken,
+  shouldBypassAuthForLocalhost
+} from '../lib/localhostAuthBypass'
 
 declare global {
   namespace Express {
@@ -79,32 +83,32 @@ const auditAccessAttempt = async ({
 
 export const requireDevAdmin = async (req: Request, res: Response, next: NextFunction) => {
   try {
-    if (shouldBypassAuthForLocalhost(req)) {
-      req.user = getLocalhostBypassUser()
-      await auditAccessAttempt({
-        req,
-        allowed: true,
-        email: req.user.email || null,
-        userId: req.user.id,
-        reason: 'localhost_bypass'
-      })
-      return next()
-    }
-
     const token = getTokenFromRequest(req)
-    if (!token) {
+    if (!token && shouldBypassAuthForLocalhost(req)) {
+      const bypassUser = getLocalhostBypassUser()
+      req.user = bypassUser
+    } else if (!token) {
       await auditAccessAttempt({ req, allowed: false, reason: 'missing_token' })
       return unauthorized(res, 'unauthorized')
+    } else if (shouldBypassAuthForLocalhost(req) && isLocalhostBypassToken(token)) {
+      req.user = getLocalhostBypassUser()
+    } else {
+      const { data, error } = await supabaseAdmin.auth.getUser(token)
+      if (error || !data?.user) {
+        await auditAccessAttempt({ req, allowed: false, reason: 'invalid_token' })
+        return unauthorized(res, 'unauthorized')
+      }
+      const userId = data.user.id
+      const email = data.user.email ?? null
+      req.user = { id: userId, email: email ?? undefined }
     }
-    const { data, error } = await supabaseAdmin.auth.getUser(token)
-    if (error || !data?.user) {
+
+    const userId = req.user?.id || null
+    const email = req.user?.email ?? null
+    if (!userId) {
       await auditAccessAttempt({ req, allowed: false, reason: 'invalid_token' })
       return unauthorized(res, 'unauthorized')
     }
-
-    const userId = data.user.id
-    const email = data.user.email ?? null
-    req.user = { id: userId, email: email ?? undefined }
 
     if (!isControlPanelOwnerEmail(email)) {
       await auditAccessAttempt({ req, allowed: false, email, userId, reason: 'unauthorized_email' })
@@ -126,7 +130,7 @@ export const requireDevAdmin = async (req: Request, res: Response, next: NextFun
       allowed: true,
       email,
       userId,
-      reason: 'password_ok'
+      reason: token ? 'password_ok' : 'localhost_bypass_password_ok'
     })
     return next()
   } catch (err) {
