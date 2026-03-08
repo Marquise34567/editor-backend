@@ -195,6 +195,194 @@ const run = () => {
     'hook should trim past audio-over-black/loading lead-ins and start when visible story content appears'
   )
 
+  // 1a3) Transcript-first selection should beat a visually louder but generic opener.
+  const transcriptDominantWindows = new Array(36).fill(null).map((_, idx) => makeWindow(idx, {
+    score: 0.34,
+    hookScore: 0.32,
+    audioEnergy: 0.26,
+    speechIntensity: 0.28,
+    motionScore: 0.12,
+    facePresence: 0.14,
+    textDensity: 0.06,
+    sceneChangeRate: 0.08,
+    emotionIntensity: 0.2,
+    vocalExcitement: 0.22,
+    curiosityTrigger: 0.06,
+    keywordIntensity: 0.05
+  }))
+  for (let second = 0; second <= 6; second += 1) {
+    transcriptDominantWindows[second] = makeWindow(second, {
+      score: 0.78,
+      hookScore: 0.8,
+      audioEnergy: 0.54,
+      speechIntensity: 0.42,
+      motionScore: 0.72,
+      facePresence: 0.48,
+      textDensity: 0.16,
+      sceneChangeRate: 0.52,
+      emotionIntensity: 0.34,
+      vocalExcitement: 0.4,
+      curiosityTrigger: 0.18,
+      keywordIntensity: 0.12
+    })
+  }
+  const transcriptDominantCues = [
+    { start: 0.1, end: 3.4, text: 'Hey guys welcome back, today we are checking this out.', keywordIntensity: 0.1, curiosityTrigger: 0.08, fillerDensity: 0.22 },
+    { start: 18.0, end: 20.9, text: 'I lost $50,000 in one week because of this mistake.', keywordIntensity: 0.92, curiosityTrigger: 0.82, fillerDensity: 0 },
+    { start: 20.9, end: 25.0, text: 'Before you do the same thing, watch what actually caused it.', keywordIntensity: 0.88, curiosityTrigger: 0.96, fillerDensity: 0 }
+  ]
+  const transcriptDominantPick = pickTopHookCandidates({
+    durationSeconds: 36,
+    segments: [{ start: 0, end: 36 }],
+    windows: transcriptDominantWindows,
+    transcriptCues: transcriptDominantCues
+  })
+  assert.ok(
+    transcriptDominantPick.selected.start >= 17.5,
+    'hook picker should prefer the later transcript-rich emotional line over a generic visual-heavy opener'
+  )
+  const transcriptDominantDecision = selectAuthoritativeAutoHookDecision({
+    candidates: [
+      {
+        start: 0,
+        duration: 6.2,
+        score: 0.76,
+        auditScore: 0.66,
+        auditPassed: true,
+        text: 'Hey guys welcome back, today we are checking this out.',
+        reason: 'Safe opener candidate.'
+      },
+      {
+        start: 18,
+        duration: 7,
+        score: 0.72,
+        auditScore: 0.78,
+        auditPassed: true,
+        text: 'I lost $50,000 in one week because of this mistake, and the reason is worse than you think.',
+        reason: 'Transcript-led curiosity opener.'
+      }
+    ],
+    aggressionLevel: 'medium' as any,
+    hasTranscript: true,
+    signalStrength: computeContentSignalStrength(transcriptDominantWindows),
+    windows: transcriptDominantWindows,
+    transcriptCues: transcriptDominantCues,
+    segments: [{ start: 0, end: 36, speed: 1 }],
+    silences: [],
+    durationSeconds: 36
+  })
+  assert.ok(
+    transcriptDominantDecision && transcriptDominantDecision.candidate.start >= 17.5,
+    'authoritative selector should keep the transcript-rich hook instead of falling back to the safer visual intro'
+  )
+
+  // 1a4) Creative variants should intentionally choose different transcript-led hooks from the same source.
+  const creativeVariantWindows = new Array(40).fill(null).map((_, idx) => makeWindow(idx, {
+    score: 0.34,
+    hookScore: 0.3,
+    audioEnergy: 0.26,
+    speechIntensity: 0.28,
+    motionScore: 0.1,
+    facePresence: 0.14,
+    textDensity: 0.05,
+    sceneChangeRate: 0.08,
+    emotionIntensity: 0.22,
+    vocalExcitement: 0.24,
+    curiosityTrigger: 0.08,
+    keywordIntensity: 0.06
+  }))
+  for (let second = 0; second <= 6; second += 1) {
+    creativeVariantWindows[second] = makeWindow(second, {
+      score: 0.82,
+      hookScore: 0.86,
+      audioEnergy: 0.62,
+      speechIntensity: 0.74,
+      motionScore: 0.78,
+      facePresence: 0.34,
+      textDensity: 0.16,
+      sceneChangeRate: 0.58,
+      emotionIntensity: 0.36,
+      vocalExcitement: 0.68,
+      curiosityTrigger: 0.92,
+      keywordIntensity: 0.76
+    })
+  }
+  for (let second = 18; second <= 25; second += 1) {
+    creativeVariantWindows[second] = makeWindow(second, {
+      score: 0.8,
+      hookScore: 0.82,
+      audioEnergy: 0.54,
+      speechIntensity: 0.72,
+      motionScore: 0.22,
+      facePresence: 0.46,
+      textDensity: 0.12,
+      sceneChangeRate: 0.14,
+      emotionIntensity: 0.9,
+      vocalExcitement: 0.84,
+      curiosityTrigger: 0.62,
+      keywordIntensity: 0.74
+    })
+  }
+  const creativeVariantCues = [
+    { start: 0.1, end: 3.4, text: 'Wait, watch what happens in the next two seconds.', keywordIntensity: 0.84, curiosityTrigger: 0.96, fillerDensity: 0 },
+    { start: 18.0, end: 21.8, text: 'I thought I was going to lose everything after she said that.', keywordIntensity: 0.76, curiosityTrigger: 0.64, fillerDensity: 0 },
+    { start: 21.8, end: 25.6, text: 'Then I realized why she warned me too late.', keywordIntensity: 0.74, curiosityTrigger: 0.82, fillerDensity: 0 }
+  ]
+  const creativeVariantCandidates = [
+    {
+      start: 0,
+      duration: 6.2,
+      score: 0.76,
+      auditScore: 0.76,
+      auditPassed: true,
+      text: 'Wait, watch what happens in the next two seconds.',
+      reason: 'Fast curiosity opener.'
+    },
+    {
+      start: 18,
+      duration: 7.1,
+      score: 0.74,
+      auditScore: 0.8,
+      auditPassed: true,
+      text: 'I thought I was going to lose everything after she said that, and then I realized why she warned me too late.',
+      reason: 'Emotional reveal opener.'
+    }
+  ]
+  const punchyDecision = selectAuthoritativeAutoHookDecision({
+    candidates: creativeVariantCandidates,
+    aggressionLevel: 'medium' as any,
+    hasTranscript: true,
+    signalStrength: computeContentSignalStrength(creativeVariantWindows),
+    windows: creativeVariantWindows,
+    transcriptCues: creativeVariantCues,
+    segments: [{ start: 0, end: 40, speed: 1 }],
+    silences: [],
+    durationSeconds: 40,
+    creativeVariant: 'punchy' as any
+  })
+  const dramaticDecision = selectAuthoritativeAutoHookDecision({
+    candidates: creativeVariantCandidates,
+    aggressionLevel: 'medium' as any,
+    hasTranscript: true,
+    signalStrength: computeContentSignalStrength(creativeVariantWindows),
+    windows: creativeVariantWindows,
+    transcriptCues: creativeVariantCues,
+    segments: [{ start: 0, end: 40, speed: 1 }],
+    silences: [],
+    durationSeconds: 40,
+    creativeVariant: 'dramatic' as any
+  })
+  assert.ok(punchyDecision && dramaticDecision, 'variant-aware selector should still produce hook decisions')
+  assert.strictEqual(
+    Number(punchyDecision!.candidate.start.toFixed(1)),
+    0,
+    'punchy variant should keep the sharper transcript curiosity opener'
+  )
+  assert.ok(
+    dramaticDecision!.candidate.start >= 17.5,
+    'dramatic variant should promote the more emotional transcript reveal'
+  )
+
   // 1aa) On repeated renders of the same weak source, the authoritative selector must move off the stale opener cluster.
   const repeatFixture = JSON.parse(
     fs.readFileSync(path.resolve(__dirname, 'fixtures', 'authoritative-hook-repeat-case.json'), 'utf8')
@@ -271,12 +459,12 @@ const run = () => {
   assert.strictEqual(
     shouldAutoTranscribeDuringAnalyze('ultra', 'horizontal', 420),
     true,
-    'long-form ultra horizontal jobs should still auto-transcribe for hook analysis'
+    'long-form ultra horizontal jobs should auto-transcribe for hook analysis'
   )
   assert.strictEqual(
     shouldAutoTranscribeDuringAnalyze('ultra', 'horizontal', 42),
-    false,
-    'short-form ultra horizontal jobs may still skip transcript analysis for speed'
+    true,
+    'short-form ultra horizontal jobs should also auto-transcribe because transcript is mandatory'
   )
 
   // 1c) Style inference should adapt pacing/aggression for different content archetypes.
@@ -1030,7 +1218,8 @@ const run = () => {
       horizontalMode: { output: 'quality', fit: 'contain' },
       verticalMode: null
     },
-    outputPaths: ['u1/j1/output.mp4']
+    outputPaths: ['u1/j1/output.mp4'],
+    creativeVariant: 'curiosity_first' as any
   })
   assert.strictEqual(persisted.hook_start_time, 12.1, 'hook metadata should persist')
   assert.strictEqual(Array.isArray(persisted.retention_attempts), true, 'attempt metadata should persist')
@@ -1038,6 +1227,7 @@ const run = () => {
   assert.strictEqual(persisted.style_profile?.style, 'reaction', 'style profile should persist')
   assert.strictEqual(Array.isArray(persisted.beat_anchors), true, 'beat anchors should persist')
   assert.strictEqual(Boolean(persisted.output_upload_fallback?.used), true, 'upload fallback metadata should persist')
+  assert.strictEqual(persisted.creativeVariant, 'curiosity_first', 'creative variant should persist')
 
   // 5) Emotional beat detection/cuts should create anchor-aware pacing boundaries.
   const emotionalWindows = new Array(26).fill(null).map((_, idx) =>

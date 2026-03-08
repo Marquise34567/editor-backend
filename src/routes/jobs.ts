@@ -903,6 +903,10 @@ type EngagementWindow = {
   keywordIntensity?: number
   curiosityTrigger?: number
   fillerDensity?: number
+  transcriptEmotion?: number
+  transcriptInterestingness?: number
+  transcriptNarrativeScore?: number
+  transcriptHookTypeStrength?: number
   boredomScore?: number
   hookScore?: number
   narrativeProgress?: number
@@ -946,6 +950,10 @@ type TranscriptCue = {
   keywordIntensity: number
   curiosityTrigger: number
   fillerDensity: number
+  emotionalIntensity?: number
+  interestingness?: number
+  hookTypeStrength?: number
+  narrativeScore?: number
   words?: TranscriptWord[]
   speaker?: string | null
   language?: string | null
@@ -1604,6 +1612,7 @@ type EditPlan = {
   }
 }
 type PipelinePowerModeSelection = 'standard' | 'ultra' | 'retention_king'
+type CreativeVariant = 'balanced' | 'punchy' | 'dramatic' | 'curiosity_first'
 type EditOptions = {
   autoHookMove: boolean
   removeBoring: boolean
@@ -1623,6 +1632,7 @@ type EditOptions = {
   maxCutsRequested?: number | null
   editorMode?: EditorModeSelection | null
   pipelinePowerMode?: PipelinePowerModeSelection | null
+  creativeVariant?: CreativeVariant | null
   hookSelectionMode?: HookSelectionMode | null
   preferredHookCandidate?: HookCandidate | null
   styleArchetypeBlend?: Partial<StyleArchetypeBlend> | null
@@ -2350,7 +2360,7 @@ const resolvePipelinePowerModePlaybook = (
       prompt: ULTRA_MODE_PLAYBOOK_PROMPT,
       notes: [
         'Fast mode playbook active: aggressive binge-cut profile enabled.',
-        'Fast mode skips long-form transcript analysis to reduce turnaround time.',
+        'Fast mode still requires transcript generation before editing can continue.',
         'Fast mode keeps hook pressure high while prioritizing speed-first output.'
       ]
     }
@@ -2375,12 +2385,10 @@ const shouldAutoTranscribeDuringAnalyze = (
   renderMode: RenderMode,
   durationSeconds?: number | null
 ) => {
-  if (renderMode !== 'horizontal') return true
-  const safeDuration = Number(durationSeconds || 0)
-  if (Number.isFinite(safeDuration) && safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS) {
-    return true
-  }
-  return pipelinePowerMode !== 'ultra'
+  void pipelinePowerMode
+  void renderMode
+  void durationSeconds
+  return true
 }
 const LEVEL_HOOK_THRESHOLD_BASE: Record<RetentionAggressionLevel, number> = {
   low: 0.62,
@@ -3614,6 +3622,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   maxCutsRequested: null,
   editorMode: null,
   pipelinePowerMode: 'standard',
+  creativeVariant: 'balanced',
   hookSelectionMode: 'auto',
   longFormPreset: 'auto',
   longFormAggression: 72,
@@ -3704,6 +3713,40 @@ type EditorModeHookScoringProfile = {
   baseBias: number
 }
 
+type CreativeVariantHookScoringProfile = {
+  transcriptImpactMultiplier: number
+  transcriptEmotionMultiplier: number
+  transcriptPriorityMultiplier: number
+  promiseGapMultiplier: number
+  emotionalTriggerMultiplier: number
+  curiosityAccelerationMultiplier: number
+  openLoopMultiplier: number
+  instantHoldMultiplier: number
+  visualLeadMultiplier: number
+  dynamicLiftMultiplier: number
+  teaserReserveMultiplier: number
+  contextPenaltyMultiplier: number
+  spoilerPenaltyMultiplier: number
+  faceoffCuriosityMultiplier: number
+  faceoffEmotionMultiplier: number
+  faceoffInstantHoldMultiplier: number
+  faceoffVisualLeadMultiplier: number
+  transcriptOverrideDelta: number
+}
+
+type CreativeVariantPacingProfile = {
+  redundancySimilarityOffset: number
+  redundancyLowEnergyOffset: number
+  redundancyFillerOffset: number
+  headTrimMultiplier: number
+  tailTrimMultiplier: number
+  spanMultiplier: number
+  speedCapBoost: number
+  narrativeBoundaryFloor: number
+  interestingnessBoundaryFloor: number
+  emotionalBoundaryFloor: number
+}
+
 const EDITOR_MODE_EMOTIONAL_TUNING: Partial<Record<EditorModeSelection, EditorModeEmotionalTuning>> = {
   ultra: {
     thresholdOffset: -0.04,
@@ -3739,6 +3782,144 @@ const DEFAULT_EDITOR_MODE_HOOK_SCORING_PROFILE: EditorModeHookScoringProfile = {
   faceoffContextPenaltyMultiplier: 1,
   faceoffSpoilerPenaltyMultiplier: 1,
   baseBias: 0
+}
+
+const DEFAULT_CREATIVE_VARIANT_HOOK_SCORING_PROFILE: CreativeVariantHookScoringProfile = {
+  transcriptImpactMultiplier: 1,
+  transcriptEmotionMultiplier: 1,
+  transcriptPriorityMultiplier: 1,
+  promiseGapMultiplier: 1,
+  emotionalTriggerMultiplier: 1,
+  curiosityAccelerationMultiplier: 1,
+  openLoopMultiplier: 1,
+  instantHoldMultiplier: 1,
+  visualLeadMultiplier: 1,
+  dynamicLiftMultiplier: 1,
+  teaserReserveMultiplier: 1,
+  contextPenaltyMultiplier: 1,
+  spoilerPenaltyMultiplier: 1,
+  faceoffCuriosityMultiplier: 1,
+  faceoffEmotionMultiplier: 1,
+  faceoffInstantHoldMultiplier: 1,
+  faceoffVisualLeadMultiplier: 1,
+  transcriptOverrideDelta: 0.04
+}
+
+const CREATIVE_VARIANT_HOOK_SCORING_PROFILE: Record<CreativeVariant, CreativeVariantHookScoringProfile> = {
+  balanced: DEFAULT_CREATIVE_VARIANT_HOOK_SCORING_PROFILE,
+  punchy: {
+    transcriptImpactMultiplier: 1.08,
+    transcriptEmotionMultiplier: 0.96,
+    transcriptPriorityMultiplier: 1,
+    promiseGapMultiplier: 1.08,
+    emotionalTriggerMultiplier: 0.94,
+    curiosityAccelerationMultiplier: 1.18,
+    openLoopMultiplier: 1.16,
+    instantHoldMultiplier: 1.22,
+    visualLeadMultiplier: 1.1,
+    dynamicLiftMultiplier: 1.14,
+    teaserReserveMultiplier: 1.02,
+    contextPenaltyMultiplier: 0.88,
+    spoilerPenaltyMultiplier: 0.94,
+    faceoffCuriosityMultiplier: 1.18,
+    faceoffEmotionMultiplier: 0.94,
+    faceoffInstantHoldMultiplier: 1.2,
+    faceoffVisualLeadMultiplier: 1.12,
+    transcriptOverrideDelta: 0.03
+  },
+  dramatic: {
+    transcriptImpactMultiplier: 1.12,
+    transcriptEmotionMultiplier: 1.22,
+    transcriptPriorityMultiplier: 1.08,
+    promiseGapMultiplier: 0.98,
+    emotionalTriggerMultiplier: 1.24,
+    curiosityAccelerationMultiplier: 0.94,
+    openLoopMultiplier: 1.04,
+    instantHoldMultiplier: 0.92,
+    visualLeadMultiplier: 0.92,
+    dynamicLiftMultiplier: 0.98,
+    teaserReserveMultiplier: 1.12,
+    contextPenaltyMultiplier: 0.96,
+    spoilerPenaltyMultiplier: 1.04,
+    faceoffCuriosityMultiplier: 0.96,
+    faceoffEmotionMultiplier: 1.24,
+    faceoffInstantHoldMultiplier: 0.94,
+    faceoffVisualLeadMultiplier: 0.92,
+    transcriptOverrideDelta: 0.03
+  },
+  curiosity_first: {
+    transcriptImpactMultiplier: 1.2,
+    transcriptEmotionMultiplier: 1.04,
+    transcriptPriorityMultiplier: 1.22,
+    promiseGapMultiplier: 1.18,
+    emotionalTriggerMultiplier: 0.94,
+    curiosityAccelerationMultiplier: 1.22,
+    openLoopMultiplier: 1.24,
+    instantHoldMultiplier: 0.96,
+    visualLeadMultiplier: 0.84,
+    dynamicLiftMultiplier: 0.94,
+    teaserReserveMultiplier: 1.18,
+    contextPenaltyMultiplier: 0.92,
+    spoilerPenaltyMultiplier: 1.08,
+    faceoffCuriosityMultiplier: 1.24,
+    faceoffEmotionMultiplier: 1,
+    faceoffInstantHoldMultiplier: 0.96,
+    faceoffVisualLeadMultiplier: 0.86,
+    transcriptOverrideDelta: 0.02
+  }
+}
+
+const DEFAULT_CREATIVE_VARIANT_PACING_PROFILE: CreativeVariantPacingProfile = {
+  redundancySimilarityOffset: 0,
+  redundancyLowEnergyOffset: 0,
+  redundancyFillerOffset: 0,
+  headTrimMultiplier: 1,
+  tailTrimMultiplier: 1,
+  spanMultiplier: 1,
+  speedCapBoost: 0,
+  narrativeBoundaryFloor: 0.28,
+  interestingnessBoundaryFloor: 0.3,
+  emotionalBoundaryFloor: 0.28
+}
+
+const CREATIVE_VARIANT_PACING_PROFILE: Record<CreativeVariant, CreativeVariantPacingProfile> = {
+  balanced: DEFAULT_CREATIVE_VARIANT_PACING_PROFILE,
+  punchy: {
+    redundancySimilarityOffset: -0.04,
+    redundancyLowEnergyOffset: 0.04,
+    redundancyFillerOffset: -0.02,
+    headTrimMultiplier: 1.22,
+    tailTrimMultiplier: 1.28,
+    spanMultiplier: 0.86,
+    speedCapBoost: 0.07,
+    narrativeBoundaryFloor: 0.24,
+    interestingnessBoundaryFloor: 0.26,
+    emotionalBoundaryFloor: 0.24
+  },
+  dramatic: {
+    redundancySimilarityOffset: 0.03,
+    redundancyLowEnergyOffset: -0.04,
+    redundancyFillerOffset: 0.02,
+    headTrimMultiplier: 0.88,
+    tailTrimMultiplier: 0.92,
+    spanMultiplier: 1.14,
+    speedCapBoost: -0.02,
+    narrativeBoundaryFloor: 0.32,
+    interestingnessBoundaryFloor: 0.34,
+    emotionalBoundaryFloor: 0.26
+  },
+  curiosity_first: {
+    redundancySimilarityOffset: -0.02,
+    redundancyLowEnergyOffset: 0.02,
+    redundancyFillerOffset: -0.01,
+    headTrimMultiplier: 1.04,
+    tailTrimMultiplier: 1.1,
+    spanMultiplier: 0.94,
+    speedCapBoost: 0.02,
+    narrativeBoundaryFloor: 0.24,
+    interestingnessBoundaryFloor: 0.26,
+    emotionalBoundaryFloor: 0.24
+  }
 }
 
 const EDITOR_MODE_HOOK_SCORING_PROFILE: Partial<Record<EditorModeSelection, EditorModeHookScoringProfile>> = {
@@ -4104,6 +4285,18 @@ const parsePipelinePowerModeSelection = (value: any): PipelinePowerModeSelection
     : null
 }
 
+const parseCreativeVariant = (value: any): CreativeVariant | null => {
+  if (value === null || value === undefined) return null
+  const normalized = String(value).trim().toLowerCase().replace(/[\s-]+/g, '_')
+  if (!normalized) return null
+  return normalized === 'balanced' ||
+    normalized === 'punchy' ||
+    normalized === 'dramatic' ||
+    normalized === 'curiosity_first'
+    ? (normalized as CreativeVariant)
+    : null
+}
+
 const inferPipelinePowerModeFromEditorMode = (
   mode?: EditorModeSelection | null
 ): PipelinePowerModeSelection => {
@@ -4117,6 +4310,18 @@ const resolvePipelinePowerMode = (
   editorMode?: EditorModeSelection | null
 ): PipelinePowerModeSelection => {
   return mode ?? inferPipelinePowerModeFromEditorMode(editorMode)
+}
+
+const getCreativeVariantHookScoringProfile = (
+  creativeVariant?: CreativeVariant | null
+): CreativeVariantHookScoringProfile => {
+  return CREATIVE_VARIANT_HOOK_SCORING_PROFILE[creativeVariant || 'balanced'] || DEFAULT_CREATIVE_VARIANT_HOOK_SCORING_PROFILE
+}
+
+const getCreativeVariantPacingProfile = (
+  creativeVariant?: CreativeVariant | null
+): CreativeVariantPacingProfile => {
+  return CREATIVE_VARIANT_PACING_PROFILE[creativeVariant || 'balanced'] || DEFAULT_CREATIVE_VARIANT_PACING_PROFILE
 }
 
 const resolveInternalEditorModeForPipelinePowerMode = (
@@ -4507,6 +4712,15 @@ const getPipelinePowerModeFromPayload = (payload?: any): PipelinePowerModeSelect
   return (
     parsePipelinePowerModeSelection((payload as any).pipelinePowerMode) ??
     parsePipelinePowerModeSelection((payload as any).pipeline_power_mode) ??
+    null
+  )
+}
+
+const getCreativeVariantFromPayload = (payload?: any): CreativeVariant | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseCreativeVariant((payload as any).creativeVariant) ??
+    parseCreativeVariant((payload as any).creative_variant) ??
     null
   )
 }
@@ -6228,6 +6442,19 @@ const getPipelinePowerModeFromJob = (job?: any): PipelinePowerModeSelection => {
   return resolvePipelinePowerMode(explicit, getEditorModeFromJob(job))
 }
 
+const getCreativeVariantFromJob = (job?: any): CreativeVariant => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseCreativeVariant(settings?.creativeVariant) ??
+    parseCreativeVariant(settings?.creative_variant) ??
+    parseCreativeVariant(analysis?.creativeVariant) ??
+    parseCreativeVariant(analysis?.creative_variant) ??
+    DEFAULT_EDIT_OPTIONS.creativeVariant ??
+    'balanced'
+  )
+}
+
 const getColdStartAutopilotFromJob = (job?: any): boolean => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -6556,6 +6783,7 @@ const buildPersistedRenderSettings = (
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
     pipelinePowerMode?: PipelinePowerModeSelection | null
+    creativeVariant?: CreativeVariant | null
     hookSelectionMode?: HookSelectionMode | null
     longFormPreset?: LongFormPreset | null
     longFormAggression?: number | null
@@ -6589,6 +6817,7 @@ const buildPersistedRenderSettings = (
     parsePipelinePowerModeSelection(opts?.pipelinePowerMode),
     editorMode
   )
+  const creativeVariant = parseCreativeVariant(opts?.creativeVariant) || DEFAULT_EDIT_OPTIONS.creativeVariant || 'balanced'
   const hookSelectionMode = parseHookSelectionMode(opts?.hookSelectionMode, 'auto') || 'auto'
   const longFormAggression = parseLongFormAggression(opts?.longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   const longFormClarityVsSpeed = parseLongFormClarityVsSpeed(opts?.longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
@@ -6632,6 +6861,8 @@ const buildPersistedRenderSettings = (
     platform_profile: platformProfile,
     pipelinePowerMode,
     pipeline_power_mode: pipelinePowerMode,
+    creativeVariant,
+    creative_variant: creativeVariant,
     hookSelectionMode,
     hook_selection_mode: hookSelectionMode,
     longFormPreset,
@@ -6678,6 +6909,7 @@ const buildPersistedRenderAnalysis = ({
   maxCuts,
   editorMode,
   pipelinePowerMode,
+  creativeVariant,
   hookSelectionMode,
   longFormPreset,
   longFormAggression,
@@ -6704,6 +6936,7 @@ const buildPersistedRenderAnalysis = ({
   maxCuts?: number | null
   editorMode?: EditorModeSelection | null
   pipelinePowerMode?: PipelinePowerModeSelection | null
+  creativeVariant?: CreativeVariant | null
   hookSelectionMode?: HookSelectionMode | null
   longFormPreset?: LongFormPreset | null
   longFormAggression?: number | null
@@ -6771,6 +7004,11 @@ const buildPersistedRenderAnalysis = ({
     ),
     resolvedEditorMode
   )
+  const resolvedCreativeVariant = parseCreativeVariant(
+    creativeVariant ??
+    (existing as any)?.creativeVariant ??
+    (existing as any)?.creative_variant
+  ) || DEFAULT_EDIT_OPTIONS.creativeVariant || 'balanced'
   const resolvedHookSelectionMode = parseHookSelectionMode(
     hookSelectionMode ??
     (existing as any)?.hookSelectionMode ??
@@ -6937,6 +7175,8 @@ const buildPersistedRenderAnalysis = ({
   payload.platform_profile = resolvedPlatformProfile
   payload.pipelinePowerMode = resolvedPipelinePowerMode
   payload.pipeline_power_mode = resolvedPipelinePowerMode
+  payload.creativeVariant = resolvedCreativeVariant
+  payload.creative_variant = resolvedCreativeVariant
   payload.hookSelectionMode = resolvedHookSelectionMode
   payload.hook_selection_mode = resolvedHookSelectionMode
   if (resolvedOnlyCuts !== null) {
@@ -10042,8 +10282,8 @@ const scoreRenderableHookCandidateSignals = ({
   const introText = String(candidate.text || '').trim()
   const textSignals = analyzeHookTextQualitySignals(introText)
   const introSignals = introText
-    ? scoreTranscriptSignals(introText.toLowerCase())
-    : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0 }
+    ? scoreTranscriptCueSignals(introText.toLowerCase())
+    : { keywordIntensity: 0, curiosityTrigger: 0, fillerDensity: 0, emotionalIntensity: 0, interestingness: 0, hookTypeStrength: 0, narrativeScore: 0 }
   const introClarity = introText
     ? clamp01(
       0.4 * scoreHookOpenLoopSignal(introText) +
@@ -10165,11 +10405,12 @@ const scoreRenderableHookCandidateSignals = ({
     0.12 * teaserTension +
     0.1 * curiosityPressure +
     0.1 * patternInterrupt +
-    0.08 * emotionalTrigger +
+    0.09 * emotionalTrigger +
+    0.06 * introSignals.interestingness +
     0.06 * relatability +
     0.06 * mutedClarity +
-    0.07 * visualNovelty +
-    0.09 * visualImpact +
+    0.04 * visualNovelty +
+    0.05 * visualImpact +
     0.05 * visualLeadScore +
     0.04 * overlayReadiness +
     0.04 * urgency -
@@ -10188,20 +10429,22 @@ const scoreRenderableHookCandidateSignals = ({
     : 0
   const selectionScore = clamp01(
     0.19 * confidence +
-    0.19 * openerQuality +
+    0.17 * openerQuality +
     0.16 * curiosityPressure +
     0.1 * teaserTension +
-    0.09 * patternInterrupt +
-    0.07 * emotionalTrigger +
-    0.08 * valuePromise +
+    0.07 * patternInterrupt +
+    0.08 * emotionalTrigger +
+    0.1 * valuePromise +
+    0.08 * textSignals.interestingness +
     0.04 * urgency +
     0.03 * mutedClarity +
-    0.03 * visualLeadScore +
+    0.02 * visualLeadScore +
     0.05 * openerTimingScore +
     0.02 * contrarianTrigger +
     0.02 * relatability +
     0.02 * conversational +
-    0.02 * textSignals.hookTypeStrength +
+    0.03 * textSignals.hookTypeStrength +
+    0.02 * textSignals.specificity +
     0.01 * authenticity -
     0.08 * deadLeadPenalty -
     0.05 * textSignals.weakIntroPenalty -
@@ -10439,7 +10682,8 @@ const selectAuthoritativeAutoHookDecision = ({
   segments = [],
   silences = [],
   durationSeconds,
-  recentHooks = null
+  recentHooks = null,
+  creativeVariant
 }: {
   candidates: HookCandidate[]
   aggressionLevel: RetentionAggressionLevel
@@ -10452,7 +10696,9 @@ const selectAuthoritativeAutoHookDecision = ({
   silences?: TimeRange[]
   durationSeconds: number
   recentHooks?: HookReuseWindow[] | null
+  creativeVariant?: CreativeVariant | null
 }): HookSelectionDecision | null => {
+  const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
     hasTranscript,
@@ -10480,9 +10726,11 @@ const selectAuthoritativeAutoHookDecision = ({
     HOOK_STANDARD_CURIOSITY_MIN
   )
   const strictVisualImpactFloor = clamp(
-    0.46 - (hasTranscript ? 0.02 : 0) - (signalStrength < 0.5 ? 0.04 : 0),
-    0.34,
-    0.5
+    hasTranscript
+      ? 0.22 - (signalStrength < 0.5 ? 0.04 : 0) + (creativeVariant === 'punchy' ? 0.03 : creativeVariant === 'curiosity_first' ? -0.05 : 0)
+      : 0.46 - (signalStrength < 0.5 ? 0.04 : 0) + (creativeVariant === 'punchy' ? 0.03 : 0),
+    hasTranscript ? 0.14 : 0.34,
+    hasTranscript ? 0.28 : 0.5
   )
   const relaxedVisualImpactFloor = clamp(
     strictVisualImpactFloor - 0.08,
@@ -10490,7 +10738,7 @@ const selectAuthoritativeAutoHookDecision = ({
     strictVisualImpactFloor
   )
   const relaxedTranscriptAuditFloor = clamp(
-    Math.max(HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE, relaxedThreshold - 0.02),
+    Math.max(HOOK_RELAXED_TRANSCRIPT_MIN_AUDIT_SCORE, relaxedThreshold - creativeVariantHookProfile.transcriptOverrideDelta * 0.5),
     0.5,
     0.72
   )
@@ -10803,14 +11051,14 @@ const selectAuthoritativeAutoHookDecision = ({
   ) => Number(clamp01(
     0.36 * verifiedAudit.auditScore +
     0.16 * row.entry.openerQuality +
-    0.14 * row.entry.visualImpact +
+    0.08 * row.entry.visualImpact +
     0.12 * row.entry.curiosityPressure +
     0.1 * row.entry.teaserTension +
     0.04 * row.entry.selectionScore +
-    0.04 * row.evaluated.textSignals.interestingness +
-    0.02 * row.evaluated.textSignals.dramaticInterest +
+    0.08 * row.evaluated.textSignals.interestingness +
+    0.04 * row.evaluated.textSignals.dramaticInterest +
     0.02 * row.evaluated.textSignals.humorInterest +
-    0.02 * row.evaluated.textSignals.specificity -
+    0.04 * row.evaluated.textSignals.specificity -
     0.14 * row.repeatPenalty
   ).toFixed(4))
   const hasDeadLeadWeakness = (audit: HookAuditResult) => (
@@ -10845,7 +11093,7 @@ const selectAuthoritativeAutoHookDecision = ({
       .filter(({ row, verifiedAudit }) => (
         !failsSyntheticCredibilityGate(row.entry) &&
         row.entry.openerQuality >= Math.max(relaxedInstantHoldFloor - 0.08, 0.28) &&
-        row.entry.visualImpact >= Math.max(relaxedVisualImpactFloor - 0.08, 0.22) &&
+        row.entry.visualImpact >= Math.max(relaxedVisualImpactFloor - (hasTranscript ? 0.12 : 0.08), hasTranscript ? 0.12 : 0.22) &&
         (
           verifiedAudit.auditScore >= Math.max(0.42, selectedVerifiedAudit.auditScore - 0.04) ||
           row.entry.curiosityPressure >= selectedEntry.curiosityPressure + 0.06 ||
@@ -10920,6 +11168,77 @@ const selectAuthoritativeAutoHookDecision = ({
       selectionMode = 'fallback'
       usedFallback = true
       reason = 'Source-truth hook audit rejected the default winner as too weak on real curiosity/payoff, so a different hook cluster was forced.'
+    }
+  }
+  if (hasTranscript && creativeVariant && creativeVariant !== 'balanced' && interestingRows.length > 1) {
+    const currentVariantRow = interestingRows.find((row) => (
+      Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) < 0.01 &&
+      Math.abs(row.entry.candidate.duration - selectedEntry.candidate.duration) < 0.01
+    )) || null
+    const scoreVariantRow = (row: InterestingFallbackRankedRow) => {
+      const signals = row.evaluated.textSignals
+      if (creativeVariant === 'punchy') {
+        return Number(clamp01(
+          0.3 * row.entry.openerQuality +
+          0.22 * row.entry.curiosityPressure +
+          0.16 * row.entry.visualImpact +
+          0.12 * row.entry.selectionScore +
+          0.1 * signals.patternInterrupt +
+          0.1 * row.entry.teaserTension
+        ).toFixed(4))
+      }
+      if (creativeVariant === 'dramatic') {
+        return Number(clamp01(
+          0.28 * signals.dramaticInterest +
+          0.2 * signals.emotionalTrigger +
+          0.16 * row.entry.teaserTension +
+          0.14 * row.entry.selectionScore +
+          0.12 * signals.authenticity +
+          0.1 * row.entry.introClarity
+        ).toFixed(4))
+      }
+      return Number(clamp01(
+        0.28 * row.entry.curiosityPressure +
+        0.22 * row.entry.teaserTension +
+        0.18 * signals.interestingness +
+        0.14 * row.entry.valuePromise +
+        0.1 * row.entry.introClarity +
+        0.08 * signals.patternInterrupt
+      ).toFixed(4))
+    }
+    const currentVariantScore = currentVariantRow ? scoreVariantRow(currentVariantRow) : 0
+    const variantAlternative = interestingRows
+      .filter((row) => (
+        Math.abs(row.entry.candidate.start - selectedEntry.candidate.start) >= 0.01 ||
+        Math.abs(row.entry.candidate.duration - selectedEntry.candidate.duration) >= 0.01
+      ))
+      .map((row) => ({
+        row,
+        verifiedAudit: getVerifiedAudit(row.entry.candidate),
+        variantScore: scoreVariantRow(row)
+      }))
+      .filter(({ row, verifiedAudit }) => (
+        !failsSyntheticCredibilityGate(row.entry) &&
+        passesNonVerbalSafety(row.entry) &&
+        (
+          verifiedAudit.passed ||
+          verifiedAudit.auditScore >= Math.max(relaxedTranscriptAuditFloor - 0.04, 0.46)
+        )
+      ))
+      .sort((a, b) => (
+        b.variantScore - a.variantScore ||
+        b.row.entry.selectionScore - a.row.entry.selectionScore ||
+        a.row.entry.candidate.start - b.row.entry.candidate.start
+      ))[0]
+    if (variantAlternative && variantAlternative.variantScore >= currentVariantScore + 0.02) {
+      selectedEntry = variantAlternative.row.entry
+      selectionMode = 'fallback'
+      usedFallback = true
+      reason = creativeVariant === 'punchy'
+        ? 'Creative variant forced the punchier transcript opener instead of the default safer winner.'
+        : creativeVariant === 'dramatic'
+          ? 'Creative variant forced the more emotional transcript opener instead of the default safer winner.'
+          : 'Creative variant forced the stronger curiosity-gap transcript opener instead of the default safer winner.'
     }
   }
   const debug = buildHookSelectionDebugPayload({
@@ -11646,20 +11965,20 @@ const computeInterestingHookPriorityFromSignals = ({
     0.14 * scored.teaserTension +
     0.08 * scored.urgency +
     0.04 * scored.contrarianTrigger +
-    0.08 * scored.valuePromise +
-    0.05 * scored.visualImpact +
-    0.04 * scored.visualNovelty +
+    0.1 * scored.valuePromise +
+    0.03 * scored.visualImpact +
+    0.02 * scored.visualNovelty +
     0.08 * scored.instantHold +
     0.04 * scored.openerQuality +
     0.04 * clamp01(Number(candidate.score || 0)) +
     0.03 * scored.confidence +
     0.02 * scored.authenticity +
-    0.1 * textSignals.interestingness +
-    0.08 * textSignals.curiosityBlend +
-    0.07 * textSignals.patternInterrupt +
-    0.06 * textSignals.specificity +
-    0.05 * textSignals.valuePromise +
-    0.05 * textSignals.dramaticInterest +
+    0.14 * textSignals.interestingness +
+    0.1 * textSignals.curiosityBlend +
+    0.08 * textSignals.patternInterrupt +
+    0.07 * textSignals.specificity +
+    0.06 * textSignals.valuePromise +
+    0.06 * textSignals.dramaticInterest +
     0.03 * textSignals.humorInterest +
     (hasTranscript ? 0.04 * clamp01(Number(candidate.auditScore || 0)) : 0) +
     postIntroBonus +
@@ -13371,6 +13690,8 @@ const toTranscriptCuePreviewRows = (cues: TranscriptCue[], limit = 1200) => (
     .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start && cue.text.length > 0)
 )
 
+const buildTranscriptRequiredError = (reason: string) => new Error(`transcript_required:${reason}`)
+
 const toSegmentPreviewRows = (segments: Segment[], limit = 1200) => (
   segments
     .slice(0, Math.max(0, limit))
@@ -13696,16 +14017,15 @@ const parseTranscriptCues = (srtPath: string | null, options?: { sidecarPath?: s
       .replace(/\s+/g, ' ')
       .trim()
     if (!text) continue
-    const scored = scoreTranscriptSignals(text)
-    cues.push({
-      start: Number(start.toFixed(3)),
-      end: Number(end.toFixed(3)),
+    const normalizedCue = normalizeTranscriptCue({
+      start,
+      end,
       text,
-      ...scored,
-      words: sidecarWords.length ? sidecarWords : undefined,
+      words: sidecarWords,
       speaker: matchedSidecar?.speaker ?? null,
       language: sidecar.language
     })
+    if (normalizedCue) cues.push(normalizedCue)
   }
   return cues.sort((a, b) => a.start - b.start)
 }
@@ -14215,7 +14535,7 @@ const overlaysToTranscriptCues = (
         start,
         end,
         text,
-        ...scoreTranscriptSignals(text),
+        ...scoreTranscriptCueSignals(text),
         words: words.length ? words : undefined
       } as TranscriptCue
     })
@@ -14278,7 +14598,11 @@ const buildTranscriptSignalBuckets = (durationSeconds: number, cues: TranscriptC
     keywordIntensity: 0,
     curiosityTrigger: 0,
     fillerDensity: 0,
-    novelty: 0
+    novelty: 0,
+    emotionalIntensity: 0,
+    interestingness: 0,
+    hookTypeStrength: 0,
+    narrativeScore: 0
   }))
   let previousText = ''
   for (const cue of cues) {
@@ -14293,6 +14617,10 @@ const buildTranscriptSignalBuckets = (durationSeconds: number, cues: TranscriptC
       buckets[second].curiosityTrigger = Math.max(buckets[second].curiosityTrigger, cue.curiosityTrigger)
       buckets[second].fillerDensity = Math.max(buckets[second].fillerDensity, cue.fillerDensity)
       buckets[second].novelty = Math.max(buckets[second].novelty, novelty)
+      buckets[second].emotionalIntensity = Math.max(buckets[second].emotionalIntensity, cue.emotionalIntensity ?? 0)
+      buckets[second].interestingness = Math.max(buckets[second].interestingness, cue.interestingness ?? 0)
+      buckets[second].hookTypeStrength = Math.max(buckets[second].hookTypeStrength, cue.hookTypeStrength ?? 0)
+      buckets[second].narrativeScore = Math.max(buckets[second].narrativeScore, cue.narrativeScore ?? 0)
     }
   }
   return buckets
@@ -14329,7 +14657,8 @@ const buildTranscriptRedundancyCuts = ({
   durationSeconds,
   tangentKiller,
   clarityVsSpeed,
-  sentenceTightening
+  sentenceTightening,
+  creativeVariant
 }: {
   transcriptCues: TranscriptCue[]
   windows: EngagementWindow[]
@@ -14337,15 +14666,29 @@ const buildTranscriptRedundancyCuts = ({
   tangentKiller: boolean
   clarityVsSpeed: number
   sentenceTightening: boolean
+  creativeVariant?: CreativeVariant | null
 }) => {
   if (!sentenceTightening || !transcriptCues.length || durationSeconds <= 0) {
     return { cuts: [] as TimeRange[], prunedSeconds: 0 }
   }
+  const pacingVariantProfile = getCreativeVariantPacingProfile(creativeVariant)
   const clarityWeight = clamp01(clamp(clarityVsSpeed, 0, 100) / 100)
-  const similarityThreshold = tangentKiller ? 0.72 : 0.84 - 0.08 * (1 - clarityWeight)
-  const lowEnergyThreshold = tangentKiller ? 0.57 : 0.52
+  const similarityThreshold = clamp(
+    (tangentKiller ? 0.72 : 0.84 - 0.08 * (1 - clarityWeight)) + pacingVariantProfile.redundancySimilarityOffset,
+    0.56,
+    0.92
+  )
+  const lowEnergyThreshold = clamp(
+    (tangentKiller ? 0.57 : 0.52) + pacingVariantProfile.redundancyLowEnergyOffset,
+    0.34,
+    0.82
+  )
   const candidateCuts: TimeRange[] = []
-  const lookbackWindow = tangentKiller ? 6 : 4
+  const lookbackWindow = clamp(
+    Math.round((tangentKiller ? 6 : 4) * (creativeVariant === 'punchy' ? 1.25 : creativeVariant === 'dramatic' ? 0.8 : 1)),
+    3,
+    8
+  )
   for (let index = 0; index < transcriptCues.length; index += 1) {
     const cue = transcriptCues[index]
     if (cue.start < 1.2 || cue.end > durationSeconds - 0.8) continue
@@ -14353,28 +14696,42 @@ const buildTranscriptRedundancyCuts = ({
     if (cueDuration < 0.22) continue
     const cueText = String(cue.text || '').trim()
     if (!cueText) continue
-    const cueEnergy = averageWindowMetric(
-      windows,
-      cue.start,
-      cue.end,
-      (window) => (
-        0.46 * (window.hookScore ?? window.score) +
-        0.24 * window.speechIntensity +
-        0.18 * window.emotionIntensity +
-        0.12 * (window.curiosityTrigger ?? 0)
-      )
+    const transcriptCueStrength = clamp01(
+      0.34 * (cue.narrativeScore ?? 0) +
+      0.24 * (cue.interestingness ?? 0) +
+      0.2 * (cue.emotionalIntensity ?? 0) +
+      0.12 * cue.keywordIntensity +
+      0.1 * cue.curiosityTrigger
+    )
+    const cueEnergy = clamp01(
+      averageWindowMetric(
+        windows,
+        cue.start,
+        cue.end,
+        (window) => (
+          0.46 * (window.hookScore ?? window.score) +
+          0.24 * window.speechIntensity +
+          0.18 * window.emotionIntensity +
+          0.12 * (window.curiosityTrigger ?? 0)
+        )
+      ) * 0.35 +
+      transcriptCueStrength * 0.65
     )
     const recent = transcriptCues.slice(Math.max(0, index - lookbackWindow), index)
     const maxSimilarity = recent.reduce((max, prevCue) => (
       Math.max(max, computeTranscriptSimilarity(prevCue.text, cueText))
     ), 0)
     const repeatedIdea = maxSimilarity >= similarityThreshold
-    const fillerHeavy = cue.fillerDensity >= (tangentKiller ? 0.12 : 0.16)
-    const lowValue = cueEnergy < lowEnergyThreshold && cue.keywordIntensity < 0.32 && cue.curiosityTrigger < 0.32
+    const fillerHeavy = cue.fillerDensity >= clamp(
+      (tangentKiller ? 0.12 : 0.16) + pacingVariantProfile.redundancyFillerOffset,
+      0.06,
+      0.24
+    )
+    const lowValue = cueEnergy < lowEnergyThreshold && (cue.narrativeScore ?? 0) < 0.42 && cue.curiosityTrigger < 0.32
     const removeCue = repeatedIdea && (tangentKiller || lowValue || fillerHeavy)
     if (!removeCue) continue
-    const headTrim = tangentKiller ? 0.06 : 0.03
-    const tailTrim = tangentKiller ? 0.08 : 0.04
+    const headTrim = (tangentKiller ? 0.06 : 0.03) * pacingVariantProfile.headTrimMultiplier
+    const tailTrim = (tangentKiller ? 0.08 : 0.04) * pacingVariantProfile.tailTrimMultiplier
     const start = Number(clamp(cue.start + headTrim, 0, durationSeconds).toFixed(3))
     const end = Number(clamp(cue.end - tailTrim, start + 0.12, durationSeconds).toFixed(3))
     if (end - start < 0.12) continue
@@ -14409,42 +14766,99 @@ const enrichWindowsWithCognitiveScores = ({
       keywordIntensity: 0,
       curiosityTrigger: 0,
       fillerDensity: 0,
-      novelty: 0
+      novelty: 0,
+      emotionalIntensity: 0,
+      interestingness: 0,
+      hookTypeStrength: 0,
+      narrativeScore: 0
     }
     const audioVariance = clamp01(Math.abs(window.audioEnergy - (prev?.audioEnergy ?? window.audioEnergy)) * 1.6)
     const motionVariance = clamp01(Math.abs(window.motionScore - (prev?.motionScore ?? window.motionScore)) * 1.8)
     const repetitiveBackground = clamp01(1 - (0.6 * window.motionScore + 0.4 * motionVariance))
-    const lowNarrativeProgress = clamp01(1 - (0.55 * transcript.novelty + 0.45 * transcript.curiosityTrigger))
-    const silencePenalty = isSilentAt(window.time) ? 1 : 0
-    const boredomScore = clamp01(
-      0.21 * (1 - audioVariance) +
-      0.19 * silencePenalty +
-      0.18 * repetitiveBackground +
-      0.15 * (1 - window.facePresence) +
-      0.13 * lowNarrativeProgress +
-      0.14 * transcript.fillerDensity
+    const transcriptMomentum = clamp01(
+      0.26 * transcript.narrativeScore +
+      0.2 * transcript.interestingness +
+      0.18 * transcript.emotionalIntensity +
+      0.16 * transcript.curiosityTrigger +
+      0.1 * transcript.keywordIntensity +
+      0.1 * transcript.novelty
     )
-    const hookScore = clamp01(
-      0.14 * audioVariance +
-      0.13 * window.speechIntensity +
-      0.12 * window.emotionIntensity +
-      0.1 * window.motionScore +
-      0.08 * window.textDensity +
-      0.11 * transcript.keywordIntensity +
-      0.11 * transcript.curiosityTrigger +
-      0.09 * window.facePresence +
-      0.06 * (window.faceIntensity ?? window.facePresence) +
-      0.06 * (window.actionSpike ?? 0)
+    const lowNarrativeProgress = clamp01(1 - transcriptMomentum)
+    const silencePenalty = isSilentAt(window.time) ? 1 : 0
+    const transcriptEmotion = transcriptMomentum > 0.08
+      ? clamp01(
+          0.58 * transcript.emotionalIntensity +
+          0.18 * transcript.interestingness +
+          0.12 * transcript.curiosityTrigger +
+          0.08 * transcript.hookTypeStrength +
+          0.04 * window.emotionIntensity
+        )
+      : window.emotionIntensity
+    const transcriptHookScore = transcriptMomentum > 0.08
+      ? clamp01(
+          0.3 * transcript.narrativeScore +
+          0.18 * transcript.interestingness +
+          0.16 * transcriptEmotion +
+          0.12 * transcript.curiosityTrigger +
+          0.08 * transcript.keywordIntensity +
+          0.08 * window.speechIntensity +
+          0.05 * window.vocalExcitement +
+          0.03 * window.motionScore
+        )
+      : clamp01(
+          0.14 * audioVariance +
+          0.13 * window.speechIntensity +
+          0.12 * window.emotionIntensity +
+          0.1 * window.motionScore +
+          0.08 * window.textDensity +
+          0.11 * transcript.keywordIntensity +
+          0.11 * transcript.curiosityTrigger +
+          0.09 * window.facePresence +
+          0.06 * (window.faceIntensity ?? window.facePresence) +
+          0.06 * (window.actionSpike ?? 0)
+        )
+    const blendedEmotionIntensity = transcriptMomentum > 0.08
+      ? clamp01(
+          0.68 * transcriptEmotion +
+          0.16 * window.emotionIntensity +
+          0.08 * window.vocalExcitement +
+          0.08 * window.speechIntensity
+        )
+      : window.emotionIntensity
+    const boredomScore = clamp01(
+      0.16 * (1 - audioVariance) +
+      0.16 * silencePenalty +
+      0.14 * repetitiveBackground +
+      0.1 * (1 - window.facePresence) +
+      0.2 * lowNarrativeProgress +
+      0.18 * transcript.fillerDensity +
+      0.06 * Number(transcriptMomentum < 0.16)
+    )
+    const score = clamp01(
+      0.34 * transcriptHookScore +
+      0.22 * blendedEmotionIntensity +
+      0.12 * transcriptMomentum +
+      0.1 * window.speechIntensity +
+      0.08 * window.vocalExcitement +
+      0.06 * window.motionScore +
+      0.04 * window.audioEnergy +
+      0.04 * window.facePresence
     )
     return {
       ...window,
       audioVariance,
+      emotionIntensity: blendedEmotionIntensity,
       keywordIntensity: transcript.keywordIntensity,
       curiosityTrigger: transcript.curiosityTrigger,
       fillerDensity: transcript.fillerDensity,
-      narrativeProgress: transcript.novelty,
+      transcriptEmotion: transcript.emotionalIntensity,
+      transcriptInterestingness: transcript.interestingness,
+      transcriptNarrativeScore: transcript.narrativeScore,
+      transcriptHookTypeStrength: transcript.hookTypeStrength,
+      narrativeProgress: transcriptMomentum,
       boredomScore,
-      hookScore
+      hookScore: transcriptHookScore,
+      score
     }
   })
 }
@@ -14931,6 +15345,60 @@ const analyzeHookTextQualitySignals = (text: string) => {
   }
 }
 
+const scoreTranscriptCueSignals = (text: string) => {
+  const transcriptSignals = scoreTranscriptSignals(text)
+  const textSignals = analyzeHookTextQualitySignals(text)
+  const emotionalIntensity = clamp01(
+    0.36 * textSignals.emotionalTrigger +
+    0.18 * textSignals.relatability +
+    0.16 * textSignals.contradiction +
+    0.12 * textSignals.dramaticInterest +
+    0.1 * textSignals.authenticity +
+    0.08 * textSignals.urgency
+  )
+  const narrativeScore = clamp01(
+    0.24 * transcriptSignals.keywordIntensity +
+    0.2 * transcriptSignals.curiosityTrigger +
+    0.18 * textSignals.interestingness +
+    0.12 * textSignals.valuePromise +
+    0.1 * textSignals.patternInterrupt +
+    0.08 * textSignals.specificity +
+    0.08 * textSignals.hookTypeStrength +
+    0.08 * (1 - transcriptSignals.fillerDensity)
+  )
+  return {
+    ...transcriptSignals,
+    emotionalIntensity: Number(emotionalIntensity.toFixed(4)),
+    interestingness: Number(clamp01(textSignals.interestingness).toFixed(4)),
+    hookTypeStrength: Number(clamp01(textSignals.hookTypeStrength).toFixed(4)),
+    narrativeScore: Number(narrativeScore.toFixed(4))
+  }
+}
+
+const normalizeTranscriptCue = (cue: any): TranscriptCue | null => {
+  const start = Number(cue?.start)
+  const end = Number(cue?.end)
+  const text = String(cue?.text || '').replace(/\s+/g, ' ').trim()
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start + 0.01 || !text) return null
+  const derivedSignals = scoreTranscriptCueSignals(text)
+  const words = parseTranscriptWordRows(cue?.words, start, end)
+  return {
+    start: Number(start.toFixed(3)),
+    end: Number(end.toFixed(3)),
+    text,
+    keywordIntensity: Number(clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? derivedSignals.keywordIntensity)).toFixed(4)),
+    curiosityTrigger: Number(clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? derivedSignals.curiosityTrigger)).toFixed(4)),
+    fillerDensity: Number(clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? derivedSignals.fillerDensity)).toFixed(4)),
+    emotionalIntensity: Number(clamp01(Number(cue?.emotionalIntensity ?? cue?.emotional_intensity ?? derivedSignals.emotionalIntensity)).toFixed(4)),
+    interestingness: Number(clamp01(Number(cue?.interestingness ?? derivedSignals.interestingness)).toFixed(4)),
+    hookTypeStrength: Number(clamp01(Number(cue?.hookTypeStrength ?? cue?.hook_type_strength ?? derivedSignals.hookTypeStrength)).toFixed(4)),
+    narrativeScore: Number(clamp01(Number(cue?.narrativeScore ?? cue?.narrative_score ?? derivedSignals.narrativeScore)).toFixed(4)),
+    words: words.length ? words : undefined,
+    speaker: typeof cue?.speaker === 'string' && cue.speaker.trim().length ? cue.speaker.trim().slice(0, 24) : null,
+    language: typeof cue?.language === 'string' && cue.language.trim().length ? cue.language.trim().slice(0, 16) : null
+  }
+}
+
 const computeHookInstantHoldScore = ({
   start,
   end,
@@ -15026,7 +15494,7 @@ const computeHookIntroClarityScore = ({
   if (!introText) return transcriptCues.length ? 0.46 : 0.52
   const words = introText.split(/\s+/).filter(Boolean)
   if (!words.length) return 0.46
-  const signals = scoreTranscriptSignals(introText.toLowerCase())
+  const signals = scoreTranscriptCueSignals(introText.toLowerCase())
   const textSignals = analyzeHookTextQualitySignals(introText)
   const contextPenalty = evaluateHookContextDependency(start, introEnd, transcriptCues)
   const leadWordPenalty = /^(and|but|so|then|because|this|that|it|they|we)\b/i.test(words[0] || '')
@@ -15064,7 +15532,7 @@ const runHookAudit = ({
   const text = extractHookText(start, end, transcriptCues).toLowerCase()
   const words = text ? text.split(/\s+/).filter(Boolean) : []
   const contextPenalty = evaluateHookContextDependency(start, end, transcriptCues)
-  const transcriptSignals = scoreTranscriptSignals(text)
+  const transcriptSignals = scoreTranscriptCueSignals(text)
   const textQualitySignals = analyzeHookTextQualitySignals(text)
   const instantHold = computeHookInstantHoldScore({
     start,
@@ -15093,11 +15561,12 @@ const runHookAudit = ({
     transcriptSignals.curiosityTrigger * 0.45
   )
   const emotionalSignal = clamp01(
-    averageWindowMetric(windows, start, end, (window) => window.emotionIntensity) * 0.42 +
+    averageWindowMetric(windows, start, end, (window) => window.emotionIntensity) * 0.32 +
     averageWindowMetric(windows, start, end, (window) => window.vocalExcitement) * 0.22 +
     averageWindowMetric(windows, start, end, (window) => window.speechIntensity) * 0.12 +
     averageWindowMetric(windows, start, end, (window) => window.motionScore) * 0.12 +
-    averageWindowMetric(windows, start, end, (window) => window.actionSpike ?? 0) * 0.12
+    averageWindowMetric(windows, start, end, (window) => window.actionSpike ?? 0) * 0.08 +
+    transcriptSignals.emotionalIntensity * 0.14
   )
   const nonVerbalClarity = clamp01(
     0.34 * emotionalSignal +
@@ -15176,7 +15645,8 @@ const runHookAudit = ({
     0.26 * curiositySignal +
     0.2 * transcriptSignals.curiosityTrigger +
     0.12 * endingUnresolved +
-    0.06 * (1 - transcriptSignals.fillerDensity) -
+    0.04 * transcriptSignals.interestingness +
+    0.02 * (1 - transcriptSignals.fillerDensity) -
     0.38 * spoilerRisk
   )
   const teaserThreshold = hasTranscriptSupport ? 0.29 : 0.24
@@ -15377,13 +15847,15 @@ const scoreHookFaceoffCandidate = ({
   windows,
   hookCalibration,
   transcriptCues,
-  editorMode
+  editorMode,
+  creativeVariant
 }: {
   candidate: HookCandidate
   windows: EngagementWindow[]
   hookCalibration?: HookCalibrationProfile | null
   transcriptCues?: TranscriptCue[]
   editorMode?: EditorModeSelection | null
+  creativeVariant?: CreativeVariant | null
 }) => {
   const computeEmotionalHookPull = (start: number, end: number) => {
     const duration = Math.max(0.5, end - start)
@@ -15459,22 +15931,23 @@ const scoreHookFaceoffCandidate = ({
     transcriptCues: Array.isArray(transcriptCues) ? transcriptCues : []
   })
   const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
+  const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const contextPenalty = evaluateHookContextDependency(start, end, Array.isArray(transcriptCues) ? transcriptCues : [])
   const spoilerRisk = scoreHookSpoilerRisk(candidate.text || '')
   const faceoffScore = clamp01(
     weights.candidateScore * candidate.score +
     weights.auditScore * candidate.auditScore * modeHookProfile.faceoffAuditMultiplier +
     weights.energy * energy +
-    weights.curiosity * curiosity * modeHookProfile.faceoffCuriosityMultiplier +
+    weights.curiosity * curiosity * modeHookProfile.faceoffCuriosityMultiplier * creativeVariantHookProfile.faceoffCuriosityMultiplier +
     0.03 * teaserTension +
-    weights.emotionalSpike * emotionalSpike +
+    weights.emotionalSpike * emotionalSpike * creativeVariantHookProfile.faceoffEmotionMultiplier +
     0.08 * emotionalPull +
-    0.08 * instantHold * modeHookProfile.faceoffInstantHoldMultiplier +
-    0.04 * visualLeadScore +
+    0.08 * instantHold * modeHookProfile.faceoffInstantHoldMultiplier * creativeVariantHookProfile.faceoffInstantHoldMultiplier +
+    0.04 * visualLeadScore * creativeVariantHookProfile.faceoffVisualLeadMultiplier +
     0.06 * introClarity -
     0.08 * deadLeadPenalty -
-    0.06 * contextPenalty * modeHookProfile.faceoffContextPenaltyMultiplier -
-    0.05 * spoilerRisk * modeHookProfile.faceoffSpoilerPenaltyMultiplier +
+    0.06 * contextPenalty * modeHookProfile.faceoffContextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
+    0.05 * spoilerRisk * modeHookProfile.faceoffSpoilerPenaltyMultiplier * creativeVariantHookProfile.spoilerPenaltyMultiplier +
     modeHookProfile.baseBias
   )
   return Number(faceoffScore.toFixed(4))
@@ -15489,7 +15962,8 @@ const pickTopHookCandidates = ({
   styleProfile,
   nicheProfile,
   aggressionLevel,
-  editorMode
+  editorMode,
+  creativeVariant
 }: {
   durationSeconds: number
   segments: TimeRange[]
@@ -15500,6 +15974,7 @@ const pickTopHookCandidates = ({
   nicheProfile?: VideoNicheProfile | null
   aggressionLevel?: RetentionAggressionLevel
   editorMode?: EditorModeSelection | null
+  creativeVariant?: CreativeVariant | null
 }) => {
   // Analyze each uploaded video independently and choose the strongest hook from
   // that video's own pacing/signal profile (never a predetermined timestamp).
@@ -15510,6 +15985,7 @@ const pickTopHookCandidates = ({
     editorMode
   })
   const modeHookProfile = getEditorModeHookScoringProfile(editorMode)
+  const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const hookCandidateTarget = resolveHookCandidateTarget(durationSeconds)
   const longFormMinHookSourceStart = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
     ? resolveLongFormMinHookSourceStart(durationSeconds)
@@ -15517,16 +15993,38 @@ const pickTopHookCandidates = ({
   const dynamicBaseline = computeHookDynamicBaseline(windows)
   const starts = new Set<number>()
   segments.forEach((segment) => starts.add(Number(segment.start.toFixed(2))))
-  windows
-    .slice()
-    .sort((a, b) => (
-      (b.hookScore ?? b.score) - (a.hookScore ?? a.score) ||
-      b.emotionIntensity - a.emotionIntensity
-    ))
-    .slice(0, 42)
-    .forEach((window) => starts.add(Math.max(0, Number((window.time - 1).toFixed(2)))))
-  for (let second = 0; second <= Math.max(0, Math.floor(durationSeconds - HOOK_MIN)); second += 1) {
-    starts.add(second)
+  if (transcriptCues.length) {
+    transcriptCues
+      .slice()
+      .sort((a, b) => (
+        ((b.narrativeScore ?? 0) + (b.interestingness ?? 0) + (b.emotionalIntensity ?? 0)) -
+        ((a.narrativeScore ?? 0) + (a.interestingness ?? 0) + (a.emotionalIntensity ?? 0)) ||
+        a.start - b.start
+      ))
+      .slice(0, Math.max(28, hookCandidateTarget * 4))
+      .forEach((cue) => {
+        const cueStart = Number(cue.start || 0)
+        const cueSpan = Math.max(0.35, Number(cue.end || cueStart) - cueStart)
+        const leadIn = Math.min(1.8, 0.55 + cueSpan * 0.45)
+        starts.add(Math.max(0, Number((cueStart - leadIn).toFixed(2))))
+        starts.add(Math.max(0, Number((cueStart - 0.25).toFixed(2))))
+        starts.add(Number(cueStart.toFixed(2)))
+      })
+    for (let second = 0; second <= Math.max(0, Math.floor(durationSeconds - HOOK_MIN)); second += 2) {
+      starts.add(second)
+    }
+  } else {
+    windows
+      .slice()
+      .sort((a, b) => (
+        (b.hookScore ?? b.score) - (a.hookScore ?? a.score) ||
+        b.emotionIntensity - a.emotionIntensity
+      ))
+      .slice(0, 42)
+      .forEach((window) => starts.add(Math.max(0, Number((window.time - 1).toFixed(2)))))
+    for (let second = 0; second <= Math.max(0, Math.floor(durationSeconds - HOOK_MIN)); second += 1) {
+      starts.add(second)
+    }
   }
   const candidateDurations = [8, 7, 6, 5]
   const evaluated: HookCandidate[] = []
@@ -15544,8 +16042,11 @@ const pickTopHookCandidates = ({
         0.26 * window.vocalExcitement
       ))
       const transcriptImpact = averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
-        0.52 * (window.keywordIntensity ?? 0) +
-        0.48 * (window.curiosityTrigger ?? 0)
+        0.28 * (window.keywordIntensity ?? 0) +
+        0.24 * (window.curiosityTrigger ?? 0) +
+        0.24 * (window.transcriptNarrativeScore ?? 0) +
+        0.14 * (window.transcriptInterestingness ?? 0) +
+        0.1 * (window.transcriptHookTypeStrength ?? 0)
       ))
       const visualImpact = averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
         0.45 * window.motionScore +
@@ -15571,6 +16072,31 @@ const pickTopHookCandidates = ({
       const contextPenalty = evaluateHookContextDependency(aligned.start, aligned.end, transcriptCues)
       const hookText = extractHookText(aligned.start, aligned.end, transcriptCues)
       const textSignals = analyzeHookTextQualitySignals(hookText)
+      const transcriptDrivenEmotion = clamp01(
+        averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
+          0.52 * (window.transcriptEmotion ?? 0) +
+          0.22 * (window.transcriptInterestingness ?? 0) +
+          0.14 * (window.transcriptNarrativeScore ?? 0) +
+          0.12 * (window.curiosityTrigger ?? 0)
+        )) * 0.55 +
+        textSignals.emotionalTrigger * 0.45
+      )
+      const transcriptDrivenPriority = clamp01(
+        averageWindowMetric(windows, aligned.start, aligned.end, (window) => (
+          0.44 * (window.transcriptNarrativeScore ?? 0) +
+          0.2 * (window.transcriptInterestingness ?? 0) +
+          0.16 * (window.keywordIntensity ?? 0) +
+          0.12 * (window.curiosityTrigger ?? 0) +
+          0.08 * (window.transcriptHookTypeStrength ?? 0)
+        )) * 0.48 +
+        (
+          0.26 * textSignals.interestingness +
+          0.2 * textSignals.valuePromise +
+          0.18 * textSignals.patternInterrupt +
+          0.18 * textSignals.specificity +
+          0.18 * textSignals.hookTypeStrength
+        ) * 0.52
+      )
       const openLoopSignal = clamp01(scoreHookOpenLoopSignal(hookText) * emotionalTuning.openLoopBoost)
       const unresolvedEndingSignal = scoreHookEndingUnresolvedSignal(hookText)
       const curiosityAcceleration = clamp01(
@@ -15664,38 +16190,40 @@ const pickTopHookCandidates = ({
         )
         : 0
       const totalScore = clamp01(
-        0.1 * baseHookScore +
-        0.07 * speechImpact +
-        0.05 * transcriptImpact +
-        0.07 * visualImpact +
-        0.07 * emotionImpact +
-        0.06 * emotionalHookPull +
+        0.06 * baseHookScore +
+        0.05 * speechImpact +
+        0.14 * transcriptImpact * creativeVariantHookProfile.transcriptImpactMultiplier +
+        0.03 * visualImpact +
+        0.05 * emotionImpact +
+        0.05 * emotionalHookPull +
         0.09 * firstThreeSecondGrab +
-        0.09 * promiseOrGap +
-        0.08 * emotionalTrigger +
-        0.05 * specificityRelatability +
+        0.11 * promiseOrGap * creativeVariantHookProfile.promiseGapMultiplier +
+        0.09 * emotionalTrigger * creativeVariantHookProfile.emotionalTriggerMultiplier +
+        0.08 * transcriptDrivenEmotion * creativeVariantHookProfile.transcriptEmotionMultiplier +
+        0.08 * transcriptDrivenPriority * creativeVariantHookProfile.transcriptPriorityMultiplier +
+        0.06 * specificityRelatability +
         0.04 * casualDelivery +
         0.04 * mutedViewerFit +
-        0.04 * textSignals.hookTypeStrength +
-        0.06 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier +
-        0.04 * openLoopSignal +
+        0.05 * textSignals.hookTypeStrength +
+        0.06 * boostedCuriosityAcceleration * modeHookProfile.curiosityMultiplier * creativeVariantHookProfile.curiosityAccelerationMultiplier +
+        0.04 * openLoopSignal * creativeVariantHookProfile.openLoopMultiplier +
         0.03 * unresolvedEndingSignal +
-        0.05 * teaserReserve * modeHookProfile.teaserReserveMultiplier +
+        0.05 * teaserReserve * modeHookProfile.teaserReserveMultiplier * creativeVariantHookProfile.teaserReserveMultiplier +
         0.03 * audit.teaserStrength +
-        0.08 * instantHoldScore * modeHookProfile.instantHoldMultiplier +
+        0.08 * instantHoldScore * modeHookProfile.instantHoldMultiplier * creativeVariantHookProfile.instantHoldMultiplier +
         0.07 * introClarityScore +
         0.04 * durationAlignment +
         0.06 * clamp01(beatRoleScore + 0.5) +
         0.08 * audit.auditScore * modeHookProfile.auditMultiplier +
-        0.05 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier +
+        0.05 * dynamicLift.score * modeHookProfile.dynamicLiftMultiplier * creativeVariantHookProfile.dynamicLiftMultiplier +
         0.03 * dynamicLift.peakDensity -
         0.1 * deadLeadPenalty -
         0.1 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
-        0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier -
-        0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier -
+        0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
+        0.08 * audit.spoilerRisk * modeHookProfile.spoilerPenaltyMultiplier * creativeVariantHookProfile.spoilerPenaltyMultiplier -
         0.05 * textSignals.weakIntroPenalty +
-        0.05 * visualLeadScore +
+        0.02 * visualLeadScore * creativeVariantHookProfile.visualLeadMultiplier +
         modeHookProfile.baseBias
       )
       evaluated.push({
@@ -15734,7 +16262,14 @@ const pickTopHookCandidates = ({
     const key = `${candidate.start.toFixed(3)}:${candidate.duration.toFixed(3)}`
     const cached = faceoffScoreCache.get(key)
     if (cached !== undefined) return cached
-    const score = scoreHookFaceoffCandidate({ candidate, windows, hookCalibration, transcriptCues, editorMode })
+    const score = scoreHookFaceoffCandidate({
+      candidate,
+      windows,
+      hookCalibration,
+      transcriptCues,
+      editorMode,
+      creativeVariant
+    })
     faceoffScoreCache.set(key, score)
     return score
   }
@@ -15809,6 +16344,45 @@ const pickTopHookCandidates = ({
     Number((entry.candidate.score100 ?? entry.candidate.score * 100).toFixed(2)) >= 85
   ))
   let selected = (highConfidencePreferred || faceoffRanked.find((entry) => entry.candidate.auditPassed) || faceoffRanked[0]).candidate
+  if (transcriptCues.length) {
+    const selectedTranscriptQuality = evaluateTranscriptHookQuality({
+      candidate: selected,
+      windows
+    })
+    const transcriptPreferred = uniqueTop
+      .map((candidate) => ({
+        candidate,
+        evaluated: evaluateTranscriptHookQuality({
+          candidate,
+          windows
+        })
+      }))
+      .filter(({ candidate, evaluated }) => (
+        String(candidate.text || '').trim().length >= 12 &&
+        !evaluated.textSignals.isGenericUtterance &&
+        (
+          evaluated.qualityScore >= Math.max(0.52, selectedTranscriptQuality.qualityScore + creativeVariantHookProfile.transcriptOverrideDelta) ||
+          evaluated.textSignals.interestingness >= selectedTranscriptQuality.textSignals.interestingness + 0.18
+        ) &&
+        (
+          candidate.auditPassed ||
+          candidate.auditScore >= Math.max(0.56, selected.auditScore + 0.08) ||
+          evaluated.textSignals.interestingness >= 0.72
+        )
+      ))
+      .sort((a, b) => (
+        b.evaluated.qualityScore - a.evaluated.qualityScore ||
+        b.candidate.auditScore - a.candidate.auditScore ||
+        b.candidate.score - a.candidate.score ||
+        a.candidate.start - b.candidate.start
+      ))[0]
+    if (transcriptPreferred) {
+      selected = {
+        ...transcriptPreferred.candidate,
+        reason: `${transcriptPreferred.candidate.reason} Transcript-first override promoted the more emotionally specific curiosity line.`
+      }
+    }
+  }
   if (hookCalibration?.enabled && hookCalibration.sampleSize >= HOOK_CALIBRATION_MIN_SAMPLES) {
     selected = {
       ...selected,
@@ -19584,6 +20158,7 @@ const buildEditPlan = async (
   const longFormPreset = parseLongFormPreset(
     options.longFormPreset || resolveLongFormPresetByAggression(longFormAggression)
   )
+  const creativeVariant = parseCreativeVariant(options.creativeVariant) || DEFAULT_EDIT_OPTIONS.creativeVariant || 'balanced'
   const tangentKiller = typeof options.tangentKiller === 'boolean'
     ? options.tangentKiller
     : DEFAULT_EDIT_OPTIONS.tangentKiller
@@ -19709,12 +20284,13 @@ const buildEditPlan = async (
     : []
   const redundancyCuts = options.removeBoring && longFormRuntimeTuning.isLongForm
     ? buildTranscriptRedundancyCuts({
-        transcriptCues,
-        windows,
-        durationSeconds,
-        tangentKiller: longFormRuntimeTuning.tangentKiller,
-        clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
-        sentenceTightening: longFormRuntimeTuning.sentenceTightening
+      transcriptCues,
+      windows,
+      durationSeconds,
+      tangentKiller: longFormRuntimeTuning.tangentKiller,
+      clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
+      sentenceTightening: longFormRuntimeTuning.sentenceTightening,
+      creativeVariant
       })
     : { cuts: [] as TimeRange[], prunedSeconds: 0 }
   let contentRemovedCandidates = mergeRanges(
@@ -19808,7 +20384,8 @@ const buildEditPlan = async (
     styleProfile,
     nicheProfile,
     aggressionLevel: styleAdjustedAggressionLevel,
-    editorMode: options.editorMode
+    editorMode: options.editorMode,
+    creativeVariant
   })
   const hookVariants = [
     topHookCandidates.selected,
@@ -19938,7 +20515,8 @@ const buildEditPlan = async (
     maxGapSeconds: modePacingCaps.maxGapSeconds,
     maxTalkingHeadShotSeconds: modePacingCaps.maxTalkingHeadShotSeconds,
     clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
-    enabled: longFormRuntimeTuning.isLongForm
+    enabled: longFormRuntimeTuning.isLongForm,
+    creativeVariant
   })
   let finalTimelineSegments = pacingGoverned.segments.map((segment) => ({ ...segment }))
   let plannerSummary: EditPlan['planner'] | undefined
@@ -20681,7 +21259,8 @@ const applyPacingGovernor = ({
   maxGapSeconds,
   maxTalkingHeadShotSeconds,
   clarityVsSpeed,
-  enabled
+  enabled,
+  creativeVariant
 }: {
   segments: Segment[]
   windows: EngagementWindow[]
@@ -20691,17 +21270,19 @@ const applyPacingGovernor = ({
   maxTalkingHeadShotSeconds: number
   clarityVsSpeed: number
   enabled: boolean
+  creativeVariant?: CreativeVariant | null
 }) => {
   if (!enabled || !segments.length || durationSeconds <= 0) {
     return { segments: segments.map((segment) => ({ ...segment })), adjustments: 0 }
   }
+  const pacingVariantProfile = getCreativeVariantPacingProfile(creativeVariant)
   const maxSpan = clamp(
     Math.min(maxGapSeconds, maxTalkingHeadShotSeconds),
     2,
     6.4
-  )
+  ) * pacingVariantProfile.spanMultiplier
   const clarityWeight = clamp01(clamp(clarityVsSpeed, 0, 100) / 100)
-  const maxSpeedCap = clamp(1.16 + 0.12 * (1 - clarityWeight), 1.12, 1.34)
+  const maxSpeedCap = clamp(1.16 + 0.12 * (1 - clarityWeight) + pacingVariantProfile.speedCapBoost, 1.08, 1.4)
   let adjustments = 0
   const governed: Segment[] = []
   for (const segment of segments) {
@@ -20784,6 +21365,9 @@ const applyPacingGovernor = ({
     const meaningfulBoundaries = transcriptCues
       .filter((cue) => cue.start > segment.start + 0.2 && cue.end < segment.end - 0.2)
       .filter((cue) => (
+        (cue.narrativeScore ?? 0) >= pacingVariantProfile.narrativeBoundaryFloor ||
+        (cue.interestingness ?? 0) >= pacingVariantProfile.interestingnessBoundaryFloor ||
+        (cue.emotionalIntensity ?? 0) >= pacingVariantProfile.emotionalBoundaryFloor ||
         cue.keywordIntensity >= 0.3 ||
         cue.curiosityTrigger >= 0.3 ||
         cue.fillerDensity <= 0.09
@@ -22940,6 +23524,42 @@ const generateSubtitles = async (
     console.warn(`subtitle generation skipped: ${captionEngine.reason}`)
   }
   return null
+}
+
+const generateRequiredTranscriptCues = async ({
+  inputPath,
+  workingDir,
+  durationSeconds,
+  renderMode,
+  fastMode,
+  purpose,
+  inputBytes,
+  cueLimit = 1200
+}: {
+  inputPath: string
+  workingDir: string
+  durationSeconds: number
+  renderMode: RenderMode
+  fastMode?: boolean | null
+  purpose: SubtitleGenerationPurpose
+  inputBytes?: number | null
+  cueLimit?: number
+}) => {
+  const transcriptSrt = await generateSubtitles(inputPath, workingDir, {
+    durationSeconds,
+    renderMode,
+    fastMode,
+    purpose,
+    inputBytes
+  })
+  if (!transcriptSrt) {
+    throw buildTranscriptRequiredError(`${purpose}_subtitle_generation_failed`)
+  }
+  const transcriptCues = parseTranscriptCues(transcriptSrt).slice(0, Math.max(1, cueLimit))
+  if (!transcriptCues.length) {
+    throw buildTranscriptRequiredError(`${purpose}_no_usable_cues`)
+  }
+  return transcriptCues
 }
 
 const generateProxy = async (inputPath: string, outPath: string, opts?: { width?: number; height?: number }) => {
@@ -26737,6 +27357,7 @@ const getEditOptionsForUser = async (
     maxCuts?: number | null
     editorMode?: EditorModeSelection | null
     pipelinePowerMode?: PipelinePowerModeSelection | null
+    creativeVariant?: CreativeVariant | null
     hookSelectionMode?: HookSelectionMode | null
     autoCaptions?: boolean | null
     subtitleStyle?: string | null
@@ -26825,6 +27446,11 @@ const getEditOptionsForUser = async (
     ),
     editorMode
   )
+  const creativeVariant = parseCreativeVariant(
+    overrides?.creativeVariant ??
+    (settings as any)?.creativeVariant ??
+    (settings as any)?.creative_variant
+  ) || DEFAULT_EDIT_OPTIONS.creativeVariant || 'balanced'
   const ultraModeRequested = pipelinePowerMode === 'ultra'
   const retentionKingModeRequested = pipelinePowerMode === 'retention_king'
   const internalEditorMode = resolveInternalEditorModeForPipelinePowerMode(editorMode, pipelinePowerMode)
@@ -26959,6 +27585,7 @@ const getEditOptionsForUser = async (
     maxCutsRequested,
     editorMode: internalEditorMode,
     pipelinePowerMode,
+    creativeVariant,
     hookSelectionMode,
     longFormPreset,
     longFormAggression,
@@ -27119,38 +27746,26 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const editorModePlaybook = resolvePipelinePowerModePlaybook(pipelinePowerMode)
     const playbookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
-    const shouldAnalyzeTranscript = shouldAutoTranscribeDuringAnalyze(
-      pipelinePowerMode,
-      initialRenderConfig.mode,
-      duration
-    )
-    if (!shouldAnalyzeTranscript) {
-      console.log(`[${requestId || 'noid'}] transcript analysis skipped for fast short-form horizontal mode`)
-    }
-    const transcriptCues = shouldAnalyzeTranscript
-      ? await runRetentionStep({
-          jobId,
-          step: 'TRANSCRIBE',
-          maxRetries: 1,
-          statusUpdate: { status: 'analyzing', progress: 18 },
-          run: async () => {
-            const transcriptSrt = await generateSubtitles(tmpIn, analysisWorkDir, {
-              durationSeconds: duration,
-              renderMode: initialRenderConfig.mode,
-              fastMode: options.fastMode,
-              purpose: 'analysis',
-              inputBytes: inStats.size
-            }).catch(() => null)
-            if (!transcriptSrt) return [] as TranscriptCue[]
-            return parseTranscriptCues(transcriptSrt)
-          },
-          summarize: (cues) => ({
-            cueCount: cues.length,
-            hasTranscript: cues.length > 0,
-            transcriptCues: toTranscriptCuePreviewRows(cues)
-          })
-        })
-      : ([] as TranscriptCue[])
+    const transcriptCues = await runRetentionStep({
+      jobId,
+      step: 'TRANSCRIBE',
+      maxRetries: 1,
+      statusUpdate: { status: 'analyzing', progress: 18 },
+      run: async () => generateRequiredTranscriptCues({
+        inputPath: tmpIn,
+        workingDir: analysisWorkDir,
+        durationSeconds: duration,
+        renderMode: initialRenderConfig.mode,
+        fastMode: options.fastMode,
+        purpose: 'analysis',
+        inputBytes: inStats.size
+      }),
+      summarize: (cues) => ({
+        cueCount: cues.length,
+        hasTranscript: cues.length > 0,
+        transcriptCues: toTranscriptCuePreviewRows(cues)
+      })
+    })
 
     let editPlan: EditPlan | null = null
     let extractedFrameCount = 0
@@ -27915,24 +28530,7 @@ const processJob = async (
           : []
       if (storedTranscriptCuesRaw.length) {
         verticalSourceCues = storedTranscriptCuesRaw
-          .map((cue: any) => {
-            const start = Number(cue?.start)
-            const end = Number(cue?.end)
-            const text = typeof cue?.text === 'string' ? cue.text : ''
-            if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start || !text.trim()) return null
-            const words = parseTranscriptWordRows(cue?.words, start, end)
-            return {
-              start: Number(start.toFixed(3)),
-              end: Number(end.toFixed(3)),
-              text: text.trim(),
-              keywordIntensity: clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? 0)),
-              curiosityTrigger: clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? 0)),
-              fillerDensity: clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0)),
-              words: words.length ? words : undefined,
-              speaker: typeof cue?.speaker === 'string' && cue.speaker.trim().length ? cue.speaker.trim().slice(0, 24) : null,
-              language: typeof cue?.language === 'string' && cue.language.trim().length ? cue.language.trim().slice(0, 16) : null
-            } as TranscriptCue
-          })
+          .map((cue: any) => normalizeTranscriptCue(cue))
           .filter((cue: TranscriptCue | null): cue is TranscriptCue => Boolean(cue))
       }
       const verticalCaptionConfig = resolveVerticalCaptionConfigForState({
@@ -28644,53 +29242,34 @@ const processJob = async (
           ? ((job.analysis as any).transcriptCues as any[])
           : []
     )
-      .map((cue) => ({
-        start: Number(cue?.start),
-        end: Number(cue?.end),
-        text: String(cue?.text || ''),
-        keywordIntensity: Number(clamp01(Number(cue?.keywordIntensity ?? cue?.keyword_intensity ?? 0))),
-        curiosityTrigger: Number(clamp01(Number(cue?.curiosityTrigger ?? cue?.curiosity_trigger ?? 0))),
-        fillerDensity: Number(clamp01(Number(cue?.fillerDensity ?? cue?.filler_density ?? 0))),
-        words: Array.isArray(cue?.words) ? cue.words : undefined,
-        speaker: typeof cue?.speaker === 'string' ? cue.speaker : null,
-        language: typeof cue?.language === 'string' ? cue.language : null
-      }))
-      .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.01)
+      .map((cue) => normalizeTranscriptCue(cue))
+      .filter((cue): cue is TranscriptCue => Boolean(cue))
       .slice(0, 1200)
-    if (
-      renderConfig.mode === 'horizontal' &&
-      durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS &&
-      !processTranscriptCues.length
-    ) {
-      const transcriptRescueDir = path.join(workDir, 'hook-transcript-rescue')
+    if (!processTranscriptCues.length) {
+      const transcriptRescueDir = path.join(workDir, 'required-transcript-rescue')
       try {
         fs.mkdirSync(transcriptRescueDir, { recursive: true })
-        const rescuedTranscriptSrt = await generateSubtitles(tmpIn, transcriptRescueDir, {
+        processTranscriptCues = await generateRequiredTranscriptCues({
+          inputPath: tmpIn,
+          workingDir: transcriptRescueDir,
           durationSeconds,
           renderMode: renderConfig.mode,
           fastMode: options.fastMode,
           purpose: 'hook_rescue',
           inputBytes: inStats.size
         })
-        if (rescuedTranscriptSrt) {
-          const rescuedTranscriptCues = parseTranscriptCues(rescuedTranscriptSrt).slice(0, 1200)
-          if (rescuedTranscriptCues.length) {
-            processTranscriptCues = rescuedTranscriptCues
-            optimizationNotes.push(
-              'Hook transcript rescue generated transcript cues during render because analysis had none.'
-            )
-            console.log(`[${requestId || 'noid'}] transcript cue rescue enabled during process`, {
-              cueCount: processTranscriptCues.length,
-              durationSeconds
-            })
-          } else {
-            console.warn(`[${requestId || 'noid'}] transcript cue rescue produced no usable cues`)
-          }
-        } else {
-          console.warn(`[${requestId || 'noid'}] transcript cue rescue failed to generate subtitles`)
-        }
+        optimizationNotes.push(
+          'Required transcript recovery generated transcript cues during render because analysis had none.'
+        )
+        console.log(`[${requestId || 'noid'}] required transcript recovery enabled during process`, {
+          cueCount: processTranscriptCues.length,
+          durationSeconds
+        })
       } catch (error) {
-        console.warn(`[${requestId || 'noid'}] transcript cue rescue failed`, error)
+        console.warn(`[${requestId || 'noid'}] required transcript recovery failed`, error)
+        throw error instanceof Error
+          ? error
+          : buildTranscriptRequiredError('process_missing_transcript')
       }
     }
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
@@ -28882,7 +29461,8 @@ const processJob = async (
         segments: storySegments,
         silences: editPlan?.silences ?? [],
         durationSeconds,
-        recentHooks: recentSourceHookReuseWindows
+        recentHooks: recentSourceHookReuseWindows,
+        creativeVariant: options.creativeVariant
       })
       if (!resolvedHookDecision) {
         throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
@@ -29333,7 +29913,8 @@ const processJob = async (
           maxGapSeconds: attemptModePacingCaps.maxGapSeconds,
           maxTalkingHeadShotSeconds: attemptModePacingCaps.maxTalkingHeadShotSeconds,
           clarityVsSpeed: longFormRuntimeTuning.clarityVsSpeed,
-          enabled: longFormRuntimeTuning.isLongForm
+          enabled: longFormRuntimeTuning.isLongForm,
+          creativeVariant: options.creativeVariant
         })
         const microRehookResult = applyLongFormMicroRehooks({
           segments: pacingGovernedAttempt.segments,
@@ -31650,6 +32231,7 @@ const processJob = async (
             }
           : null,
         audio_polish_chain: audioFiltersForAnalysis,
+        transcript_cues: processTranscriptCues.slice(0, 1200),
         edited_transcript_cues: editedTranscriptCuesForAnalysis,
         output_upload_fallback: outputUploadFallbackUsed
           ? {
@@ -31851,6 +32433,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         maxCuts: getMaxCutsFromJob(existing),
         editorMode: getEditorModeFromJob(existing),
         pipelinePowerMode: getPipelinePowerModeFromJob(existing),
+        creativeVariant: getCreativeVariantFromJob(existing),
         hookSelectionMode: getHookSelectionModeFromJob(existing),
         longFormPreset: getLongFormPresetFromJob(existing),
         longFormAggression: getLongFormAggressionFromJob(existing),
@@ -31883,6 +32466,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         maxCuts: getMaxCutsFromJob(latestBeforeProcess),
         editorMode: getEditorModeFromJob(latestBeforeProcess),
         pipelinePowerMode: getPipelinePowerModeFromJob(latestBeforeProcess),
+        creativeVariant: getCreativeVariantFromJob(latestBeforeProcess),
         hookSelectionMode: getHookSelectionModeFromJob(latestBeforeProcess),
         longFormPreset: getLongFormPresetFromJob(latestBeforeProcess),
         longFormAggression: getLongFormAggressionFromJob(latestBeforeProcess),
@@ -32386,6 +32970,7 @@ const handleCreateJob = async (req: any, res: any) => {
     let soundFxOverride = getSoundFxFromPayload(req.body)
     let maxCutsOverride = getMaxCutsFromPayload(req.body)
     let editorModeOverride = getEditorModeFromPayload(req.body)
+    const creativeVariantOverride = getCreativeVariantFromPayload(req.body)
     let hookSelectionModeOverride = getHookSelectionModeFromPayload(req.body)
     let longFormPresetOverride = getLongFormPresetFromPayload(req.body)
     let longFormAggressionOverride = getLongFormAggressionFromPayload(req.body)
@@ -32539,6 +33124,7 @@ const handleCreateJob = async (req: any, res: any) => {
             soundFx: soundFxOverride,
             maxCuts: maxCutsOverride,
             editorMode: editorModeOverride,
+            creativeVariant: creativeVariantOverride,
             hookSelectionMode: hookSelectionModeOverride,
             longFormPreset: longFormPresetOverride,
             longFormAggression: longFormAggressionOverride,
@@ -32649,6 +33235,7 @@ const handleCreateJob = async (req: any, res: any) => {
             soundFx: soundFxOverride,
             maxCuts: maxCutsOverride,
             editorMode: editorModeOverride,
+            creativeVariant: creativeVariantOverride,
             pipelinePowerMode: createModePlaybook.id,
             hookSelectionMode: hookSelectionModeOverride,
             longFormPreset: longFormPresetOverride,
@@ -32716,6 +33303,7 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(onlyCutsOverride === null ? {} : { onlyCuts: onlyCutsOverride, onlyHookAndCut: onlyCutsOverride }),
             ...(maxCutsOverride === null ? {} : { maxCuts: maxCutsOverride, max_cuts: maxCutsOverride, maxCutsRequested: maxCutsOverride }),
             ...(editorModeOverride === null ? {} : { editorMode: editorModeOverride, editor_mode: editorModeOverride, contentMode: editorModeOverride }),
+            ...(creativeVariantOverride === null ? {} : { creativeVariant: creativeVariantOverride, creative_variant: creativeVariantOverride }),
             ...(hookSelectionModeOverride === null ? {} : { hookSelectionMode: hookSelectionModeOverride, hook_selection_mode: hookSelectionModeOverride }),
             ...(longFormPresetOverride === null ? {} : { longFormPreset: longFormPresetOverride, longformPreset: longFormPresetOverride, longform_preset: longFormPresetOverride }),
             ...(longFormAggressionOverride === null ? {} : { longFormAggression: longFormAggressionOverride, longformAggression: longFormAggressionOverride, long_form_aggression: longFormAggressionOverride }),
@@ -32730,9 +33318,10 @@ const handleCreateJob = async (req: any, res: any) => {
           smartZoom: smartZoomOverride,
           transitions: transitionsOverride,
           soundFx: soundFxOverride,
-          maxCuts: maxCutsOverride,
-          editorMode: editorModeOverride,
-          hookSelectionMode: hookSelectionModeOverride,
+            maxCuts: maxCutsOverride,
+            editorMode: editorModeOverride,
+            creativeVariant: creativeVariantOverride,
+            hookSelectionMode: hookSelectionModeOverride,
           longFormPreset: longFormPresetOverride,
           longFormAggression: longFormAggressionOverride,
           longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
@@ -33288,6 +33877,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const resolvedOnlyCuts = onlyCutsOverride ?? getOnlyCutsFromJob(job)
     const resolvedMaxCuts = maxCutsOverride ?? getMaxCutsFromJob(job)
     const resolvedEditorModeRaw = editorModeOverride ?? getEditorModeFromJob(job)
+    const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { plan, tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
@@ -33372,6 +33962,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
       ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: resolvedLongFormPreset,
       longformPreset: resolvedLongFormPreset,
       longform_preset: resolvedLongFormPreset,
@@ -33414,6 +34006,8 @@ const handleCompleteUpload = async (req: any, res: any) => {
       ...(resolvedOnlyCuts === null ? {} : { onlyCuts: resolvedOnlyCuts, onlyHookAndCut: resolvedOnlyCuts }),
       ...(resolvedMaxCuts === null ? {} : { maxCuts: resolvedMaxCuts, max_cuts: resolvedMaxCuts, maxCutsRequested: resolvedMaxCuts }),
       ...(resolvedEditorMode === null ? {} : { editorMode: resolvedEditorMode, editor_mode: resolvedEditorMode, contentMode: resolvedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: resolvedLongFormPreset,
       longformPreset: resolvedLongFormPreset,
       longform_preset: resolvedLongFormPreset,
@@ -33505,6 +34099,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
@@ -33538,6 +34133,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -33585,6 +34182,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -33619,6 +34218,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      creativeVariant: requestedCreativeVariant,
       pipelinePowerMode: (
         getPipelinePowerModeFromPayload(req.body) ??
         getPipelinePowerModeFromJob(job)
@@ -33711,6 +34311,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedOnlyCuts = getOnlyCutsFromPayload(req.body) ?? getOnlyCutsFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
@@ -33744,6 +34345,8 @@ router.post('/:id/process', async (req: any, res) => {
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -33791,6 +34394,8 @@ router.post('/:id/process', async (req: any, res) => {
       ...(requestedOnlyCuts === null ? {} : { onlyCuts: requestedOnlyCuts, onlyHookAndCut: requestedOnlyCuts }),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -33825,6 +34430,7 @@ router.post('/:id/process', async (req: any, res) => {
       onlyCuts: requestedOnlyCuts,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      creativeVariant: requestedCreativeVariant,
       pipelinePowerMode: (
         getPipelinePowerModeFromPayload(req.body) ??
         getPipelinePowerModeFromJob(job)
@@ -34006,6 +34612,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedSoundFx = getSoundFxFromPayload(req.body) ?? getSoundFxFromJob(job)
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
+    const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
     const effectiveTier: PlanTier = devBypass ? 'studio' : tier
@@ -34038,6 +34645,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         soundFx: requestedSoundFx,
         maxCuts: requestedMaxCuts,
         editorMode: requestedEditorMode,
+        creativeVariant: requestedCreativeVariant,
         pipelinePowerMode: (
           getPipelinePowerModeFromPayload(req.body) ??
           getPipelinePowerModeFromJob(job)
@@ -34085,6 +34693,8 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         top_human_guard_mode: requestedTopHumanGuardMode,
         creatorStyleLock: requestedCreatorStyleLockPercent,
         creator_style_lock: requestedCreatorStyleLockPercent,
+        creativeVariant: requestedCreativeVariant,
+        creative_variant: requestedCreativeVariant,
         style_archetype_blend_override: styleBlendOverride
       },
       renderConfig: effectiveRenderConfig,
@@ -34096,6 +34706,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       soundFx: requestedSoundFx,
       maxCuts: requestedMaxCuts,
       editorMode: requestedEditorMode,
+      creativeVariant: requestedCreativeVariant,
       hookSelectionMode: requestedHookSelectionMode,
       longFormPreset: requestedLongFormPreset,
       longFormAggression: requestedLongFormAggression,
@@ -34371,6 +34982,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedMaxCuts = getMaxCutsFromPayload(req.body) ?? getMaxCutsFromJob(job)
     const requestedEditorModeRaw = getEditorModeFromPayload(req.body) ?? getEditorModeFromJob(job)
     const requestedEditorMode = resolveEditorModeForTier(requestedEditorModeRaw, effectiveTier)
+    const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const requestedHookSelectionMode = getHookSelectionModeFromPayload(req.body) ?? getHookSelectionModeFromJob(job) ?? 'auto'
     const requestedLongFormPreset = getLongFormPresetFromPayload(req.body) ?? getLongFormPresetFromJob(job)
     const requestedLongFormAggression = getLongFormAggressionFromPayload(req.body) ?? getLongFormAggressionFromJob(job)
@@ -34441,6 +35053,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -34506,6 +35120,8 @@ router.post('/:id/reprocess', async (req: any, res) => {
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride),
       ...(requestedMaxCuts === null ? {} : { maxCuts: requestedMaxCuts, max_cuts: requestedMaxCuts, maxCutsRequested: requestedMaxCuts }),
       ...(requestedEditorMode === null ? {} : { editorMode: requestedEditorMode, editor_mode: requestedEditorMode, contentMode: requestedEditorMode }),
+      creativeVariant: requestedCreativeVariant,
+      creative_variant: requestedCreativeVariant,
       longFormPreset: requestedLongFormPreset,
       longformPreset: requestedLongFormPreset,
       longform_preset: requestedLongFormPreset,
@@ -35456,18 +36072,8 @@ const buildEditPlanForTest = async ({
   }
   let normalizedTranscriptCues: TranscriptCue[] = Array.isArray(transcriptCues)
     ? transcriptCues
-        .map((cue) => ({
-          start: Number(cue?.start),
-          end: Number(cue?.end),
-          text: String(cue?.text || ''),
-          keywordIntensity: Number(clamp01(Number(cue?.keywordIntensity ?? 0))),
-          curiosityTrigger: Number(clamp01(Number(cue?.curiosityTrigger ?? 0))),
-          fillerDensity: Number(clamp01(Number(cue?.fillerDensity ?? 0))),
-          words: Array.isArray(cue?.words) ? cue.words : undefined,
-          speaker: typeof cue?.speaker === 'string' ? cue.speaker : null,
-          language: typeof cue?.language === 'string' ? cue.language : null
-        }))
-        .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start + 0.01)
+        .map((cue) => normalizeTranscriptCue(cue))
+        .filter((cue): cue is TranscriptCue => Boolean(cue))
     : []
   if (!normalizedTranscriptCues.length && transcriptSrtPath) {
     const absoluteSrt = path.resolve(String(transcriptSrtPath))
@@ -35531,7 +36137,8 @@ const buildEditPlanForTest = async ({
     segments: planSegments,
     silences: planSilences,
     durationSeconds,
-    recentHooks: null
+    recentHooks: null,
+    creativeVariant: options.creativeVariant
   })
   const resolvedHook = hookDecision?.candidate || buildFallbackHookCandidateFromStorySegments({
     segments: planSegments,
