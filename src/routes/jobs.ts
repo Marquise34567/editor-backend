@@ -2433,21 +2433,38 @@ const RENDER_CODEC_THREADS = (() => {
   if (!Number.isFinite(envValue) || envValue < 1) return 1
   return Math.min(8, Math.round(envValue))
 })()
-const FAST_MODE_FFMPEG_PRESET = String(process.env.FAST_MODE_FFMPEG_PRESET || 'ultrafast').trim() || 'ultrafast'
+const normalizeX264Preset = (value: unknown, fallback: string) => {
+  const raw = String(value || '').trim().toLowerCase()
+  const allowed = new Set([
+    'ultrafast',
+    'superfast',
+    'veryfast',
+    'faster',
+    'fast',
+    'medium',
+    'slow',
+    'slower',
+    'veryslow'
+  ])
+  if (!raw) return fallback
+  return allowed.has(raw) ? raw : fallback
+}
+const FAST_MODE_FFMPEG_PRESET = normalizeX264Preset(process.env.FAST_MODE_FFMPEG_PRESET, 'superfast')
 const FAST_MODE_FFMPEG_CRF = (() => {
-  const envValue = Number(process.env.FAST_MODE_FFMPEG_CRF || 23)
-  if (!Number.isFinite(envValue)) return 23
-  return Math.round(Math.min(35, Math.max(22, envValue)))
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_CRF || 21)
+  if (!Number.isFinite(envValue)) return 21
+  // Keep fast-mode quality inside a safe floor so uploads do not come out visibly soft.
+  return Math.round(Math.min(24, Math.max(18, envValue)))
 })()
 const FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS = (() => {
-  const envValue = Number(process.env.FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS || 160)
-  if (!Number.isFinite(envValue)) return 160
-  return Math.round(Math.min(256, Math.max(64, envValue)))
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS || 192)
+  if (!Number.isFinite(envValue)) return 192
+  return Math.round(Math.min(320, Math.max(160, envValue)))
 })()
 const FORCE_RENDER_STAGE_MAX_SPEED = !/^(0|false|no)$/i.test(
-  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'true').trim()
+  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'false').trim()
 )
-const FORCE_RENDER_STAGE_PRESET = String(process.env.FORCE_RENDER_STAGE_PRESET || 'ultrafast').trim() || 'ultrafast'
+const FORCE_RENDER_STAGE_PRESET = normalizeX264Preset(process.env.FORCE_RENDER_STAGE_PRESET, 'superfast')
 const FORCE_RENDER_STAGE_CODEC_THREADS = (() => {
   const envValue = Number(process.env.FORCE_RENDER_STAGE_CODEC_THREADS || 1)
   if (Number.isFinite(envValue) && envValue >= 1) return Math.round(Math.min(32, Math.max(1, envValue)))
@@ -28450,6 +28467,42 @@ const buildAudioFilters = ({
   return filters
 }
 
+const buildFastModeAudioFilters = ({
+  aggressionLevel,
+  audioProfile
+}: {
+  aggressionLevel: RetentionAggressionLevel
+  audioProfile?: AudioStreamProfile | null
+}) => {
+  const sourceChannels = Math.max(1, Number(audioProfile?.channels || 2))
+  const sourceLayout = String(audioProfile?.channelLayout || '').toLowerCase()
+  const sourceIsMono = sourceChannels <= 1 || sourceLayout.includes('mono')
+  const targetLoudness = aggressionLevel === 'viral'
+    ? -13.8
+    : aggressionLevel === 'high'
+      ? -14
+      : aggressionLevel === 'low'
+        ? -14.8
+        : -14.4
+  const filters: string[] = [
+    'highpass=f=72',
+    'lowpass=f=17500',
+    'acompressor=threshold=-18dB:ratio=2.6:attack=14:release=180:makeup=1.8',
+    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.2:LRA=10`
+  ]
+  if (sourceIsMono) {
+    if (hasFfmpegFilter('haas')) {
+      filters.push('haas')
+    } else if (hasFfmpegFilter('extrastereo')) {
+      filters.push('extrastereo=m=1.35:c=0.0')
+    }
+  }
+  if (hasFfmpegFilter('alimiter')) {
+    filters.push('alimiter=limit=0.97:level=true')
+  }
+  return filters
+}
+
 const buildVerticalVoiceFilters = (preset: VerticalVoicePreset): string[] => {
   const resolved = parseVerticalVoicePreset(preset) || 'none'
   if (resolved === 'none') return []
@@ -33594,15 +33647,26 @@ const processJob = async (
           musicDuck: options.musicDuck
         })
       }
-      const audioFilters = withAudio && !renderFastMode
-        ? buildAudioFilters({
-            aggressionLevel,
-            styleProfile: styleProfileForAnalysis,
-            audioProfile: audioProfileForAnalysis
-          })
+      const audioFilters = withAudio
+        ? (
+          renderFastMode
+            ? buildFastModeAudioFilters({
+                aggressionLevel,
+                audioProfile: audioProfileForAnalysis
+              })
+            : buildAudioFilters({
+                aggressionLevel,
+                styleProfile: styleProfileForAnalysis,
+                audioProfile: audioProfileForAnalysis
+              })
+        )
         : []
       if (renderFastMode && withAudio) {
-        optimizationNotes.push('Render speed mode: audio polish filters skipped for quicker render.')
+        optimizationNotes.push(
+          audioFilters.length
+            ? 'Render speed mode: lightweight audio normalization chain enabled.'
+            : 'Render speed mode: audio normalization unavailable with current FFmpeg build.'
+        )
       }
       audioFiltersForAnalysis = audioFilters.slice()
       await updateJob(jobId, { status: 'retention', progress: 72 })
