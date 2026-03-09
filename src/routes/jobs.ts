@@ -2390,7 +2390,7 @@ const FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS = (() => {
   return Math.round(Math.min(256, Math.max(64, envValue)))
 })()
 const FORCE_RENDER_STAGE_MAX_SPEED = !/^(0|false|no)$/i.test(
-  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'true').trim()
+  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'false').trim()
 )
 const FORCE_RENDER_STAGE_PRESET = String(process.env.FORCE_RENDER_STAGE_PRESET || 'ultrafast').trim() || 'ultrafast'
 const FORCE_RENDER_STAGE_CODEC_THREADS = (() => {
