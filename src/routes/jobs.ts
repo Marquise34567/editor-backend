@@ -25861,6 +25861,7 @@ const generateRequiredTranscriptCues = async ({
   inputBytes?: number | null
   cueLimit?: number
 }) => {
+  const allowsFallbackWithoutTranscript = purpose === 'analysis' || purpose === 'hook_rescue'
   const transcriptSrt = await generateSubtitles(inputPath, workingDir, {
     durationSeconds,
     renderMode,
@@ -25869,10 +25870,24 @@ const generateRequiredTranscriptCues = async ({
     inputBytes
   })
   if (!transcriptSrt) {
+    if (allowsFallbackWithoutTranscript) {
+      console.warn(`[transcript] ${purpose} cues unavailable; continuing without transcript cues`, {
+        durationSeconds,
+        renderMode
+      })
+      return [] as TranscriptCue[]
+    }
     throw buildTranscriptRequiredError(`${purpose}_subtitle_generation_failed`)
   }
   const transcriptCues = parseTranscriptCues(transcriptSrt).slice(0, Math.max(1, cueLimit))
   if (!transcriptCues.length) {
+    if (allowsFallbackWithoutTranscript) {
+      console.warn(`[transcript] ${purpose} produced no usable cues; continuing without transcript cues`, {
+        durationSeconds,
+        renderMode
+      })
+      return [] as TranscriptCue[]
+    }
     throw buildTranscriptRequiredError(`${purpose}_no_usable_cues`)
   }
   return transcriptCues
