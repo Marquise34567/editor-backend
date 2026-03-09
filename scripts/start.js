@@ -62,25 +62,29 @@ const hasDatabaseUrl = Boolean(String(process.env.DATABASE_URL || '').trim())
 const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
 const shouldBuildOnStartup = parseBool(process.env.BUILD_ON_STARTUP)
 const shouldGeneratePrismaOnStartup = parseBool(process.env.PRISMA_GENERATE_ON_STARTUP)
+const shouldStartWorker = parseBool(process.env.JOB_PROCESSOR_ENABLED) && !parseBool(process.env.FORCE_API_SERVER)
 const rawCaptionRuntimeInstallToggle = String(
   process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
   process.env.INSTALL_CAPTION_RUNTIME ??
   ''
 ).trim()
 const shouldInstallCaptionRuntimeOnStartup = !/^(0|false|no|off)$/i.test(rawCaptionRuntimeInstallToggle)
-const distEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
+const apiDistEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
+const workerDistEntryPath = path.resolve(process.cwd(), 'dist', 'worker.js')
+const primaryDistEntryPath = shouldStartWorker ? workerDistEntryPath : apiDistEntryPath
 const sourceMtimeMs = Math.max(
   getLatestMtimeMs(path.resolve(process.cwd(), 'src')),
   getLatestMtimeMs(path.resolve(process.cwd(), 'prisma')),
   getLatestMtimeMs(path.resolve(process.cwd(), 'tsconfig.json'))
 )
-const distMtimeMs = getLatestMtimeMs(distEntryPath)
+const distMtimeMs = getLatestMtimeMs(primaryDistEntryPath)
 const distStale = sourceMtimeMs > distMtimeMs + 1000
 
-if (shouldBuildOnStartup || !existsSync(distEntryPath) || distStale) {
+if (shouldBuildOnStartup || !existsSync(primaryDistEntryPath) || distStale) {
   run('Building backend', 'npm run build')
 } else {
-  console.log('[startup] Skipping startup build; dist/index.js is up to date')
+  const targetLabel = shouldStartWorker ? 'dist/worker.js' : 'dist/index.js'
+  console.log(`[startup] Skipping startup build; ${targetLabel} is up to date`)
 }
 
 if (shouldGeneratePrismaOnStartup) {
@@ -103,5 +107,10 @@ if (!hasDatabaseUrl) {
   run('Applying Prisma migrations', 'prisma migrate deploy', { allowFailure: true })
 }
 
-console.log('[startup] Starting API server')
-require('../dist/index.js')
+if (shouldStartWorker) {
+  console.log('[startup] Starting pipeline worker')
+  require('../dist/worker.js')
+} else {
+  console.log('[startup] Starting API server')
+  require('../dist/index.js')
+}
