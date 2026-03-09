@@ -84,6 +84,19 @@ const installWithFallback = (pythonBin, extraArgs, opts = {}) => {
   return runPipInstall(pythonBin, ['--break-system-packages', ...extraArgs])
 }
 
+const hasUsablePip = (pythonBin) => {
+  const probe = spawnSync(
+    pythonBin,
+    ['-m', 'pip', '--version'],
+    {
+      encoding: 'utf8',
+      stdio: 'pipe',
+      windowsHide: true
+    }
+  )
+  return !probe.error && probe.status === 0
+}
+
 const resolveVenvPythonPath = (venvDir) => (
   process.platform === 'win32'
     ? path.join(venvDir, 'Scripts', 'python.exe')
@@ -98,13 +111,33 @@ const venvDir = path.resolve(
 const venvPython = resolveVenvPythonPath(venvDir)
 
 const ensureVenv = () => {
-  if (existsSync(venvPython)) return true
-  console.log(`[caption-runtime] creating virtualenv at ${venvDir}`)
-  const result = spawnSync(pythonCommand, ['-m', 'venv', venvDir], {
+  if (!existsSync(venvPython)) {
+    console.log(`[caption-runtime] creating virtualenv at ${venvDir}`)
+    const result = spawnSync(pythonCommand, ['-m', 'venv', venvDir], {
+      stdio: 'inherit',
+      windowsHide: true
+    })
+    if (result.status !== 0 || !existsSync(venvPython)) return false
+  }
+  if (hasUsablePip(venvPython)) return true
+
+  // Debian/Ubuntu slim images can create venvs without pip; recover before falling back to global installs.
+  console.warn('[caption-runtime] virtualenv missing pip; attempting ensurepip bootstrap')
+  const ensurePipResult = spawnSync(venvPython, ['-m', 'ensurepip', '--upgrade'], {
     stdio: 'inherit',
     windowsHide: true
   })
-  return result.status === 0 && existsSync(venvPython)
+  if (ensurePipResult.status === 0 && hasUsablePip(venvPython)) return true
+
+  console.warn('[caption-runtime] ensurepip unavailable; attempting virtualenv bootstrap')
+  const virtualenvInstalled = installWithFallback(pythonCommand, ['--upgrade', 'virtualenv'])
+  if (!virtualenvInstalled) return false
+  const rebuildResult = spawnSync(pythonCommand, ['-m', 'virtualenv', '--clear', venvDir], {
+    stdio: 'inherit',
+    windowsHide: true
+  })
+  if (rebuildResult.status !== 0 || !existsSync(venvPython)) return false
+  return hasUsablePip(venvPython)
 }
 
 const persistPythonPointer = (pythonBin) => {
