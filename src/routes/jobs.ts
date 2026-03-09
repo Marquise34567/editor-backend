@@ -15296,7 +15296,16 @@ const toTranscriptCuePreviewRows = (cues: TranscriptCue[], limit = 1200) => (
     .filter((cue) => Number.isFinite(cue.start) && Number.isFinite(cue.end) && cue.end > cue.start && cue.text.length > 0)
 )
 
-const buildTranscriptRequiredError = (reason: string) => new Error(`transcript_required:${reason}`)
+const TRANSCRIPT_REQUIRED_ERROR_PREFIX = 'transcript_required:'
+
+const buildTranscriptRequiredError = (reason: string) => new Error(`${TRANSCRIPT_REQUIRED_ERROR_PREFIX}${reason}`)
+
+const parseTranscriptRequiredReason = (error: any) => {
+  const message = String(error?.message || error || '').trim()
+  if (!message.startsWith(TRANSCRIPT_REQUIRED_ERROR_PREFIX)) return null
+  const reason = message.slice(TRANSCRIPT_REQUIRED_ERROR_PREFIX.length).trim()
+  return reason || null
+}
 
 const toSegmentPreviewRows = (segments: Segment[], limit = 1200) => (
   segments
@@ -30304,26 +30313,49 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
     const editorModePlaybook = resolvePipelinePowerModePlaybook(pipelinePowerMode)
     const playbookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
     const hookCalibration = await loadHookCalibrationProfile(job.userId)
-    const transcriptCues = await runRetentionStep({
-      jobId,
-      step: 'TRANSCRIBE',
-      maxRetries: 1,
-      statusUpdate: { status: 'analyzing', progress: 18 },
-      run: async () => generateRequiredTranscriptCues({
-        inputPath: tmpIn,
-        workingDir: analysisWorkDir,
-        durationSeconds: duration,
-        renderMode: initialRenderConfig.mode,
-        fastMode: options.fastMode,
-        purpose: 'analysis',
-        inputBytes: inStats.size
-      }),
-      summarize: (cues) => ({
-        cueCount: cues.length,
-        hasTranscript: cues.length > 0,
-        transcriptCues: toTranscriptCuePreviewRows(cues)
+    let transcriptCues: TranscriptCue[] = []
+    try {
+      transcriptCues = await runRetentionStep({
+        jobId,
+        step: 'TRANSCRIBE',
+        maxRetries: 1,
+        statusUpdate: { status: 'analyzing', progress: 18 },
+        run: async () => generateRequiredTranscriptCues({
+          inputPath: tmpIn,
+          workingDir: analysisWorkDir,
+          durationSeconds: duration,
+          renderMode: initialRenderConfig.mode,
+          fastMode: options.fastMode,
+          purpose: 'analysis',
+          inputBytes: inStats.size
+        }),
+        summarize: (cues) => ({
+          cueCount: cues.length,
+          hasTranscript: cues.length > 0,
+          transcriptCues: toTranscriptCuePreviewRows(cues)
+        })
       })
-    })
+    } catch (error: any) {
+      const transcriptReason = parseTranscriptRequiredReason(error)
+      if (!transcriptReason || !transcriptReason.startsWith('analysis_')) throw error
+      transcriptCues = []
+      console.warn(`[${requestId || 'noid'}] analysis transcript unavailable, continuing in no-transcript mode`, {
+        reason: transcriptReason,
+        durationSeconds: duration,
+        inputBytes: inStats.size
+      })
+      await updatePipelineStepState(jobId, 'TRANSCRIBE', {
+        status: 'completed',
+        completedAt: toIsoNow(),
+        lastError: truncateErrorText(error?.message || error) || 'analysis_transcript_unavailable',
+        meta: {
+          cueCount: 0,
+          hasTranscript: false,
+          fallback: 'no_transcript_mode',
+          reason: transcriptReason
+        }
+      })
+    }
 
     let editPlan: EditPlan | null = null
     let extractedFrameCount = 0
@@ -31884,10 +31916,22 @@ const processJob = async (
           durationSeconds
         })
       } catch (error) {
-        console.warn(`[${requestId || 'noid'}] required transcript recovery failed`, error)
-        throw error instanceof Error
-          ? error
-          : buildTranscriptRequiredError('process_missing_transcript')
+        const transcriptReason = parseTranscriptRequiredReason(error)
+        if (!transcriptReason || !transcriptReason.startsWith('hook_rescue_')) {
+          console.warn(`[${requestId || 'noid'}] required transcript recovery failed`, error)
+          throw error instanceof Error
+            ? error
+            : buildTranscriptRequiredError('process_missing_transcript')
+        }
+        processTranscriptCues = []
+        optimizationNotes.push(
+          'Transcript recovery unavailable; continued in no-transcript mode (caption generation may be limited).'
+        )
+        console.warn(`[${requestId || 'noid'}] transcript recovery unavailable, continuing in no-transcript mode`, {
+          reason: transcriptReason,
+          durationSeconds,
+          inputBytes: inStats.size
+        })
       }
     }
     let beatAnchorsForAnalysis: number[] = Array.isArray((job.analysis as any)?.beat_anchors)
