@@ -34390,12 +34390,34 @@ const processJob = async (
           renderedDurationBeforeGuard > 0 &&
           renderedDurationBeforeGuard + 1 < minimumRenderedDuration
         ) {
+          const runtimeHookCandidate = selectedHook || initialHook
+          let runtimeRescueTimeline: Segment[] = buildGuaranteedFallbackSegments(durationSeconds, {
+            ...options,
+            aggressiveMode: false,
+            onlyCuts: false
+          })
+          if (runtimeHookCandidate && shouldMoveHookForRender) {
+            const hookRange: TimeRange = {
+              start: Number(runtimeHookCandidate.start || 0),
+              end: Number((Number(runtimeHookCandidate.start || 0) + Number(runtimeHookCandidate.duration || 0)).toFixed(3))
+            }
+            const hookSegment: Segment = {
+              start: Number(hookRange.start.toFixed(3)),
+              end: Number(hookRange.end.toFixed(3)),
+              speed: 1,
+              subtitleIntent: 'hook',
+              emphasize: true,
+              transitionStyle: 'smooth',
+              audioLeadInMs: 140,
+              audioTailMs: 180
+            }
+            runtimeRescueTimeline = [
+              hookSegment,
+              ...subtractRange(runtimeRescueTimeline.map((segment) => ({ ...segment })), hookRange)
+            ]
+          }
           const conservativeRuntimeSegments = prepareSegmentsForRender(
-            buildGuaranteedFallbackSegments(durationSeconds, {
-              ...options,
-              aggressiveMode: false,
-              onlyCuts: false
-            }),
+            runtimeRescueTimeline,
             durationSeconds,
             processTranscriptCues
           )
@@ -34405,6 +34427,11 @@ const processJob = async (
               const renderedDurationAfterGuard = Number(getDurationSeconds(tmpOut) || 0)
               if (renderedDurationAfterGuard > renderedDurationBeforeGuard + 0.5) {
                 finalSegments = conservativeRuntimeSegments
+                selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+                  sourceStart: Number(segment.start.toFixed(3)),
+                  sourceEnd: Number(segment.end.toFixed(3)),
+                  orderedIndex
+                }))
                 optimizationNotes.push(
                   `Horizontal runtime floor rescue applied (${(renderedDurationBeforeGuard / 60).toFixed(2)}m -> ${(renderedDurationAfterGuard / 60).toFixed(2)}m; floor ${(runtimeFloorRatio * 100).toFixed(1)}%).`
                 )
@@ -34475,6 +34502,11 @@ const processJob = async (
               })
               if (!rescueAudit.noOp || rescueRenderedDuration + 0.5 < renderedDurationAfterFloorGuard) {
                 finalSegments = noOpRescueSegments
+                selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+                  sourceStart: Number(segment.start.toFixed(3)),
+                  sourceEnd: Number(segment.end.toFixed(3)),
+                  orderedIndex
+                }))
                 optimizationNotes.push(
                   `No-op rescue applied (${noOpAudit.reasons.join(', ')}; impact ${(noOpAudit.impact * 100).toFixed(1)}% -> ${(rescueAudit.impact * 100).toFixed(1)}%).`
                 )
@@ -34483,6 +34515,27 @@ const processJob = async (
               console.warn(`[${requestId || 'noid'}] no-op rescue render failed`, noOpRescueError)
             }
           }
+        }
+        finalSegmentsForAnalysis = finalSegments.map((segment) => ({ ...segment }))
+        if (selectedHook && finalSegmentsForAnalysis.length) {
+          const styleName = behaviorStyleProfileForAnalysis?.styleName || `${strategyProfile}_adaptive_v1`
+          const resolvedBlendForDecision = styleArchetypeBlendForAnalysis || behaviorStyleProfileForAnalysis?.archetypeBlend || null
+          editDecisionTimelineForAnalysis = buildEditDecisionTimeline({
+            styleName,
+            hook: { start: selectedHook.start },
+            segments: finalSegmentsForAnalysis,
+            patternInterruptCount: selectedPatternInterruptCount,
+            autoEscalationEvents: selectedAutoEscalationEvents,
+            includeBrollMarkers: Boolean(
+              resolvedBlendForDecision &&
+              Number(resolvedBlendForDecision.cinematic_lifestyle_archive) >= 0.24
+            )
+          })
+          styleFeatureSnapshotForAnalysis = extractTimelineFeatures({
+            timeline: editDecisionTimelineForAnalysis,
+            durationSeconds,
+            energySamples: energySamplesForEscalation
+          })
         }
       }
     }
