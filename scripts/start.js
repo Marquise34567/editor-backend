@@ -62,7 +62,12 @@ const hasDatabaseUrl = Boolean(String(process.env.DATABASE_URL || '').trim())
 const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
 const shouldBuildOnStartup = parseBool(process.env.BUILD_ON_STARTUP)
 const shouldGeneratePrismaOnStartup = parseBool(process.env.PRISMA_GENERATE_ON_STARTUP)
-const shouldInstallCaptionRuntimeOnStartup = parseBool(process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP)
+const rawCaptionRuntimeInstallToggle = String(
+  process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
+  process.env.INSTALL_CAPTION_RUNTIME ??
+  ''
+).trim()
+const shouldInstallCaptionRuntimeOnStartup = !/^(0|false|no|off)$/i.test(rawCaptionRuntimeInstallToggle)
 const distEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
 const sourceMtimeMs = Math.max(
   getLatestMtimeMs(path.resolve(process.cwd(), 'src')),

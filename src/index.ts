@@ -14,12 +14,13 @@ const STARTUP_CHECK_TIMEOUT_MS = 5_000
 const REQUIRE_FFMPEG_ON_STARTUP = /^(1|true|yes)$/i.test(
   String(process.env.REQUIRE_FFMPEG_ON_STARTUP || '').trim()
 )
-const SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP = /^(1|true|yes|on)$/i.test(
-  String(
-    process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
-    process.env.INSTALL_CAPTION_RUNTIME ??
-    ''
-  ).trim()
+const RAW_CAPTION_RUNTIME_INSTALL_TOGGLE = String(
+  process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
+  process.env.INSTALL_CAPTION_RUNTIME ??
+  ''
+).trim()
+const SHOULD_INSTALL_CAPTION_RUNTIME_ON_STARTUP = !/^(0|false|no|off)$/i.test(
+  RAW_CAPTION_RUNTIME_INSTALL_TOGGLE
 )
 
 const server = createServer(app)
