@@ -24216,6 +24216,14 @@ const alignSegmentsToTranscriptBoundariesForRender = (
   for (const segment of sorted) {
     const normalized = normalizeSegmentForRender(segment, durationSeconds)
     if (!normalized) continue
+    if (
+      preserveTimelineOrder &&
+      aligned.length === 0 &&
+      normalized.subtitleIntent === 'hook'
+    ) {
+      aligned.push({ ...normalized })
+      continue
+    }
     const span = Math.max(MIN_RENDER_SEGMENT_SECONDS, normalized.end - normalized.start)
     const maxShift = clamp(span * 0.2, 0.04, 0.2)
     const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, boundaries, maxShift)
