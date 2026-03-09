@@ -2317,6 +2317,38 @@ const FILTER_COMPLEX_SCRIPT_THRESHOLD = (() => {
 const SILENCE_DB = -30
 const SILENCE_MIN = 0.8
 const SILENCE_KEEP_PADDING_SEC = 0.2
+const IS_RAILWAY_RUNTIME = Boolean(
+  process.env.RAILWAY_PROJECT_ID ||
+  process.env.RAILWAY_SERVICE_ID ||
+  process.env.RAILWAY_REPLICA_ID ||
+  process.env.RAILWAY_ENVIRONMENT ||
+  process.env.RAILWAY_ENVIRONMENT_NAME
+)
+const AUTO_FAST_RUNTIME_PROFILE_ENABLED = (() => {
+  const raw = String(process.env.AUTO_FAST_RUNTIME_PROFILE_ENABLED || '').trim()
+  if (!raw) return IS_RAILWAY_RUNTIME
+  return /^(1|true|yes)$/i.test(raw)
+})()
+const AUTO_FAST_RUNTIME_PROFILE_MIN_DURATION_SECONDS = (() => {
+  const envValue = Number(process.env.AUTO_FAST_RUNTIME_PROFILE_MIN_DURATION_SECONDS || 6 * 60)
+  if (!Number.isFinite(envValue) || envValue < 60) return 6 * 60
+  return Math.round(envValue)
+})()
+const AUTO_FAST_RUNTIME_PROFILE_MIN_INPUT_BYTES = (() => {
+  const envValue = Number(process.env.AUTO_FAST_RUNTIME_PROFILE_MIN_INPUT_BYTES || 90 * 1024 * 1024)
+  if (!Number.isFinite(envValue) || envValue < 30 * 1024 * 1024) return 90 * 1024 * 1024
+  return Math.round(envValue)
+})()
+const AUTO_FAST_RUNTIME_PROFILE_ANALYZE_CAP_SECONDS = (() => {
+  const envValue = Number(process.env.AUTO_FAST_RUNTIME_PROFILE_ANALYZE_CAP_SECONDS || 12 * 60)
+  if (!Number.isFinite(envValue) || envValue < 120) return 12 * 60
+  return Math.round(envValue)
+})()
+const AUTO_FAST_RUNTIME_PROFILE_MAX_VERTICAL_CLIPS = (() => {
+  const envValue = Number(process.env.AUTO_FAST_RUNTIME_PROFILE_MAX_VERTICAL_CLIPS || 6)
+  if (!Number.isFinite(envValue) || envValue < 3) return 6
+  return Math.round(Math.max(3, Math.min(12, envValue)))
+})()
 const HOOK_ANALYZE_MAX = (() => {
   const envValue = Number(process.env.HOOK_ANALYZE_MAX_SECONDS || 1800)
   return Number.isFinite(envValue) && envValue >= 45 ? Math.round(envValue) : 1800
@@ -2366,6 +2398,29 @@ const ANALYSIS_FAST_PATH_SCALE_WIDTH = (() => {
   const envValue = Number(process.env.ANALYSIS_FAST_PATH_SCALE_WIDTH || 300)
   return Number.isFinite(envValue) && envValue >= 160 ? Math.round(envValue) : 300
 })()
+const shouldUseRuntimeFastProfile = ({
+  durationSeconds,
+  inputBytes
+}: {
+  durationSeconds?: number | null
+  inputBytes?: number | null
+}) => {
+  if (!AUTO_FAST_RUNTIME_PROFILE_ENABLED) return false
+  const duration = Number(durationSeconds || 0)
+  const bytes = Number(inputBytes || 0)
+  return (
+    (Number.isFinite(duration) && duration >= AUTO_FAST_RUNTIME_PROFILE_MIN_DURATION_SECONDS) ||
+    (Number.isFinite(bytes) && bytes >= AUTO_FAST_RUNTIME_PROFILE_MIN_INPUT_BYTES)
+  )
+}
+const resolveAnalysisWindowSeconds = (durationSeconds: number) => {
+  const baseline = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  if (!AUTO_FAST_RUNTIME_PROFILE_ENABLED) return baseline
+  if (!Number.isFinite(durationSeconds) || durationSeconds < AUTO_FAST_RUNTIME_PROFILE_MIN_DURATION_SECONDS) {
+    return baseline
+  }
+  return Math.max(45, Math.min(baseline, AUTO_FAST_RUNTIME_PROFILE_ANALYZE_CAP_SECONDS))
+}
 const ANALYSIS_DISABLE_FACE_DETECTION = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_FACE_DETECTION || '').trim())
 const ANALYSIS_DISABLE_TEXT_DENSITY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_TEXT_DENSITY || '').trim())
 const ANALYSIS_DISABLE_EMOTION_MODEL = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_EMOTION_MODEL || '').trim())
@@ -2669,14 +2724,14 @@ Mission: create a cliffhanger/teaser opener built around the single most surpris
 Core hook rules:
 1) First 1-3 seconds must be a scroll-stopper: motion/surprise/contrast/pattern-break in frame one.
 2) Select the #1 peak moment and rate it 1-10 for surprise/intrigue/funny/crazy with a short reason.
-3) Tease at least 8 seconds from or immediately leading into that moment; never reveal payoff too early.
+3) Tease in a 5-8 second window from or immediately leading into that moment; never reveal the full payoff too early.
 4) Create unresolved tension + curiosity gap (question, contradiction, specific detail, or "what happens next" pull).
 5) Overlay large bold mute-proof text in first 1-2 seconds with a clear value promise.
 6) Keep authenticity: creator-style/UGC energy beats polished ad tone; retain relatable human voice.
 7) Optimize retention psychology: short-form for completion/loops; long-form for first 30-60s survival.
 
 Format adaptation:
-- Short-form: 3-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
+- Short-form: 5-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
 - Long-form: 5-8s opener with a hard cap under 10s, strongest visible story content in the first 1-3s, no black/loading/setup lead-ins, then immediate story promise.
 
 Required output framing:
@@ -2693,13 +2748,13 @@ Standard mode profile:
 const ULTRA_MODE_PLAYBOOK_PROMPT = `Dynamic Binge Editor Prompt
 ${UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT}
 Step 1: Analyze content type quickly, detect weak spots, then adapt edits dynamically.
-Step 2: Ruthless cuts, no dead air, lock an 8-second opener window at 0:00 (target 6-8 seconds), make the first 3 seconds impossible to scroll past, keep the opener teaser-first without revealing the full payoff, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
+Step 2: Ruthless cuts, no dead air, lock a 5-8 second opener window at 0:00 (target ~6-7 seconds), make the first 3 seconds impossible to scroll past, keep the opener teaser-first without revealing the full payoff, then run micro-hooks every 5-15 seconds and close with verbal tease + preview + playlist/end-screen push.
 Step 3: Apply type-specific adaptation (challenge, story, tutorial, reaction, list, gaming, ASMR, humor, documentary, hybrid) with pacing and visual pattern interrupts tuned to that type.
 Universal boosters: bold timed subtitles, constant visual/audio changes, re-hooks, and test for any >20% drop-off risk windows.`
 const RETENTION_KING_PLAYBOOK_PROMPT = `Retention Engineer Prompt
 ${UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT}
 Objective: maximize watch time, completion rate, and emotional momentum while eliminating drop-off.
-Rules: opener hook must run 6-8 seconds at the beginning, with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay, while still withholding the full payoff as a teaser; remove filler/dead air/repetition; compress aggressively without losing clarity.
+Rules: opener hook must run 5-8 seconds at the beginning, with the first 3 seconds delivering strongest curiosity/emotional spike and a clear reason to stay, while still withholding the full payoff as a teaser; remove filler/dead air/repetition; compress aggressively without losing clarity.
 Every 5-12 seconds introduce a pacing shift, visual change, pattern interrupt, or tension spike.
 Use curiosity looping, emotional escalation, and micro-payoffs; adapt behavior by format (educational, story, commentary, vlog, talking head, tutorial).
 Before final render, re-test intro strength, 3-second scroll risk windows, and ending satisfaction/anticipation.`
@@ -2732,7 +2787,7 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Retention King playbook active: retention-engineering profile enabled.',
         'Retention King prioritizes watch-time stability: stronger narrative coherence and stricter quality-gate checks.',
-        'Retention King enforces 6-8s openers while protecting context clarity and payoff sequencing.'
+        'Retention King enforces 5-8s openers while protecting context clarity and payoff sequencing.'
       ]
     }
   }
@@ -9843,7 +9898,7 @@ const applyPlannerPacingAdjustmentsToSegments = ({
 
 const detectAudioEnergy = async (filePath: string, durationSeconds: number) => {
   if (!hasFfmpeg() || !hasAudioStream(filePath)) return [] as { time: number; rms: number }[]
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -9875,7 +9930,7 @@ const detectAudioEnergy = async (filePath: string, durationSeconds: number) => {
 
 const detectSceneChanges = async (filePath: string, durationSeconds: number) => {
   if (!hasFfmpeg()) return [] as number[]
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -9908,7 +9963,7 @@ const extractFramesEveryHalfSecond = async (
   }
 ) => {
   if (!hasFfmpeg()) return [] as string[]
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   fs.mkdirSync(outDir, { recursive: true })
   const framePattern = path.join(outDir, 'frame-%06d.jpg')
   const fps = Number.isFinite(Number(opts?.fpsOverride))
@@ -10124,9 +10179,25 @@ const computeContentSignalStrength = (windows: EngagementWindow[]) => {
 const countPhraseHits = (text: string, phrases: string[]) => {
   if (!text) return 0
   const normalized = text.toLowerCase()
-  return phrases.reduce((sum, phrase) => (
-    sum + (normalized.includes(phrase.toLowerCase()) ? 1 : 0)
-  ), 0)
+  return phrases.reduce((sum, phrase) => {
+    const needle = phrase.toLowerCase().trim()
+    if (!needle) return sum
+    let hitsForPhrase = 0
+    let cursor = 0
+    while (cursor < normalized.length) {
+      const found = normalized.indexOf(needle, cursor)
+      if (found < 0) break
+      const left = found === 0 ? ' ' : normalized[found - 1]
+      const rightIndex = found + needle.length
+      const right = rightIndex >= normalized.length ? ' ' : normalized[rightIndex]
+      const leftOk = !/[a-z0-9]/i.test(left)
+      const rightOk = !/[a-z0-9]/i.test(right)
+      if (leftOk && rightOk) hitsForPhrase += 1
+      cursor = Math.max(found + 1, found + needle.length)
+    }
+    // Cap per-phrase contribution so repeated words do not dominate style classification.
+    return sum + Math.min(2, hitsForPhrase)
+  }, 0)
 }
 
 const inferContentStyleProfile = ({
@@ -10149,26 +10220,84 @@ const inferContentStyleProfile = ({
   const avgEmotion = windows.reduce((sum, window) => sum + window.emotionIntensity, 0) / totalWindows
   const spikeRatio = windows.filter((window) => window.emotionalSpike > 0 || window.emotionIntensity > 0.72).length / totalWindows
   const longFormBias = durationSeconds > 120 ? 0.08 : 0
+  const contentSignalStrength = computeContentSignalStrength(windows)
+
+  const keywordSupportByStyle: Record<ContentStyle, number> = {
+    reaction: clamp01(reactionHits / 3.5),
+    vlog: clamp01(vlogHits / 3.5),
+    tutorial: clamp01(tutorialHits / 4),
+    gaming: clamp01(gamingHits / 3.5),
+    story: clamp01(1 - clamp01((reactionHits + vlogHits + tutorialHits + gamingHits) / 7))
+  }
+  const metricSupportByStyle: Record<ContentStyle, number> = {
+    reaction: clamp01(0.46 * avgEmotion + 0.28 * spikeRatio + 0.26 * avgScene),
+    vlog: clamp01(0.52 * avgSpeech + 0.3 * (1 - avgScene) + 0.18 * longFormBias),
+    tutorial: clamp01(0.58 * avgSpeech + 0.22 * (1 - spikeRatio) + 0.2 * (1 - avgScene)),
+    gaming: clamp01(0.5 * avgScene + 0.28 * spikeRatio + 0.22 * avgEmotion),
+    story: clamp01(
+      0.34 * avgSpeech +
+      0.3 * avgEmotion +
+      0.22 * clamp01(1 - Math.abs(avgScene - 0.34)) +
+      0.14 * clamp01(1 - Math.abs(spikeRatio - 0.18))
+    )
+  }
 
   const scores: Record<ContentStyle, number> = {
-    reaction: clamp01(0.34 * clamp01(reactionHits / 3) + 0.24 * avgEmotion + 0.18 * spikeRatio + 0.12 * avgScene + 0.12 * computeContentSignalStrength(windows)),
-    vlog: clamp01(0.34 * clamp01(vlogHits / 3) + 0.24 * avgSpeech + 0.18 * (1 - avgScene) + 0.14 * longFormBias + 0.1 * avgEmotion),
-    tutorial: clamp01(0.42 * clamp01(tutorialHits / 4) + 0.28 * avgSpeech + 0.18 * (1 - spikeRatio) + 0.12 * (1 - avgScene)),
-    gaming: clamp01(0.36 * clamp01(gamingHits / 3) + 0.24 * avgScene + 0.2 * spikeRatio + 0.2 * avgEmotion),
+    reaction: clamp01(0.3 * keywordSupportByStyle.reaction + 0.42 * metricSupportByStyle.reaction + 0.28 * contentSignalStrength),
+    vlog: clamp01(0.34 * keywordSupportByStyle.vlog + 0.44 * metricSupportByStyle.vlog + 0.22 * contentSignalStrength),
+    tutorial: clamp01(0.4 * keywordSupportByStyle.tutorial + 0.44 * metricSupportByStyle.tutorial + 0.16 * contentSignalStrength),
+    gaming: clamp01(0.34 * keywordSupportByStyle.gaming + 0.44 * metricSupportByStyle.gaming + 0.22 * contentSignalStrength),
     story: clamp01(0.26 + 0.22 * avgEmotion + 0.2 * avgSpeech + 0.16 * clamp01(1 - Math.abs(avgScene - 0.34)) + 0.16 * clamp01(1 - Math.abs(spikeRatio - 0.18)))
   }
   const ranked = (Object.keys(scores) as ContentStyle[])
     .map((style) => ({ style, score: scores[style] }))
     .sort((a, b) => b.score - a.score)
-  const selected = ranked[0]
-  const runnerUp = ranked[1]
-  const confidence = Number(clamp01(0.58 + (selected.score - (runnerUp?.score ?? 0)) * 0.9).toFixed(4))
+  const topStyle = ranked[0]
+  const topRunner = ranked[1]
+  const compositeSupportByStyle: Record<ContentStyle, number> = {
+    reaction: clamp01(0.55 * metricSupportByStyle.reaction + 0.45 * keywordSupportByStyle.reaction),
+    vlog: clamp01(0.55 * metricSupportByStyle.vlog + 0.45 * keywordSupportByStyle.vlog),
+    tutorial: clamp01(0.55 * metricSupportByStyle.tutorial + 0.45 * keywordSupportByStyle.tutorial),
+    gaming: clamp01(0.55 * metricSupportByStyle.gaming + 0.45 * keywordSupportByStyle.gaming),
+    story: clamp01(0.64 * metricSupportByStyle.story + 0.36 * keywordSupportByStyle.story)
+  }
+  let selected = topStyle
+  const closeRace = Boolean(topRunner && (topStyle.score - topRunner.score) <= 0.06)
+  const selectedSupport = compositeSupportByStyle[topStyle.style]
+  const runnerSupport = topRunner ? compositeSupportByStyle[topRunner.style] : 0
+  if (
+    topStyle.style !== 'story' &&
+    closeRace &&
+    selectedSupport < 0.46 &&
+    runnerSupport >= selectedSupport + 0.08
+  ) {
+    selected = topRunner
+  }
+  const runnerUp = ranked.find((entry) => entry.style !== selected.style) || null
+  const margin = selected.score - (runnerUp?.score ?? 0)
+  const ambiguityPenalty = clamp01((0.1 - Math.max(0, margin)) / 0.1)
+  const keywordPenalty = selected.style === 'story'
+    ? 0
+    : clamp01((0.26 - keywordSupportByStyle[selected.style]) / 0.26)
+  const confidence = Number(clamp01(
+    0.48 +
+    margin * 1.05 +
+    0.22 * compositeSupportByStyle[selected.style] +
+    0.08 * contentSignalStrength -
+    0.16 * ambiguityPenalty -
+    0.12 * keywordPenalty
+  ).toFixed(4))
   const rationale: string[] = []
   if (selected.style === 'reaction') rationale.push('Emotion spikes and reaction-style language dominate.')
   if (selected.style === 'vlog') rationale.push('Conversational flow and day-style narration indicate vlog pacing.')
   if (selected.style === 'tutorial') rationale.push('Instructional language favors clarity-first pacing.')
   if (selected.style === 'gaming') rationale.push('High scene churn and action terms indicate gaming cadence.')
   if (selected.style === 'story') rationale.push('Balanced narrative signals favor story pacing.')
+  if (selected.style !== topStyle.style) {
+    rationale.push(`Ambiguous style signals were resolved toward ${selected.style} using stronger transcript and pacing evidence.`)
+  } else if (closeRace && runnerUp && selected.style !== runnerUp.style) {
+    rationale.push(`Signals were close; ${selected.style} evidence was slightly stronger than ${runnerUp.style}.`)
+  }
   if (!rationale.length) rationale.push('Default story profile selected from mixed signals.')
 
   return buildStyleProfileFromSelection(selected.style, confidence, rationale)
@@ -17340,13 +17469,13 @@ const runHookAudit = ({
     0.12 * endingUnresolved +
     0.04 * transcriptSignals.interestingness +
     0.02 * (1 - transcriptSignals.fillerDensity) -
-    0.38 * spoilerRisk
+    0.46 * spoilerRisk
   )
   const teaserThreshold = hasTranscriptSupport ? 0.29 : 0.24
   const teaserPass = teaserStrength >= teaserThreshold && !lowInformationTranscriptText
   const highIntensityTeaserBySignal = emotionalSignal >= 0.76 && curiositySignal >= 0.58
   const endingTensionPass = endingUnresolved >= (hasTranscriptSupport ? 0.24 : 0.18) || highIntensityTeaserBySignal
-  const spoilerLimit = hasTranscriptSupport ? 0.52 : 0.62
+  const spoilerLimit = hasTranscriptSupport ? 0.48 : 0.58
   const noOverReveal = spoilerRisk <= spoilerLimit
   const attentionGrabPass = instantAttentionSignal >= (hasTranscriptSupport ? 0.42 : 0.46)
   const valuePromisePass = valueGapSignal >= (hasTranscriptSupport ? 0.3 : 0.28)
@@ -19008,7 +19137,7 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
   const sourceWidth = Number(sourceProbe?.width)
   const sourceHeight = Number(sourceProbe?.height)
   const hasSourceDimensions = Number.isFinite(sourceWidth) && Number.isFinite(sourceHeight) && sourceWidth > 0 && sourceHeight > 0
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   const args = [
     '-hide_banner',
     '-nostdin',
@@ -19096,7 +19225,7 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
 const detectEmotionModelSignals = async (filePath: string, durationSeconds: number) => {
   const modelBin = process.env.EMOTION_MODEL_BIN
   if (!modelBin) return [] as { time: number; intensity: number }[]
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   return new Promise<{ time: number; intensity: number }[]>((resolve) => {
     let stdout = ''
     const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -19234,7 +19363,7 @@ const detectTextDensity = async (filePath: string, durationSeconds: number) => {
     }
     return [] as { time: number; density: number; confidence?: number }[]
   }
-  const analyzeSeconds = Math.min(HOOK_ANALYZE_MAX, durationSeconds || HOOK_ANALYZE_MAX)
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
   return new Promise<{ time: number; density: number; confidence?: number }[]>((resolve) => {
     let stdout = ''
     const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
@@ -20190,73 +20319,73 @@ const buildRetentionMetadataSummary = ({
   const improvements: string[] = []
   if (styleProfile?.style) {
     improvements.push(
-      `Detected ${styleProfile.style} style signals (confidence ${(styleProfile.confidence * 100).toFixed(0)}%) and adapted pacing profile.`
+      `Detected a ${styleProfile.style} style (${(styleProfile.confidence * 100).toFixed(0)}% confidence). Pace and cut rhythm were tuned to match it.`
     )
   }
   if (nicheProfile?.niche) {
     improvements.push(
-      `Detected ${nicheProfile.niche.replace('_', ' ')} niche (confidence ${(nicheProfile.confidence * 100).toFixed(0)}%) and tuned pacing accordingly.`
+      `Detected ${nicheProfile.niche.replace('_', ' ')} content (${(nicheProfile.confidence * 100).toFixed(0)}% confidence) and adjusted pacing to fit.`
     )
   }
   if (behaviorStyleProfile) {
     improvements.push(
-      `Applied adaptive behavior profile (${behaviorStyleProfile.styleName}) with ~${behaviorStyleProfile.avgCutInterval.toFixed(1)}s average cut interval.`
+      `Applied ${behaviorStyleProfile.styleName} behavior profile: cuts average about ${behaviorStyleProfile.avgCutInterval.toFixed(1)}s apart.`
     )
   }
   if (hook) {
     const hookSourceLabel =
       hookSelectionSource === 'user_selected'
-        ? 'User-selected hook was locked to the opening.'
+        ? 'Your selected hook was locked at the opening.'
         : hookSelectionSource === 'fallback'
-          ? 'Fallback hook was used to keep the opening attention-grabbing.'
-          : 'Best-performing hook candidate was moved to the opening.'
+          ? 'Fallback hook was used to keep the opening strong.'
+          : 'Best-performing hook candidate was placed at the opening.'
     const hookRangeLabel = formatHookRange(hook.start, hook.start + hook.duration)
     improvements.push(
       `${hookSourceLabel} Hook window ${hookRangeLabel}.`
     )
   }
   if (removedSeconds >= 1.2) {
-    improvements.push(`Removed ${removedSeconds.toFixed(1)}s of low-signal footage to tighten pacing.`)
+    improvements.push(`Removed ${removedSeconds.toFixed(1)}s of slow or repetitive footage to keep momentum.`)
   }
   if (segmentStats.cutCount > 0) {
-    improvements.push(`Applied ${segmentStats.cutCount} cut${segmentStats.cutCount === 1 ? '' : 's'} to reduce dead time.`)
+    improvements.push(`Made ${segmentStats.cutCount} cut${segmentStats.cutCount === 1 ? '' : 's'} to reduce dead time.`)
   }
   if (segmentStats.averageSpeed > 1.02) {
-    improvements.push(`Applied selective speed-ups (avg ${segmentStats.averageSpeed.toFixed(2)}x).`)
+    improvements.push(`Used selective speed-ups (average ${segmentStats.averageSpeed.toFixed(2)}x) to keep pace.`)
   }
   if (Number(patternInterruptCount ?? 0) > 0) {
-    improvements.push(`Inserted ${Number(patternInterruptCount)} pattern interrupt${Number(patternInterruptCount) === 1 ? '' : 's'} for retention resets.`)
+    improvements.push(`Added ${Number(patternInterruptCount)} attention-reset beat${Number(patternInterruptCount) === 1 ? '' : 's'} to prevent drop-off.`)
   }
   if (Number.isFinite(Number(cutQualityScore))) {
-    improvements.push(`Elite cut refinement quality score: ${(clamp01(Number(cutQualityScore)) * 100).toFixed(0)}%.`)
+    improvements.push(`Estimated cut quality: ${(clamp01(Number(cutQualityScore)) * 100).toFixed(0)}/100.`)
   }
   if (resolvedBoundaryPathologySummary.boundaryCount > 0) {
     improvements.push(
-      `Boundary pathology audit: worst ${resolvedBoundaryPathologySummary.worst.toFixed(2)}, high-risk cuts ${resolvedBoundaryPathologySummary.highCount}, fixes ${resolvedBoundaryPathologySummary.fixesApplied}.`
+      `Cut-boundary safety check: worst score ${resolvedBoundaryPathologySummary.worst.toFixed(2)}, high-risk cuts ${resolvedBoundaryPathologySummary.highCount}, fixes ${resolvedBoundaryPathologySummary.fixesApplied}.`
     )
   }
   if (cuttingAudit && (cuttingAudit.lowEnergyHeadTrims > 0 || cuttingAudit.lowEnergyTailTrims > 0)) {
     const trims = cuttingAudit.lowEnergyHeadTrims + cuttingAudit.lowEnergyTailTrims
-    improvements.push(`Trimmed ${trims} low-signal cut boundaries to sharpen pacing transitions.`)
+    improvements.push(`Trimmed ${trims} low-energy cut starts/ends for cleaner transitions.`)
   }
   const jlCutCount = segments.filter((segment) => Number(segment.audioLeadInMs ?? 0) >= 80 || Number(segment.audioTailMs ?? 0) >= 80).length
   if (jlCutCount > 0) {
-    improvements.push(`Applied ${jlCutCount} J/L-style audio overlaps to smooth hard visual cuts.`)
+    improvements.push(`Added ${jlCutCount} audio overlaps (J/L style) so cuts sound smoother.`)
   }
   const reframeCount = segments.filter((segment) => segment.reframeMode === 'punch_in' || segment.reframeMode === 'punch_out').length
   if (reframeCount > 0) {
-    improvements.push(`Applied ${reframeCount} intentional punch-in/punch-out reframes for emphasis.`)
+    improvements.push(`Added ${reframeCount} punch-in/punch-out reframes for emphasis.`)
   }
   const brollHintCount = segments.filter((segment) => Boolean(segment.brollOverlayHint)).length
   if (brollHintCount > 0) {
-    improvements.push(`Flagged ${brollHintCount} contextual B-roll overlay opportunities.`)
+    improvements.push(`Marked ${brollHintCount} spots where B-roll can improve clarity or variety.`)
   }
   const swellCount = segments.filter((segment) => Boolean(segment.musicSwell)).length
   if (swellCount > 0) {
-    improvements.push(`Applied ${swellCount} tension-aware music/SFX swell cue${swellCount === 1 ? '' : 's'}.`)
+    improvements.push(`Added ${swellCount} music/SFX swell cue${swellCount === 1 ? '' : 's'} to increase tension at key beats.`)
   }
   if (autoEscalationCount > 0) {
-    improvements.push(`Auto-escalation guarantee fired ${autoEscalationCount} time${autoEscalationCount === 1 ? '' : 's'} to prevent flat pacing.`)
+    improvements.push(`Detected flat pacing ${autoEscalationCount} time${autoEscalationCount === 1 ? '' : 's'} and automatically raised energy.`)
   }
   if (strategy && strategy !== 'BASELINE') {
     improvements.push(`Used ${strategy.replace('_', ' ').toLowerCase()} retry strategy to improve retention quality.`)
@@ -20267,11 +20396,11 @@ const buildRetentionMetadataSummary = ({
       : targetPlatform === 'tiktok'
         ? 'TikTok'
         : 'YouTube'
-    improvements.push(`Tuned pacing and quality gate targets for ${platformLabel}.`)
+    improvements.push(`Tuned hook pacing and quality targets for ${platformLabel}.`)
   }
   if (outcomeMenuProfile?.enabled) {
     improvements.push(
-      `Outcome automation calibrated from ${outcomeMenuProfile.sampleSize} watch-time outcome samples (confidence ${Math.round(outcomeMenuProfile.confidence * 100)}%).`
+      `Outcome automation used ${outcomeMenuProfile.sampleSize} watch-time samples (confidence ${Math.round(outcomeMenuProfile.confidence * 100)}%).`
     )
   }
   if (outcomeMenuApply?.strategyApplied || outcomeMenuApply?.targetPlatformApplied || outcomeMenuApply?.editorModeApplied) {
@@ -20279,10 +20408,10 @@ const buildRetentionMetadataSummary = ({
     if (outcomeMenuApply.strategyApplied) applied.push('strategy')
     if (outcomeMenuApply.targetPlatformApplied) applied.push('platform')
     if (outcomeMenuApply.editorModeApplied) applied.push('editor mode')
-    improvements.push(`Applied outcome-driven menu automation to ${applied.join(', ')}.`)
+    improvements.push(`Outcome automation updated: ${applied.join(', ')}.`)
   }
   if (qualityGateOverride?.applied && qualityGateOverride.reason) {
-    improvements.push(`Quality gate override: ${qualityGateOverride.reason}`)
+    improvements.push(`Quality gate override applied: ${qualityGateOverride.reason}`)
   }
   const normalizedNotes = Array.isArray(optimizationNotes)
     ? optimizationNotes
@@ -20307,9 +20436,9 @@ const buildRetentionMetadataSummary = ({
     ? Number((resolvedAfterScore - resolvedBeforeScore).toFixed(1))
     : null
   if (retentionDelta !== null && retentionDelta >= 0.5) {
-    improvements.unshift(`Projected retention improved by +${retentionDelta.toFixed(1)} points vs source baseline.`)
+    improvements.unshift(`Projected retention improved by +${retentionDelta.toFixed(1)} points versus the source baseline.`)
   } else if (retentionDelta !== null && retentionDelta <= -0.5) {
-    improvements.unshift(`Projected retention is ${Math.abs(retentionDelta).toFixed(1)} points below source baseline.`)
+    improvements.unshift(`Projected retention is ${Math.abs(retentionDelta).toFixed(1)} points below the source baseline.`)
   }
   return {
     metadataVersion: 2,
@@ -21105,7 +21234,7 @@ const buildStoryBeatGraph = ({
         0.26 * (window.curiosityTrigger ?? 0) +
         0.26 * window.motionScore
       ))).toFixed(4)),
-      summary: 'Context setup and premise framing.'
+      summary: 'Sets up what is happening and why it matters.'
     },
     {
       role: 'escalation',
@@ -21117,7 +21246,7 @@ const buildStoryBeatGraph = ({
         0.16 * (window.curiosityTrigger ?? 0) +
         0.14 * window.sceneChangeRate
       ))).toFixed(4)),
-      summary: 'Rising stakes and momentum build.'
+      summary: 'Builds tension so viewers want to see what happens next.'
     },
     {
       role: 'peak',
@@ -21128,7 +21257,7 @@ const buildStoryBeatGraph = ({
           ? 0.6 * peakCandidate.score + 0.4 * peakCandidate.auditScore
           : averageWindowMetric(windows, safeDuration * 0.42, safeDuration * 0.52, (window) => (window.hookScore ?? window.score))
       ).toFixed(4)),
-      summary: 'Highest emotional/surprise payoff candidate.'
+      summary: 'Strongest payoff moment (highest surprise or emotion).'
     },
     {
       role: 'resolution',
@@ -21139,14 +21268,14 @@ const buildStoryBeatGraph = ({
         0.25 * window.speechIntensity +
         0.3 * (1 - (window.fillerDensity ?? 0))
       ))).toFixed(4)),
-      summary: 'Partial resolution while preserving momentum.'
+      summary: 'Gives progress without fully closing the story.'
     },
     {
       role: 'sequel_hook',
       start: sequelStart,
       end: sequelEnd,
       strength: Number(clamp01(0.56 * sequelTension + 0.44 * sequelCuriosity).toFixed(4)),
-      summary: 'Open-loop ending to trigger next-view intent.'
+      summary: 'Ends with an open question to pull viewers into the next part.'
     }
   ] as StoryBeatNode[]).filter((node) => node.end > node.start + 0.05)
   const unresolvedTensionScore = clamp01(
@@ -29233,14 +29362,14 @@ const buildRetentionJudgeReport = ({
 
   const whatIsGeneric: string[] = []
   if (interruptCoverage < interruptCoverageTarget) {
-    whatIsGeneric.push(`Interrupt density is below ${resolvedContentFormat.replace('_', ' ')} target for this runtime.`)
+    whatIsGeneric.push('There are not enough pacing changes for this runtime.')
   }
-  if (retentionScore.details.boredomRemovalRatio < 0.07) whatIsGeneric.push('Too much low-arousal material remains.')
-  if (!hook.auditPassed) whatIsGeneric.push('Hook is not fully understandable without prior context.')
-  if (hookSignals.instantHold < 0.48) whatIsGeneric.push('First 3 seconds are not stopping the scroll hard enough.')
-  if (hookTextSignals.valuePromise < 0.28 && hookTextSignals.curiosityBlend < 0.28) whatIsGeneric.push('Opener does not make the reason to keep watching clear enough.')
-  if (hookTextSignals.weakIntroPenalty >= 0.44) whatIsGeneric.push('Opener starts too slowly instead of leading with the strongest moment.')
-  if (whatIsGeneric.length === 0) whatIsGeneric.push('Generic signals are low for this attempt.')
+  if (retentionScore.details.boredomRemovalRatio < 0.07) whatIsGeneric.push('Too much low-energy footage remains.')
+  if (!hook.auditPassed) whatIsGeneric.push('The hook needs too much prior context to make sense.')
+  if (hookSignals.instantHold < 0.48) whatIsGeneric.push('The first 3 seconds are not scroll-stopping enough.')
+  if (hookTextSignals.valuePromise < 0.28 && hookTextSignals.curiosityBlend < 0.28) whatIsGeneric.push('The opener does not clearly explain why viewers should keep watching.')
+  if (hookTextSignals.weakIntroPenalty >= 0.44) whatIsGeneric.push('The opener starts slow instead of leading with the strongest moment.')
+  if (whatIsGeneric.length === 0) whatIsGeneric.push('No major generic-pattern risks were detected in this attempt.')
 
   return {
     retention_score: retention,
@@ -30082,6 +30211,17 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       await updateJob(jobId, { status: 'failed', error: 'duration_unavailable' })
       throw new Error('duration_unavailable')
     }
+    const runtimeFastProfileEnabledForAnalyze = shouldUseRuntimeFastProfile({
+      durationSeconds: duration,
+      inputBytes: inStats.size
+    })
+    if (runtimeFastProfileEnabledForAnalyze && !options.fastMode) {
+      options.fastMode = true
+      console.log(`[${requestId || 'noid'}] runtime fast profile enabled for analyze`, {
+        durationSeconds: duration,
+        inputBytes: inStats.size
+      })
+    }
 
     await updateJob(jobId, { status: 'analyzing', progress: 15, inputDurationSeconds: Math.round(duration) })
     await ensureBucket(OUTPUT_BUCKET, false)
@@ -30765,6 +30905,16 @@ const processJob = async (
   const normalizedSubtitle = normalizeSubtitlePreset(subtitleStyle) ?? DEFAULT_SUBTITLE_PRESET
   const baseCrf = getDefaultCrfForQuality(finalQuality)
   const adjustedCrf = Math.round(clamp(baseCrf + platformProfile.crfDelta, 16, 30))
+  const runtimeFastProfileEnabledForProcess = shouldUseRuntimeFastProfile({
+    durationSeconds: Number(job.inputDurationSeconds || 0),
+    inputBytes: null
+  })
+  if (runtimeFastProfileEnabledForProcess && !options.fastMode) {
+    options.fastMode = true
+    console.log(`[${requestId || 'noid'}] runtime fast profile enabled for process`, {
+      durationSeconds: Number(job.inputDurationSeconds || 0)
+    })
+  }
   const renderFastMode = Boolean(
     FORCE_RENDER_STAGE_MAX_SPEED ||
     options.fastMode ||
@@ -30885,6 +31035,17 @@ const processJob = async (
     }
     const durationMinutes = toMinutes(durationSeconds)
     await updateJob(jobId, { inputDurationSeconds: Math.round(durationSeconds) })
+    const runtimeFastProfileEnabledWithInputStats = shouldUseRuntimeFastProfile({
+      durationSeconds,
+      inputBytes: inStats.size
+    })
+    if (runtimeFastProfileEnabledWithInputStats && !options.fastMode) {
+      options.fastMode = true
+      console.log(`[${requestId || 'noid'}] runtime fast profile activated mid-process`, {
+        durationSeconds,
+        inputBytes: inStats.size
+      })
+    }
     const runtimeRetentionProfile = resolveRuntimeRetentionProfile({
       renderMode: renderConfig.mode,
       runtimeSeconds: durationSeconds,
@@ -31062,6 +31223,18 @@ const processJob = async (
         const adjustedClipCount = Math.round(clamp(requiredClipCount, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS))
         if (adjustedClipCount > verticalRequestedClipCount) {
           verticalRequestedClipCount = adjustedClipCount
+        }
+      }
+      if (runtimeFastProfileEnabledWithInputStats) {
+        const cappedVerticalClipCount = Math.round(
+          clamp(verticalRequestedClipCount, MIN_VERTICAL_CLIPS, AUTO_FAST_RUNTIME_PROFILE_MAX_VERTICAL_CLIPS)
+        )
+        if (cappedVerticalClipCount < verticalRequestedClipCount) {
+          console.log(`[${requestId || 'noid'}] runtime fast profile capped vertical clip count`, {
+            requested: verticalRequestedClipCount,
+            capped: cappedVerticalClipCount
+          })
+          verticalRequestedClipCount = cappedVerticalClipCount
         }
       }
       const verticalSelection = buildVerticalRetentionCandidates({
@@ -35162,7 +35335,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       opts?: { markStarted?: boolean; markFinished?: boolean; markRecovered?: boolean }
     ) => {
       try {
-        await updatePipelineRuntimeLease({
+        return await updatePipelineRuntimeLease({
           jobId,
           workerId: pipelineWorkerId,
           state,
@@ -35172,6 +35345,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         })
       } catch (error) {
         console.warn(`[queue] pipeline lease update failed for ${jobId}`, error)
+        return false
       }
     }
     try {
@@ -35179,13 +35353,24 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       if (!existing) return
       const status = String(existing.status || '').toLowerCase()
       if (status === 'completed' || status === 'failed') return
+      const existingAnalysis = getAnalysisRecord((existing as any)?.analysis)
+      const existingLease = getPipelineRuntimeLease(existingAnalysis)
+      const skipAnalyzeForRecoveredJob = shouldSkipAnalyzeForRecoveredJob({
+        status,
+        analysis: existingAnalysis,
+        lease: existingLease
+      })
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       const progress = Number(existing.progress ?? 0)
       if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
         console.log(`[${requestId || 'noid'}] skip pipeline ${jobId} (upload not completed yet)`)
         return
       }
-      await touchLease('running', { markStarted: true })
+      const leaseClaimed = await touchLease('running', { markStarted: true })
+      if (!leaseClaimed) {
+        console.warn(`[queue] skipping ${jobId}: lease was not acquired by worker ${pipelineWorkerId}`)
+        return
+      }
       heartbeatTimer = setInterval(() => {
         void touchLease('running')
       }, PIPELINE_HEARTBEAT_INTERVAL_MS)
@@ -35226,7 +35411,11 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
       if (styleBlendOverride) analyzeOptions.styleArchetypeBlend = styleBlendOverride
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
-      await analyzeJob(jobId, analyzeOptions, requestId)
+      if (!skipAnalyzeForRecoveredJob) {
+        await analyzeJob(jobId, analyzeOptions, requestId)
+      } else {
+        console.warn(`[queue] recovered job ${jobId} resumed at process stage (analyze skipped)`)
+      }
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       const latestBeforeProcess = await prisma.job.findUnique({ where: { id: jobId } })
       if (!latestBeforeProcess) throw new Error('not_found')
@@ -35390,9 +35579,33 @@ const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
   if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
   return Math.max(90_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
 })()
+const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
+  String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
+)
+const PIPELINE_LEASE_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
+  String(process.env.PIPELINE_LEASE_RECOVERY_ENABLED || 'true').trim()
+)
+const PIPELINE_LEASE_STALE_GRACE_MS = (() => {
+  const envVal = Number(process.env.PIPELINE_LEASE_STALE_GRACE_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
+  return Math.max(120_000, PIPELINE_HEARTBEAT_GRACE_MS + 15_000)
+})()
+const QUEUE_RECOVERY_SKIP_ANALYZE = !/^(0|false|no)$/i.test(
+  String(process.env.QUEUE_RECOVERY_SKIP_ANALYZE || 'true').trim()
+)
 const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
 const STALE_RECOVERABLE_STATUSES = new Set([
   'analyzing',
+  'hooking',
+  'cutting',
+  'pacing',
+  'story',
+  'subtitling',
+  'audio',
+  'retention',
+  'rendering'
+])
+const PROCESS_RESUME_FROM_RECOVERY_STATUSES = new Set([
   'hooking',
   'cutting',
   'pacing',
@@ -35510,6 +35723,7 @@ type PipelineRuntimeLease = {
   heartbeatAt?: string | null
   finishedAt?: string | null
   recoveredAt?: string | null
+  recoveredFromStatus?: string | null
 }
 
 const getAnalysisRecord = (value: unknown): Record<string, any> => {
@@ -35524,6 +35738,43 @@ const getPipelineRuntimeLease = (analysis: unknown): PipelineRuntimeLease | null
   const raw = record.pipeline_runtime ?? record.pipelineRuntime
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
   return raw as PipelineRuntimeLease
+}
+
+const hasRecoveredProcessResumeSignals = (analysis: Record<string, any>) => {
+  const transcriptCues = Array.isArray(analysis?.transcript_cues)
+    ? analysis.transcript_cues
+    : Array.isArray(analysis?.transcriptCues)
+      ? analysis.transcriptCues
+      : []
+  const engagementWindows = Array.isArray(analysis?.engagement_windows)
+    ? analysis.engagement_windows
+    : Array.isArray(analysis?.engagementWindows)
+      ? analysis.engagementWindows
+      : []
+  const hasHookSignals = (
+    Number.isFinite(Number(analysis?.hook_start_time)) ||
+    Number.isFinite(Number(analysis?.hookStartTime)) ||
+    (Array.isArray(analysis?.hook_candidates) && analysis.hook_candidates.length > 0) ||
+    (Array.isArray(analysis?.hookCandidates) && analysis.hookCandidates.length > 0)
+  )
+  return transcriptCues.length > 0 && (engagementWindows.length > 0 || hasHookSignals)
+}
+
+const shouldSkipAnalyzeForRecoveredJob = ({
+  status,
+  analysis,
+  lease
+}: {
+  status: string
+  analysis: Record<string, any>
+  lease: PipelineRuntimeLease | null
+}) => {
+  if (!QUEUE_RECOVERY_SKIP_ANALYZE) return false
+  const leaseState = String(lease?.state || '').toLowerCase()
+  if (leaseState !== 'recovered') return false
+  const recoveredFromStatus = String(lease?.recoveredFromStatus || status || '').toLowerCase()
+  if (!PROCESS_RESUME_FROM_RECOVERY_STATUSES.has(recoveredFromStatus)) return false
+  return hasRecoveredProcessResumeSignals(analysis)
 }
 
 const isPipelineLeaseFresh = (lease: PipelineRuntimeLease | null, nowMs: number) => {
@@ -35570,6 +35821,7 @@ const updatePipelineRuntimeLease = async ({
     nextLease.startedAt = previousLease.startedAt || nowIso
     nextLease.finishedAt = null
     nextLease.recoveredAt = null
+    nextLease.recoveredFromStatus = null
   }
   if (markFinished) {
     nextLease.finishedAt = nowIso
@@ -35623,6 +35875,7 @@ const processQueue = () => {
 
 export const enqueuePipeline = (item: QueueItem) => {
   if (!item?.jobId || !item?.user?.id) return
+  if (!JOB_PROCESSOR_ENABLED) return
   if (queuedPipelineJobIds.has(item.jobId) || runningPipelineJobIds.has(item.jobId)) return
   const index = pipelineQueue.findIndex((queued) => queued.priorityLevel > item.priorityLevel)
   if (index === -1) {
@@ -35665,23 +35918,45 @@ const recoverQueuedJobs = async () => {
       const runtimeLease = getPipelineRuntimeLease(analysis)
       const hasFreshLease = isPipelineLeaseFresh(runtimeLease, nowMs)
       if (hasFreshLease) continue
+      const updatedAtMs = toTimeMs(job?.updatedAt)
+      const elapsedSinceUpdateMs = updatedAtMs > 0 ? nowMs - updatedAtMs : Number.POSITIVE_INFINITY
+      const heartbeatMs = toTimeMs(runtimeLease?.heartbeatAt)
+      const leaseState = String(runtimeLease?.state || '').toLowerCase()
+      const leaseTimedOut = (
+        leaseState === 'running' &&
+        (
+          (heartbeatMs > 0 && (nowMs - heartbeatMs) >= PIPELINE_LEASE_STALE_GRACE_MS) ||
+          (heartbeatMs <= 0 && elapsedSinceUpdateMs >= PIPELINE_LEASE_STALE_GRACE_MS)
+        )
+      )
+      const noLeaseTimeout = (
+        !runtimeLease &&
+        elapsedSinceUpdateMs >= Math.max(120_000, PIPELINE_LEASE_STALE_GRACE_MS)
+      )
+      const leaseExpiredRecoverable = (
+        PIPELINE_LEASE_RECOVERY_ENABLED &&
+        STALE_RECOVERABLE_STATUSES.has(status) &&
+        (leaseTimedOut || noLeaseTimeout)
+      )
       const startable = STARTABLE_QUEUE_STATUSES.has(status)
       const staleRecoverable =
         STALE_RECOVERABLE_STATUSES.has(status) &&
-        nowMs - toTimeMs(job?.updatedAt) >= STALE_PIPELINE_MS
+        (elapsedSinceUpdateMs >= STALE_PIPELINE_MS || leaseExpiredRecoverable)
 
       if (!startable && !staleRecoverable) continue
       if (startable && !uploadReady) continue
 
       if (staleRecoverable) {
         const boundedProgress = Math.max(1, Math.min(90, Number(job?.progress || 1)))
+        const recoveryReason = leaseExpiredRecoverable ? 'stale_lease' : 'stale_timeout'
         try {
           const recoveredLease: PipelineRuntimeLease = {
             ...(runtimeLease || {}),
             state: 'recovered',
             workerId: null,
             recoveredAt: toIsoNow(),
-            heartbeatAt: toIsoNow()
+            heartbeatAt: toIsoNow(),
+            recoveredFromStatus: status
           }
           await updateJob(jobId, {
             status: 'queued',
@@ -35693,7 +35968,7 @@ const recoverQueuedJobs = async () => {
               pipelineRuntime: recoveredLease
             }
           })
-          console.warn(`[queue] recovered stale job ${jobId} from ${status}`)
+          console.warn(`[queue] recovered stale job ${jobId} from ${status} (${recoveryReason})`)
         } catch (err) {
           console.error('[queue] stale recovery update failed', { jobId, status, err })
           continue
@@ -35718,6 +35993,10 @@ const recoverQueuedJobs = async () => {
 }
 
 const startQueueRecoveryLoop = () => {
+  if (!JOB_PROCESSOR_ENABLED) {
+    console.log('[queue] job processor disabled for this process')
+    return
+  }
   if (queueRecoveryLoopStarted) return
   queueRecoveryLoopStarted = true
   setTimeout(() => void recoverQueuedJobs(), 2000)
