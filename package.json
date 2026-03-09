@@ -5,8 +5,10 @@
   "type": "commonjs",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev:worker": "ts-node-dev --respawn --transpile-only src/worker.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node scripts/start.js",
+    "start:worker": "node scripts/start-worker.js",
     "postinstall": "prisma generate && node scripts/install-caption-runtime.js",
     "prisma:migrate": "prisma migrate dev --name init",
     "prisma:generate": "prisma generate",
