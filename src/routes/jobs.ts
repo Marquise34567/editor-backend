@@ -2380,38 +2380,37 @@ const RENDER_CODEC_THREADS = (() => {
 })()
 const FAST_MODE_FFMPEG_PRESET = String(process.env.FAST_MODE_FFMPEG_PRESET || 'ultrafast').trim() || 'ultrafast'
 const FAST_MODE_FFMPEG_CRF = (() => {
-  const envValue = Number(process.env.FAST_MODE_FFMPEG_CRF || 29)
-  if (!Number.isFinite(envValue)) return 29
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_CRF || 23)
+  if (!Number.isFinite(envValue)) return 23
   return Math.round(Math.min(35, Math.max(22, envValue)))
 })()
 const FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS = (() => {
-  const envValue = Number(process.env.FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS || 128)
-  if (!Number.isFinite(envValue)) return 128
+  const envValue = Number(process.env.FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS || 160)
+  if (!Number.isFinite(envValue)) return 160
   return Math.round(Math.min(256, Math.max(64, envValue)))
 })()
 const FORCE_RENDER_STAGE_MAX_SPEED = !/^(0|false|no)$/i.test(
-  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'false').trim()
+  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'true').trim()
 )
 const FORCE_RENDER_STAGE_PRESET = String(process.env.FORCE_RENDER_STAGE_PRESET || 'ultrafast').trim() || 'ultrafast'
 const FORCE_RENDER_STAGE_CODEC_THREADS = (() => {
-  const envValue = Number(process.env.FORCE_RENDER_STAGE_CODEC_THREADS || 0)
+  const envValue = Number(process.env.FORCE_RENDER_STAGE_CODEC_THREADS || 1)
   if (Number.isFinite(envValue) && envValue >= 1) return Math.round(Math.min(32, Math.max(1, envValue)))
-  const cpuCount = os.cpus()?.length || 1
-  return Math.max(2, Math.min(12, cpuCount))
+  return 1
 })()
 const SEGMENT_FILE_FALLBACK_MIN_SEGMENTS = (() => {
-  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 20)
-  if (!Number.isFinite(envValue) || envValue < 6) return 20
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 10)
+  if (!Number.isFinite(envValue) || envValue < 6) return 10
   return Math.round(envValue)
 })()
 const SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS = (() => {
-  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS || 9 * 60)
-  if (!Number.isFinite(envValue) || envValue < 120) return 9 * 60
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_DURATION_SECONDS || 4 * 60)
+  if (!Number.isFinite(envValue) || envValue < 120) return 4 * 60
   return Math.round(envValue)
 })()
 const SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES = (() => {
-  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES || 300 * 1024 * 1024)
-  if (!Number.isFinite(envValue) || envValue < 100 * 1024 * 1024) return 300 * 1024 * 1024
+  const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_INPUT_BYTES || 150 * 1024 * 1024)
+  if (!Number.isFinite(envValue) || envValue < 100 * 1024 * 1024) return 150 * 1024 * 1024
   return Math.round(envValue)
 })()
 const SEGMENT_FILE_FALLBACK_SEEK_PAD_SECONDS = (() => {
@@ -2428,7 +2427,7 @@ const RENDER_FORCE_FAST_HORIZONTAL = /^(1|true|yes)$/i.test(
   String(process.env.RENDER_FORCE_FAST_HORIZONTAL || '').trim()
 )
 const RENDER_PREFER_SEGMENT_FILE_FALLBACK = /^(1|true|yes)$/i.test(
-  String(process.env.RENDER_PREFER_SEGMENT_FILE_FALLBACK || '').trim()
+  String(process.env.RENDER_PREFER_SEGMENT_FILE_FALLBACK || 'true').trim()
 )
 const RENDER_FAST_HORIZONTAL_CUT_ONLY = /^(1|true|yes)$/i.test(
   String(process.env.RENDER_FAST_HORIZONTAL_CUT_ONLY || '').trim()
