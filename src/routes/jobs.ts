@@ -26147,6 +26147,74 @@ const enforceAutoHookDurationRange = ({
   }
 }
 
+const buildOpeningContractTimeline = ({
+  segments,
+  hook,
+  durationSeconds
+}: {
+  segments: Segment[]
+  hook: HookCandidate
+  durationSeconds: number
+}) => {
+  const enforcedHook = enforceAutoHookDurationRange({
+    candidate: {
+      ...hook,
+      start: Number(clamp(Number(hook.start || 0), 0, Math.max(0, durationSeconds - HOOK_MIN)).toFixed(3))
+    },
+    durationSeconds
+  })
+  const hookRange: TimeRange = {
+    start: Number(enforcedHook.start.toFixed(3)),
+    end: Number((enforcedHook.start + enforcedHook.duration).toFixed(3))
+  }
+  if (hookRange.end - hookRange.start < MIN_RENDER_SEGMENT_SECONDS) {
+    return null
+  }
+  const hookSegment: Segment = {
+    start: hookRange.start,
+    end: hookRange.end,
+    speed: 1,
+    subtitleIntent: 'hook',
+    emphasize: true,
+    transitionStyle: 'smooth',
+    audioLeadInMs: 140,
+    audioTailMs: 180
+  }
+  const remainder = subtractRange(
+    segments.map((segment) => ({ ...segment })),
+    hookRange
+  ).filter((segment) => segment.end - segment.start > 0.2)
+  return {
+    hook: enforcedHook,
+    segments: [hookSegment, ...remainder]
+  }
+}
+
+const isOpeningContractBroken = ({
+  segments,
+  hook,
+  shouldMoveHook
+}: {
+  segments: Segment[]
+  hook: HookCandidate | null
+  shouldMoveHook: boolean
+}) => {
+  if (!hook || !shouldMoveHook || hook.noRelocate) return false
+  if (!segments.length) return true
+  const placement = mapSourceRangeToEditedTimeline({
+    start: hook.start,
+    end: hook.start + hook.duration,
+    segments
+  })
+  if (!placement) return true
+  const firstSegment = segments[0]
+  return (
+    !firstSegment ||
+    Math.abs(Number(firstSegment.start || 0) - Number(hook.start || 0)) > 0.08 ||
+    placement.outputStart > 0.15
+  )
+}
+
 const matchPreferredHookCandidate = ({
   preferred,
   candidates
@@ -34514,6 +34582,49 @@ const processJob = async (
             } catch (noOpRescueError) {
               console.warn(`[${requestId || 'noid'}] no-op rescue render failed`, noOpRescueError)
             }
+          }
+        }
+        const needsOpeningContractEnforcement = isOpeningContractBroken({
+          segments: finalSegments,
+          hook: selectedHook,
+          shouldMoveHook: shouldMoveHookForRender
+        })
+        if (needsOpeningContractEnforcement && selectedHook) {
+          const openingContract = buildOpeningContractTimeline({
+            segments: finalSegments,
+            hook: selectedHook,
+            durationSeconds
+          })
+          if (openingContract) {
+            const enforcedSegments = prepareSegmentsForRender(
+              openingContract.segments,
+              durationSeconds,
+              processTranscriptCues
+            )
+            const enforcedPlacement = mapSourceRangeToEditedTimeline({
+              start: openingContract.hook.start,
+              end: openingContract.hook.start + openingContract.hook.duration,
+              segments: enforcedSegments
+            })
+            const contractSatisfied = Boolean(
+              enforcedSegments.length &&
+              enforcedPlacement &&
+              enforcedPlacement.outputStart <= 0.15 &&
+              Math.abs(Number(enforcedSegments[0]?.start || 0) - Number(openingContract.hook.start || 0)) <= 0.08
+            )
+            if (!contractSatisfied) {
+              await updateJob(jobId, { status: 'failed', error: 'opening_contract_broken' })
+              throw new Error('opening_contract_broken')
+            }
+            await runSegmentFileFallback(enforcedSegments)
+            finalSegments = enforcedSegments
+            selectedHook = openingContract.hook
+            selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+              sourceStart: Number(segment.start.toFixed(3)),
+              sourceEnd: Number(segment.end.toFixed(3)),
+              orderedIndex
+            }))
+            optimizationNotes.push('Opening contract enforcement rerender applied to keep the chosen hook at the true start of the exported video.')
           }
         }
         finalSegmentsForAnalysis = finalSegments.map((segment) => ({ ...segment }))
