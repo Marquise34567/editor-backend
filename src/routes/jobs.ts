@@ -25419,6 +25419,28 @@ const ALLOW_OPENAI_TRANSCRIPTION_FALLBACK = /^(1|true|yes)$/i.test(
 )
 const FAST_WHISPER_SCRIPT_OUTPUT_PATTERN = /\{[\s\S]*"srtPath"[\s\S]*\}/
 
+const getLocalCaptionRuntimePythonCandidates = () => {
+  const candidates = [
+    path.resolve(
+      process.cwd(),
+      '.caption-runtime-venv',
+      process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'
+    )
+  ]
+  const pointerPath = path.resolve(process.cwd(), '.caption-runtime-python-path')
+  if (fs.existsSync(pointerPath)) {
+    try {
+      const pointed = String(fs.readFileSync(pointerPath, 'utf8') || '').trim()
+      if (pointed) candidates.push(pointed)
+    } catch {
+      // ignore pointer read failures
+    }
+  }
+  return candidates
+    .map((candidate) => String(candidate || '').trim())
+    .filter((candidate, index, list) => candidate.length > 0 && list.indexOf(candidate) === index && fs.existsSync(candidate))
+}
+
 const buildFasterWhisperAttempts = () => {
   const configuredPython = String(process.env.FASTER_WHISPER_PYTHON || '').trim()
   const attempts: Array<{ command: string; preArgs: string[]; label: string }> = []
@@ -25431,6 +25453,9 @@ const buildFasterWhisperAttempts = () => {
     ))
     if (duplicate) return
     attempts.push({ command: normalized, preArgs, label })
+  }
+  for (const candidate of getLocalCaptionRuntimePythonCandidates()) {
+    add(candidate, [], `LOCAL_CAPTION_RUNTIME_PYTHON(${candidate})`)
   }
   if (configuredPython) add(configuredPython, [], 'FASTER_WHISPER_PYTHON')
   add('python', [], 'python')

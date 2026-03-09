@@ -1,5 +1,5 @@
 import { spawnSync } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import path from 'path'
 
 type CaptionProbeMode = 'faster_whisper' | 'whisper' | 'python_module' | 'api'
@@ -43,6 +43,24 @@ let cacheUpdatedAtMs = 0
 
 const trimToEmpty = (value?: string | null) => String(value || '').trim()
 
+const getLocalCaptionRuntimePythonCandidates = () => {
+  const candidates = [
+    path.resolve(process.cwd(), '.caption-runtime-venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
+  ]
+  const pointerPath = path.resolve(process.cwd(), '.caption-runtime-python-path')
+  if (existsSync(pointerPath)) {
+    try {
+      const pointed = trimToEmpty(readFileSync(pointerPath, 'utf8'))
+      if (pointed) candidates.push(pointed)
+    } catch {
+      // ignore pointer read failures
+    }
+  }
+  return candidates
+    .map((candidate) => trimToEmpty(candidate))
+    .filter((candidate, index, list) => candidate.length > 0 && list.indexOf(candidate) === index && existsSync(candidate))
+}
+
 const getLikelyWindowsWhisperBins = () => {
   if (process.platform !== 'win32') return []
   const roots = [
@@ -76,6 +94,9 @@ const buildProbeAttempts = () => {
     attempts.push({ label, command: normalized, args, mode })
   }
 
+  for (const candidate of getLocalCaptionRuntimePythonCandidates()) {
+    addAttempt(`LOCAL_CAPTION_RUNTIME_PYTHON(${candidate})`, candidate, ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
+  }
   addAttempt('FASTER_WHISPER_PYTHON', process.env.FASTER_WHISPER_PYTHON, ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
   addAttempt('python -c faster_whisper', 'python', ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
   addAttempt('python3 -c faster_whisper', 'python3', ['-c', 'import faster_whisper;print("ok")'], 'faster_whisper')
