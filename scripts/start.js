@@ -1,5 +1,5 @@
 const { execSync } = require('child_process')
-const { existsSync } = require('fs')
+const { existsSync, readdirSync, statSync } = require('fs')
 const path = require('path')
 
 const parseBool = (value) => /^(1|true|yes)$/i.test(String(value || '').trim())
@@ -19,17 +19,63 @@ const run = (label, command, options = {}) => {
   }
 }
 
+const getLatestMtimeMs = (targetPath) => {
+  if (!existsSync(targetPath)) return 0
+  try {
+    const targetStats = statSync(targetPath)
+    if (!targetStats.isDirectory()) return Number(targetStats.mtimeMs || 0)
+  } catch {
+    return 0
+  }
+  let latest = 0
+  const stack = [targetPath]
+  while (stack.length > 0) {
+    const current = stack.pop()
+    if (!current) continue
+    let entries = []
+    try {
+      entries = readdirSync(current, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry.name)
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name.startsWith('.')) continue
+        stack.push(fullPath)
+        continue
+      }
+      if (!entry.isFile()) continue
+      if (!/\.(ts|js|json|prisma)$/i.test(entry.name)) continue
+      try {
+        const mtimeMs = Number(statSync(fullPath).mtimeMs || 0)
+        if (mtimeMs > latest) latest = mtimeMs
+      } catch {
+        // ignore stat failures for transient files
+      }
+    }
+  }
+  return latest
+}
+
 const hasDatabaseUrl = Boolean(String(process.env.DATABASE_URL || '').trim())
 const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
 const shouldBuildOnStartup = parseBool(process.env.BUILD_ON_STARTUP)
 const shouldGeneratePrismaOnStartup = parseBool(process.env.PRISMA_GENERATE_ON_STARTUP)
 const shouldInstallCaptionRuntimeOnStartup = parseBool(process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP)
 const distEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
+const sourceMtimeMs = Math.max(
+  getLatestMtimeMs(path.resolve(process.cwd(), 'src')),
+  getLatestMtimeMs(path.resolve(process.cwd(), 'prisma')),
+  getLatestMtimeMs(path.resolve(process.cwd(), 'tsconfig.json'))
+)
+const distMtimeMs = getLatestMtimeMs(distEntryPath)
+const distStale = sourceMtimeMs > distMtimeMs + 1000
 
-if (shouldBuildOnStartup || !existsSync(distEntryPath)) {
+if (shouldBuildOnStartup || !existsSync(distEntryPath) || distStale) {
   run('Building backend', 'npm run build')
 } else {
-  console.log('[startup] Skipping startup build; dist/index.js already exists')
+  console.log('[startup] Skipping startup build; dist/index.js is up to date')
 }
 
 if (shouldGeneratePrismaOnStartup) {
