@@ -2389,6 +2389,16 @@ const FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS = (() => {
   if (!Number.isFinite(envValue)) return 128
   return Math.round(Math.min(256, Math.max(64, envValue)))
 })()
+const FORCE_RENDER_STAGE_MAX_SPEED = !/^(0|false|no)$/i.test(
+  String(process.env.FORCE_RENDER_STAGE_MAX_SPEED || 'true').trim()
+)
+const FORCE_RENDER_STAGE_PRESET = String(process.env.FORCE_RENDER_STAGE_PRESET || 'ultrafast').trim() || 'ultrafast'
+const FORCE_RENDER_STAGE_CODEC_THREADS = (() => {
+  const envValue = Number(process.env.FORCE_RENDER_STAGE_CODEC_THREADS || 0)
+  if (Number.isFinite(envValue) && envValue >= 1) return Math.round(Math.min(32, Math.max(1, envValue)))
+  const cpuCount = os.cpus()?.length || 1
+  return Math.max(2, Math.min(12, cpuCount))
+})()
 const SEGMENT_FILE_FALLBACK_MIN_SEGMENTS = (() => {
   const envValue = Number(process.env.SEGMENT_FILE_FALLBACK_MIN_SEGMENTS || 20)
   if (!Number.isFinite(envValue) || envValue < 6) return 20
@@ -27967,7 +27977,8 @@ const renderVerticalClip = async ({
   watermarkImagePath,
   subtitlePath,
   subtitleIsAss,
-  subtitleStyle
+  subtitleStyle,
+  codecThreads
 }: {
   inputPath: string
   outputPath: string
@@ -27993,6 +28004,7 @@ const renderVerticalClip = async ({
   subtitlePath?: string | null
   subtitleIsAss?: boolean
   subtitleStyle?: string | null
+  codecThreads?: number
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
@@ -28135,7 +28147,7 @@ const renderVerticalClip = async ({
     '-crf',
     videoCrf,
     '-threads',
-    String(RENDER_CODEC_THREADS),
+    String(Math.max(1, Math.round(Number(codecThreads || RENDER_CODEC_THREADS)))),
     '-pix_fmt',
     'yuv420p',
     '-filter_complex',
@@ -30714,6 +30726,9 @@ const processJob = async (
     requestedAggressionLevel = 'viral'
     options.fastMode = true
   }
+  if (FORCE_RENDER_STAGE_MAX_SPEED) {
+    options.fastMode = true
+  }
   if (editorModePlaybookNotes.length) {
     outcomeAutomationNotes.push(...editorModePlaybookNotes)
   }
@@ -30752,12 +30767,16 @@ const processJob = async (
   const baseCrf = getDefaultCrfForQuality(finalQuality)
   const adjustedCrf = Math.round(clamp(baseCrf + platformProfile.crfDelta, 16, 30))
   const renderFastMode = Boolean(
+    FORCE_RENDER_STAGE_MAX_SPEED ||
     options.fastMode ||
     (renderConfig.mode === 'horizontal' && RENDER_FORCE_FAST_HORIZONTAL)
   )
   const renderFastHorizontalMode = renderFastMode && renderConfig.mode === 'horizontal'
   const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
   const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
+  const renderCodecThreads = renderFastMode
+    ? Math.max(RENDER_CODEC_THREADS, FORCE_RENDER_STAGE_CODEC_THREADS)
+    : RENDER_CODEC_THREADS
   const renderSubtitlesEnabled = Boolean(
     CAPTIONS_PIPELINE_ENABLED &&
     renderConfig.mode === 'vertical' &&
@@ -30765,7 +30784,7 @@ const processJob = async (
     !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
   )
   const ffPreset = renderFastMode
-    ? FAST_MODE_FFMPEG_PRESET
+    ? (FORCE_RENDER_STAGE_MAX_SPEED ? FORCE_RENDER_STAGE_PRESET : FAST_MODE_FFMPEG_PRESET)
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
   const ffCrf = renderFastMode
     ? String(FAST_MODE_FFMPEG_CRF)
@@ -31206,6 +31225,7 @@ const processJob = async (
           videoCrf: ffCrf,
           audioBitrate: ffAudioBitrate,
           audioSampleRate: ffAudioSampleRate,
+          codecThreads: renderCodecThreads,
           audioFilters: verticalAudioFilters,
           enableTransitions: options.transitions,
           enableSmartZoom: options.smartZoom,
@@ -31291,7 +31311,7 @@ const processJob = async (
               '-crf',
               ffCrf,
               '-threads',
-              String(RENDER_CODEC_THREADS),
+              String(renderCodecThreads),
               '-pix_fmt',
               'yuv420p'
             ]
@@ -33883,7 +33903,7 @@ const processJob = async (
         '-crf',
         ffCrf,
         '-threads',
-        String(RENDER_CODEC_THREADS),
+        String(renderCodecThreads),
         '-pix_fmt',
         'yuv420p'
       ]
@@ -34092,7 +34112,7 @@ const processJob = async (
               '-crf',
               ffCrf,
               '-threads',
-              String(RENDER_CODEC_THREADS),
+              String(renderCodecThreads),
               '-pix_fmt',
               'yuv420p'
             ]
@@ -34190,7 +34210,7 @@ const processJob = async (
               '-crf',
               ffCrf,
               '-threads',
-              String(RENDER_CODEC_THREADS),
+              String(renderCodecThreads),
               '-pix_fmt',
               'yuv420p'
             ]
@@ -34224,7 +34244,7 @@ const processJob = async (
                 '-crf',
                 ffCrf,
                 '-threads',
-                String(RENDER_CODEC_THREADS),
+                String(renderCodecThreads),
                 '-pix_fmt',
                 'yuv420p',
                 '-vf',
