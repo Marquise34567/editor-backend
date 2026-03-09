@@ -11278,6 +11278,7 @@ const selectAuthoritativeAutoHookDecision = ({
   aggressionLevel,
   hasTranscript,
   signalStrength,
+  strictFailClosed = false,
   thresholdOffset = 0,
   windows = [],
   transcriptCues = [],
@@ -11291,6 +11292,7 @@ const selectAuthoritativeAutoHookDecision = ({
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
+  strictFailClosed?: boolean
   thresholdOffset?: number
   windows?: EngagementWindow[]
   transcriptCues?: TranscriptCue[]
@@ -11300,7 +11302,7 @@ const selectAuthoritativeAutoHookDecision = ({
   recentHooks?: HookReuseWindow[] | null
   creativeVariant?: CreativeVariant | null
 }): HookSelectionDecision | null => {
-  const strictHookFailClosed = true
+  const strictHookFailClosed = strictFailClosed === true
   const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
@@ -31875,6 +31877,7 @@ const processJob = async (
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength,
+        strictFailClosed: Boolean(options.topHumanGuardMode),
         thresholdOffset: hookThresholdOffset,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
         transcriptCues: processTranscriptCues,
@@ -39161,6 +39164,7 @@ const buildEditPlanForTest = async ({
     aggressionLevel: normalizedAggression,
     hasTranscript: hasTranscriptSignals,
     signalStrength,
+    strictFailClosed: false,
     windows: planWindows,
     transcriptCues: normalizedTranscriptCues,
     segments: planSegments,
