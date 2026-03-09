@@ -13,7 +13,7 @@ const rawInstallToggle = String(
 const shouldInstallCaptionRuntime = (() => {
   if (ENABLED_PATTERN.test(rawInstallToggle)) return true
   if (DISABLED_PATTERN.test(rawInstallToggle)) return false
-  return false
+  return true
 })()
 
 const CAPTION_RUNTIME_POINTER_FILE = path.resolve(process.cwd(), '.caption-runtime-python-path')
