@@ -13,9 +13,15 @@ import {
 } from '../lib/planFeatures'
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
+import { getCaptionEngineStatus } from '../lib/captionEngine'
 
 const router = express.Router()
-const CAPTIONS_PIPELINE_ENABLED = false
+const CAPTIONS_PIPELINE_ENABLED = (() => {
+  const raw = String(process.env.CAPTIONS_PIPELINE_ENABLED ?? 'true').trim().toLowerCase()
+  if (!raw) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(raw)) return false
+  return true
+})()
 
 const DEFAULT_SETTINGS = {
   userId: null,
@@ -47,12 +53,23 @@ const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message:
 }
 
 const getCaptionCapabilities = () => {
+  if (!CAPTIONS_PIPELINE_ENABLED) {
+    return {
+      captions: {
+        available: false,
+        provider: null,
+        mode: 'disabled',
+        reason: 'Captions are disabled in the editor pipeline.'
+      }
+    }
+  }
+  const status = getCaptionEngineStatus()
   return {
     captions: {
-      available: false,
-      provider: null,
-      mode: 'disabled',
-      reason: CAPTIONS_PIPELINE_ENABLED ? null : 'Captions are disabled in the editor pipeline.'
+      available: status.available,
+      provider: status.provider,
+      mode: status.mode,
+      reason: status.reason
     }
   }
 }

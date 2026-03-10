@@ -2656,7 +2656,12 @@ const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
   return Number.isFinite(envValue) && envValue > 2 ? Math.round(envValue) : 24
 })()
 const HOOK_CALIBRATION_MIN_SAMPLES = 3
-const CAPTIONS_PIPELINE_ENABLED = false
+const CAPTIONS_PIPELINE_ENABLED = (() => {
+  const raw = String(process.env.CAPTIONS_PIPELINE_ENABLED ?? 'true').trim().toLowerCase()
+  if (!raw) return true
+  if (['0', 'false', 'no', 'off', 'disabled'].includes(raw)) return false
+  return true
+})()
 const OUTCOME_AUTOMATION_LOOKBACK_JOBS = (() => {
   const envValue = Number(process.env.OUTCOME_AUTOMATION_LOOKBACK_JOBS || 90)
   return Number.isFinite(envValue) && envValue > 8 ? Math.round(envValue) : 90
