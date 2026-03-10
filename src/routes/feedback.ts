@@ -323,17 +323,26 @@ const resolveTrendFromLift = (liftPercent: number | null): RealtimePredictionTre
 
 const buildClassicRealtimePrediction = (job: any): RealtimePredictionVideo => {
   const analysis = readObject(job?.analysis)
-  const metadata = readObject(analysis?.metadata_summary)
-  const retention = readObject(metadata?.retention)
+  const metadata = readObject(analysis?.metadata_summary) || readObject(analysis?.metadataSummary)
+  const retention = readObject(metadata?.retention) || readObject(metadata?.retention_summary)
   const automation = readObject(retention?.automation)
-  const qualityGate = readObject(metadata?.qualityGate)
+  const qualityGate = readObject(metadata?.qualityGate) || readObject(metadata?.quality_gate)
   const qualityScores = readObject(qualityGate?.scores)
-  const timeline = readObject(metadata?.timeline)
-  const pacing = readObject(metadata?.pacing)
+  const timeline = readObject(metadata?.timeline) || readObject(metadata?.timeline_summary)
+  const pacing = readObject(metadata?.pacing) || readObject(metadata?.pacing_summary)
   const clips = Array.isArray(metadata?.clips) ? metadata.clips : []
 
   const clipPredictions = clips
-    .map((clip: any) => parsePercent(clip?.predictedCompletion))
+    .map((clip: any) => parsePercent(
+      clip?.predictedCompletion ??
+      clip?.predicted_completion ??
+      clip?.predictedPercent ??
+      clip?.predicted_percent ??
+      clip?.predicted ??
+      clip?.watchPercent ??
+      clip?.watchedPercent ??
+      clip?.watched_pct
+    ))
     .filter((value: number | null): value is number => value !== null)
   const clipAverage = clipPredictions.length
     ? Number((clipPredictions.reduce((sum, value) => sum + value, 0) / clipPredictions.length).toFixed(2))
@@ -341,27 +350,46 @@ const buildClassicRealtimePrediction = (job: any): RealtimePredictionVideo => {
 
   const score = pickFirstNumber([
     parsePercent(retention?.afterScore),
+    parsePercent(retention?.after_score),
     parsePercent(retention?.score),
+    parsePercent(retention?.retentionScore),
     parsePercent(job?.retentionScore),
     parsePercent(analysis?.retention_score_after),
-    parsePercent(analysis?.retentionScore)
+    parsePercent(analysis?.retentionScore),
+    parsePercent(analysis?.retention_judge?.retention_score)
   ])
   const predictedCompletion = pickFirstNumber([
     parsePercent(metadata?.predictedAverage),
+    parsePercent(metadata?.predicted_average),
+    parsePercent(metadata?.predictedAverageRetention),
+    parsePercent(metadata?.predicted_average_retention),
     clipAverage
   ])
   const expectedLift = pickFirstNumber([
     parseSignedPercent(automation?.expectedLift),
-    parseSignedPercent(retention?.delta)
+    parseSignedPercent(automation?.expected_lift),
+    parseSignedPercent(retention?.delta),
+    parseSignedPercent(retention?.retentionDelta),
+    parseSignedPercent(retention?.retention_delta)
   ])
   const hookStrength = pickFirstNumber([
     parsePercent(qualityScores?.hook),
-    parsePercent(analysis?.hook_score)
+    parsePercent(qualityScores?.hook_strength),
+    parsePercent(analysis?.hook_score),
+    parsePercent(analysis?.hookScore)
   ])
   const pacingScore = pickFirstNumber([
     parsePercent(qualityScores?.pacing),
+    parsePercent(qualityScores?.pacing_score),
     parsePercent(analysis?.retention_judge?.pacing_score),
-    parsePercent(pacing?.withinTargetRatio !== undefined ? Number(pacing.withinTargetRatio) * 100 : null)
+    parsePercent(analysis?.retention_judge?.pacingScore),
+    parsePercent(
+      pacing?.withinTargetRatio !== undefined
+        ? Number(pacing.withinTargetRatio) * 100
+        : pacing?.within_target_ratio !== undefined
+          ? Number(pacing.within_target_ratio) * 100
+          : null
+    )
   ])
   const confidencePercent = pickFirstNumber([
     parsePercent(automation?.confidence),
