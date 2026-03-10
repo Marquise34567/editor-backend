@@ -1738,6 +1738,7 @@ type VerticalCaptionPreset =
   | 'retro_wave'
   | 'glitch_pop'
   | 'cinema_punch'
+  | 'shadow_strike'
 type VerticalCaptionConfig = {
   enabled: boolean
   autoGenerate: boolean
@@ -2159,7 +2160,8 @@ const VERTICAL_CAPTION_PRESETS: VerticalCaptionPreset[] = [
   'ice_pop',
   'retro_wave',
   'glitch_pop',
-  'cinema_punch'
+  'cinema_punch',
+  'shadow_strike'
 ]
 const VERTICAL_CAPTION_FONT_IDS: SubtitleFontId[] = ['impact', 'sans_bold', 'condensed', 'serif_bold', 'display_black', 'mono_bold']
 const VERTICAL_CAPTION_FONT_SIZE_MIN = 32
@@ -5948,7 +5950,7 @@ const parseVerticalCaptionPreset = (value: any): VerticalCaptionPreset | null =>
     glitch: 'glitch_pop',
     cinema_punch: 'cinema_punch',
     cinema: 'cinema_punch',
-    shadow_strike: 'cinema_punch',
+    shadow_strike: 'shadow_strike',
     opus_pop: 'mrbeast_animated',
     opus: 'mrbeast_animated',
     capcut_kinetic: 'rage_mode',
@@ -6001,7 +6003,7 @@ const parseVerticalCaptionShadowBlur = (value: any): number | null => {
 const parseVerticalCaptionPosition = (value: any): number | null => {
   const parsed = Number(value)
   if (!Number.isFinite(parsed)) return null
-  return Number(clamp(parsed, 0.02, 0.98).toFixed(4))
+  return Number(clamp(parsed, 0, 1).toFixed(4))
 }
 
 const parseVerticalCaptionAnimationEnabled = (value: any): boolean | null => {
@@ -6473,22 +6475,22 @@ const resolveVerticalCaptionConfig = (
     if (preset === 'bold_clean_box') {
       return {
         fontId: 'sans_bold' as SubtitleFontId,
-        textColor: 'FFFFFF',
-        accentColor: 'FFE047',
-        outlineColor: '000000',
-        outlineWidth: 6,
+        textColor: '0B0D12',
+        accentColor: '0B0D12',
+        outlineColor: '0B0D12',
+        outlineWidth: 1,
         shadowEnabled: true,
-        shadowColor: '000000',
-        shadowBlur: 10,
+        shadowColor: '0B0D12',
+        shadowBlur: 4,
         boxEnabled: true,
-        boxColor: '111827',
+        boxColor: 'FFFFFF',
         animationEnabled: false,
         animation: 'none' as VerticalClipCaptionAnimation,
-        animationSpeed: 0.96,
+        animationSpeed: 1,
         dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
-        highlightWords: true,
-        autoEmphasis: true,
+        highlightWords: false,
+        autoEmphasis: false,
         autoEmoji: false,
         removeFillers: true
       }
@@ -6496,24 +6498,24 @@ const resolveVerticalCaptionConfig = (
     if (preset === 'rage_mode') {
       return {
         fontId: 'impact' as SubtitleFontId,
-        textColor: 'FDE68A',
-        accentColor: 'FB923C',
-        outlineColor: '1A0202',
-        outlineWidth: 14,
+        textColor: 'FFFFFF',
+        accentColor: 'FFFFFF',
+        outlineColor: '000000',
+        outlineWidth: 12,
         shadowEnabled: true,
-        shadowColor: '050505',
-        shadowBlur: 18,
-        boxEnabled: true,
-        boxColor: '111111',
-        animationEnabled: true,
-        animation: 'bounce' as VerticalClipCaptionAnimation,
-        animationSpeed: 1.2,
-        dynamicMode: 'kinetic_word' as VerticalCaptionDynamicMode,
+        shadowColor: '000000',
+        shadowBlur: 14,
+        boxEnabled: false,
+        boxColor: '000000',
+        animationEnabled: false,
+        animation: 'none' as VerticalClipCaptionAnimation,
+        animationSpeed: 1,
+        dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
-        highlightWords: true,
-        autoEmphasis: true,
-        autoEmoji: true,
-        removeFillers: false
+        highlightWords: false,
+        autoEmphasis: false,
+        autoEmoji: false,
+        removeFillers: true
       }
     }
     if (preset === 'ice_pop') {
@@ -6604,6 +6606,29 @@ const resolveVerticalCaptionConfig = (
         voicePreset: 'none' as VerticalVoicePreset,
         highlightWords: true,
         autoEmphasis: true,
+        autoEmoji: false,
+        removeFillers: true
+      }
+    }
+    if (preset === 'shadow_strike') {
+      return {
+        fontId: 'display_black' as SubtitleFontId,
+        textColor: 'FFFFFF',
+        accentColor: 'FFFFFF',
+        outlineColor: '000000',
+        outlineWidth: 9,
+        shadowEnabled: true,
+        shadowColor: '000000',
+        shadowBlur: 24,
+        boxEnabled: false,
+        boxColor: '000000',
+        animationEnabled: false,
+        animation: 'none' as VerticalClipCaptionAnimation,
+        animationSpeed: 1,
+        dynamicMode: 'classic' as VerticalCaptionDynamicMode,
+        voicePreset: 'none' as VerticalVoicePreset,
+        highlightWords: false,
+        autoEmphasis: false,
         autoEmoji: false,
         removeFillers: true
       }
@@ -25263,20 +25288,20 @@ const buildVerticalCaptionSubtitleStyle = ({
     }
     if (preset === 'bold_clean_box') {
       return {
-        textColor: 'FFFFFF',
-        accentColor: 'FFE047',
-        outlineColor: '000000',
-        outlineWidth: 6,
+        textColor: '0B0D12',
+        accentColor: '0B0D12',
+        outlineColor: '0B0D12',
+        outlineWidth: 1,
         animation: 'none' as const
       }
     }
     if (preset === 'rage_mode') {
       return {
-        textColor: 'FDE68A',
-        accentColor: 'FB923C',
-        outlineColor: '1A0202',
-        outlineWidth: 14,
-        animation: 'pop' as const
+        textColor: 'FFFFFF',
+        accentColor: 'FFFFFF',
+        outlineColor: '000000',
+        outlineWidth: 12,
+        animation: 'none' as const
       }
     }
     if (preset === 'ice_pop') {
@@ -25312,6 +25337,15 @@ const buildVerticalCaptionSubtitleStyle = ({
         accentColor: 'FFD166',
         outlineColor: '1A1203',
         outlineWidth: 7,
+        animation: 'none' as const
+      }
+    }
+    if (preset === 'shadow_strike') {
+      return {
+        textColor: 'FFFFFF',
+        accentColor: 'FFFFFF',
+        outlineColor: '000000',
+        outlineWidth: 9,
         animation: 'none' as const
       }
     }
@@ -25387,8 +25421,8 @@ const buildVerticalCaptionAss = ({
   const shadowColor = toAssColorFromHexWithAlpha(config.shadowColor || '000000', 0)
   const borderStyle = boxEnabled ? 3 : 1
   const backColor = boxEnabled ? boxColor : shadowColor
-  const posX = Math.round(clamp(config.positionX || 0.5, 0.02, 0.98) * 1080)
-  const posY = Math.round(clamp(config.positionY || 0.84, 0.02, 0.98) * 1920)
+  const posX = Math.round(clamp(config.positionX ?? 0.5, 0, 1) * 1080)
+  const posY = Math.round(clamp(config.positionY ?? 0.84, 0, 1) * 1920)
   const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
     (config.animationEnabled ? 'pop' : 'none')
   const effectiveAnimationMode: VerticalClipCaptionAnimation = (
