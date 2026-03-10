@@ -6,6 +6,7 @@ import { initRealtime } from './realtime'
 import { FFMPEG_PATH, formatCommand } from './lib/ffmpeg'
 import { getCaptionEngineStatus } from './lib/captionEngine'
 import { initWeeklyReportScheduler } from './services/weeklyReports'
+import { initDailyEngagementScheduler } from './services/dailyEngagement'
 import { warmIpBanCache } from './services/ipBan'
 
 const PORT = Number(process.env.PORT || 4000)
@@ -108,6 +109,7 @@ const runStartupWarmups = async () => {
   }
   await warmIpBanCache().catch(() => null)
   initWeeklyReportScheduler()
+  initDailyEngagementScheduler()
 }
 
 const start = async () => {

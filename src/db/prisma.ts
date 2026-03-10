@@ -20,6 +20,7 @@ class StubDB {
   analyticsEvents = new Map<string, any>()
   bannedIps = new Map<string, any>()
   weeklyReportSubscriptions = new Map<string, any>()
+  dailyEngagementSubscriptions = new Map<string, any>()
 
   async $queryRaw() { return 1 }
 
@@ -27,14 +28,24 @@ class StubDB {
     findUnique: async ({ where }: any) => {
       const id = where?.id
       const email = where?.email
+      const referralCode = where?.referralCode
+      const stripeCustomerId = where?.stripeCustomerId
       if (id) return this.users.get(id) ?? null
       if (email) return Array.from(this.users.values()).find((u:any)=>u.email===email) ?? null
+      if (referralCode) {
+        return Array.from(this.users.values()).find((u: any) => String(u.referralCode || '') === String(referralCode)) ?? null
+      }
+      if (stripeCustomerId) {
+        return Array.from(this.users.values()).find((u: any) => String(u.stripeCustomerId || '') === String(stripeCustomerId)) ?? null
+      }
       return null
     },
     findMany: async ({ where, orderBy, take }: any = {}) => {
       let rows = Array.from(this.users.values())
       if (where?.email) rows = rows.filter((user: any) => user.email === where.email)
       if (where?.id) rows = rows.filter((user: any) => user.id === where.id)
+      if (where?.referralCode) rows = rows.filter((user: any) => String(user.referralCode || '') === String(where.referralCode))
+      if (where?.referredByUserId) rows = rows.filter((user: any) => String(user.referredByUserId || '') === String(where.referredByUserId))
       if (orderBy?.createdAt) {
         const dir = String(orderBy.createdAt).toLowerCase() === 'asc' ? 1 : -1
         rows = rows.sort((a: any, b: any) => {
@@ -47,6 +58,14 @@ class StubDB {
         rows = rows.slice(0, Number(take))
       }
       return rows
+    },
+    count: async ({ where }: any = {}) => {
+      let rows = Array.from(this.users.values())
+      if (where?.id) rows = rows.filter((user: any) => user.id === where.id)
+      if (where?.email) rows = rows.filter((user: any) => user.email === where.email)
+      if (where?.referralCode) rows = rows.filter((user: any) => String(user.referralCode || '') === String(where.referralCode))
+      if (where?.referredByUserId) rows = rows.filter((user: any) => String(user.referredByUserId || '') === String(where.referredByUserId))
+      return rows.length
     },
     create: async ({ data }: any) => {
       const id = data.id || `stub-${Math.random().toString(36).slice(2,9)}`
@@ -222,6 +241,100 @@ class StubDB {
       if (!existing) throw new Error('record_not_found')
       const next = { ...existing, ...data, updatedAt: new Date() }
       this.weeklyReportSubscriptions.set(next.id, next)
+      return next
+    }
+  }
+
+  dailyEngagementSubscription = {
+    findUnique: async ({ where }: any) => {
+      if (where?.id) return this.dailyEngagementSubscriptions.get(where.id) ?? null
+      if (where?.userId) {
+        return (
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.userId || '') === String(where.userId)
+          ) ?? null
+        )
+      }
+      if (where?.email) {
+        return (
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ) ?? null
+        )
+      }
+      return null
+    },
+    findMany: async ({ where, orderBy }: any = {}) => {
+      let rows = Array.from(this.dailyEngagementSubscriptions.values())
+      if (where?.email) {
+        rows = rows.filter((row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase())
+      }
+      if (where?.userId) {
+        rows = rows.filter((row: any) => String(row.userId || '') === String(where.userId))
+      }
+      if (typeof where?.enabled === 'boolean') {
+        rows = rows.filter((row: any) => Boolean(row.enabled) === where.enabled)
+      }
+      if (where?.nextSendAt?.lte) {
+        const lte = new Date(where.nextSendAt.lte).getTime()
+        rows = rows.filter((row: any) => {
+          const value = row?.nextSendAt ? new Date(row.nextSendAt).getTime() : Number.POSITIVE_INFINITY
+          return value <= lte
+        })
+      }
+      if (orderBy?.updatedAt) {
+        const dir = String(orderBy.updatedAt).toLowerCase() === 'asc' ? 1 : -1
+        rows = rows.sort((a: any, b: any) => {
+          const aMs = new Date(a?.updatedAt || 0).getTime()
+          const bMs = new Date(b?.updatedAt || 0).getTime()
+          return (aMs - bMs) * dir
+        })
+      }
+      return rows
+    },
+    upsert: async ({ where, update, create }: any) => {
+      const existing =
+        (where?.id && this.dailyEngagementSubscriptions.get(where.id)) ||
+        (where?.userId &&
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.userId || '') === String(where.userId)
+          )) ||
+        (where?.email &&
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ))
+      if (existing) {
+        const next = { ...existing, ...update, updatedAt: new Date() }
+        this.dailyEngagementSubscriptions.set(next.id, next)
+        return next
+      }
+      const id = create?.id || `des-${Math.random().toString(36).slice(2, 9)}`
+      const created = {
+        id,
+        ...create,
+        enabled: create?.enabled ?? true,
+        emailEnabled: create?.emailEnabled ?? true,
+        pushEnabled: create?.pushEnabled ?? false,
+        createdAt: create?.createdAt || new Date(),
+        updatedAt: new Date()
+      }
+      this.dailyEngagementSubscriptions.set(id, created)
+      return created
+    },
+    update: async ({ where, data }: any) => {
+      const existing =
+        (where?.id && this.dailyEngagementSubscriptions.get(where.id)) ||
+        (where?.userId &&
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.userId || '') === String(where.userId)
+          )) ||
+        (where?.email &&
+          Array.from(this.dailyEngagementSubscriptions.values()).find(
+            (row: any) => String(row.email || '').toLowerCase() === String(where.email).toLowerCase()
+          ))
+      if (!existing) throw new Error('record_not_found')
+      const next = { ...existing, ...data, updatedAt: new Date() }
+      this.dailyEngagementSubscriptions.set(next.id, next)
       return next
     }
   }

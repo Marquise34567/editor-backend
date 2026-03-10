@@ -14,6 +14,12 @@ import {
 import { DEFAULT_SUBTITLE_PRESET, normalizeSubtitlePreset } from '../shared/subtitlePresets'
 import { resolveDevAdminAccess } from '../lib/devAccounts'
 import { getCaptionEngineStatus } from '../lib/captionEngine'
+import {
+  disableDailyPushSubscription,
+  getDailyEngagementStatusForUser,
+  updateDailyEngagementPreferences,
+  upsertDailyPushSubscription
+} from '../services/dailyEngagement'
 
 const router = express.Router()
 const CAPTIONS_PIPELINE_ENABLED = (() => {
@@ -46,6 +52,16 @@ const coerceAutoZoomMax = (value: any, maxValue: number) => {
   if (!Number.isFinite(parsed)) return maxValue
   const clamped = Math.max(1, Math.min(parsed, maxValue))
   return Math.round(clamped * 100) / 100
+}
+
+const parseOptionalBoolean = (value: unknown): boolean | null => {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (['true', '1', 'yes', 'on'].includes(normalized)) return true
+    if (['false', '0', 'no', 'off'].includes(normalized)) return false
+  }
+  return null
 }
 
 const sendPlanLimit = (res: any, requiredPlan: string, feature: string, message: string) => {
@@ -88,9 +104,13 @@ router.get('/', async (req: any, res) => {
     const userId = req.user?.id
     const capabilities = getCaptionCapabilities()
     // If not authenticated, return safe defaults (do not 500)
-    if (!userId) return res.status(200).json({ settings: DEFAULT_SETTINGS, capabilities })
+    if (!userId) return res.status(200).json({ settings: DEFAULT_SETTINGS, capabilities, dailyEngagement: null })
 
     await getOrCreateUser(userId, req.user?.email)
+    const dailyEngagement = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
     const { tier } = await getUserPlan(userId)
     const devAccess = await resolveDevAdminAccess(userId, req.user?.email)
     const effectiveTier = devAccess.emailAuthorized ? 'studio' : tier
@@ -122,7 +142,7 @@ router.get('/', async (req: any, res) => {
       } catch (e) {
         // If DB write fails, fall back to defaults in-memory
         console.warn('failed to create settings, falling back to defaults', e)
-        return res.status(200).json({ settings: { ...DEFAULT_SETTINGS, userId }, capabilities })
+        return res.status(200).json({ settings: { ...DEFAULT_SETTINGS, userId }, capabilities, dailyEngagement })
       }
     }
 
@@ -149,7 +169,7 @@ router.get('/', async (req: any, res) => {
       subtitleStyle: enforcedSubtitle,
       autoZoomMax: enforcedAutoZoomMax
     }
-    res.json({ settings: enforced, capabilities })
+    res.json({ settings: enforced, capabilities, dailyEngagement })
   } catch (err: any) {
     // Log full stack to Railway logs for diagnosis (do not log auth tokens)
     console.error('get settings error', err?.stack || err)
@@ -219,17 +239,125 @@ router.patch('/', async (req: any, res) => {
       autoZoomMax: sanitizedAutoZoom
     }
     const updated = await prisma.userSettings.upsert({ where: { userId }, create: { userId, ...sanitized }, update: sanitized })
+    const dailyEngagement = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
     res.json({
       settings: {
         ...updated,
         autoCaptions: Boolean(updated?.autoCaptions)
       },
-      capabilities
+      capabilities,
+      dailyEngagement
     })
   } catch (err: any) {
     console.error('save settings error', err?.stack || err)
     const message = err?.message || String(err) || 'Unknown error'
     res.status(500).json({ error: 'server_error', message, path: '/api/settings' })
+  }
+})
+
+router.post('/engagement/preferences', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    await getOrCreateUser(userId, req.user?.email)
+
+    const current = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
+    const requestedEnabled = parseOptionalBoolean(req.body?.enabled)
+    const requestedEmailEnabled = parseOptionalBoolean(req.body?.emailEnabled)
+    const emailEnabled = requestedEmailEnabled ?? current.emailEnabled
+    const channelsEnabled = Boolean(emailEnabled || current.pushEnabled)
+    const enabled = Boolean((requestedEnabled ?? channelsEnabled) && channelsEnabled)
+
+    await updateDailyEngagementPreferences({
+      userId,
+      email: req.user?.email,
+      enabled,
+      emailEnabled
+    })
+
+    const dailyEngagement = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
+    return res.json({ ok: true, dailyEngagement })
+  } catch (err: any) {
+    console.error('save daily engagement preferences error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    return res.status(500).json({ error: 'server_error', message, path: '/api/settings/engagement/preferences' })
+  }
+})
+
+router.post('/engagement/push-subscription', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    await getOrCreateUser(userId, req.user?.email)
+
+    const current = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
+    if (!current.provider?.webPushConfigured) {
+      return res.status(400).json({
+        error: 'daily_engagement_push_provider_not_configured',
+        message: 'Configure WEB_PUSH_VAPID_SUBJECT, WEB_PUSH_VAPID_PUBLIC_KEY, and WEB_PUSH_VAPID_PRIVATE_KEY first.'
+      })
+    }
+
+    const endpoint = String(req.body?.endpoint || '').trim()
+    const p256dh = String(req.body?.p256dh || req.body?.keys?.p256dh || '').trim()
+    const auth = String(req.body?.auth || req.body?.keys?.auth || '').trim()
+    if (!endpoint || !p256dh || !auth) {
+      return res.status(400).json({
+        error: 'invalid_push_subscription',
+        message: 'Missing endpoint, p256dh, or auth.'
+      })
+    }
+
+    await upsertDailyPushSubscription({
+      userId,
+      email: req.user?.email,
+      endpoint,
+      p256dh,
+      auth
+    })
+    const dailyEngagement = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
+    return res.json({ ok: true, dailyEngagement })
+  } catch (err: any) {
+    console.error('save daily push subscription error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    return res.status(500).json({ error: 'server_error', message, path: '/api/settings/engagement/push-subscription' })
+  }
+})
+
+router.delete('/engagement/push-subscription', async (req: any, res) => {
+  try {
+    const userId = String(req.user?.id || '').trim()
+    if (!userId) return res.status(401).json({ error: 'unauthorized' })
+    await getOrCreateUser(userId, req.user?.email)
+
+    await disableDailyPushSubscription({
+      userId,
+      email: req.user?.email
+    })
+    const dailyEngagement = await getDailyEngagementStatusForUser({
+      userId,
+      email: req.user?.email
+    })
+    return res.json({ ok: true, dailyEngagement })
+  } catch (err: any) {
+    console.error('disable daily push subscription error', err?.stack || err)
+    const message = err?.message || String(err) || 'Unknown error'
+    return res.status(500).json({ error: 'server_error', message, path: '/api/settings/engagement/push-subscription' })
   }
 })
 

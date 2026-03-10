@@ -42,6 +42,9 @@ model User {
   id                    String   @id @default(uuid())
   email                 String   @unique
   createdAt             DateTime @default(now()) @map("created_at")
+  referralCode          String?  @unique @map("referral_code")
+  referredByUserId      String?  @map("referred_by_user_id")
+  referralRewardsGranted Int     @default(0) @map("referral_rewards_granted")
   stripeCustomerId      String?  @map("stripe_customer_id")
   stripeSubscriptionId  String?  @map("stripe_subscription_id")
   stripePriceId         String?  @map("stripe_price_id")
@@ -55,8 +58,10 @@ model User {
   exportCounter         ExportCounter?
   lessonProgress        LessonProgress[]
   analyticsEvents       SiteAnalyticsEvent[]
+  dailyEngagementSubscription DailyEngagementSubscription?
 
   @@map("profiles")
+  @@index([referredByUserId], map: "idx_profiles_referred_by_user_id")
 }
 
 model Job {
@@ -347,4 +352,25 @@ model WeeklyReportSubscription {
   updatedAt  DateTime @updatedAt @map("updated_at")
 
   @@map("weekly_report_subscriptions")
+}
+
+model DailyEngagementSubscription {
+  id          String   @id @default(uuid())
+  userId      String   @unique @map("user_id")
+  email       String   @unique
+  enabled     Boolean  @default(true)
+  emailEnabled Boolean @default(true) @map("email_enabled")
+  pushEnabled Boolean  @default(false) @map("push_enabled")
+  pushEndpoint String? @map("push_endpoint")
+  pushP256dh  String?  @map("push_p256dh")
+  pushAuth    String?  @map("push_auth")
+  lastSentAt  DateTime? @map("last_sent_at")
+  nextSendAt  DateTime? @map("next_send_at")
+  lastError   String?  @map("last_error")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([enabled, nextSendAt], map: "idx_daily_engagement_subscriptions_due")
+  @@map("daily_engagement_subscriptions")
 }
