@@ -1,0 +1,15 @@
+node_modules/
+dist/
+output/
+outputs/
+.caption-runtime-venv/
+backend-deploy-clean-*/
+backend-deploy-worker-start/
+backend-clean-*.tar
+*.log
+*.tmp
+*.tmpTEMP_MPY_wvf_snd.mp4
+*.mp4
+*.jsonl
+startup-check-*.out.log
+startup-check-*.err.log
