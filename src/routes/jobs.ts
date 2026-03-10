@@ -1999,6 +1999,7 @@ type EditPlan = {
 }
 type PipelinePowerModeSelection = 'standard' | 'ultra' | 'retention_king'
 type CreativeVariant = 'balanced' | 'punchy' | 'dramatic' | 'curiosity_first'
+type X264Preset = 'ultrafast' | 'superfast' | 'veryfast' | 'faster' | 'fast' | 'medium' | 'slow' | 'slower' | 'veryslow'
 type EditOptions = {
   autoHookMove: boolean
   removeBoring: boolean
@@ -2034,6 +2035,9 @@ type EditOptions = {
   creatorStyleLock: number
   manualTimestampConfig?: ManualTimestampConfig | null
   editorInstructionPrompt?: string | null
+  videoPreset?: X264Preset | null
+  videoCrf?: number | null
+  audioBitrateKbps?: number | null
 }
 type ContentStyle = 'reaction' | 'vlog' | 'tutorial' | 'gaming' | 'story'
 type EditorModeSelection = 'auto' | 'reaction' | 'commentary' | 'savage-roast' | 'vlog' | 'gaming' | 'sports' | 'education' | 'podcast' | 'ultra' | 'retention-king'
@@ -2433,21 +2437,40 @@ const RENDER_CODEC_THREADS = (() => {
   if (!Number.isFinite(envValue) || envValue < 1) return 1
   return Math.min(8, Math.round(envValue))
 })()
+const X264_PRESET_VALUES: X264Preset[] = [
+  'ultrafast',
+  'superfast',
+  'veryfast',
+  'faster',
+  'fast',
+  'medium',
+  'slow',
+  'slower',
+  'veryslow'
+]
 const normalizeX264Preset = (value: unknown, fallback: string) => {
   const raw = String(value || '').trim().toLowerCase()
-  const allowed = new Set([
-    'ultrafast',
-    'superfast',
-    'veryfast',
-    'faster',
-    'fast',
-    'medium',
-    'slow',
-    'slower',
-    'veryslow'
-  ])
+  const allowed = new Set<string>(X264_PRESET_VALUES)
   if (!raw) return fallback
   return allowed.has(raw) ? raw : fallback
+}
+const parseVideoPresetOverride = (value: unknown): X264Preset | null => {
+  if (value === undefined || value === null) return null
+  const normalized = normalizeX264Preset(value, '')
+  if (!normalized) return null
+  return normalized as X264Preset
+}
+const parseVideoCrfOverride = (value: unknown): number | null => {
+  if (value === undefined || value === null || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.round(clamp(parsed, 16, 35))
+}
+const parseAudioBitrateKbpsOverride = (value: unknown): number | null => {
+  if (value === undefined || value === null || value === '') return null
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed)) return null
+  return Math.round(clamp(parsed, 96, 320))
 }
 const FAST_MODE_FFMPEG_PRESET = normalizeX264Preset(process.env.FAST_MODE_FFMPEG_PRESET, 'superfast')
 const FAST_MODE_FFMPEG_CRF = (() => {
@@ -5786,11 +5809,66 @@ const getSubtitleStyleFromPayload = (payload?: any): string | null => {
   return text.slice(0, 320)
 }
 
+const getVideoPresetFromPayload = (payload?: any): X264Preset | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const encoding = (payload as any).encoding
+  return (
+    parseVideoPresetOverride((payload as any).videoPreset) ??
+    parseVideoPresetOverride((payload as any).video_preset) ??
+    parseVideoPresetOverride(encoding?.videoPreset) ??
+    parseVideoPresetOverride(encoding?.video_preset) ??
+    parseVideoPresetOverride(encoding?.preset) ??
+    null
+  )
+}
+
+const getVideoCrfFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const encoding = (payload as any).encoding
+  return (
+    parseVideoCrfOverride((payload as any).videoCrf) ??
+    parseVideoCrfOverride((payload as any).video_crf) ??
+    parseVideoCrfOverride(encoding?.videoCrf) ??
+    parseVideoCrfOverride(encoding?.video_crf) ??
+    parseVideoCrfOverride(encoding?.crf) ??
+    null
+  )
+}
+
+const getAudioBitrateKbpsFromPayload = (payload?: any): number | null => {
+  if (!payload || typeof payload !== 'object') return null
+  const encoding = (payload as any).encoding
+  return (
+    parseAudioBitrateKbpsOverride((payload as any).audioBitrateKbps) ??
+    parseAudioBitrateKbpsOverride((payload as any).audio_bitrate_kbps) ??
+    parseAudioBitrateKbpsOverride(encoding?.audioBitrateKbps) ??
+    parseAudioBitrateKbpsOverride(encoding?.audio_bitrate_kbps) ??
+    parseAudioBitrateKbpsOverride(encoding?.audioBitrate) ??
+    parseAudioBitrateKbpsOverride(encoding?.audio_bitrate) ??
+    null
+  )
+}
+
 const pickFirstDefinedValue = (...values: any[]) => {
   for (const value of values) {
     if (value !== undefined) return value
   }
   return undefined
+}
+
+const buildEncodingPreferencePersistenceFields = (opts?: {
+  videoPreset?: X264Preset | null
+  videoCrf?: number | null
+  audioBitrateKbps?: number | null
+}) => {
+  const videoPreset = parseVideoPresetOverride(opts?.videoPreset)
+  const videoCrf = parseVideoCrfOverride(opts?.videoCrf)
+  const audioBitrateKbps = parseAudioBitrateKbpsOverride(opts?.audioBitrateKbps)
+  return {
+    ...(videoPreset ? { videoPreset, video_preset: videoPreset } : {}),
+    ...(videoCrf === null ? {} : { videoCrf, video_crf: videoCrf }),
+    ...(audioBitrateKbps === null ? {} : { audioBitrateKbps, audio_bitrate_kbps: audioBitrateKbps })
+  }
 }
 
 const MAX_VERTICAL_CAPTION_WORDS = 5
@@ -7077,6 +7155,42 @@ const getFastModeFromJob = (job?: any): boolean => {
   )
 }
 
+const getVideoPresetFromJob = (job?: any): X264Preset | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseVideoPresetOverride(settings?.videoPreset) ??
+    parseVideoPresetOverride(settings?.video_preset) ??
+    parseVideoPresetOverride(analysis?.videoPreset) ??
+    parseVideoPresetOverride(analysis?.video_preset) ??
+    null
+  )
+}
+
+const getVideoCrfFromJob = (job?: any): number | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseVideoCrfOverride(settings?.videoCrf) ??
+    parseVideoCrfOverride(settings?.video_crf) ??
+    parseVideoCrfOverride(analysis?.videoCrf) ??
+    parseVideoCrfOverride(analysis?.video_crf) ??
+    null
+  )
+}
+
+const getAudioBitrateKbpsFromJob = (job?: any): number | null => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseAudioBitrateKbpsOverride(settings?.audioBitrateKbps) ??
+    parseAudioBitrateKbpsOverride(settings?.audio_bitrate_kbps) ??
+    parseAudioBitrateKbpsOverride(analysis?.audioBitrateKbps) ??
+    parseAudioBitrateKbpsOverride(analysis?.audio_bitrate_kbps) ??
+    null
+  )
+}
+
 const getPipelinePowerModeFromJob = (job?: any): PipelinePowerModeSelection => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -7460,6 +7574,9 @@ const buildPersistedRenderSettings = (
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
     editorInstructionPrompt?: string | null
+    videoPreset?: X264Preset | null
+    videoCrf?: number | null
+    audioBitrateKbps?: number | null
   }
 ) => {
   const retentionLevel = parseRetentionAggressionLevel(
@@ -7494,6 +7611,9 @@ const buildPersistedRenderSettings = (
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(opts?.creatorStyleLockPercent) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const editorInstructionPrompt = normalizeEditorInstructionPrompt(opts?.editorInstructionPrompt)
+  const videoPreset = parseVideoPresetOverride(opts?.videoPreset)
+  const videoCrf = parseVideoCrfOverride(opts?.videoCrf)
+  const audioBitrateKbps = parseAudioBitrateKbpsOverride(opts?.audioBitrateKbps)
   const verticalCaptionConfig = opts?.verticalCaptionConfig
     ? resolveVerticalCaptionConfig(opts.verticalCaptionConfig, getDefaultVerticalCaptionConfig())
     : null
@@ -7558,6 +7678,9 @@ const buildPersistedRenderSettings = (
     ...(soundFx === null ? {} : { soundFx }),
     ...(maxCuts === null ? {} : { maxCuts, max_cuts: maxCuts, maxCutsRequested: maxCuts }),
     ...(editorMode === null ? {} : { editorMode, editor_mode: editorMode, contentMode: editorMode }),
+    ...(videoPreset ? { videoPreset, video_preset: videoPreset } : {}),
+    ...(videoCrf === null ? {} : { videoCrf, video_crf: videoCrf }),
+    ...(audioBitrateKbps === null ? {} : { audioBitrateKbps, audio_bitrate_kbps: audioBitrateKbps }),
     ...(manualTimestampConfig ? buildManualTimestampPersistenceFields(manualTimestampConfig) : {}),
     ...(verticalCaptionConfig ? buildVerticalCaptionPersistenceFields(verticalCaptionConfig) : {})
   }
@@ -7586,6 +7709,9 @@ const buildPersistedRenderAnalysis = ({
   exploreX3Mode,
   topHumanGuardMode,
   creatorStyleLockPercent,
+  videoPreset,
+  videoCrf,
+  audioBitrateKbps,
   manualTimestampConfig,
   verticalCaptionConfig,
   editorInstructionPrompt,
@@ -7614,6 +7740,9 @@ const buildPersistedRenderAnalysis = ({
   exploreX3Mode?: boolean | null
   topHumanGuardMode?: boolean | null
   creatorStyleLockPercent?: number | null
+  videoPreset?: X264Preset | null
+  videoCrf?: number | null
+  audioBitrateKbps?: number | null
   manualTimestampConfig?: ManualTimestampConfig | null
   verticalCaptionConfig?: VerticalCaptionConfig | null
   editorInstructionPrompt?: string | null
@@ -7763,6 +7892,21 @@ const buildPersistedRenderAnalysis = ({
     (existing as any)?.editor_instruction_prompt ??
     (existing as any)?.directorNotes
   )
+  const resolvedVideoPreset = parseVideoPresetOverride(
+    videoPreset ??
+    (existing as any)?.videoPreset ??
+    (existing as any)?.video_preset
+  )
+  const resolvedVideoCrf = parseVideoCrfOverride(
+    videoCrf ??
+    (existing as any)?.videoCrf ??
+    (existing as any)?.video_crf
+  )
+  const resolvedAudioBitrateKbps = parseAudioBitrateKbpsOverride(
+    audioBitrateKbps ??
+    (existing as any)?.audioBitrateKbps ??
+    (existing as any)?.audio_bitrate_kbps
+  )
   const resolvedManualTimestampConfig = (
     parseManualTimestampConfig(manualTimestampConfig) ??
     parseManualTimestampConfig((existing as any)?.manualTimestamp ?? (existing as any)?.manual_timestamp) ??
@@ -7809,6 +7953,14 @@ const buildPersistedRenderAnalysis = ({
       : null,
     verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
   }
+  Object.assign(
+    payload,
+    buildEncodingPreferencePersistenceFields({
+      videoPreset: resolvedVideoPreset,
+      videoCrf: resolvedVideoCrf,
+      audioBitrateKbps: resolvedAudioBitrateKbps
+    })
+  )
   const existingVerticalCaptionOverride = getVerticalCaptionConfigFromPayload(existing)
   const shouldPersistVerticalCaptions = Boolean(
     renderConfig.mode === 'vertical' ||
@@ -15322,6 +15474,33 @@ const parseTranscriptRequiredReason = (error: any) => {
   if (!message.startsWith(TRANSCRIPT_REQUIRED_ERROR_PREFIX)) return null
   const reason = message.slice(TRANSCRIPT_REQUIRED_ERROR_PREFIX.length).trim()
   return reason || null
+}
+
+const TRANSCRIPT_AUTO_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
+  String(process.env.TRANSCRIPT_AUTO_RECOVERY_ENABLED || 'true').trim()
+)
+const TRANSCRIPT_AUTO_RECOVERY_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.TRANSCRIPT_AUTO_RECOVERY_MAX_ATTEMPTS || 1)
+  if (!Number.isFinite(raw)) return 1
+  return Math.max(0, Math.min(3, Math.round(raw)))
+})()
+
+const isTranscriptRelatedFailureReason = (reason: string | null | undefined) => {
+  const normalized = String(reason || '').trim().toLowerCase()
+  if (!normalized) return false
+  return (
+    normalized.includes('transcript') ||
+    normalized.includes('subtitle') ||
+    normalized.includes('cue') ||
+    normalized.includes('captions')
+  )
+}
+
+const normalizeTranscriptRecoveryHistory = (value: unknown) => {
+  if (!Array.isArray(value)) return [] as Array<Record<string, any>>
+  return value
+    .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
+    .slice(-8) as Array<Record<string, any>>
 }
 
 const toSegmentPreviewRows = (segments: Segment[], limit = 1200) => (
@@ -24283,21 +24462,73 @@ const applyEliteCutRefinement = ({
   }
 }
 
+const SENTENCE_TERMINAL_CUE_PATTERN = /[.!?]["')\]]*$/
+const CONTINUATION_CUE_LEAD_PATTERN = /^(?:and|but|so|then|because|which|who|that|if|when|while|or|to|for|with)\b/i
+
+const dedupeTranscriptBoundaryTimes = (values: number[]) => {
+  const sorted = values
+    .filter((value) => Number.isFinite(value))
+    .sort((left, right) => left - right)
+  const deduped: number[] = []
+  for (const boundary of sorted) {
+    const previous = deduped[deduped.length - 1]
+    if (previous !== undefined && Math.abs(previous - boundary) < 0.03) continue
+    deduped.push(boundary)
+  }
+  return deduped
+}
+
+const cueLikelyEndsSentenceForRender = (cue: TranscriptCue, nextCue: TranscriptCue | null) => {
+  const text = String(cue?.text || '').trim()
+  if (!text) return false
+  if (SENTENCE_TERMINAL_CUE_PATTERN.test(text)) return true
+  const cueEnd = Number(cue?.end)
+  const nextStart = Number(nextCue?.start)
+  const gapToNext = Number.isFinite(cueEnd) && Number.isFinite(nextStart)
+    ? nextStart - cueEnd
+    : Number.POSITIVE_INFINITY
+  if (gapToNext >= 0.34) return true
+  const nextText = String(nextCue?.text || '').trim()
+  if (nextText && CONTINUATION_CUE_LEAD_PATTERN.test(nextText)) return false
+  const tokenCount = text.split(/\s+/).filter(Boolean).length
+  return tokenCount >= 8
+}
+
 const collectTranscriptBoundaryTimesForRender = (
   transcriptCues: TranscriptCue[],
   durationSeconds: number
 ) => {
-  if (!Array.isArray(transcriptCues) || !transcriptCues.length) return [] as number[]
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length) {
+    return {
+      all: [] as number[],
+      cueStarts: [] as number[],
+      cueEnds: [] as number[],
+      sentenceEnds: [] as number[]
+    }
+  }
   const safeDuration = Number.isFinite(durationSeconds) && durationSeconds > 0
     ? durationSeconds
     : Number.MAX_SAFE_INTEGER
   const boundaries: number[] = []
-  for (const cue of transcriptCues.slice(0, 2200)) {
+  const cueStarts: number[] = []
+  const cueEnds: number[] = []
+  const sentenceEnds: number[] = []
+  const cues = transcriptCues.slice(0, 2200)
+  for (let cueIndex = 0; cueIndex < cues.length; cueIndex += 1) {
+    const cue = cues[cueIndex]
+    const nextCue = cueIndex + 1 < cues.length ? cues[cueIndex + 1] : null
     const cueStart = Number(cue?.start)
     const cueEnd = Number(cue?.end)
     if (!Number.isFinite(cueStart) || !Number.isFinite(cueEnd) || cueEnd <= cueStart + 0.01) continue
-    boundaries.push(roundForFilter(clamp(cueStart, 0, safeDuration)))
-    boundaries.push(roundForFilter(clamp(cueEnd, 0, safeDuration)))
+    const startBoundary = roundForFilter(clamp(cueStart, 0, safeDuration))
+    const endBoundary = roundForFilter(clamp(cueEnd, 0, safeDuration))
+    boundaries.push(startBoundary)
+    boundaries.push(endBoundary)
+    cueStarts.push(startBoundary)
+    cueEnds.push(endBoundary)
+    if (cueLikelyEndsSentenceForRender(cue, nextCue)) {
+      sentenceEnds.push(endBoundary)
+    }
     if (Array.isArray(cue?.words) && cue.words.length) {
       const stride = cue.words.length > 30 ? 2 : 1
       for (let index = 0; index < cue.words.length; index += stride) {
@@ -24323,16 +24554,12 @@ const collectTranscriptBoundaryTimesForRender = (
       }
     }
   }
-  const sorted = boundaries
-    .filter((value) => Number.isFinite(value))
-    .sort((left, right) => left - right)
-  const deduped: number[] = []
-  for (const boundary of sorted) {
-    const previous = deduped[deduped.length - 1]
-    if (previous !== undefined && Math.abs(previous - boundary) < 0.03) continue
-    deduped.push(boundary)
+  return {
+    all: dedupeTranscriptBoundaryTimes(boundaries),
+    cueStarts: dedupeTranscriptBoundaryTimes(cueStarts),
+    cueEnds: dedupeTranscriptBoundaryTimes(cueEnds),
+    sentenceEnds: dedupeTranscriptBoundaryTimes(sentenceEnds)
   }
-  return deduped
 }
 
 const snapTimeToNearestTranscriptBoundary = (
@@ -24371,8 +24598,15 @@ const alignSegmentsToTranscriptBoundariesForRender = (
   if (!segments.length || !Array.isArray(transcriptCues) || !transcriptCues.length) {
     return segments.map((segment) => ({ ...segment }))
   }
-  const boundaries = collectTranscriptBoundaryTimesForRender(transcriptCues, durationSeconds)
+  const boundarySets = collectTranscriptBoundaryTimesForRender(transcriptCues, durationSeconds)
+  const boundaries = boundarySets.all
   if (!boundaries.length) return segments.map((segment) => ({ ...segment }))
+  const startBoundaries = boundarySets.cueStarts.length ? boundarySets.cueStarts : boundaries
+  const sentenceEndBoundaries = boundarySets.sentenceEnds.length
+    ? boundarySets.sentenceEnds
+    : boundarySets.cueEnds.length
+      ? boundarySets.cueEnds
+      : boundaries
   const orderedInput = segments.map((segment) => ({ ...segment }))
   const preserveTimelineOrder = hasIntentionalTimelineReorder(orderedInput)
   const sorted = preserveTimelineOrder
@@ -24392,8 +24626,10 @@ const alignSegmentsToTranscriptBoundariesForRender = (
     }
     const span = Math.max(MIN_RENDER_SEGMENT_SECONDS, normalized.end - normalized.start)
     const maxShift = clamp(span * 0.2, 0.04, 0.2)
-    const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, boundaries, maxShift)
-    const snappedEndCandidate = snapTimeToNearestTranscriptBoundary(normalized.end, boundaries, maxShift)
+    const sentenceEndShift = clamp(maxShift * 1.9, 0.06, 0.45)
+    const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, startBoundaries, maxShift)
+    const snappedEndSentence = snapTimeToNearestTranscriptBoundary(normalized.end, sentenceEndBoundaries, sentenceEndShift)
+    const snappedEndCandidate = snapTimeToNearestTranscriptBoundary(snappedEndSentence, boundaries, maxShift)
     let start = roundForFilter(clamp(Math.min(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
     let end = roundForFilter(clamp(Math.max(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
     const previous = aligned[aligned.length - 1]
@@ -25903,7 +26139,11 @@ const generateRequiredTranscriptCues = async ({
   inputBytes?: number | null
   cueLimit?: number
 }) => {
-  const allowsFallbackWithoutTranscript = purpose === 'analysis' || purpose === 'hook_rescue'
+  const allowsFallbackWithoutTranscript = (
+    purpose === 'analysis' ||
+    purpose === 'hook_rescue' ||
+    purpose === 'captions'
+  )
   const transcriptSrt = await generateSubtitles(inputPath, workingDir, {
     durationSeconds,
     renderMode,
@@ -29912,6 +30152,9 @@ const getEditOptionsForUser = async (
     topHumanGuardMode?: boolean | null
     creatorStyleLockPercent?: number | null
     editorInstructionPrompt?: string | null
+    videoPreset?: X264Preset | null
+    videoCrf?: number | null
+    audioBitrateKbps?: number | null
   },
   userEmail?: string | null
 ) => {
@@ -29962,6 +30205,21 @@ const getEditOptionsForUser = async (
     (settings as any)?.creator_style_lock
   ) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const creatorStyleLock = toCreatorStyleLockStrength(creatorStyleLockPercent)
+  const videoPreset = parseVideoPresetOverride(
+    overrides?.videoPreset ??
+    (settings as any)?.videoPreset ??
+    (settings as any)?.video_preset
+  )
+  const videoCrf = parseVideoCrfOverride(
+    overrides?.videoCrf ??
+    (settings as any)?.videoCrf ??
+    (settings as any)?.video_crf
+  )
+  const audioBitrateKbps = parseAudioBitrateKbpsOverride(
+    overrides?.audioBitrateKbps ??
+    (settings as any)?.audioBitrateKbps ??
+    (settings as any)?.audio_bitrate_kbps
+  )
   const editorInstructionPrompt = assertEditorInstructionPromptAllowed(
     overrides?.editorInstructionPrompt,
     effectiveTier
@@ -30239,6 +30497,9 @@ const getEditOptionsForUser = async (
     exploreX3Mode,
     topHumanGuardMode,
     creatorStyleLock,
+    videoPreset,
+    videoCrf,
+    audioBitrateKbps,
     manualTimestampConfig,
     fastMode: resolvedFastMode,
     editorInstructionPrompt
@@ -30815,6 +31076,9 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
       topHumanGuardMode: options.topHumanGuardMode,
       creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
       editorInstructionPrompt: options.editorInstructionPrompt,
+      videoPreset: options.videoPreset,
+      videoCrf: options.videoCrf,
+      audioBitrateKbps: options.audioBitrateKbps,
       verticalCaptionConfig: verticalCaptionConfigForAnalysis
     })
     const analysisPath = `${job.userId}/${jobId}/analysis.json`
@@ -30848,6 +31112,9 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
         topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         editorInstructionPrompt: options.editorInstructionPrompt,
+        videoPreset: options.videoPreset,
+        videoCrf: options.videoCrf,
+        audioBitrateKbps: options.audioBitrateKbps,
         verticalCaptionConfig: verticalCaptionConfigForAnalysis
       }),
       analysis: analysis
@@ -31045,6 +31312,9 @@ const processJob = async (
     options.fastMode ||
     (renderConfig.mode === 'horizontal' && RENDER_FORCE_FAST_HORIZONTAL)
   )
+  const requestedVideoPresetOverride = parseVideoPresetOverride(options.videoPreset)
+  const requestedVideoCrfOverride = parseVideoCrfOverride(options.videoCrf)
+  const requestedAudioBitrateKbpsOverride = parseAudioBitrateKbpsOverride(options.audioBitrateKbps)
   const renderFastHorizontalMode = renderFastMode && renderConfig.mode === 'horizontal'
   const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
   const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
@@ -31057,15 +31327,20 @@ const processJob = async (
     options.autoCaptions &&
     !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
   )
-  const ffPreset = renderFastMode
+  const ffPresetBase = renderFastMode
     ? (FORCE_RENDER_STAGE_MAX_SPEED ? FORCE_RENDER_STAGE_PRESET : FAST_MODE_FFMPEG_PRESET)
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
-  const ffCrf = renderFastMode
+  const ffCrfBase = renderFastMode
     ? String(FAST_MODE_FFMPEG_CRF)
     : (process.env.FFMPEG_CRF || String(adjustedCrf))
-  const ffAudioBitrate = renderFastMode
+  const ffAudioBitrateBase = renderFastMode
     ? `${FAST_MODE_FFMPEG_AUDIO_BITRATE_KBPS}k`
     : resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
+  const ffPreset = requestedVideoPresetOverride || ffPresetBase
+  const ffCrf = requestedVideoCrfOverride === null ? ffCrfBase : String(requestedVideoCrfOverride)
+  const ffAudioBitrate = requestedAudioBitrateKbpsOverride === null
+    ? ffAudioBitrateBase
+    : `${requestedAudioBitrateKbpsOverride}k`
   const ffAudioSampleRate = String(
     resolveAudioSampleRate(process.env.FFMPEG_AUDIO_SAMPLE_RATE, platformProfile.audioSampleRate)
   )
@@ -31809,6 +32084,9 @@ const processJob = async (
         topHumanGuardMode: options.topHumanGuardMode,
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         editorInstructionPrompt: options.editorInstructionPrompt,
+        videoPreset: options.videoPreset,
+        videoCrf: options.videoCrf,
+        audioBitrateKbps: options.audioBitrateKbps,
         verticalCaptionConfig,
         outputPaths
       })
@@ -31877,13 +32155,16 @@ const processJob = async (
           continuityFirstMode: options.continuityFirstMode,
           exploreX3Mode: options.exploreX3Mode,
           topHumanGuardMode: options.topHumanGuardMode,
-          creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
-          manualTimestampConfig: requestedManualTimestampConfig,
-          verticalCaptionConfig,
-          editorInstructionPrompt: options.editorInstructionPrompt
-        }),
-        analysis: nextAnalysis
-      })
+        creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
+        manualTimestampConfig: requestedManualTimestampConfig,
+        verticalCaptionConfig,
+        editorInstructionPrompt: options.editorInstructionPrompt,
+        videoPreset: options.videoPreset,
+        videoCrf: options.videoCrf,
+        audioBitrateKbps: options.audioBitrateKbps
+      }),
+      analysis: nextAnalysis
+    })
 
       try {
         await computeAndStoreRenderQualityMetric({
@@ -31912,6 +32193,19 @@ const processJob = async (
     let retentionScoreBeforeEdit: number | null = null
     let retentionScoreAfterEdit: number | null = null
     let optimizationNotes: string[] = []
+    const transcriptRecoveryState = getAnalysisRecord(
+      (job.analysis as any)?.transcript_auto_recovery ??
+      (job.analysis as any)?.transcriptAutoRecovery
+    )
+    const transcriptRecoveryAttempts = Number.isFinite(Number(transcriptRecoveryState.attempts))
+      ? Math.max(0, Math.floor(Number(transcriptRecoveryState.attempts)))
+      : 0
+    if (transcriptRecoveryAttempts > 0) {
+      const recoveryReason = String(transcriptRecoveryState.lastReason || '').trim() || 'transcript_unavailable'
+      optimizationNotes.push(
+        `Pipeline auto-recovery used no-transcript fallback (${transcriptRecoveryAttempts} attempt${transcriptRecoveryAttempts === 1 ? '' : 's'}; reason: ${recoveryReason}).`
+      )
+    }
     if (runtimeRetentionNotes.length) {
       optimizationNotes.push(...runtimeRetentionNotes)
     }
@@ -35399,6 +35693,9 @@ const processJob = async (
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: persistedVerticalCaptionConfig,
       editorInstructionPrompt: options.editorInstructionPrompt,
+      videoPreset: options.videoPreset,
+      videoCrf: options.videoCrf,
+      audioBitrateKbps: options.audioBitrateKbps,
       outputPaths
     })
 
@@ -35438,7 +35735,10 @@ const processJob = async (
         creatorStyleLockPercent: toCreatorStyleLockPercent(options.creatorStyleLock),
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: persistedVerticalCaptionConfig,
-        editorInstructionPrompt: options.editorInstructionPrompt
+        editorInstructionPrompt: options.editorInstructionPrompt,
+        videoPreset: options.videoPreset,
+        videoCrf: options.videoCrf,
+        audioBitrateKbps: options.audioBitrateKbps
       }),
       analysis: nextAnalysis
     })
@@ -35469,10 +35769,182 @@ const processJob = async (
   }
 }
 
+const scheduleTranscriptAutoRecoveryRetry = async ({
+  jobId,
+  user,
+  requestedQuality,
+  requestId,
+  reason,
+  snapshot
+}: {
+  jobId: string
+  user: { id: string; email?: string }
+  requestedQuality?: ExportQuality
+  requestId?: string
+  reason: string
+  snapshot?: any
+}) => {
+  if (!TRANSCRIPT_AUTO_RECOVERY_ENABLED || TRANSCRIPT_AUTO_RECOVERY_MAX_ATTEMPTS <= 0) return false
+  const normalizedReason = String(reason || '').trim().toLowerCase()
+  if (!isTranscriptRelatedFailureReason(normalizedReason)) return false
+
+  const job = snapshot || await prisma.job.findUnique({ where: { id: jobId } })
+  if (!job) return false
+  const status = String(job.status || '').toLowerCase()
+  if (status === 'completed' || status === 'failed') return false
+
+  const analysis = getAnalysisRecord((job as any)?.analysis)
+  const recoveryState = getAnalysisRecord(
+    analysis.transcript_auto_recovery ?? analysis.transcriptAutoRecovery
+  )
+  const attemptsSoFar = Number.isFinite(Number(recoveryState.attempts))
+    ? Math.max(0, Math.floor(Number(recoveryState.attempts)))
+    : 0
+  if (attemptsSoFar >= TRANSCRIPT_AUTO_RECOVERY_MAX_ATTEMPTS) return false
+
+  const attempt = attemptsSoFar + 1
+  const nowIso = toIsoNow()
+  const decisionEntry = {
+    at: nowIso,
+    attempt,
+    reason: normalizedReason,
+    action: 'retry_with_no_transcript_fallback',
+    summary: `Auto recovery attempt ${attempt}: transcript generation failed (${normalizedReason}). Disabled auto-captions and queued a retry with no-transcript fallback.`
+  }
+  const history = [...normalizeTranscriptRecoveryHistory(recoveryState.history), decisionEntry].slice(-8)
+  const nextRecoveryState = {
+    ...recoveryState,
+    attempts: attempt,
+    lastAttemptAt: nowIso,
+    lastReason: normalizedReason,
+    lastAction: decisionEntry.action,
+    lastSummary: decisionEntry.summary,
+    history
+  }
+  const subtitlesRecord = (
+    analysis.subtitles && typeof analysis.subtitles === 'object' && !Array.isArray(analysis.subtitles)
+      ? analysis.subtitles
+      : {}
+  ) as Record<string, any>
+  const decisionTrace = (
+    Array.isArray(analysis.pipeline_decision_trace)
+      ? analysis.pipeline_decision_trace
+      : Array.isArray(analysis.pipelineDecisionTrace)
+        ? analysis.pipelineDecisionTrace
+        : []
+  )
+    .filter((entry) => entry && typeof entry === 'object' && !Array.isArray(entry))
+    .slice(-19)
+  decisionTrace.push(decisionEntry)
+
+  const nextAnalysis = {
+    ...analysis,
+    autoCaptions: false,
+    auto_captions: false,
+    fastMode: true,
+    fast_mode: true,
+    subtitles: {
+      ...subtitlesRecord,
+      enabled: false,
+      autoDisabledByRecovery: true,
+      disableReason: normalizedReason,
+      disabledAt: nowIso
+    },
+    transcript_auto_recovery: nextRecoveryState,
+    transcriptAutoRecovery: nextRecoveryState,
+    pipeline_decision_trace: decisionTrace,
+    pipelineDecisionTrace: decisionTrace
+  }
+  const existingRenderSettings = readPersistedJsonObject((job as any)?.renderSettings) || {}
+  const nextRenderSettings = {
+    ...existingRenderSettings,
+    fastMode: true,
+    fast_mode: true,
+    transcriptRecoveryAttempt: attempt,
+    transcriptRecoveryReason: normalizedReason,
+    transcriptRecoveryUpdatedAt: nowIso
+  }
+
+  const retryProgress = Number.isFinite(Number(job.progress))
+    ? Math.max(3, Math.min(24, Math.round(Number(job.progress))))
+    : 8
+  let updated: any
+  try {
+    updated = await updateJob(
+      jobId,
+      {
+        status: 'queued',
+        progress: retryProgress,
+        error: null,
+        analysis: nextAnalysis,
+        renderSettings: nextRenderSettings
+      },
+      { expectedUpdatedAt: job.updatedAt }
+    )
+  } catch (error: any) {
+    const code = String(error?.code || '').toLowerCase()
+    const message = String(error?.message || '').toLowerCase()
+    if (code !== 'job_update_conflict' && !message.includes('job_update_conflict')) {
+      throw error
+    }
+    updated = await updateJob(jobId, {
+      status: 'queued',
+      progress: retryProgress,
+      error: null,
+      analysis: nextAnalysis,
+      renderSettings: nextRenderSettings
+    })
+  }
+
+  try {
+    await updatePipelineStepState(jobId, 'TRANSCRIBE', {
+      retries: attempt,
+      completedAt: nowIso,
+      lastError: truncateErrorText(`${TRANSCRIPT_REQUIRED_ERROR_PREFIX}${normalizedReason}`),
+      meta: {
+        cueCount: 0,
+        hasTranscript: false,
+        autoRecoveryQueued: true,
+        autoRecoveryAttempt: attempt,
+        autoRecoveryReason: normalizedReason
+      }
+    })
+  } catch {
+    // ignore best-effort metadata patch
+  }
+
+  const priorityLevel = Number((updated as any)?.priorityLevel ?? (job as any)?.priorityLevel ?? 2) || 2
+  const queueItem = {
+    jobId,
+    user: { id: user.id, ...(user.email ? { email: user.email } : {}) },
+    requestedQuality,
+    requestId,
+    priorityLevel
+  }
+  const retryTimer = setTimeout(() => {
+    try {
+      enqueuePipeline(queueItem)
+    } catch (error) {
+      console.warn(`[queue] transcript auto-recovery enqueue failed for ${jobId}`, error)
+    }
+  }, 25)
+  if (typeof (retryTimer as any).unref === 'function') {
+    ;(retryTimer as any).unref()
+  }
+  console.warn(`[queue] transcript auto-recovery queued for ${jobId}`, {
+    reason: normalizedReason,
+    attempt,
+    status: updated.status,
+    progress: updated.progress
+  })
+  return true
+}
+
 const runPipeline = async (jobId: string, user: { id: string; email?: string }, requestedQuality?: ExportQuality, requestId?: string) => {
   await pipelineJobContext.run({ jobId }, async () => {
     const pipelineWorkerId = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`
     let heartbeatTimer: NodeJS.Timeout | null = null
+    let latestJobSnapshot: any = null
     const stopHeartbeat = () => {
       if (!heartbeatTimer) return
       clearInterval(heartbeatTimer)
@@ -35499,6 +35971,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
     try {
       const existing = await prisma.job.findUnique({ where: { id: jobId } })
       if (!existing) return
+      latestJobSnapshot = existing
       const status = String(existing.status || '').toLowerCase()
       if (status === 'completed' || status === 'failed') return
       const existingAnalysis = getAnalysisRecord((existing as any)?.analysis)
@@ -35553,6 +36026,9 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         topHumanGuardMode: getTopHumanGuardModeFromJob(existing),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(existing),
         editorInstructionPrompt: getEditorInstructionPromptFromJob(existing),
+        videoPreset: getVideoPresetFromJob(existing),
+        videoCrf: getVideoCrfFromJob(existing),
+        audioBitrateKbps: getAudioBitrateKbpsFromJob(existing),
         autoCaptions: getAutoCaptionsFromPayload((existing.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((existing.analysis as any) || {})
       }, user.email)
@@ -35567,6 +36043,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       const latestBeforeProcess = await prisma.job.findUnique({ where: { id: jobId } })
       if (!latestBeforeProcess) throw new Error('not_found')
+      latestJobSnapshot = latestBeforeProcess
       const { options: processOptions } = await getEditOptionsForUser(user.id, {
         retentionAggressionLevel: getRetentionAggressionFromJob(latestBeforeProcess),
         retentionStrategyProfile: getRetentionStrategyFromJob(latestBeforeProcess),
@@ -35591,6 +36068,9 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         topHumanGuardMode: getTopHumanGuardModeFromJob(latestBeforeProcess),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(latestBeforeProcess),
         editorInstructionPrompt: getEditorInstructionPromptFromJob(latestBeforeProcess),
+        videoPreset: getVideoPresetFromJob(latestBeforeProcess),
+        videoCrf: getVideoCrfFromJob(latestBeforeProcess),
+        audioBitrateKbps: getAudioBitrateKbpsFromJob(latestBeforeProcess),
         autoCaptions: getAutoCaptionsFromPayload((latestBeforeProcess.analysis as any) || {}),
         subtitleStyle: getSubtitleStyleFromPayload((latestBeforeProcess.analysis as any) || {})
       }, user.email)
@@ -35672,6 +36152,22 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
           // ignore cancellation update races
         }
         return
+      }
+      const transcriptReason = parseTranscriptRequiredReason(err)
+      if (transcriptReason) {
+        try {
+          const queuedRecovery = await scheduleTranscriptAutoRecoveryRetry({
+            jobId,
+            user,
+            requestedQuality,
+            requestId,
+            reason: transcriptReason,
+            snapshot: latestJobSnapshot
+          })
+          if (queuedRecovery) return
+        } catch (recoveryErr) {
+          console.warn(`[queue] transcript auto-recovery failed for ${jobId}`, recoveryErr)
+        }
       }
       console.error(`[${requestId || 'noid'}] pipeline error`, err)
       try {
@@ -36181,6 +36677,9 @@ const handleCreateJob = async (req: any, res: any) => {
     let manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body)
     let requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const videoPresetOverride = getVideoPresetFromPayload(req.body)
+    const videoCrfOverride = getVideoCrfFromPayload(req.body)
+    const audioBitrateKbpsOverride = getAudioBitrateKbpsFromPayload(req.body)
     const coldStartAutopilotOverride = getColdStartAutopilotFromPayload(req.body)
     const continuityFirstModeOverride = getContinuityFirstModeFromPayload(req.body)
     const exploreX3ModeOverride = getExploreX3ModeFromPayload(req.body)
@@ -36366,6 +36865,9 @@ const handleCreateJob = async (req: any, res: any) => {
             longFormClarityVsSpeed: longFormClarityVsSpeedOverride,
             tangentKiller: tangentKillerOverride,
             fastMode: requestedFastMode,
+            videoPreset: videoPresetOverride,
+            videoCrf: videoCrfOverride,
+            audioBitrateKbps: audioBitrateKbpsOverride,
             coldStartAutopilot,
             continuityFirstMode,
             exploreX3Mode,
@@ -36487,6 +36989,10 @@ const handleCreateJob = async (req: any, res: any) => {
             manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride,
             editorInstructionPrompt
+            ,
+            videoPreset: videoPresetOverride,
+            videoCrf: videoCrfOverride,
+            audioBitrateKbps: audioBitrateKbpsOverride
           }),
           algorithm_config_version_id: configSelection.config_version_id,
           algorithm_experiment_id: configSelection.experiment_id,
@@ -36548,6 +37054,12 @@ const handleCreateJob = async (req: any, res: any) => {
             ...(tangentKillerOverride === null ? {} : { tangentKiller: tangentKillerOverride, tangent_killer: tangentKillerOverride }),
             ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
             ...(manualTimestampConfigOverride ? buildManualTimestampPersistenceFields(manualTimestampConfigOverride) : {})
+            ,
+            ...buildEncodingPreferencePersistenceFields({
+              videoPreset: videoPresetOverride,
+              videoCrf: videoCrfOverride,
+              audioBitrateKbps: audioBitrateKbpsOverride
+            })
           },
           renderConfig,
           retentionTargetPlatform,
@@ -36573,6 +37085,9 @@ const handleCreateJob = async (req: any, res: any) => {
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
           editorInstructionPrompt,
+          videoPreset: videoPresetOverride,
+          videoCrf: videoCrfOverride,
+          audioBitrateKbps: audioBitrateKbpsOverride,
           outputPaths: null
         })
       }
@@ -37139,6 +37654,9 @@ const handleCompleteUpload = async (req: any, res: any) => {
     const manualTimestampConfigOverride = getManualTimestampConfigFromPayload(req.body)
     const requestedEditorInstructionPrompt = getEditorInstructionPromptFromPayload(req.body)
     const requestedFastMode = parseBooleanFlag(req.body?.fastMode)
+    const videoPresetOverride = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
+    const videoCrfOverride = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
+    const audioBitrateKbpsOverride = getAudioBitrateKbpsFromPayload(req.body) ?? getAudioBitrateKbpsFromJob(job)
     const requestedCreativeVariant = getCreativeVariantFromPayload(req.body) ?? getCreativeVariantFromJob(job)
     const { plan, tier } = await getUserPlan(req.user.id)
     const devBypass = isDevAccount(req.user.id, req.user?.email)
@@ -37265,6 +37783,11 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: videoPresetOverride,
+        videoCrf: videoCrfOverride,
+        audioBitrateKbps: audioBitrateKbpsOverride
+      }),
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {}),
       ...buildVerticalCaptionPersistenceFields(verticalCaptionConfigOverride)
@@ -37310,6 +37833,11 @@ const handleCompleteUpload = async (req: any, res: any) => {
       long_form_clarity_vs_speed: resolvedLongFormClarityVsSpeed,
       tangentKiller: resolvedTangentKiller,
       tangent_killer: resolvedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: videoPresetOverride,
+        videoCrf: videoCrfOverride,
+        audioBitrateKbps: audioBitrateKbpsOverride
+      }),
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
       ...(resolvedManualTimestampConfig ? buildManualTimestampPersistenceFields(resolvedManualTimestampConfig) : {})
     }
@@ -37414,6 +37942,9 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
+    const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
+    const requestedAudioBitrateKbps = getAudioBitrateKbpsFromPayload(req.body) ?? getAudioBitrateKbpsFromJob(job)
     const promptAppliedAnalyze = applyEditorInstructionPlanToDraft({
       retentionStrategyProfile: tuning.strategy,
       retentionAggressionLevel: tuning.aggression,
@@ -37472,6 +38003,11 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
@@ -37522,6 +38058,11 @@ router.post('/:id/analyze', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
@@ -37562,6 +38103,9 @@ router.post('/:id/analyze', async (req: any, res) => {
       exploreX3Mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
+      videoPreset: requestedVideoPreset,
+      videoCrf: requestedVideoCrf,
+      audioBitrateKbps: requestedAudioBitrateKbps,
       manualTimestampConfig: requestedManualTimestampConfig,
       editorInstructionPrompt,
       autoCaptions: autoCaptionsOverride,
@@ -37649,6 +38193,9 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
+    const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
+    const requestedAudioBitrateKbps = getAudioBitrateKbpsFromPayload(req.body) ?? getAudioBitrateKbpsFromJob(job)
     const promptAppliedProcess = applyEditorInstructionPlanToDraft({
       retentionStrategyProfile: tuning.strategy,
       retentionAggressionLevel: tuning.aggression,
@@ -37707,6 +38254,11 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
@@ -37757,6 +38309,11 @@ router.post('/:id/process', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
@@ -37797,6 +38354,9 @@ router.post('/:id/process', async (req: any, res) => {
       exploreX3Mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
+      videoPreset: requestedVideoPreset,
+      videoCrf: requestedVideoCrf,
+      audioBitrateKbps: requestedAudioBitrateKbps,
       manualTimestampConfig: requestedManualTimestampConfig,
       editorInstructionPrompt,
       autoCaptions: autoCaptionsOverride,
@@ -37975,6 +38535,9 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
+    const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
+    const requestedAudioBitrateKbps = getAudioBitrateKbpsFromPayload(req.body) ?? getAudioBitrateKbpsFromJob(job)
     const promptAppliedLive = applyEditorInstructionPlanToDraft({
       retentionStrategyProfile: requestedStrategyProfile,
       retentionAggressionLevel: requestedAggressionLevel,
@@ -38037,6 +38600,9 @@ router.patch('/:id/live-settings', async (req: any, res) => {
         exploreX3Mode: requestedExploreX3Mode,
         topHumanGuardMode: requestedTopHumanGuardMode,
         creatorStyleLockPercent: requestedCreatorStyleLockPercent,
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps,
         manualTimestampConfig: requestedManualTimestampConfig,
         verticalCaptionConfig: verticalCaptionConfigOverride,
         editorInstructionPrompt
@@ -38095,6 +38661,9 @@ router.patch('/:id/live-settings', async (req: any, res) => {
       exploreX3Mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
+      videoPreset: requestedVideoPreset,
+      videoCrf: requestedVideoCrf,
+      audioBitrateKbps: requestedAudioBitrateKbps,
       manualTimestampConfig: requestedManualTimestampConfig,
       verticalCaptionConfig: verticalCaptionConfigOverride,
       editorInstructionPrompt
@@ -38377,6 +38946,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
+    const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
+    const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
+    const requestedAudioBitrateKbps = getAudioBitrateKbpsFromPayload(req.body) ?? getAudioBitrateKbpsFromJob(job)
     const promptAppliedReprocess = applyEditorInstructionPlanToDraft({
       retentionStrategyProfile: requestedStrategyProfile,
       retentionAggressionLevel: requestedAggressionLevel,
@@ -38485,6 +39057,11 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
@@ -38553,6 +39130,11 @@ router.post('/:id/reprocess', async (req: any, res) => {
       long_form_clarity_vs_speed: requestedLongFormClarityVsSpeed,
       tangentKiller: requestedTangentKiller,
       tangent_killer: requestedTangentKiller,
+      ...buildEncodingPreferencePersistenceFields({
+        videoPreset: requestedVideoPreset,
+        videoCrf: requestedVideoCrf,
+        audioBitrateKbps: requestedAudioBitrateKbps
+      }),
       coldStartAutopilot: requestedColdStartAutopilot,
       cold_start_autopilot: requestedColdStartAutopilot,
       continuityFirstMode: requestedContinuityFirstMode,
