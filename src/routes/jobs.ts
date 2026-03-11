@@ -24620,6 +24620,58 @@ const snapTimeToNearestTranscriptBoundary = (
   return bestDistance <= maxShift ? nearest : value
 }
 
+const findTranscriptBoundaryAtOrAfter = (boundaries: number[], value: number): number | null => {
+  if (!boundaries.length || !Number.isFinite(value)) return null
+  let left = 0
+  let right = boundaries.length - 1
+  while (left < right) {
+    const mid = Math.floor((left + right) / 2)
+    if (boundaries[mid] < value) left = mid + 1
+    else right = mid
+  }
+  const candidate = boundaries[left]
+  return Number.isFinite(candidate) && candidate >= value ? candidate : null
+}
+
+const findTranscriptBoundaryAtOrBefore = (boundaries: number[], value: number): number | null => {
+  if (!boundaries.length || !Number.isFinite(value)) return null
+  let left = 0
+  let right = boundaries.length - 1
+  while (left < right) {
+    const mid = Math.ceil((left + right) / 2)
+    if (boundaries[mid] > value) right = mid - 1
+    else left = mid
+  }
+  const candidate = boundaries[left]
+  return Number.isFinite(candidate) && candidate <= value ? candidate : null
+}
+
+const snapSegmentEndToSentenceBoundary = (
+  value: number,
+  sentenceEndBoundaries: number[],
+  nearestShift: number,
+  maxForwardShift: number
+) => {
+  if (!sentenceEndBoundaries.length || !Number.isFinite(value)) return value
+  const forwardSentenceEnd = findTranscriptBoundaryAtOrAfter(sentenceEndBoundaries, value)
+  const priorSentenceEnd = findTranscriptBoundaryAtOrBefore(sentenceEndBoundaries, value)
+  if (forwardSentenceEnd !== null && Math.abs(forwardSentenceEnd - value) <= 0.08) {
+    return forwardSentenceEnd
+  }
+  if (priorSentenceEnd !== null && Math.abs(value - priorSentenceEnd) <= 0.08) {
+    return priorSentenceEnd
+  }
+  const nearest = snapTimeToNearestTranscriptBoundary(value, sentenceEndBoundaries, nearestShift)
+  if (nearest > value && nearest - value <= maxForwardShift) return nearest
+  if (forwardSentenceEnd !== null && forwardSentenceEnd - value <= maxForwardShift) {
+    return forwardSentenceEnd
+  }
+  if (priorSentenceEnd !== null && value - priorSentenceEnd <= 0.08) {
+    return priorSentenceEnd
+  }
+  return value
+}
+
 const alignSegmentsToTranscriptBoundariesForRender = (
   segments: Segment[],
   transcriptCues: TranscriptCue[],
@@ -24657,8 +24709,14 @@ const alignSegmentsToTranscriptBoundariesForRender = (
     const span = Math.max(MIN_RENDER_SEGMENT_SECONDS, normalized.end - normalized.start)
     const maxShift = clamp(span * 0.2, 0.04, 0.2)
     const sentenceEndShift = clamp(maxShift * 1.9, 0.06, 0.45)
+    const sentenceForwardShift = clamp(Math.max(span * 1.8, 0.7), 0.7, 4.5)
     const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, startBoundaries, maxShift)
-    const snappedEndSentence = snapTimeToNearestTranscriptBoundary(normalized.end, sentenceEndBoundaries, sentenceEndShift)
+    const snappedEndSentence = snapSegmentEndToSentenceBoundary(
+      normalized.end,
+      sentenceEndBoundaries,
+      sentenceEndShift,
+      sentenceForwardShift
+    )
     const snappedEndCandidate = snapTimeToNearestTranscriptBoundary(snappedEndSentence, boundaries, maxShift)
     let start = roundForFilter(clamp(Math.min(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
     let end = roundForFilter(clamp(Math.max(snappedStartCandidate, snappedEndCandidate), 0, durationSeconds))
