@@ -280,7 +280,7 @@ type UploadRuthlessSignal = {
   confidence: number
   quickControlMode: QuickControlMode | null
   reason: string
-  provider: 'local' | 'huggingface' | 'none'
+  provider: 'local' | 'huggingface' | 'gemini' | 'none'
   model: string | null
 } | null
 
@@ -1399,7 +1399,7 @@ const parseQuickControlModeToken = (value: unknown): QuickControlMode | null => 
 
 const parseUploadRuthlessSignal = (
   text: string,
-  provider: 'local' | 'huggingface' | 'none',
+  provider: 'local' | 'huggingface' | 'gemini' | 'none',
   model: string | null
 ): UploadRuthlessSignal => {
   const parsed = tryParseJson(text) as any

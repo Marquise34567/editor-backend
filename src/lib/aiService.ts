@@ -1,6 +1,6 @@
 import { llamaQuery, type LlamaProvider } from '../services/llamaService'
 
-export type AiProvider = 'local' | 'huggingface' | 'none'
+export type AiProvider = 'local' | 'huggingface' | 'gemini' | 'none'
 
 export type AiQueryParams = {
   prompt: string
@@ -19,16 +19,17 @@ export type AiQueryResult = {
 
 const resolveRetentionModelOverride = () => {
   const configured = String(
-    process.env.HF_RETENTION_MODEL ||
-    process.env.HF_LLAMA_PRIMARY_MODEL ||
-    'meta-llama/Meta-Llama-3.1-405B-Instruct'
+    process.env.RETENTION_MODEL_OVERRIDE ||
+    process.env.AI_MODEL ||
+    ''
   ).trim()
-  return configured || 'meta-llama/Meta-Llama-3.1-405B-Instruct'
+  return configured || undefined
 }
 
 const mapProvider = (provider: LlamaProvider | null): AiProvider => {
   if (provider === 'local') return 'local'
   if (provider === 'huggingface') return 'huggingface'
+  if (provider === 'gemini') return 'gemini'
   return 'none'
 }
 

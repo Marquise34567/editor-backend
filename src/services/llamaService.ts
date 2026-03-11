@@ -5,6 +5,8 @@ const clamp = (value: number, min: number, max: number) => Math.max(min, Math.mi
 
 const DEFAULT_PRIMARY_MODEL = 'meta-llama/Meta-Llama-3.1-405B-Instruct'
 const DEFAULT_FALLBACK_MODELS = ['meta-llama/Meta-Llama-3.1-70B-Instruct']
+const DEFAULT_GEMINI_PRIMARY_MODEL = 'gemini-1.5-flash'
+const DEFAULT_GEMINI_FALLBACK_MODELS = ['gemini-1.5-pro']
 const DEFAULT_MAX_TOKENS = 512
 
 const RETRYABLE_STATUS_CODES = new Set([408, 409, 425, 429, 500, 502, 503, 504])
@@ -17,7 +19,7 @@ Rules:
 - Prioritize smooth retention with no deep valleys.
 - Keep strongest opener in first 8-15 seconds and sustain micro-progress every 15-30 seconds.`
 
-export type LlamaProvider = 'huggingface' | 'local'
+export type LlamaProvider = 'huggingface' | 'local' | 'gemini'
 
 export type LlamaQueryResult = {
   ok: boolean
@@ -59,6 +61,12 @@ const getLocalEndpoint = () => {
   const ollamaBaseUrl = String(process.env.OLLAMA_BASE_URL || '').trim().replace(/\/+$/, '')
   return ollamaBaseUrl ? `${ollamaBaseUrl}/api/chat` : ''
 }
+const getGeminiApiKey = () =>
+  String(process.env.GEMINI_API_KEY || process.env.GOOGLE_GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '').trim()
+const getGeminiBaseUrl = () =>
+  String(process.env.GEMINI_BASE_URL || process.env.GOOGLE_GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com')
+    .trim()
+    .replace(/\/+$/, '')
 
 const resolvePrimaryModel = () =>
   String(process.env.HF_LLAMA_PRIMARY_MODEL || process.env.HF_RETENTION_MODEL || DEFAULT_PRIMARY_MODEL).trim() ||
@@ -72,11 +80,37 @@ const resolveFallbackModels = () => {
   return Array.from(new Set(combined.filter(Boolean)))
 }
 
+const resolveGeminiPrimaryModel = () =>
+  String(process.env.GEMINI_MODEL || process.env.GOOGLE_GEMINI_MODEL || DEFAULT_GEMINI_PRIMARY_MODEL).trim() ||
+  DEFAULT_GEMINI_PRIMARY_MODEL
+
+const resolveGeminiFallbackModels = () => {
+  const configured = parseList(process.env.GEMINI_FALLBACK_MODELS || process.env.GOOGLE_GEMINI_FALLBACK_MODELS || '')
+  const combined = [...configured, ...DEFAULT_GEMINI_FALLBACK_MODELS]
+  return Array.from(new Set(combined.filter(Boolean)))
+}
+
 const buildModelList = (overrideModel?: string, includeFallback = true) => {
   const selected = String(overrideModel || '').trim()
   const primary = selected || resolvePrimaryModel()
   const fallback = includeFallback ? resolveFallbackModels() : []
   return [primary, ...fallback.filter((model) => model !== primary)]
+}
+
+const buildGeminiModelList = (overrideModel?: string, includeFallback = true) => {
+  const selected = String(overrideModel || '').trim()
+  const primary = selected || resolveGeminiPrimaryModel()
+  const fallback = includeFallback ? resolveGeminiFallbackModels() : []
+  return [primary, ...fallback.filter((model) => model !== primary)]
+}
+
+const buildModelListForProvider = (
+  provider: LlamaProvider,
+  overrideModel?: string,
+  includeFallback = true
+) => {
+  if (provider === 'gemini') return buildGeminiModelList(overrideModel, includeFallback)
+  return buildModelList(overrideModel, includeFallback)
 }
 
 const buildPrompt = (prompt: string, prependRuthlessPrompt = true) => {
@@ -129,6 +163,24 @@ const coerceGeneratedText = (payload: any): string => {
   if (typeof payload.text === 'string') return payload.text.trim()
   if (typeof payload.summary_text === 'string') return payload.summary_text.trim()
   if (typeof payload.content === 'string') return payload.content.trim()
+  if (Array.isArray(payload?.candidates) && payload.candidates.length > 0) {
+    const candidateText = payload.candidates
+      .map((candidate: any) => {
+        if (typeof candidate?.output === 'string') return candidate.output
+        if (typeof candidate?.content === 'string') return candidate.content
+        if (Array.isArray(candidate?.content?.parts)) {
+          return candidate.content.parts
+            .map((part: any) => (typeof part?.text === 'string' ? part.text : ''))
+            .filter(Boolean)
+            .join('\n')
+        }
+        return ''
+      })
+      .filter(Boolean)
+      .join('\n')
+      .trim()
+    if (candidateText) return candidateText
+  }
   if (Array.isArray(payload?.choices) && payload.choices[0]) {
     const choice = payload.choices[0]
     if (typeof choice?.text === 'string') return choice.text.trim()
@@ -263,24 +315,120 @@ const requestLocal = async ({
   }
 }
 
+const requestGemini = async ({
+  apiKey,
+  baseUrl,
+  model,
+  prompt,
+  maxTokens,
+  temperature,
+  topP
+}: {
+  apiKey: string
+  baseUrl: string
+  model: string
+  prompt: string
+  maxTokens: number
+  temperature: number
+  topP: number
+}): Promise<ProviderRequestResult> => {
+  try {
+    const endpoint = `${baseUrl}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature,
+          topP,
+          maxOutputTokens: maxTokens
+        }
+      })
+    })
+
+    const payload: any = await response.json().catch(() => null)
+    if (!response.ok) {
+      const reason = String(
+        payload?.error?.message ||
+        payload?.error ||
+        payload?.message ||
+        payload?.promptFeedback?.blockReason ||
+        `gemini_status_${response.status}`
+      ).trim()
+      return {
+        ok: false,
+        text: '',
+        statusCode: response.status,
+        reason: reason || `gemini_status_${response.status}`
+      }
+    }
+
+    const text = coerceGeneratedText(payload)
+    if (!text) {
+      return {
+        ok: false,
+        text: '',
+        statusCode: response.status,
+        reason: String(payload?.promptFeedback?.blockReason || 'gemini_empty_response')
+      }
+    }
+
+    return { ok: true, text, statusCode: response.status }
+  } catch (error: any) {
+    return { ok: false, text: '', reason: String(error?.message || 'gemini_exception') }
+  }
+}
+
+const parseProviderToken = (token: string): LlamaProvider | null => {
+  const normalized = String(token || '').trim().toLowerCase()
+  if (!normalized) return null
+  if (normalized === 'local' || normalized === 'ollama') return 'local'
+  if (normalized === 'huggingface' || normalized === 'hf') return 'huggingface'
+  if (normalized === 'gemini' || normalized === 'google' || normalized === 'google_gemini') return 'gemini'
+  return null
+}
+
 const buildProviderOrder = (): LlamaProvider[] => {
-  const requested = String(process.env.LLAMA_PROVIDER || '').trim().toLowerCase()
+  const requestedRaw = String(process.env.LLAMA_PROVIDER || process.env.RETENTION_AI_PROVIDER_ORDER || '')
+    .trim()
+    .toLowerCase()
   const hasToken = Boolean(getHfToken())
   const hasLocal = Boolean(getLocalEndpoint())
-
-  if (requested === 'local') {
-    return hasLocal ? ['local'] : (hasToken ? ['huggingface'] : [])
+  const hasGemini = Boolean(getGeminiApiKey())
+  const availability: Record<LlamaProvider, boolean> = {
+    local: hasLocal,
+    gemini: hasGemini,
+    huggingface: hasToken
   }
-  if (requested === 'huggingface' || requested === 'hf') {
+  const autoPriority: LlamaProvider[] = ['local', 'gemini', 'huggingface']
+  const appendIfAvailable = (order: LlamaProvider[], provider: LlamaProvider) => {
+    if (!availability[provider]) return
+    if (!order.includes(provider)) order.push(provider)
+  }
+
+  const requestedList = parseList(requestedRaw)
+    .map(parseProviderToken)
+    .filter((provider): provider is LlamaProvider => Boolean(provider))
+  if (requestedList.length > 0) {
     const order: LlamaProvider[] = []
-    if (hasToken) order.push('huggingface')
-    if (hasLocal) order.push('local')
+    for (const provider of requestedList) appendIfAvailable(order, provider)
+    for (const provider of autoPriority) appendIfAvailable(order, provider)
+    return order
+  }
+
+  const requestedSingle = parseProviderToken(requestedRaw)
+  if (requestedSingle) {
+    const order: LlamaProvider[] = []
+    appendIfAvailable(order, requestedSingle)
+    for (const provider of autoPriority) appendIfAvailable(order, provider)
     return order
   }
 
   const autoOrder: LlamaProvider[] = []
-  if (hasLocal) autoOrder.push('local')
-  if (hasToken) autoOrder.push('huggingface')
+  for (const provider of autoPriority) appendIfAvailable(autoOrder, provider)
   return autoOrder
 }
 
@@ -288,7 +436,9 @@ export const isLlamaConfigured = () => buildProviderOrder().length > 0
 
 export const getLlamaModelConfig = () => ({
   primary: resolvePrimaryModel(),
-  fallback: resolveFallbackModels()
+  fallback: resolveFallbackModels(),
+  geminiPrimary: resolveGeminiPrimaryModel(),
+  geminiFallback: resolveGeminiFallbackModels()
 })
 
 export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}): Promise<LlamaQueryResult> => {
@@ -309,7 +459,6 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
   const topP = clamp(Number(options.topP ?? 0.9), 0.1, 1)
   const promptText = buildPrompt(prompt, options.prependRuthlessPrompt !== false)
   const includeFallback = options.useFallbackModels !== false
-  const models = buildModelList(options.model, includeFallback)
   const maxRetries = clamp(Math.round(Number(process.env.LLAMA_MAX_RETRIES || 3)), 1, 8)
   const baseBackoffMs = clamp(Math.round(Number(process.env.LLAMA_BACKOFF_BASE_MS || 1200)), 200, 15_000)
   const totalTimeoutMs = clamp(
@@ -331,6 +480,10 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
   for (const provider of providers) {
     const token = getHfToken()
     const localEndpoint = getLocalEndpoint()
+    const geminiApiKey = getGeminiApiKey()
+    const geminiBaseUrl = getGeminiBaseUrl()
+    const models = buildModelListForProvider(provider, options.model, includeFallback)
+    if (!models.length) continue
 
     for (const model of models) {
       for (let attempt = 1; attempt <= maxRetries; attempt += 1) {
@@ -347,7 +500,7 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
           }
         }
         attempts += 1
-        const result = await withTimeoutResult(
+        const providerRequest =
           provider === 'huggingface'
             ? requestHf({
                 token,
@@ -357,14 +510,26 @@ export const llamaQuery = async (prompt: string, options: LlamaQueryOptions = {}
                 temperature,
                 topP
               })
-            : requestLocal({
-                endpoint: localEndpoint,
-                model,
-                prompt: promptText,
-                maxTokens,
-                temperature,
-                topP
-              }),
+            : provider === 'gemini'
+              ? requestGemini({
+                  apiKey: geminiApiKey,
+                  baseUrl: geminiBaseUrl,
+                  model,
+                  prompt: promptText,
+                  maxTokens,
+                  temperature,
+                  topP
+                })
+              : requestLocal({
+                  endpoint: localEndpoint,
+                  model,
+                  prompt: promptText,
+                  maxTokens,
+                  temperature,
+                  topP
+                })
+        const result = await withTimeoutResult(
+          providerRequest,
           Math.min(perAttemptTimeoutMs, remainingMs),
           () => ({
             ok: false,
