@@ -1096,6 +1096,8 @@ type RetentionJudgeReport = {
   pacing_score: number
   clarity_score: number
   emotional_pull: number
+  narrative_arc_score?: number
+  narrative_arc_pass?: boolean
   content_format?: RetentionContentFormat
   target_platform?: RetentionTargetPlatform
   strategy_profile?: RetentionStrategyProfile
@@ -1106,6 +1108,7 @@ type RetentionJudgeReport = {
     raise_emotion: boolean
     improve_pacing: boolean
     increase_interrupts: boolean
+    strengthen_story_arc?: boolean
   }
   applied_thresholds: QualityGateThresholds
   gate_mode: 'strict' | 'adaptive'
@@ -1122,6 +1125,8 @@ type RetentionAttemptRecord = {
   predictedRetention?: number
   variantScore?: number
   cutQualityScore?: number
+  storyArcScore?: number
+  storyArcPass?: boolean
 }
 type HookSelectionDecision = {
   candidate: HookCandidate
@@ -2765,6 +2770,12 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
   ultra: { target: 79, floor: 68 },
   'retention-king': { target: 82, floor: 70 }
 }
+const NARRATIVE_ARC_STRUCTURE_CONTRACT = `Narrative arc contract (mandatory in every mode):
+1) Hook: open with a 5-8 second teaser that creates curiosity without giving away the full outcome.
+2) Build-up: after the hook, keep context and escalate stakes in a clear progression.
+3) Payout: deliver the strongest payoff moment after the build-up (not randomly before it).
+4) Cliffhanger: end with unresolved tension or a strong "what happens next" pull.
+Never scramble these phases out of order.`
 const UNIVERSAL_HOOK_MODE_PLAYBOOK_PROMPT = `You are an expert video editor specializing in high-retention hooks for short-form (15-60 seconds) and long-form (8-60+ minutes).
 Mission: create a cliffhanger/teaser opener built around the single most surprising, intriguing, funniest, or craziest moment without fully revealing the payoff.
 
@@ -2776,6 +2787,8 @@ Core hook rules:
 5) Overlay large bold mute-proof text in first 1-2 seconds with a clear value promise.
 6) Keep authenticity: creator-style/UGC energy beats polished ad tone; retain relatable human voice.
 7) Optimize retention psychology: short-form for completion/loops; long-form for first 30-60s survival.
+
+${NARRATIVE_ARC_STRUCTURE_CONTRACT}
 
 Format adaptation:
 - Short-form: 5-8s opener, strongest visual in first 1-3s, aggressive cut cadence, re-hook CTA.
@@ -2822,7 +2835,8 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Ultra mode playbook active: dynamic binge editing profile enabled.',
         'Ultra mode enforces fast-mode processing and upload acceleration.',
-        'Ultra mode favors velocity: heavier hook pressure, denser pattern interrupts, and faster pacing resets.'
+        'Ultra mode favors velocity: heavier hook pressure, denser pattern interrupts, and faster pacing resets.',
+        'Ultra mode enforces arc order: hook -> build-up -> payout -> cliffhanger.'
       ]
     }
   }
@@ -2834,7 +2848,8 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
       notes: [
         'Retention King playbook active: retention-engineering profile enabled.',
         'Retention King prioritizes watch-time stability: stronger narrative coherence and stricter quality-gate checks.',
-        'Retention King enforces 5-8s openers while protecting context clarity and payoff sequencing.'
+        'Retention King enforces 5-8s openers while protecting context clarity and payoff sequencing.',
+        'Retention King enforces arc order: hook -> build-up -> payout -> cliffhanger.'
       ]
     }
   }
@@ -2843,7 +2858,8 @@ const resolveEditorModePlaybook = (mode?: EditorModeSelection | null): EditorMod
     label: 'Standard',
     prompt: STANDARD_MODE_PLAYBOOK_PROMPT,
     notes: [
-      'Standard mode playbook active: universal high-retention hook framework enabled.'
+      'Standard mode playbook active: universal high-retention hook framework enabled.',
+      'Standard mode enforces arc order: hook -> build-up -> payout -> cliffhanger.'
     ]
   }
 }
@@ -2859,7 +2875,8 @@ const resolvePipelinePowerModePlaybook = (
       notes: [
         'Fast mode playbook active: aggressive binge-cut profile enabled.',
         'Fast mode still requires transcript generation before editing can continue.',
-        'Fast mode keeps hook pressure high while prioritizing speed-first output.'
+        'Fast mode keeps hook pressure high while prioritizing speed-first output.',
+        'Fast mode enforces arc order: hook -> build-up -> payout -> cliffhanger.'
       ]
     }
   }
@@ -2871,7 +2888,8 @@ const resolvePipelinePowerModePlaybook = (
       notes: [
         'Quality mode playbook active: aggressive binge-cut profile enabled.',
         'Quality mode keeps transcript-assisted hook and cut analysis enabled for stronger opener selection.',
-        'Quality mode favors better edit decisions over the absolute fastest turnaround.'
+        'Quality mode favors better edit decisions over the absolute fastest turnaround.',
+        'Quality mode enforces arc order: hook -> build-up -> payout -> cliffhanger.'
       ]
     }
   }
@@ -21405,6 +21423,176 @@ const scoreCliffhangerUnresolvedTension = ({
   }
 }
 
+type NarrativeArcPhaseName = 'hook' | 'build_up' | 'payout' | 'cliffhanger'
+type NarrativeArcPhaseWindow = {
+  phase: NarrativeArcPhaseName
+  sourceStart: number
+  sourceEnd: number
+  outputStart: number | null
+  outputEnd: number | null
+  coverageRatio: number
+}
+type NarrativeArcCoherenceReport = {
+  score: number
+  pass: boolean
+  phaseOrderValid: boolean
+  orderingScore: number
+  hookCoverage: number
+  buildUpCoverage: number
+  payoutCoverage: number
+  cliffhangerCoverage: number
+  missingPhases: NarrativeArcPhaseName[]
+  phases: NarrativeArcPhaseWindow[]
+}
+
+const getStoryBeatNode = (storyBeatGraph: StoryBeatGraph | null | undefined, role: StoryBeatRole) => {
+  if (!storyBeatGraph?.nodes?.length) return null
+  return storyBeatGraph.nodes.find((node) => node.role === role) || null
+}
+
+const scoreNarrativeArcCoherence = ({
+  segments,
+  durationSeconds,
+  hook,
+  storyBeatGraph
+}: {
+  segments: Segment[]
+  durationSeconds: number
+  hook: HookCandidate
+  storyBeatGraph: StoryBeatGraph | null
+}): NarrativeArcCoherenceReport => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const hookStart = Number(clamp(Number(hook?.start || 0), 0, Math.max(0, safeDuration - 0.05)).toFixed(3))
+  const hookEnd = Number(clamp(
+    hookStart + Math.max(0.2, Number(hook?.duration || HOOK_MIN)),
+    hookStart + 0.2,
+    safeDuration
+  ).toFixed(3))
+  const escalationNode = getStoryBeatNode(storyBeatGraph, 'escalation')
+  const peakNode = getStoryBeatNode(storyBeatGraph, 'peak')
+  const sequelNode = getStoryBeatNode(storyBeatGraph, 'sequel_hook')
+  const cliffFallbackStart = Number(clamp(
+    safeDuration - (safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS ? 18 : 8),
+    0,
+    safeDuration
+  ).toFixed(3))
+  const cliffSourceStart = Number(clamp(
+    Number(sequelNode?.start ?? storyBeatGraph?.sequelHookWindow?.start ?? cliffFallbackStart),
+    0,
+    safeDuration
+  ).toFixed(3))
+  const cliffSourceEnd = Number(clamp(
+    Number(sequelNode?.end ?? storyBeatGraph?.sequelHookWindow?.end ?? safeDuration),
+    cliffSourceStart + 0.25,
+    safeDuration
+  ).toFixed(3))
+  const buildUpSourceStart = Number(clamp(
+    Math.max(hookEnd, Number(escalationNode?.start ?? hookEnd)),
+    0,
+    safeDuration
+  ).toFixed(3))
+  const buildUpSourceEnd = Number(clamp(
+    Number(peakNode?.start ?? safeDuration * 0.58),
+    buildUpSourceStart + 0.35,
+    safeDuration
+  ).toFixed(3))
+  const payoutSourceStart = Number(clamp(
+    Number(peakNode?.start ?? Math.max(buildUpSourceEnd, safeDuration * 0.45)),
+    0,
+    safeDuration
+  ).toFixed(3))
+  const payoutSourceEnd = Number(clamp(
+    Math.min(Number(peakNode?.end ?? safeDuration * 0.78), cliffSourceStart),
+    payoutSourceStart + 0.3,
+    safeDuration
+  ).toFixed(3))
+
+  const phaseRanges: Array<{ phase: NarrativeArcPhaseName; start: number; end: number }> = [
+    { phase: 'hook', start: hookStart, end: hookEnd },
+    { phase: 'build_up', start: buildUpSourceStart, end: buildUpSourceEnd },
+    { phase: 'payout', start: payoutSourceStart, end: payoutSourceEnd },
+    { phase: 'cliffhanger', start: cliffSourceStart, end: cliffSourceEnd }
+  ]
+
+  const phases: NarrativeArcPhaseWindow[] = phaseRanges.map((range) => {
+    const sourceStart = Number(clamp(range.start, 0, Math.max(0, safeDuration - 0.05)).toFixed(3))
+    const sourceEnd = Number(clamp(range.end, sourceStart + 0.05, safeDuration).toFixed(3))
+    const mapped = mapSourceRangeToEditedTimeline({
+      start: sourceStart,
+      end: sourceEnd,
+      segments
+    })
+    return {
+      phase: range.phase,
+      sourceStart,
+      sourceEnd,
+      outputStart: mapped?.outputStart ?? null,
+      outputEnd: mapped?.outputEnd ?? null,
+      coverageRatio: Number(clamp01(Number(mapped?.coverageRatio || 0)).toFixed(4))
+    }
+  })
+
+  const getPhase = (phase: NarrativeArcPhaseName) => phases.find((entry) => entry.phase === phase)
+  const hookCoverage = Number(getPhase('hook')?.coverageRatio || 0)
+  const buildUpCoverage = Number(getPhase('build_up')?.coverageRatio || 0)
+  const payoutCoverage = Number(getPhase('payout')?.coverageRatio || 0)
+  const cliffhangerCoverage = Number(getPhase('cliffhanger')?.coverageRatio || 0)
+  const phaseOrder: NarrativeArcPhaseName[] = ['hook', 'build_up', 'payout', 'cliffhanger']
+  let comparisons = 0
+  let orderedComparisons = 0
+  for (let index = 0; index < phaseOrder.length - 1; index += 1) {
+    const left = getPhase(phaseOrder[index])?.outputStart
+    const right = getPhase(phaseOrder[index + 1])?.outputStart
+    if (!Number.isFinite(Number(left)) || !Number.isFinite(Number(right))) continue
+    comparisons += 1
+    if (Number(right) + 0.02 >= Number(left)) orderedComparisons += 1
+  }
+  const orderingScore = Number((comparisons ? orderedComparisons / comparisons : 0.5).toFixed(4))
+  const phaseOrderValid = comparisons > 0 && orderedComparisons === comparisons
+  const phaseCoverageScore = clamp01(
+    0.3 * hookCoverage +
+    0.24 * buildUpCoverage +
+    0.24 * payoutCoverage +
+    0.22 * cliffhangerCoverage
+  )
+  const score = clamp01(
+    0.82 * phaseCoverageScore +
+    0.18 * orderingScore
+  )
+  const minScore = safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS ? 0.6 : 0.54
+  const pass = (
+    score >= minScore &&
+    hookCoverage >= 0.42 &&
+    buildUpCoverage >= 0.24 &&
+    payoutCoverage >= 0.3 &&
+    cliffhangerCoverage >= 0.3 &&
+    phaseOrderValid
+  )
+  const missingPhases = phases
+    .filter((entry) => (
+      entry.coverageRatio < (
+        entry.phase === 'hook'
+          ? 0.42
+          : entry.phase === 'build_up'
+            ? 0.24
+            : 0.3
+      )
+    ))
+    .map((entry) => entry.phase)
+  return {
+    score: Number(score.toFixed(4)),
+    pass,
+    phaseOrderValid,
+    orderingScore,
+    hookCoverage: Number(hookCoverage.toFixed(4)),
+    buildUpCoverage: Number(buildUpCoverage.toFixed(4)),
+    payoutCoverage: Number(payoutCoverage.toFixed(4)),
+    cliffhangerCoverage: Number(cliffhangerCoverage.toFixed(4)),
+    missingPhases,
+    phases
+  }
+}
+
 const buildStoryBeatGraph = ({
   durationSeconds,
   windows,
@@ -29706,7 +29894,8 @@ const buildRetentionJudgeReport = ({
   thresholds,
   contentFormat,
   targetPlatform,
-  strategyProfile
+  strategyProfile,
+  storyArcCoherence
 }: {
   retentionScore: ReturnType<typeof computeRetentionScore>
   hook: HookCandidate
@@ -29720,6 +29909,7 @@ const buildRetentionJudgeReport = ({
   contentFormat?: RetentionContentFormat
   targetPlatform?: RetentionTargetPlatform
   strategyProfile?: RetentionStrategyProfile
+  storyArcCoherence?: NarrativeArcCoherenceReport | null
 }): RetentionJudgeReport => {
   const appliedThresholds = normalizeQualityGateThresholds(thresholds)
   const runtimeSeconds = Math.max(1, computeEditedRuntimeSeconds(segments))
@@ -29788,15 +29978,22 @@ const buildRetentionJudgeReport = ({
   const clarity = Math.round(100 * clamp01(
     0.72 * (1 - clarityPenalty) +
     0.14 * (captionsEnabled ? 1 : 0.7) +
-    0.14 * (hook.auditPassed ? 1 : 0.6)
+    0.1 * (hook.auditPassed ? 1 : 0.6) +
+    0.04 * clamp01(storyArcCoherence?.score ?? 0.5)
   ))
   const retention = Math.round(retentionScore.score)
+  const narrativeArcScore = Number(clamp01(storyArcCoherence?.score ?? 0).toFixed(4))
+  const narrativeArcScorePercent = Math.round(narrativeArcScore * 100)
+  const narrativeArcPass = Boolean(storyArcCoherence?.pass)
 
   const whyKeepWatching: string[] = []
   if (hookStrength >= 80) whyKeepWatching.push('Hook opens with a high-impact moment that promises payoff.')
   if (emotionalPull >= 70) whyKeepWatching.push('Emotional intensity rises quickly and stays above baseline.')
   if (pacing >= 70) whyKeepWatching.push('Frequent editorial interrupts keep momentum and reduce drop-off risk.')
   if (hookSignals.instantHold >= 0.7) whyKeepWatching.push('First 1-3 seconds create a strong scroll-stopping pattern interrupt.')
+  if (narrativeArcPass) {
+    whyKeepWatching.push('Story arc stays coherent: hook leads to build-up, payout, then a clear cliffhanger.')
+  }
   if (whyKeepWatching.length === 0) whyKeepWatching.push('Retention signals are mixed; stronger setup/payoff needed.')
 
   const whatIsGeneric: string[] = []
@@ -29808,6 +30005,23 @@ const buildRetentionJudgeReport = ({
   if (hookSignals.instantHold < 0.48) whatIsGeneric.push('The first 3 seconds are not scroll-stopping enough.')
   if (hookTextSignals.valuePromise < 0.28 && hookTextSignals.curiosityBlend < 0.28) whatIsGeneric.push('The opener does not clearly explain why viewers should keep watching.')
   if (hookTextSignals.weakIntroPenalty >= 0.44) whatIsGeneric.push('The opener starts slow instead of leading with the strongest moment.')
+  if (storyArcCoherence && !storyArcCoherence.pass) {
+    const phaseLabels: Record<NarrativeArcPhaseName, string> = {
+      hook: 'hook',
+      build_up: 'build-up',
+      payout: 'payout',
+      cliffhanger: 'cliffhanger'
+    }
+    const missing = storyArcCoherence.missingPhases
+      .slice(0, 3)
+      .map((phase) => phaseLabels[phase] || phase)
+      .join(', ')
+    whatIsGeneric.push(
+      missing
+        ? `Story arc is unstable (${missing} under-covered), so the edit can feel random.`
+        : 'Story arc order is unstable, so progression feels scattered.'
+    )
+  }
   if (whatIsGeneric.length === 0) whatIsGeneric.push('No major generic-pattern risks were detected in this attempt.')
 
   return {
@@ -29816,6 +30030,8 @@ const buildRetentionJudgeReport = ({
     pacing_score: pacing,
     clarity_score: clarity,
     emotional_pull: emotionalPull,
+    narrative_arc_score: Number(narrativeArcScorePercent.toFixed(0)),
+    narrative_arc_pass: narrativeArcPass,
     content_format: resolvedContentFormat,
     target_platform: resolvedTargetPlatform,
     strategy_profile: strategyProfile || 'balanced',
@@ -29825,7 +30041,8 @@ const buildRetentionJudgeReport = ({
       stronger_hook: hookStrength < appliedThresholds.hook_strength,
       raise_emotion: emotionalPull < appliedThresholds.emotional_pull,
       improve_pacing: pacing < appliedThresholds.pacing_score,
-      increase_interrupts: interruptCoverage < interruptCoverageTarget
+      increase_interrupts: interruptCoverage < interruptCoverageTarget,
+      strengthen_story_arc: storyArcCoherence ? !storyArcCoherence.pass : undefined
     },
     applied_thresholds: appliedThresholds,
     gate_mode:
@@ -32364,6 +32581,8 @@ const processJob = async (
     let selectedCutQualityScore = Number.isFinite(Number((job.analysis as any)?.cut_quality_score))
       ? Number((job.analysis as any).cut_quality_score)
       : 0
+    let selectedStoryArcCoherence: NarrativeArcCoherenceReport | null =
+      ((job.analysis as any)?.story_arc_coherence as NarrativeArcCoherenceReport) || null
     let selectedBoundaryPathologySummary: BoundaryPathologySummary | null =
       ((job.analysis as any)?.boundary_pathology_summary as BoundaryPathologySummary) || null
     let selectedContentFormat: RetentionContentFormat = inferRetentionContentFormat({
@@ -33123,6 +33342,12 @@ const processJob = async (
             ? segment.transitionStyle
             : undefined
         }))
+        const storyArcCoherence = scoreNarrativeArcCoherence({
+          segments: governedAttemptSegments,
+          durationSeconds,
+          hook: effectiveHookCandidate,
+          storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+        })
         const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count + microRehookResult.applied
         const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(governedAttemptSegments))
         return {
@@ -33137,7 +33362,8 @@ const processJob = async (
             eliteCutRefined.cutQualityScore,
             Number((multiPassRefined.report.pass2.boundaryGate.averageScore || 0).toFixed(4))
           ),
-          boundaryPathologySummary: eliteCutRefined.boundaryPathologySummary
+          boundaryPathologySummary: eliteCutRefined.boundaryPathologySummary,
+          storyArcCoherence
         }
       }
 
@@ -33202,6 +33428,7 @@ const processJob = async (
         eliteCutAudit: EliteCutAudit
         cutQualityScore: number
         boundaryPathologySummary: BoundaryPathologySummary
+        storyArcCoherence: NarrativeArcCoherenceReport
         pacingCurve: 'aggressive' | 'balanced' | 'steady'
         cliffhangerStyle: 'open_loop' | 'reveal_tease' | 'mystery_question'
         policyId: string
@@ -33258,7 +33485,8 @@ const processJob = async (
           thresholds: qualityGateThresholds,
           contentFormat: selectedContentFormat,
           targetPlatform: retentionTargetPlatform,
-          strategyProfile
+          strategyProfile,
+          storyArcCoherence: attempt.storyArcCoherence
         })
         const predictedRetention = predictVariantRetention({
           strategy,
@@ -33291,6 +33519,8 @@ const processJob = async (
           0.75 * predictedRetention +
           0.2 * judge.retention_score +
           2.2 * (attempt.cutQualityScore ?? 0) +
+          5.4 * attempt.storyArcCoherence.score +
+          (attempt.storyArcCoherence.pass ? 1.2 : 0) +
           4.5 * cliffhangerTension +
           (storyBeatGraphForAnalysis?.unresolvedTensionScore ? storyBeatGraphForAnalysis.unresolvedTensionScore * 2 : 0) +
           (judge.passed ? 3.5 : 0)
@@ -33305,7 +33535,9 @@ const processJob = async (
           boredomRemovalRatio: retention.details.boredomRemovalRatio,
           predictedRetention,
           variantScore,
-          cutQualityScore: attempt.cutQualityScore
+          cutQualityScore: attempt.cutQualityScore,
+          storyArcScore: attempt.storyArcCoherence.score,
+          storyArcPass: attempt.storyArcCoherence.pass
         })
         attemptEvaluations.push({
           strategy,
@@ -33321,6 +33553,7 @@ const processJob = async (
           eliteCutAudit: attempt.eliteCutAudit,
           cutQualityScore: attempt.cutQualityScore,
           boundaryPathologySummary: attempt.boundaryPathologySummary,
+          storyArcCoherence: attempt.storyArcCoherence,
           pacingCurve,
           cliffhangerStyle,
           policyId
@@ -33335,6 +33568,7 @@ const processJob = async (
             .slice()
             .sort((a, b) => (
               b.variantScore - a.variantScore ||
+              b.storyArcCoherence.score - a.storyArcCoherence.score ||
               b.cutQualityScore - a.cutQualityScore ||
               b.predictedRetention - a.predictedRetention ||
               b.judge.retention_score - a.judge.retention_score
@@ -33435,6 +33669,7 @@ const processJob = async (
           selectedEliteCutAudit = winner.eliteCutAudit
           selectedCutQualityScore = winner.cutQualityScore
           selectedBoundaryPathologySummary = winner.boundaryPathologySummary
+          selectedStoryArcCoherence = winner.storyArcCoherence
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -33447,6 +33682,7 @@ const processJob = async (
               ? `Strict render lock kept baseline policy ${winner.policyId} (${winner.strategy}).`
               : `Variant winner policy: ${winner.policyId} (${winner.strategy}).`,
             `Elite cut quality score: ${(winner.cutQualityScore * 100).toFixed(0)}%.`,
+            `Narrative arc coherence: ${(winner.storyArcCoherence.score * 100).toFixed(0)}% (${winner.storyArcCoherence.pass ? 'pass' : 'needs refinement'}).`,
             ...winner.judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
           ]
         }
@@ -33638,7 +33874,8 @@ const processJob = async (
             thresholds: rescueThresholds,
             contentFormat: selectedContentFormat,
             targetPlatform: retentionTargetPlatform,
-            strategyProfile
+            strategyProfile,
+            storyArcCoherence: rescueAttempt.storyArcCoherence
           })
           retentionAttempts.push({
             attempt: retentionAttempts.length + 1,
@@ -33648,7 +33885,9 @@ const processJob = async (
             patternInterruptCount: rescueAttempt.patternInterruptCount,
             patternInterruptDensity: rescueAttempt.patternInterruptDensity,
             boredomRemovalRatio: rescueRetention.details.boredomRemovalRatio,
-            cutQualityScore: rescueAttempt.cutQualityScore
+            cutQualityScore: rescueAttempt.cutQualityScore,
+            storyArcScore: rescueAttempt.storyArcCoherence.score,
+            storyArcPass: rescueAttempt.storyArcCoherence.pass
           })
           finalSegments = rescueAttempt.segments
           selectedHook = rescueHookCandidate
@@ -33661,6 +33900,7 @@ const processJob = async (
           selectedStrategy = 'RESCUE_MODE'
           selectedEliteCutAudit = rescueAttempt.eliteCutAudit
           selectedCutQualityScore = rescueAttempt.cutQualityScore
+          selectedStoryArcCoherence = rescueAttempt.storyArcCoherence
           selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
             sourceStart: Number(segment.start.toFixed(3)),
             sourceEnd: Number(segment.end.toFixed(3)),
@@ -33824,6 +34064,13 @@ const processJob = async (
             nicheProfile: nicheProfileForAnalysis
           }
         )
+        const manualStoryArcCoherence = scoreNarrativeArcCoherence({
+          segments: finalSegments,
+          durationSeconds,
+          hook: manualHookForJudge,
+          storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+        })
+        selectedStoryArcCoherence = manualStoryArcCoherence
         const manualJudgeRaw = buildRetentionJudgeReport({
           retentionScore: manualRetention,
           hook: manualHookForJudge,
@@ -33836,7 +34083,8 @@ const processJob = async (
           thresholds: qualityGateThresholds,
           contentFormat: selectedContentFormat,
           targetPlatform: retentionTargetPlatform,
-          strategyProfile
+          strategyProfile,
+          storyArcCoherence: manualStoryArcCoherence
         })
         selectedJudge = {
           ...manualJudgeRaw,
@@ -33856,7 +34104,9 @@ const processJob = async (
             hook: manualHookForJudge,
             patternInterruptCount: selectedPatternInterruptCount,
             patternInterruptDensity: selectedPatternInterruptDensity,
-            boredomRemovalRatio: selectedBoredomRemovalRatio
+            boredomRemovalRatio: selectedBoredomRemovalRatio,
+            storyArcScore: manualStoryArcCoherence.score,
+            storyArcPass: manualStoryArcCoherence.pass
           }
         ]
         qualityGateOverride = {
@@ -34376,6 +34626,15 @@ const processJob = async (
             sourceEnd: Number(segment.end.toFixed(3)),
             orderedIndex
           }))
+          selectedStoryArcCoherence = scoreNarrativeArcCoherence({
+            segments: recoveredSegments,
+            durationSeconds,
+            hook: recoveredHook,
+            storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+          })
+          recoveryNotes.push(
+            `Hard quality recovery: narrative arc coherence ${(selectedStoryArcCoherence.score * 100).toFixed(0)}% (${selectedStoryArcCoherence.pass ? 'pass' : 'needs refinement'}).`
+          )
           const reevaluatedHardQuality = evaluateHardQualityBar({
             durationSeconds,
             contentFormat: selectedContentFormat,
@@ -35506,6 +35765,14 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       editorMode: editorModeForRender
     })
+    if (selectedHook && finalSegmentsForAnalysis.length) {
+      selectedStoryArcCoherence = scoreNarrativeArcCoherence({
+        segments: finalSegmentsForAnalysis,
+        durationSeconds,
+        hook: selectedHook,
+        storyBeatGraph: storyBeatGraphForAnalysis || null
+      })
+    }
     const selectedHookSourceEnd = selectedHook
       ? Number((selectedHook.start + selectedHook.duration).toFixed(3))
       : null
@@ -35684,6 +35951,8 @@ const processJob = async (
         cutting_audit: selectedEliteCutAudit,
         boundary_pathology_summary: selectedBoundaryPathologySummary,
         boundaryPathologySummary: selectedBoundaryPathologySummary,
+        story_arc_coherence: selectedStoryArcCoherence,
+        storyArcCoherence: selectedStoryArcCoherence,
         story_reorder_map: selectedStoryReorderMap,
         style_profile: styleProfileForAnalysis,
         niche_profile: nicheProfileForAnalysis,
