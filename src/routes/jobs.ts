@@ -31579,7 +31579,11 @@ const processJob = async (
         : []
       const verticalAudioFilters = [...verticalBaseAudioFilters, ...verticalVoiceFilters]
       const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
-      const shouldApplyVerticalCaptionOverlays = CAPTIONS_PIPELINE_ENABLED && Boolean(verticalCaptionConfig.enabled)
+      const shouldApplyVerticalCaptionOverlays = (
+        CAPTIONS_PIPELINE_ENABLED &&
+        Boolean(options.autoCaptions) &&
+        Boolean(verticalCaptionConfig.enabled)
+      )
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
         preset: verticalCaptionConfig.preset,
         animationEnabled: verticalCaptionConfig.animationEnabled,
