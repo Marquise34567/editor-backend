@@ -2958,6 +2958,75 @@ router.post('/jobs/:id/cancel', async (req: any, res) => {
   }
 })
 
+router.post('/jobs/cancel-all', async (req: any, res) => {
+  const reason = sanitizeReason(req.body?.reason) || 'queue_canceled_by_admin_bulk'
+  const maxCandidates = 5000
+  const candidates = await prisma.job.findMany({
+    where: {
+      status: { in: Array.from(QUEUE_STATUSES) as any }
+    },
+    orderBy: { createdAt: 'asc' },
+    take: maxCandidates,
+    select: { id: true, userId: true, status: true }
+  })
+
+  let canceled = 0
+  let skipped = 0
+  let failed = 0
+  let running = 0
+  let killedCount = 0
+  const failedItems: Array<{ id: string; error: string }> = []
+  const ownerUserIds = new Set<string>()
+
+  for (const row of candidates) {
+    const jobId = String(row.id || '').trim()
+    if (!jobId) continue
+    ownerUserIds.add(String(row.userId || '').trim())
+    try {
+      const result = await cancelJobById({
+        jobId,
+        reason
+      })
+      canceled += 1
+      if (result.running) running += 1
+      killedCount += Number(result.killedCount || 0)
+    } catch (err: any) {
+      const code = String(err?.code || '')
+      if (code === 'cannot_cancel' || code === 'not_found') {
+        skipped += 1
+      } else {
+        failed += 1
+        failedItems.push({
+          id: jobId,
+          error: String(err?.message || 'cancel_failed')
+        })
+      }
+    }
+  }
+
+  await auditAdminAction({
+    actor: req.user?.email || req.user?.id || null,
+    action: 'admin_jobs_cancel_all',
+    targetEmail: req.user?.email || null,
+    planKey: `${canceled}/${candidates.length}`,
+    reason
+  })
+
+  return res.json({
+    ok: true,
+    reason,
+    candidates: candidates.length,
+    canceled,
+    skipped,
+    failed,
+    running,
+    killedCount,
+    failedItems: failedItems.slice(0, 20),
+    ownerUsersTouched: ownerUserIds.size,
+    truncatedByLimit: candidates.length >= maxCandidates
+  })
+})
+
 router.post('/errors/:id/fix-now', async (req: any, res) => {
   const id = String(req.params?.id || '').trim()
   if (!id) {
