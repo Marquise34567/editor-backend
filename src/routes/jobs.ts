@@ -861,7 +861,7 @@ type HorizontalModeSettings = {
   fit: HorizontalFitMode
 }
 type VerticalFitMode = 'cover' | 'contain'
-type VerticalLayoutMode = 'stacked' | 'single'
+type VerticalLayoutMode = 'stacked' | 'single' | 'auto'
 type VerticalSelectionMode = 'best_moments' | 'story_arc' | 'hook_storm' | 'loop_builder'
 type VerticalZoomProfile = 'none' | 'smooth' | 'punch' | 'kinetic'
 type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
@@ -873,6 +873,7 @@ type VerticalModeSettings = {
   zoomProfile: VerticalZoomProfile
   zoomIntensity: number
   webcamCrop: VerticalWebcamCrop | null
+  bottomCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
   bottomFit: VerticalFitMode
 }
@@ -4701,10 +4702,11 @@ const parseVerticalFitMode = (value?: any, fallback: VerticalFitMode = 'cover'):
   return fallback
 }
 
-const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'stacked'): VerticalLayoutMode => {
+const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'auto'): VerticalLayoutMode => {
   const raw = String(value || '').trim().toLowerCase()
   if (raw === 'single' || raw === 'source' || raw === 'original') return 'single'
   if (raw === 'stacked') return 'stacked'
+  if (raw === 'auto' || raw === 'detect' || raw === 'smart') return 'auto'
   return fallback
 }
 
@@ -4956,7 +4958,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
   return {
     enabled: (value as any).enabled !== false,
     output: parseVerticalOutput((value as any).output),
-    layout: parseVerticalLayoutMode((value as any).layout, 'stacked'),
+    layout: parseVerticalLayoutMode((value as any).layout, 'auto'),
     selectionMode: parseVerticalSelectionMode(
       (value as any).selectionMode ?? (value as any).selection_mode,
       DEFAULT_VERTICAL_SELECTION_MODE
@@ -4970,6 +4972,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
       DEFAULT_VERTICAL_ZOOM_INTENSITY
     ),
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
+    bottomCrop: parseVerticalWebcamCrop((value as any).bottomCrop ?? (value as any).contentCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
     bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover')
   }
@@ -4988,11 +4991,12 @@ const legacyWebcamCropToVerticalCrop = (value: WebcamCrop | null): VerticalWebca
 const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   enabled: true,
   output: { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT },
-  layout: 'stacked',
+  layout: 'auto',
   selectionMode: DEFAULT_VERTICAL_SELECTION_MODE,
   zoomProfile: DEFAULT_VERTICAL_ZOOM_PROFILE,
   zoomIntensity: DEFAULT_VERTICAL_ZOOM_INTENSITY,
   webcamCrop: null,
+  bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
   bottomFit: 'cover'
 })
@@ -6798,34 +6802,34 @@ const resolveVerticalCaptionConfig = (
 }
 
 const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
-  const preset = 'mrbeast_animated' as VerticalCaptionPreset
+  const preset = 'rage_mode' as VerticalCaptionPreset
   return resolveVerticalCaptionConfig({ preset }, {
     enabled: true,
     autoGenerate: true,
     preset,
-    animationEnabled: true,
-    animation: 'pop',
-    animationSpeed: 1.1,
-    dynamicMode: 'karaoke_word',
+    animationEnabled: false,
+    animation: 'none',
+    animationSpeed: 1,
+    dynamicMode: 'classic',
     voicePreset: 'none',
-    highlightWords: true,
-    autoEmphasis: true,
-    autoEmoji: true,
-    removeFillers: false,
+    highlightWords: false,
+    autoEmphasis: false,
+    autoEmoji: false,
+    removeFillers: true,
     fontId: 'impact',
     fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
     text: '',
-    textColor: 'FFE500',
-    accentColor: 'FFF173',
-    outlineColor: '050505',
-    outlineWidth: 18,
+    textColor: 'FFFFFF',
+    accentColor: 'FFE500',
+    outlineColor: '000000',
+    outlineWidth: 12,
     shadowEnabled: true,
-    shadowColor: '050505',
-    shadowBlur: 8,
+    shadowColor: '000000',
+    shadowBlur: 7,
     boxEnabled: false,
     boxColor: '000000',
     positionX: 0.5,
-    positionY: 0.84
+    positionY: 0.82
   })
 }
 
@@ -6848,7 +6852,7 @@ const resolveVerticalCaptionConfigForState = ({
 }
 
 const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) => {
-  const preset = parseVerticalCaptionPreset(config.preset) || 'mrbeast_animated'
+  const preset = parseVerticalCaptionPreset(config.preset) || 'rage_mode'
   const defaults = resolveVerticalCaptionConfig({ preset }, getDefaultVerticalCaptionConfig())
   const fontSize = parseVerticalCaptionFontSize(config.fontSize) ?? VERTICAL_CAPTION_FONT_SIZE_DEFAULT
   const text = normalizeVerticalCaptionTextInput(config.text)
@@ -16356,7 +16360,7 @@ const buildVerticalClipCaptionOverlays = ({
     kineticMode ? 2 : 1,
     kineticMode ? 7 : 3
   ))
-  const effectivePreset: VerticalCaptionPreset = captionPreset || 'mrbeast_animated'
+  const effectivePreset: VerticalCaptionPreset = captionPreset || 'rage_mode'
   const selectedPhrases: string[] = []
   if (userPhrases.length) {
     for (let index = 0; index < phraseCount; index += 1) {
@@ -25935,6 +25939,7 @@ const resolveGeneratedSubtitlePath = (inputPath: string, workingDir: string) => 
 
 const FASTER_WHISPER_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/faster_whisper_transcribe.py')
 const VERTICAL_CLIP_PREVIEW_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/vertical_clip_preview.py')
+const MEDIAPIPE_CORNER_SCAN_SCRIPT_PATH = path.resolve(__dirname, '../../scripts/mediapipe_corner_face_scan.py')
 const FASTER_WHISPER_TIMEOUT_MS = (() => {
   const raw = Number(process.env.FASTER_WHISPER_TIMEOUT_MS || 120_000)
   if (!Number.isFinite(raw)) return 120_000
@@ -25956,6 +25961,35 @@ const ALLOW_OPENAI_TRANSCRIPTION_FALLBACK = /^(1|true|yes)$/i.test(
   ).trim()
 )
 const FAST_WHISPER_SCRIPT_OUTPUT_PATTERN = /\{[\s\S]*"srtPath"[\s\S]*\}/
+const MEDIAPIPE_CORNER_SCAN_OUTPUT_PATTERN = /\{[\s\S]*"crop"[\s\S]*\}/
+const ENABLE_MEDIAPIPE_CORNER_SCAN = !/^(0|false|no|off)$/i.test(
+  String(process.env.ENABLE_MEDIAPIPE_CORNER_SCAN ?? 'true').trim()
+)
+const MEDIAPIPE_CORNER_SCAN_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.MEDIAPIPE_CORNER_SCAN_TIMEOUT_MS || 45_000)
+  if (!Number.isFinite(raw)) return 45_000
+  return Math.max(10_000, Math.min(120_000, Math.round(raw)))
+})()
+const MEDIAPIPE_CORNER_SCAN_MAX_ATTEMPTS = (() => {
+  const raw = Number(process.env.MEDIAPIPE_CORNER_SCAN_MAX_ATTEMPTS || 2)
+  if (!Number.isFinite(raw)) return 2
+  return Math.max(1, Math.min(4, Math.round(raw)))
+})()
+const MEDIAPIPE_CORNER_SCAN_SAMPLE_EVERY = (() => {
+  const raw = Number(process.env.MEDIAPIPE_CORNER_SCAN_SAMPLE_EVERY || 3)
+  if (!Number.isFinite(raw)) return 3
+  return Math.max(1, Math.min(24, Math.round(raw)))
+})()
+const MEDIAPIPE_CORNER_SCAN_MAX_SAMPLES = (() => {
+  const raw = Number(process.env.MEDIAPIPE_CORNER_SCAN_MAX_SAMPLES || 420)
+  if (!Number.isFinite(raw)) return 420
+  return Math.max(24, Math.min(1800, Math.round(raw)))
+})()
+const MEDIAPIPE_CORNER_SCAN_MIN_CONFIDENCE = (() => {
+  const raw = Number(process.env.MEDIAPIPE_CORNER_SCAN_MIN_CONFIDENCE || 0.5)
+  if (!Number.isFinite(raw)) return 0.5
+  return Number(clamp(raw, 0.05, 0.95).toFixed(3))
+})()
 
 const getLocalCaptionRuntimePythonCandidates = () => {
   const candidates = [
@@ -26290,6 +26324,131 @@ const prependPathEntry = (existingPath: string | undefined, entry: string) => {
   )
   if (hasEntry) return parts.join(path.delimiter)
   return [normalizedEntry, ...parts].join(path.delimiter)
+}
+
+const parseMediapipeCornerScanResult = (stdout: string): {
+  crop: VerticalWebcamCrop
+  fallback: boolean
+  detector: string
+  corner: string
+  confidence: number
+} | null => {
+  const output = String(stdout || '').trim()
+  if (!output) return null
+  const parseCandidate = (candidate: string) => {
+    try {
+      const parsed = JSON.parse(candidate)
+      const crop = parseVerticalWebcamCrop(parsed?.crop)
+      if (!crop) return null
+      return {
+        crop,
+        fallback: Boolean(parsed?.fallback),
+        detector: String(parsed?.detector || 'unknown').trim() || 'unknown',
+        corner: String(parsed?.corner || 'unknown').trim() || 'unknown',
+        confidence: Number(clamp(Number(parsed?.confidence || 0), 0, 1).toFixed(4))
+      }
+    } catch {
+      return null
+    }
+  }
+  const direct = parseCandidate(output)
+  if (direct) return direct
+  const match = output.match(MEDIAPIPE_CORNER_SCAN_OUTPUT_PATTERN)
+  if (!match) return null
+  return parseCandidate(match[0])
+}
+
+const inferVerticalWebcamCropViaMediapipe = async ({
+  inputPath,
+  sourceWidth,
+  sourceHeight,
+  requestId
+}: {
+  inputPath: string
+  sourceWidth: number
+  sourceHeight: number
+  requestId?: string
+}): Promise<VerticalWebcamCrop | null> => {
+  if (!ENABLE_MEDIAPIPE_CORNER_SCAN) return null
+  if (!fs.existsSync(MEDIAPIPE_CORNER_SCAN_SCRIPT_PATH)) return null
+  const attempts = buildFasterWhisperAttempts().slice(0, MEDIAPIPE_CORNER_SCAN_MAX_ATTEMPTS)
+  for (const attempt of attempts) {
+    const invocationArgs = [
+      ...attempt.preArgs,
+      MEDIAPIPE_CORNER_SCAN_SCRIPT_PATH,
+      '--input',
+      inputPath,
+      '--sample-every',
+      String(MEDIAPIPE_CORNER_SCAN_SAMPLE_EVERY),
+      '--max-samples',
+      String(MEDIAPIPE_CORNER_SCAN_MAX_SAMPLES),
+      '--min-confidence',
+      String(MEDIAPIPE_CORNER_SCAN_MIN_CONFIDENCE)
+    ]
+    const ffmpegDir = path.dirname(FFMPEG_PATH)
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PYTHONUTF8: process.env.PYTHONUTF8 || '1',
+      PYTHONIOENCODING: process.env.PYTHONIOENCODING || 'utf-8'
+    }
+    if (ffmpegDir && ffmpegDir !== '.' && ffmpegDir !== FFMPEG_PATH) {
+      env.PATH = prependPathEntry(process.env.PATH, ffmpegDir)
+    }
+    const output = await new Promise<{ ok: boolean; stdout: string; stderr: string }>((resolve) => {
+      let stdout = ''
+      let stderr = ''
+      const proc = spawn(attempt.command, invocationArgs, { env, windowsHide: true })
+      const timeout = setTimeout(() => {
+        try {
+          proc.kill('SIGKILL')
+        } catch {
+          // ignore
+        }
+      }, MEDIAPIPE_CORNER_SCAN_TIMEOUT_MS)
+      proc.stdout.on('data', (chunk) => {
+        stdout = appendBoundedOutput(stdout, String(chunk || ''), SCRIPT_STDIO_LIMIT)
+      })
+      proc.stderr.on('data', (chunk) => {
+        stderr = appendBoundedOutput(stderr, String(chunk || ''), SCRIPT_STDIO_LIMIT)
+      })
+      proc.on('error', () => {
+        clearTimeout(timeout)
+        resolve({ ok: false, stdout, stderr })
+      })
+      proc.on('close', (code) => {
+        clearTimeout(timeout)
+        resolve({ ok: code === 0, stdout, stderr })
+      })
+    })
+    if (!output.ok) {
+      const reason = String(output.stderr || output.stdout || '').trim().slice(0, 280)
+      console.warn(`[${requestId || 'noid'}] mediapipe corner scan failed via ${attempt.label}${reason ? `: ${reason}` : ''}`)
+      continue
+    }
+    const parsed = parseMediapipeCornerScanResult(output.stdout)
+    if (!parsed?.crop) {
+      const preview = String(output.stdout || '').trim().slice(0, 280)
+      console.warn(`[${requestId || 'noid'}] mediapipe corner scan returned unparseable output`, preview)
+      continue
+    }
+    const normalizedCrop = normalizeVerticalCropToSource({
+      crop: parsed.crop,
+      sourceWidth,
+      sourceHeight
+    })
+    console.log(`[${requestId || 'noid'}] mediapipe corner scan crop selected`, {
+      corner: parsed.corner,
+      confidence: parsed.confidence,
+      detector: parsed.detector,
+      fallback: parsed.fallback,
+      x: normalizedCrop.x,
+      y: normalizedCrop.y,
+      w: normalizedCrop.w,
+      h: normalizedCrop.h
+    })
+    return normalizedCrop
+  }
+  return null
 }
 
 const runWhisperTranscribe = async ({
@@ -28395,6 +28554,198 @@ const computeVerticalTopHeightPx = (mode: VerticalModeSettings, outputHeight: nu
   return Math.round(clamp(topHeight, 200, Math.max(200, outputHeight - 200)))
 }
 
+const buildCornerWebcamScan = ({
+  windows
+}: {
+  windows: EngagementWindow[]
+}) => {
+  const valid = (Array.isArray(windows) ? windows : []).filter((window) => (
+    Number(window?.facePresence ?? 0) >= 0.1 &&
+    Number.isFinite(window?.faceCenterX) &&
+    Number.isFinite(window?.faceCenterY)
+  ))
+  if (valid.length < 4) return null
+
+  const corners = [
+    { id: 'top_left', x: 0.08, y: 0.08, isTop: true, isLeft: true },
+    { id: 'top_right', x: 0.92, y: 0.08, isTop: true, isLeft: false },
+    { id: 'bottom_left', x: 0.08, y: 0.92, isTop: false, isLeft: true },
+    { id: 'bottom_right', x: 0.92, y: 0.92, isTop: false, isLeft: false }
+  ] as const
+  type CornerId = typeof corners[number]['id']
+  const stats = new Map<CornerId, {
+    score: number
+    count: number
+    weight: number
+    sumX: number
+    sumY: number
+  }>()
+  for (const corner of corners) {
+    stats.set(corner.id, { score: 0, count: 0, weight: 0, sumX: 0, sumY: 0 })
+  }
+
+  const baseWeightForWindow = (window: EngagementWindow) => clamp(
+    Number.isFinite(Number(window.faceIntensity))
+      ? Number(window.faceIntensity)
+      : Number(window.facePresence ?? 0),
+    0.05,
+    1
+  )
+
+  for (const window of valid) {
+    const x = clamp01(Number(window.faceCenterX))
+    const y = clamp01(Number(window.faceCenterY))
+    const baseWeight = baseWeightForWindow(window)
+    for (const corner of corners) {
+      const dx = Math.abs(x - corner.x)
+      const dy = Math.abs(y - corner.y)
+      const distance = Math.sqrt((dx / 0.62) ** 2 + (dy / 0.62) ** 2)
+      const proximity = clamp01(1 - distance)
+      if (proximity < 0.1) continue
+      const weighted = baseWeight * proximity * proximity
+      if (weighted <= 0.004) continue
+      const entry = stats.get(corner.id)
+      if (!entry) continue
+      entry.score += weighted
+      entry.count += 1
+      entry.weight += weighted
+      entry.sumX += x * weighted
+      entry.sumY += y * weighted
+      stats.set(corner.id, entry)
+    }
+  }
+
+  const ranked = corners
+    .map((corner) => {
+      const entry = stats.get(corner.id) || { score: 0, count: 0, weight: 0, sumX: 0, sumY: 0 }
+      return {
+        ...corner,
+        score: Number(entry.score || 0),
+        count: Number(entry.count || 0),
+        meanX: entry.weight > 0 ? clamp01(entry.sumX / entry.weight) : corner.x,
+        meanY: entry.weight > 0 ? clamp01(entry.sumY / entry.weight) : corner.y
+      }
+    })
+    .sort((a, b) => b.score - a.score)
+  const best = ranked[0]
+  if (!best || best.score <= 0) return null
+
+  let spreadWeight = 0
+  let spreadX = 0
+  let spreadY = 0
+  for (const window of valid) {
+    const x = clamp01(Number(window.faceCenterX))
+    const y = clamp01(Number(window.faceCenterY))
+    const baseWeight = baseWeightForWindow(window)
+    const dx = Math.abs(x - best.x)
+    const dy = Math.abs(y - best.y)
+    const distance = Math.sqrt((dx / 0.62) ** 2 + (dy / 0.62) ** 2)
+    const proximity = clamp01(1 - distance)
+    if (proximity < 0.12) continue
+    const weighted = baseWeight * proximity
+    if (weighted <= 0.004) continue
+    spreadWeight += weighted
+    spreadX += Math.abs(x - best.meanX) * weighted
+    spreadY += Math.abs(y - best.meanY) * weighted
+  }
+  const spreadXNorm = spreadWeight > 0 ? spreadX / spreadWeight : 0.08
+  const spreadYNorm = spreadWeight > 0 ? spreadY / spreadWeight : 0.08
+  const totalScore = ranked.reduce((sum, item) => sum + item.score, 0)
+  const topScore = ranked.filter((item) => item.isTop).reduce((sum, item) => sum + item.score, 0)
+  return {
+    best: {
+      ...best,
+      spreadX: Number(clamp(spreadXNorm, 0.02, 0.26).toFixed(4)),
+      spreadY: Number(clamp(spreadYNorm, 0.02, 0.26).toFixed(4))
+    },
+    totalScore: Number(totalScore.toFixed(4)),
+    topScore: Number(topScore.toFixed(4)),
+    validCount: valid.length
+  }
+}
+
+const resolveAutoVerticalLayoutMode = ({
+  layout,
+  sourceWidth,
+  sourceHeight,
+  windows
+}: {
+  layout?: VerticalLayoutMode | null
+  sourceWidth: number
+  sourceHeight: number
+  windows: EngagementWindow[]
+}): VerticalLayoutMode => {
+  const requestedLayout = parseVerticalLayoutMode(layout, 'auto')
+  if (requestedLayout !== 'auto') return requestedLayout
+  if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
+    return 'single'
+  }
+  if (sourceHeight >= sourceWidth * 1.02) return 'single'
+  const cornerScan = buildCornerWebcamScan({ windows })
+  if (!cornerScan) return 'single'
+  const cornerDominance = cornerScan.best.score / Math.max(0.001, cornerScan.totalScore)
+  const topShare = cornerScan.topScore / Math.max(0.001, cornerScan.totalScore)
+  const webcamLikely = (
+    cornerScan.best.count >= 3 &&
+    (
+      (cornerScan.best.isTop && topShare >= 0.45 && cornerDominance >= 0.26 && cornerScan.best.score >= 0.42) ||
+      (topShare >= 0.58 && cornerScan.best.score >= 0.5) ||
+      (cornerDominance >= 0.34 && cornerScan.best.score >= 0.72)
+    )
+  )
+  return webcamLikely ? 'stacked' : 'single'
+}
+
+const inferVerticalWebcamCropFromWindows = ({
+  windows,
+  sourceWidth,
+  sourceHeight
+}: {
+  windows: EngagementWindow[]
+  sourceWidth: number
+  sourceHeight: number
+}): VerticalWebcamCrop | null => {
+  if (!Number.isFinite(sourceWidth) || !Number.isFinite(sourceHeight) || sourceWidth <= 0 || sourceHeight <= 0) {
+    return null
+  }
+  const cornerScan = buildCornerWebcamScan({ windows })
+  if (!cornerScan) return null
+  const best = cornerScan.best
+  const cornerDominance = best.score / Math.max(0.001, cornerScan.totalScore)
+  if (best.count < 3 || best.score < 0.36 || cornerDominance < 0.2) return null
+
+  const widthRatio = clamp(0.32 + best.spreadX * 1.7, 0.28, 0.62)
+  const heightRatio = clamp(0.32 + best.spreadY * 1.9, 0.26, 0.66)
+  const cropW = Math.round(clamp(sourceWidth * widthRatio, 96, sourceWidth))
+  const cropH = Math.round(clamp(sourceHeight * heightRatio, 96, sourceHeight))
+  const marginX = Math.round(sourceWidth * 0.02)
+  const marginY = Math.round(sourceHeight * 0.02)
+  let minX = marginX
+  let maxX = Math.max(marginX, sourceWidth - cropW - marginX)
+  let minY = marginY
+  let maxY = Math.max(marginY, sourceHeight - cropH - marginY)
+  if (best.isLeft) {
+    maxX = Math.min(maxX, Math.max(minX, Math.round(sourceWidth * 0.58) - cropW))
+  } else {
+    minX = Math.max(minX, Math.min(maxX, Math.round(sourceWidth * 0.42)))
+  }
+  if (best.isTop) {
+    maxY = Math.min(maxY, Math.max(minY, Math.round(sourceHeight * 0.58) - cropH))
+  } else {
+    minY = Math.max(minY, Math.min(maxY, Math.round(sourceHeight * 0.42)))
+  }
+  const centerX = best.meanX * sourceWidth
+  const centerY = best.meanY * sourceHeight
+  const x = Math.round(clamp(centerX - cropW / 2, minX, maxX))
+  const y = Math.round(clamp(centerY - cropH / 2, minY, maxY))
+  return {
+    x,
+    y,
+    w: cropW,
+    h: cropH
+  }
+}
+
 const normalizeVerticalCropToSource = ({
   crop,
   sourceWidth,
@@ -28404,12 +28755,14 @@ const normalizeVerticalCropToSource = ({
   sourceWidth: number
   sourceHeight: number
 }) => {
+  const defaultWidth = Math.round(clamp(sourceWidth * 0.42, 48, sourceWidth))
   const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
-  const defaultY = Math.round(clamp(sourceHeight * 0.05, 0, Math.max(0, sourceHeight - defaultHeight)))
+  const defaultX = Math.round(clamp(sourceWidth - defaultWidth - sourceWidth * 0.03, 0, Math.max(0, sourceWidth - defaultWidth)))
+  const defaultY = Math.round(clamp(sourceHeight * 0.04, 0, Math.max(0, sourceHeight - defaultHeight)))
   const fallbackCrop = {
-    x: 0,
+    x: defaultX,
     y: defaultY,
-    w: sourceWidth,
+    w: defaultWidth,
     h: defaultHeight
   }
   let x = 0
@@ -28472,6 +28825,7 @@ const buildVerticalStackedFilterGraph = ({
   start,
   end,
   crop,
+  bottomCrop,
   outputWidth,
   outputHeight,
   topHeight,
@@ -28481,6 +28835,7 @@ const buildVerticalStackedFilterGraph = ({
   start: number
   end: number
   crop: VerticalWebcamCrop
+  bottomCrop: VerticalWebcamCrop | null
   outputWidth: number
   outputHeight: number
   topHeight: number
@@ -28496,10 +28851,18 @@ const buildVerticalStackedFilterGraph = ({
       `crop=w=${outputWidth}:h=${topHeight}`,
       'setsar=1',
       'format=yuv420p[top]'
-    ].join(','),
-    `[vfull]${buildVerticalBottomFilter(bottomFit, outputWidth, bottomHeight)}[bottom]`,
-    '[top][bottom]vstack=inputs=2[outv]'
+    ].join(',')
   ]
+  const bottomSourceLabel = bottomCrop ? 'vfullbottomsrc' : 'vfull'
+  if (bottomCrop) {
+    filters.push(
+      `[vfull]crop=w=${bottomCrop.w}:h=${bottomCrop.h}:x=${bottomCrop.x}:y=${bottomCrop.y}[vfullbottomsrc]`
+    )
+  }
+  filters.push(
+    `[${bottomSourceLabel}]${buildVerticalBottomFilter(bottomFit, outputWidth, bottomHeight)}[bottom]`,
+    '[top][bottom]vstack=inputs=2[outv]'
+  )
   if (withAudio) {
     filters.push('[0:a]atrim=start=' + start + ':end=' + end + ',asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]')
   }
@@ -28727,7 +29090,8 @@ const renderVerticalClip = async ({
 }) => {
   const outputWidth = Math.round(clamp(verticalMode.output.width, 240, 4320))
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
-  const layout = parseVerticalLayoutMode(verticalMode.layout, 'stacked')
+  const layoutCandidate = parseVerticalLayoutMode(verticalMode.layout, 'single')
+  const layout: Exclude<VerticalLayoutMode, 'auto'> = layoutCandidate === 'auto' ? 'single' : layoutCandidate
   const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
   const baseFilterComplex = layout === 'single'
     ? buildVerticalSingleFilterGraph({
@@ -28745,10 +29109,18 @@ const renderVerticalClip = async ({
           sourceWidth,
           sourceHeight
         })
+        const sourceBottomCrop = verticalMode.bottomCrop
+          ? normalizeVerticalCropToSource({
+              crop: verticalMode.bottomCrop,
+              sourceWidth,
+              sourceHeight
+            })
+          : null
         return buildVerticalStackedFilterGraph({
           start,
           end,
           crop: sourceCrop,
+          bottomCrop: sourceBottomCrop,
           outputWidth,
           outputHeight,
           topHeight,
@@ -31821,6 +32193,16 @@ const processJob = async (
             }
           }
         : defaultVerticalModeSettings()
+      const fixedVerticalWebcamCrop = normalizeVerticalCropToSource({
+        crop: resolvedVerticalMode.webcamCrop,
+        sourceWidth: sourceStream.width,
+        sourceHeight: sourceStream.height
+      })
+      const resolvedVerticalModeForRender: VerticalModeSettings = {
+        ...resolvedVerticalMode,
+        layout: 'stacked',
+        webcamCrop: fixedVerticalWebcamCrop
+      }
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
       const hasInputAudio = hasAudioStream(tmpIn)
@@ -31927,7 +32309,8 @@ const processJob = async (
         targetPlatform: retentionTargetPlatform
       })
       let verticalRequestedClipCount = renderConfig.verticalClipCount
-      if (durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) {
+      const exactVerticalCountRequested = Number.isFinite(Number(renderConfig.verticalClipCount)) && Number(renderConfig.verticalClipCount) > 0
+      if (!exactVerticalCountRequested && durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) {
         const minVerticalEditedRuntimeRatio = resolveLongFormMinimumEditedRuntimeRatio({
           durationSeconds,
           aggressiveMode: Boolean(options.aggressiveMode),
@@ -31943,7 +32326,7 @@ const processJob = async (
           verticalRequestedClipCount = adjustedClipCount
         }
       }
-      if (runtimeFastProfileEnabledWithInputStats) {
+      if (!exactVerticalCountRequested && runtimeFastProfileEnabledWithInputStats) {
         const cappedVerticalClipCount = Math.round(
           clamp(verticalRequestedClipCount, MIN_VERTICAL_CLIPS, AUTO_FAST_RUNTIME_PROFILE_MAX_VERTICAL_CLIPS)
         )
@@ -32107,7 +32490,7 @@ const processJob = async (
           outputPath: localClipPath,
           start: range.start,
           end: range.end,
-          verticalMode: resolvedVerticalMode,
+          verticalMode: resolvedVerticalModeForRender,
           sourceWidth: sourceStream.width,
           sourceHeight: sourceStream.height,
           withAudio: hasInputAudio,
@@ -32257,7 +32640,7 @@ const processJob = async (
 
       const finalRenderConfig: RenderConfig = {
         ...renderConfig,
-        verticalMode: resolvedVerticalMode
+        verticalMode: resolvedVerticalModeForRender
       }
       const verticalMetadataSummary = buildVerticalMetadataSummary({
         durationSeconds,
@@ -32265,9 +32648,9 @@ const processJob = async (
         selectionResult: verticalSelection,
         preScan: verticalPreScan,
         clipCaptionOverlaysByClip: verticalClipCaptionOverlays,
-        selectionMode: resolvedVerticalMode.selectionMode,
-        zoomProfile: resolvedVerticalMode.zoomProfile,
-        zoomIntensity: resolvedVerticalMode.zoomIntensity
+        selectionMode: resolvedVerticalModeForRender.selectionMode,
+        zoomProfile: resolvedVerticalModeForRender.zoomProfile,
+        zoomIntensity: resolvedVerticalModeForRender.zoomIntensity
       })
       const verticalClipDetails = selectedVerticalCandidates.map((candidate, index) => {
         const range = candidate.range
@@ -32356,9 +32739,10 @@ const processJob = async (
           vertical_selection: {
             requestedClipCount: requestedVerticalClipCount,
             renderedClipCount: clipRanges.length,
-            selectionMode: resolvedVerticalMode.selectionMode,
-            zoomProfile: resolvedVerticalMode.zoomProfile,
-            zoomIntensity: resolvedVerticalMode.zoomIntensity,
+            selectionMode: resolvedVerticalModeForRender.selectionMode,
+            zoomProfile: resolvedVerticalModeForRender.zoomProfile,
+            zoomIntensity: resolvedVerticalModeForRender.zoomIntensity,
+            layout: resolvedVerticalModeForRender.layout,
             outputTarget: verticalSelection.outputTarget,
             candidateTarget: verticalSelection.candidateTarget,
             evaluatedCount: verticalSelection.evaluatedCount,
