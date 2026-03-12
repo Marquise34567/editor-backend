@@ -2595,8 +2595,8 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MIN_VERTICAL_CLIPS = 3
 const MAX_VERTICAL_CLIPS = 12
-const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 8
-const VERTICAL_CLIP_DURATION_LONG_SECONDS = 10
+const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 30
+const VERTICAL_CLIP_DURATION_LONG_SECONDS = 60
 const DEFAULT_VERTICAL_CLIP_DURATION_SECONDS = VERTICAL_CLIP_DURATION_LONG_SECONDS
 const MIN_PREDICTED_COMPLETION_PERCENT = 70
 const LONG_CLIP_PREDICTION_FLOOR = 75
@@ -27560,7 +27560,10 @@ const buildVerticalClipSelection = (
   })
   const requested = Number.isFinite(Number(requestedCount)) ? Number(requestedCount) : 0
   let exportTarget = requested > 0 ? Math.round(requested) : recommendedExportTarget
-  const maxFeasibleByLength = Math.max(1, Math.floor(total / Math.max(8, platformProfile.verticalMinClipSeconds)))
+  const maxFeasibleByLength = Math.max(
+    1,
+    Math.floor(total / Math.max(VERTICAL_CLIP_DURATION_SHORT_SECONDS, platformProfile.verticalMinClipSeconds))
+  )
   const minFeasibleTarget = Math.max(1, Math.min(MIN_VERTICAL_CLIPS, maxFeasibleByLength))
   const maxFeasibleTarget = Math.max(minFeasibleTarget, Math.min(MAX_VERTICAL_CLIPS, maxFeasibleByLength))
   exportTarget = clamp(exportTarget, minFeasibleTarget, maxFeasibleTarget)
@@ -27607,9 +27610,17 @@ const buildVerticalClipSelection = (
     minMomentSeconds,
     VERTICAL_CLIP_DURATION_LONG_SECONDS
   ).toFixed(2))
-  const baseDurations = [8, 9, 10]
+  const durationSpread = Math.max(0, VERTICAL_CLIP_DURATION_LONG_SECONDS - VERTICAL_CLIP_DURATION_SHORT_SECONDS)
+  const baseDurations = [
+    Number(VERTICAL_CLIP_DURATION_SHORT_SECONDS.toFixed(2)),
+    Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.35).toFixed(2)),
+    Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.65).toFixed(2)),
+    Number(VERTICAL_CLIP_DURATION_LONG_SECONDS.toFixed(2))
+  ]
   const durationSet = new Set<number>(baseDurations)
-  if (highEnergyMode || opts?.strategyProfile === 'viral') durationSet.add(8.5)
+  if (highEnergyMode || opts?.strategyProfile === 'viral') {
+    durationSet.add(Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.2).toFixed(2)))
+  }
   const candidateDurations = Array.from(durationSet)
     .filter((duration) => duration <= Math.min(maxMomentSeconds, total))
     .filter((duration) => duration >= Math.min(minMomentSeconds, total))
@@ -28547,26 +28558,31 @@ const buildVerticalRetentionCandidates = ({
     VERTICAL_CLIP_DURATION_SHORT_SECONDS,
     Math.min(total, maxClipDuration, VERTICAL_CLIP_DURATION_LONG_SECONDS)
   )
+  const durationSpread = Math.max(0, VERTICAL_CLIP_DURATION_LONG_SECONDS - VERTICAL_CLIP_DURATION_SHORT_SECONDS)
+  const durationTierA = Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.35).toFixed(2))
+  const durationTierB = Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.65).toFixed(2))
+  const compactDuration = Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.2).toFixed(2))
+  const extendedDuration = Number((VERTICAL_CLIP_DURATION_SHORT_SECONDS + durationSpread * 0.82).toFixed(2))
   const clipDurations = (
     resolvedSelectionMode === 'story_arc'
-      ? [8, 9, 10]
+      ? [durationTierB, extendedDuration, VERTICAL_CLIP_DURATION_LONG_SECONDS]
       : resolvedSelectionMode === 'hook_storm'
-        ? [8, 8.5, 9, 10]
+        ? [VERTICAL_CLIP_DURATION_SHORT_SECONDS, compactDuration, durationTierA, durationTierB]
         : resolvedSelectionMode === 'loop_builder'
-          ? [8, 9, 10]
-          : [8, 9, 10]
+          ? [durationTierA, durationTierB, VERTICAL_CLIP_DURATION_LONG_SECONDS]
+          : [VERTICAL_CLIP_DURATION_SHORT_SECONDS, durationTierA, durationTierB, VERTICAL_CLIP_DURATION_LONG_SECONDS]
   )
     .filter((seconds) => seconds <= total && seconds <= maxClipDuration)
     .filter((seconds) => seconds >= minDuration - 0.01)
   const stepSeconds = total >= 3600
-    ? 6
+    ? 20
     : total >= 1800
-      ? 4
+      ? 14
       : total >= 900
-        ? 3
+        ? 10
         : total >= 300
-          ? 2
-          : 1
+          ? 6
+          : 3
   const preScored: Array<{ range: TimeRange; score: number }> = []
   const modeBias = getVerticalModeScoreBias(editorMode, resolvedSelectionMode)
   for (let start = 0; start + minDuration <= total; start += stepSeconds) {
