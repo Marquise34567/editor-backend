@@ -28746,6 +28746,26 @@ const inferVerticalWebcamCropFromWindows = ({
   }
 }
 
+const getDefaultVerticalWebcamCrop = ({
+  sourceWidth,
+  sourceHeight
+}: {
+  sourceWidth: number
+  sourceHeight: number
+}): VerticalWebcamCrop => {
+  // Webcam overlays in reaction sources are commonly anchored lower-left.
+  const defaultWidth = Math.round(clamp(sourceWidth * 0.28, 48, sourceWidth))
+  const defaultHeight = Math.round(clamp(sourceHeight * 0.34, 48, sourceHeight))
+  const defaultX = Math.round(clamp(sourceWidth * 0.02, 0, Math.max(0, sourceWidth - defaultWidth)))
+  const defaultY = Math.round(clamp(sourceHeight - defaultHeight - sourceHeight * 0.02, 0, Math.max(0, sourceHeight - defaultHeight)))
+  return {
+    x: defaultX,
+    y: defaultY,
+    w: defaultWidth,
+    h: defaultHeight
+  }
+}
+
 const normalizeVerticalCropToSource = ({
   crop,
   sourceWidth,
@@ -28755,16 +28775,10 @@ const normalizeVerticalCropToSource = ({
   sourceWidth: number
   sourceHeight: number
 }) => {
-  const defaultWidth = Math.round(clamp(sourceWidth * 0.42, 48, sourceWidth))
-  const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
-  const defaultX = Math.round(clamp(sourceWidth - defaultWidth - sourceWidth * 0.03, 0, Math.max(0, sourceWidth - defaultWidth)))
-  const defaultY = Math.round(clamp(sourceHeight * 0.04, 0, Math.max(0, sourceHeight - defaultHeight)))
-  const fallbackCrop = {
-    x: defaultX,
-    y: defaultY,
-    w: defaultWidth,
-    h: defaultHeight
-  }
+  const fallbackCrop = getDefaultVerticalWebcamCrop({
+    sourceWidth,
+    sourceHeight
+  })
   let x = fallbackCrop.x
   let y = fallbackCrop.y
   let w = fallbackCrop.w
@@ -28815,16 +28829,16 @@ const isLikelyDefaultVerticalWebcamCrop = ({
 }) => {
   if (!crop) return true
   const normalized = normalizeVerticalCropToSource({ crop, sourceWidth, sourceHeight })
-  const defaultWidth = Math.round(clamp(sourceWidth * 0.42, 48, sourceWidth))
-  const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
-  const defaultX = Math.round(clamp(sourceWidth - defaultWidth - sourceWidth * 0.03, 0, Math.max(0, sourceWidth - defaultWidth)))
-  const defaultY = Math.round(clamp(sourceHeight * 0.04, 0, Math.max(0, sourceHeight - defaultHeight)))
+  const fallbackCrop = getDefaultVerticalWebcamCrop({
+    sourceWidth,
+    sourceHeight
+  })
   const tolerance = Math.max(4, Math.round(Math.min(sourceWidth, sourceHeight) * 0.012))
   return (
-    Math.abs(normalized.x - defaultX) <= tolerance &&
-    Math.abs(normalized.y - defaultY) <= tolerance &&
-    Math.abs(normalized.w - defaultWidth) <= tolerance &&
-    Math.abs(normalized.h - defaultHeight) <= tolerance
+    Math.abs(normalized.x - fallbackCrop.x) <= tolerance &&
+    Math.abs(normalized.y - fallbackCrop.y) <= tolerance &&
+    Math.abs(normalized.w - fallbackCrop.w) <= tolerance &&
+    Math.abs(normalized.h - fallbackCrop.h) <= tolerance
   )
 }
 
@@ -32235,6 +32249,32 @@ const processJob = async (
           sourceHeight: sourceStream.height,
           requestId
         })
+        if (inferredVerticalWebcamCrop) {
+          const inferredCenterY = inferredVerticalWebcamCrop.y + (inferredVerticalWebcamCrop.h / 2)
+          const inferredWidthRatio = inferredVerticalWebcamCrop.w / Math.max(1, sourceStream.width)
+          const inferredHeightRatio = inferredVerticalWebcamCrop.h / Math.max(1, sourceStream.height)
+          const inferredAreaRatio =
+            (inferredVerticalWebcamCrop.w * inferredVerticalWebcamCrop.h) /
+            Math.max(1, sourceStream.width * sourceStream.height)
+          const rejectLowerHalf = inferredCenterY > (sourceStream.height * 0.7)
+          const rejectOversized = inferredAreaRatio > 0.16
+          const rejectTooWide = inferredWidthRatio > 0.32
+          const rejectTooTall = inferredHeightRatio > 0.5
+          if (rejectLowerHalf || rejectOversized || rejectTooWide || rejectTooTall) {
+            console.warn(`[${requestId || 'noid'}] rejected inferred vertical webcam crop`, {
+              centerY: Math.round(inferredCenterY),
+              sourceHeight: sourceStream.height,
+              widthRatio: Number(inferredWidthRatio.toFixed(4)),
+              heightRatio: Number(inferredHeightRatio.toFixed(4)),
+              areaRatio: Number(inferredAreaRatio.toFixed(4)),
+              rejectLowerHalf,
+              rejectOversized,
+              rejectTooWide,
+              rejectTooTall,
+            })
+            inferredVerticalWebcamCrop = null
+          }
+        }
       }
       const resolvedVerticalWebcamCrop = inferredVerticalWebcamCrop || fixedVerticalWebcamCrop
       const resolvedVerticalModeForRender: VerticalModeSettings = {
