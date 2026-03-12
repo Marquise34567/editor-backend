@@ -881,6 +881,7 @@ type VerticalModeSettings = {
   selectionMode: VerticalSelectionMode
   zoomProfile: VerticalZoomProfile
   zoomIntensity: number
+  autoWebcamCrop: boolean
   webcamCrop: VerticalWebcamCrop | null
   bottomCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
@@ -5076,6 +5077,14 @@ const parseVerticalOutput = (value?: any) => {
 const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> | null => {
   if (!value || typeof value !== 'object') return null
   const topHeightPxRaw = Number((value as any).topHeightPx)
+  const autoWebcamCropRaw = parseBooleanFlag(
+    pickFirstDefinedValue(
+      (value as any).autoWebcamCrop,
+      (value as any).auto_webcam_crop,
+      (value as any).autoWebcam,
+      (value as any).auto_webcam
+    )
+  )
   const manualClipRanges = parseVerticalManualClipRanges(
     (value as any).manualClipRanges ??
     (value as any).manual_clip_ranges ??
@@ -5090,6 +5099,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
       (value as any).selectionMode ?? (value as any).selection_mode,
       DEFAULT_VERTICAL_SELECTION_MODE
     ),
+    ...(autoWebcamCropRaw === null ? {} : { autoWebcamCrop: autoWebcamCropRaw }),
     zoomProfile: parseVerticalZoomProfile(
       (value as any).zoomProfile ?? (value as any).zoom_profile,
       DEFAULT_VERTICAL_ZOOM_PROFILE
@@ -5123,6 +5133,7 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   selectionMode: DEFAULT_VERTICAL_SELECTION_MODE,
   zoomProfile: DEFAULT_VERTICAL_ZOOM_PROFILE,
   zoomIntensity: DEFAULT_VERTICAL_ZOOM_INTENSITY,
+  autoWebcamCrop: true,
   webcamCrop: null,
   bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
@@ -33028,11 +33039,14 @@ const processJob = async (
         sourceHeight: sourceStream.height
       })
       let inferredVerticalWebcamCrop: VerticalWebcamCrop | null = null
-      const shouldTryAutoWebcamCrop = isLikelyDefaultVerticalWebcamCrop({
-        crop: resolvedVerticalMode.webcamCrop,
-        sourceWidth: sourceStream.width,
-        sourceHeight: sourceStream.height
-      })
+      const shouldTryAutoWebcamCrop = (
+        resolvedVerticalMode.autoWebcamCrop !== false &&
+        isLikelyDefaultVerticalWebcamCrop({
+          crop: resolvedVerticalMode.webcamCrop,
+          sourceWidth: sourceStream.width,
+          sourceHeight: sourceStream.height
+        })
+      )
       if (shouldTryAutoWebcamCrop) {
         inferredVerticalWebcamCrop = await inferVerticalWebcamCropViaMediapipe({
           inputPath: tmpIn,
