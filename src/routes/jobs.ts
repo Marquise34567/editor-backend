@@ -1744,6 +1744,7 @@ type VerticalRetentionCandidate = {
 type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'bounce' | 'glitch' | 'none'
 type VerticalCaptionDynamicMode = 'classic' | 'karaoke_word' | 'kinetic_word'
 type VerticalVoicePreset = 'none' | 'deep' | 'helium' | 'radio' | 'robot'
+type VerticalPacingPreset = 'normal' | 'fast' | 'slow'
 type VerticalCaptionPreset =
   | 'basic_clean'
   | 'mrbeast_animated'
@@ -1764,6 +1765,7 @@ type VerticalCaptionConfig = {
   animationSpeed: number
   dynamicMode: VerticalCaptionDynamicMode
   voicePreset: VerticalVoicePreset
+  pacingPreset: VerticalPacingPreset
   highlightWords: boolean
   autoEmphasis: boolean
   autoEmoji: boolean
@@ -2593,9 +2595,9 @@ const STRATEGIST_HOOK_WINDOW_SEC = 35
 const STRATEGIST_LATE_HOOK_PENALTY_SEC = 55
 const MIN_VERTICAL_CLIPS = 3
 const MAX_VERTICAL_CLIPS = 12
-const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 30
-const VERTICAL_CLIP_DURATION_LONG_SECONDS = 60
-const DEFAULT_VERTICAL_CLIP_DURATION_SECONDS = VERTICAL_CLIP_DURATION_SHORT_SECONDS
+const VERTICAL_CLIP_DURATION_SHORT_SECONDS = 8
+const VERTICAL_CLIP_DURATION_LONG_SECONDS = 10
+const DEFAULT_VERTICAL_CLIP_DURATION_SECONDS = VERTICAL_CLIP_DURATION_LONG_SECONDS
 const MIN_PREDICTED_COMPLETION_PERCENT = 70
 const LONG_CLIP_PREDICTION_FLOOR = 75
 const LONG_FORM_PRESCAN_MIN_CHUNK_SECONDS = 45
@@ -2624,6 +2626,7 @@ const LONG_FORM_MAX_REMOVAL_RATIO_AGGRESSIVE = 0.36
 const LONG_FORM_SPEED_CAP_MIN = 1.08
 const LONG_FORM_SPEED_CAP_MAX = 1.18
 const LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS = 6 * 60
+const LONG_FORM_MIN_OUTPUT_RUNTIME_SECONDS = 8 * 60
 const isVerticalRuntimeShortForm = (renderMode: RenderMode, runtimeSeconds: number) => (
   renderMode === 'vertical' && Math.max(0, Number(runtimeSeconds || 0)) < LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS
 )
@@ -4780,14 +4783,14 @@ const parseVerticalClipDurationSeconds = (
   value?: any,
   fallback = DEFAULT_VERTICAL_CLIP_DURATION_SECONDS
 ) => {
-  const normalizedFallback = Number(fallback) >= VERTICAL_CLIP_DURATION_LONG_SECONDS
-    ? VERTICAL_CLIP_DURATION_LONG_SECONDS
-    : VERTICAL_CLIP_DURATION_SHORT_SECONDS
+  const normalizedFallback = Number(clamp(
+    Number.isFinite(Number(fallback)) ? Number(fallback) : DEFAULT_VERTICAL_CLIP_DURATION_SECONDS,
+    VERTICAL_CLIP_DURATION_SHORT_SECONDS,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  ).toFixed(2))
   const parsed = Number.parseFloat(String(value ?? ''))
   if (!Number.isFinite(parsed) || parsed <= 0) return normalizedFallback
-  return parsed >= 45
-    ? VERTICAL_CLIP_DURATION_LONG_SECONDS
-    : VERTICAL_CLIP_DURATION_SHORT_SECONDS
+  return Number(clamp(parsed, VERTICAL_CLIP_DURATION_SHORT_SECONDS, VERTICAL_CLIP_DURATION_LONG_SECONDS).toFixed(2))
 }
 
 const parseMaxCutsPreference = (value: any): number | null => {
@@ -6210,10 +6213,19 @@ const parseVerticalVoicePreset = (value: any): VerticalVoicePreset | null => {
   const normalized = String(value ?? '').trim().toLowerCase()
   if (!normalized) return null
   if (['none', 'off', 'disable', 'disabled', 'normal', 'clean'].includes(normalized)) return 'none'
-  if (['deep', 'low', 'bass', 'baritone'].includes(normalized)) return 'deep'
-  if (['helium', 'high', 'chipmunk'].includes(normalized)) return 'helium'
+  if (['deep', 'low', 'low_pitch', 'low-pitch', 'bass', 'baritone'].includes(normalized)) return 'deep'
+  if (['helium', 'high', 'high_pitch', 'high-pitch', 'chipmunk'].includes(normalized)) return 'helium'
   if (['radio', 'walkie', 'walkie-talkie', 'broadcast'].includes(normalized)) return 'radio'
   if (['robot', 'ai', 'synth', 'synthetic'].includes(normalized)) return 'robot'
+  return null
+}
+
+const parseVerticalPacingPreset = (value: any): VerticalPacingPreset | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['normal', 'default', 'standard', 'none', 'off'].includes(normalized)) return 'normal'
+  if (['fast', 'faster', 'rapid', 'quick', 'speed_up', 'speedup'].includes(normalized)) return 'fast'
+  if (['slow', 'slower', 'calm', 'smooth', 'slow_down', 'slowdown'].includes(normalized)) return 'slow'
   return null
 }
 
@@ -6396,6 +6408,24 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.voiceEffect,
     nested?.voice_effect
   )
+  const pacingPresetCandidate = pickFirstDefinedValue(
+    (payload as any).pacingPreset,
+    (payload as any).pacing_preset,
+    (payload as any).pacePreset,
+    (payload as any).pace_preset,
+    (payload as any).pacing,
+    (payload as any).pace,
+    (payload as any).verticalPacingPreset,
+    (payload as any).vertical_pacing_preset,
+    (payload as any).verticalCaptionPacingPreset,
+    (payload as any).vertical_caption_pacing_preset,
+    nested?.pacingPreset,
+    nested?.pacing_preset,
+    nested?.pacePreset,
+    nested?.pace_preset,
+    nested?.pacing,
+    nested?.pace
+  )
   const positionXCandidate = pickFirstDefinedValue(
     (payload as any).positionX,
     (payload as any).position_x,
@@ -6528,6 +6558,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     animationSpeedCandidate === undefined &&
     dynamicModeCandidate === undefined &&
     voicePresetCandidate === undefined &&
+    pacingPresetCandidate === undefined &&
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
     variantPositionsCandidate === undefined &&
@@ -6557,6 +6588,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedAnimationSpeed = parseVerticalCaptionAnimationSpeed(animationSpeedCandidate)
   const parsedDynamicMode = parseVerticalCaptionDynamicMode(dynamicModeCandidate)
   const parsedVoicePreset = parseVerticalVoicePreset(voicePresetCandidate)
+  const parsedPacingPreset = parseVerticalPacingPreset(pacingPresetCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   const parsedVariantPositions = parseVerticalVariantCaptionPositions(variantPositionsCandidate)
@@ -6579,6 +6611,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedAnimationSpeed === null ? {} : { animationSpeed: parsedAnimationSpeed }),
     ...(parsedDynamicMode ? { dynamicMode: parsedDynamicMode } : {}),
     ...(parsedVoicePreset ? { voicePreset: parsedVoicePreset } : {}),
+    ...(parsedPacingPreset ? { pacingPreset: parsedPacingPreset } : {}),
     ...(highlightWordsCandidate === null ? {} : { highlightWords: highlightWordsCandidate }),
     ...(autoEmphasisCandidate === null ? {} : { autoEmphasis: autoEmphasisCandidate }),
     ...(autoEmojiCandidate === null ? {} : { autoEmoji: autoEmojiCandidate }),
@@ -6892,6 +6925,18 @@ const resolveVerticalCaptionConfig = (
         (defaults as any)?.vertical_caption_voice_preset
       )
     ) || fallbackPresetStyle.voicePreset,
+    pacingPreset: parseVerticalPacingPreset(
+      pickFirstDefinedValue(
+        (defaults as any)?.pacingPreset,
+        (defaults as any)?.pacing_preset,
+        (defaults as any)?.pacePreset,
+        (defaults as any)?.pace_preset,
+        (defaults as any)?.verticalPacingPreset,
+        (defaults as any)?.vertical_pacing_preset,
+        (defaults as any)?.verticalCaptionPacingPreset,
+        (defaults as any)?.vertical_caption_pacing_preset
+      )
+    ) || parseVerticalPacingPreset((fallbackPresetStyle as any).pacingPreset) || 'normal',
     highlightWords: typeof defaults?.highlightWords === 'boolean' ? defaults.highlightWords : fallbackPresetStyle.highlightWords,
     autoEmphasis: typeof defaults?.autoEmphasis === 'boolean' ? defaults.autoEmphasis : fallbackPresetStyle.autoEmphasis,
     autoEmoji: typeof defaults?.autoEmoji === 'boolean' ? defaults.autoEmoji : fallbackPresetStyle.autoEmoji,
@@ -6920,6 +6965,9 @@ const resolveVerticalCaptionConfig = (
   const resolvedAnimationSpeed = parseVerticalCaptionAnimationSpeed(override.animationSpeed) ?? styleBaseline.animationSpeed
   const resolvedDynamicMode = parseVerticalCaptionDynamicMode(override.dynamicMode) ?? styleBaseline.dynamicMode
   const resolvedVoicePreset = parseVerticalVoicePreset((override as any).voicePreset) ?? styleBaseline.voicePreset
+  const resolvedPacingPreset = parseVerticalPacingPreset((override as any).pacingPreset) ??
+    parseVerticalPacingPreset((styleBaseline as any).pacingPreset) ??
+    'normal'
 
   return {
     enabled: typeof override.enabled === 'boolean' ? override.enabled : fallbackEnabled,
@@ -6942,6 +6990,7 @@ const resolveVerticalCaptionConfig = (
     animationSpeed: resolvedAnimationSpeed,
     dynamicMode: resolvedDynamicMode,
     voicePreset: resolvedVoicePreset,
+    pacingPreset: resolvedPacingPreset,
     highlightWords: typeof override.highlightWords === 'boolean' ? override.highlightWords : styleBaseline.highlightWords,
     autoEmphasis: typeof override.autoEmphasis === 'boolean' ? override.autoEmphasis : styleBaseline.autoEmphasis,
     autoEmoji: typeof override.autoEmoji === 'boolean' ? override.autoEmoji : styleBaseline.autoEmoji,
@@ -6963,6 +7012,7 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     animationSpeed: 1,
     dynamicMode: 'classic',
     voicePreset: 'none',
+    pacingPreset: 'normal',
     highlightWords: false,
     autoEmphasis: false,
     autoEmoji: false,
@@ -7021,6 +7071,7 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
   const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? defaults.animationSpeed
   const dynamicMode = parseVerticalCaptionDynamicMode((config as any).dynamicMode) ?? defaults.dynamicMode
   const voicePreset = parseVerticalVoicePreset((config as any).voicePreset) ?? defaults.voicePreset
+  const pacingPreset = parseVerticalPacingPreset((config as any).pacingPreset) ?? defaults.pacingPreset
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
@@ -7030,6 +7081,7 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     animationSpeed,
     dynamicMode,
     voicePreset,
+    pacingPreset,
     highlightWords: typeof config.highlightWords === 'boolean' ? config.highlightWords : defaults.highlightWords,
     autoEmphasis: typeof config.autoEmphasis === 'boolean' ? config.autoEmphasis : defaults.autoEmphasis,
     autoEmoji: typeof config.autoEmoji === 'boolean' ? config.autoEmoji : defaults.autoEmoji,
@@ -7069,6 +7121,10 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       voice_preset: normalized.voicePreset,
       voiceEffect: normalized.voicePreset,
       voice_effect: normalized.voicePreset,
+      pacingPreset: normalized.pacingPreset,
+      pacing_preset: normalized.pacingPreset,
+      pacePreset: normalized.pacingPreset,
+      pace_preset: normalized.pacingPreset,
       highlightWords: normalized.highlightWords,
       highlight_words: normalized.highlightWords,
       autoEmphasis: normalized.autoEmphasis,
@@ -7113,6 +7169,10 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     vertical_caption_voice_preset: normalized.voicePreset,
     verticalVoicePreset: normalized.voicePreset,
     vertical_voice_preset: normalized.voicePreset,
+    verticalCaptionPacingPreset: normalized.pacingPreset,
+    vertical_caption_pacing_preset: normalized.pacingPreset,
+    verticalPacingPreset: normalized.pacingPreset,
+    vertical_pacing_preset: normalized.pacingPreset,
     verticalCaptionHighlightWords: normalized.highlightWords,
     vertical_caption_highlight_words: normalized.highlightWords,
     verticalCaptionAutoEmphasis: normalized.autoEmphasis,
@@ -8453,6 +8513,47 @@ const getLocalOutputFileInfo = (job: any, clipIndex = 0) => {
   } catch {
     return null
   }
+}
+
+const openLocalPathInExplorer = ({
+  directoryPath,
+  filePath
+}: {
+  directoryPath: string
+  filePath?: string | null
+}) => {
+  const resolvedDirectory = path.resolve(directoryPath)
+  const resolvedFile = filePath ? path.resolve(filePath) : null
+
+  const spawnDetached = (command: string, args: string[]) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: false
+    })
+    child.unref()
+    return { command, args }
+  }
+
+  if (process.platform === 'win32') {
+    if (resolvedFile && fs.existsSync(resolvedFile)) {
+      return spawnDetached('explorer.exe', [`/select,${resolvedFile}`])
+    }
+    return spawnDetached('explorer.exe', [resolvedDirectory])
+  }
+  if (process.platform === 'darwin') {
+    if (resolvedFile && fs.existsSync(resolvedFile)) {
+      return spawnDetached('open', ['-R', resolvedFile])
+    }
+    return spawnDetached('open', [resolvedDirectory])
+  }
+  if (process.platform === 'linux') {
+    const target = resolvedFile && fs.existsSync(resolvedFile)
+      ? path.dirname(resolvedFile)
+      : resolvedDirectory
+    return spawnDetached('xdg-open', [target])
+  }
+  throw new Error('explorer_not_supported')
 }
 
 const buildAbsoluteApiUrl = (req: any, pathname: string) => {
@@ -20346,10 +20447,18 @@ const resolveLongFormMinimumEditedRuntimeRatio = ({
   if (shortFormTarget && !longRuntime) ratio -= 0.03
   ratio += clamp((resolvedClarity - 60) / 100 * 0.07, -0.03, 0.06)
   ratio -= clamp((resolvedAggression - 60) / 100 * 0.05, -0.02, 0.04)
-  const minFloor = shortFormTarget
+  const adaptiveFloor = shortFormTarget
     ? (longRuntime ? 0.5 : 0.4)
     : 0.42
-  return Number(clamp(ratio, minFloor, 0.62).toFixed(4))
+  const absoluteMinimumEditedSeconds = durationSeconds > LONG_FORM_MIN_OUTPUT_RUNTIME_SECONDS
+    ? LONG_FORM_MIN_OUTPUT_RUNTIME_SECONDS
+    : 0
+  const absoluteFloorRatio = absoluteMinimumEditedSeconds > 0
+    ? clamp(absoluteMinimumEditedSeconds / durationSeconds, 0, 1)
+    : 0
+  const minFloor = Math.max(adaptiveFloor, absoluteFloorRatio)
+  const maxFloor = Math.max(0.62, minFloor)
+  return Number(clamp(ratio, minFloor, maxFloor).toFixed(4))
 }
 
 const capRemovedRangesByBudget = ({
@@ -22641,7 +22750,10 @@ const applyContinuityGuardsToCuts = (
 const inferPacingProfile = (
   windows: EngagementWindow[],
   durationSeconds: number,
-  aggressiveMode: boolean
+  aggressiveMode: boolean,
+  opts?: {
+    enforceFiveToTenWindow?: boolean
+  }
 ): PacingProfile => {
   const profiles: Record<PacingNiche, Omit<PacingProfile, 'niche'>> = {
     high_energy: {
@@ -22681,9 +22793,28 @@ const inferPacingProfile = (
       speedCap: 1.32
     }
   }
+  const enforceFiveToTenWindow = Boolean(opts?.enforceFiveToTenWindow)
+  const clampProfileWindow = (
+    niche: PacingNiche,
+    profile: Omit<PacingProfile, 'niche'>
+  ): PacingProfile => {
+    let minLen = Number(profile.minLen)
+    let maxLen = Number(profile.maxLen)
+    if (enforceFiveToTenWindow) {
+      minLen = Number(clamp(minLen, 5, 10).toFixed(2))
+      maxLen = Number(clamp(maxLen, Math.max(5, minLen), 10).toFixed(2))
+    }
+    return {
+      ...profile,
+      niche,
+      minLen,
+      maxLen
+    }
+  }
+
   if (!windows.length || durationSeconds <= 0) {
     const fallback = profiles.story
-    return { niche: 'story', ...fallback }
+    return clampProfileWindow('story', fallback)
   }
 
   const activeWindows = windows.filter((window) => (
@@ -22714,8 +22845,7 @@ const inferPacingProfile = (
   const minLen = Number(clamp(base.minLen - aggressiveShift * 0.45 - shortFormFactor * 0.12, CUT_MIN, PACE_MAX).toFixed(2))
   const maxLen = Number(clamp(base.maxLen - aggressiveShift * 0.5 - shortFormFactor * 0.2, Math.min(CUT_MAX - 0.4, minLen + 0.8), CUT_MAX).toFixed(2))
   const speedCap = Number(clamp(base.speedCap + (aggressiveMode ? 0.1 : 0), 1.2, 1.5).toFixed(3))
-  return {
-    niche,
+  return clampProfileWindow(niche, {
     minLen,
     maxLen,
     earlyTarget: Math.max(minLen, base.earlyTarget - aggressiveShift * 0.5),
@@ -22723,7 +22853,7 @@ const inferPacingProfile = (
     lateTarget: Math.max(minLen, base.lateTarget - aggressiveShift * 0.5),
     jitter: base.jitter + (aggressiveMode ? 0.04 : 0),
     speedCap
-  }
+  })
 }
 
 const inferVideoNicheProfile = ({
@@ -23098,8 +23228,11 @@ const buildEditPlan = async (
     getStyleAdjustedAggressionLevel(aggressionLevel, styleProfile),
     options.editorMode
   )
+  const enforceFiveToTenWindow = longFormPreset !== 'balanced'
   const basePacingProfile = applyStyleToPacingProfile(
-    inferPacingProfile(windows, durationSeconds, options.aggressiveMode),
+    inferPacingProfile(windows, durationSeconds, options.aggressiveMode, {
+      enforceFiveToTenWindow
+    }),
     styleProfile,
     options.aggressiveMode
   )
@@ -27464,14 +27597,24 @@ const buildVerticalClipSelection = (
     opts?.styleProfile?.style === 'reaction' ||
     opts?.styleProfile?.style === 'gaming'
   )
-  const baseDurations = [15, 18, 21, 24, 27, 30, 33, 35]
+  const minMomentSeconds = Number(clamp(
+    Number(platformProfile.verticalMinClipSeconds || VERTICAL_CLIP_DURATION_SHORT_SECONDS),
+    VERTICAL_CLIP_DURATION_SHORT_SECONDS,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  ).toFixed(2))
+  const maxMomentSeconds = Number(clamp(
+    Math.min(maxClipDuration, platformProfile.verticalMaxClipSeconds || VERTICAL_CLIP_DURATION_LONG_SECONDS),
+    minMomentSeconds,
+    VERTICAL_CLIP_DURATION_LONG_SECONDS
+  ).toFixed(2))
+  const baseDurations = [8, 9, 10]
   const durationSet = new Set<number>(baseDurations)
-  if (highEnergyMode || opts?.strategyProfile === 'viral') durationSet.add(38)
-  if (total >= 45) [45, 50, 55, 60].forEach((duration) => durationSet.add(duration))
+  if (highEnergyMode || opts?.strategyProfile === 'viral') durationSet.add(8.5)
   const candidateDurations = Array.from(durationSet)
-    .filter((duration) => duration <= Math.min(maxClipDuration, total))
-    .filter((duration) => duration >= Math.max(12, Math.min(15, platformProfile.verticalMinClipSeconds)))
+    .filter((duration) => duration <= Math.min(maxMomentSeconds, total))
+    .filter((duration) => duration >= Math.min(minMomentSeconds, total))
     .sort((a, b) => a - b)
+  const smallestDuration = candidateDurations[0] || Math.min(total, minMomentSeconds)
   const timelineStep = total >= 7_200
     ? 4
     : total >= 3_600
@@ -27480,14 +27623,14 @@ const buildVerticalClipSelection = (
         ? 2
         : 1
   const anchorStarts = new Set<number>()
-  for (let second = 0; second <= Math.max(0, Math.floor(total - 12)); second += timelineStep) {
+  for (let second = 0; second <= Math.max(0, Math.floor(total - smallestDuration)); second += timelineStep) {
     anchorStarts.add(second)
   }
   hookCandidates
     .slice(0, Math.max(8, resolveHookCandidateTarget(total)))
     .forEach((candidate) => {
       const anchors = [candidate.start - 3, candidate.start - 1.5, candidate.start, candidate.start + 1.5]
-      anchors.forEach((start) => anchorStarts.add(Number(clamp(start, 0, Math.max(0, total - 12)).toFixed(3))))
+      anchors.forEach((start) => anchorStarts.add(Number(clamp(start, 0, Math.max(0, total - smallestDuration)).toFixed(3))))
     })
   windows
     .slice()
@@ -27497,7 +27640,7 @@ const buildVerticalClipSelection = (
     ))
     .slice(0, 80)
     .forEach((window) => {
-      anchorStarts.add(Number(clamp(window.time - 1, 0, Math.max(0, total - 12)).toFixed(3)))
+      anchorStarts.add(Number(clamp(window.time - 1, 0, Math.max(0, total - smallestDuration)).toFixed(3)))
     })
 
   const anchorList = Array.from(anchorStarts.values()).sort((a, b) => a - b)
@@ -28212,8 +28355,14 @@ const buildVerticalPaddingRanges = ({
     clipDurationMaxSeconds,
     VERTICAL_CLIP_DURATION_LONG_SECONDS
   )
-  const minClip = total >= 15 ? 15 : Math.max(4, Math.min(total, 14.8, maxDuration))
-  const maxClip = Math.max(minClip, Math.min(maxDuration, total))
+  const minClip = Math.max(
+    VERTICAL_CLIP_DURATION_SHORT_SECONDS,
+    Math.min(total, maxDuration, VERTICAL_CLIP_DURATION_LONG_SECONDS)
+  )
+  const maxClip = Math.max(
+    minClip,
+    Math.min(total, maxDuration, VERTICAL_CLIP_DURATION_LONG_SECONDS)
+  )
   const durationTarget = clamp(
     total / Math.max(1, Math.min(target, 4)),
     minClip,
@@ -28394,16 +28543,21 @@ const buildVerticalRetentionCandidates = ({
       paddingReason: 'Generated fallback clip windows because analysis peaks were unavailable.'
     }
   }
-  const minDuration = 15
+  const minDuration = Math.max(
+    VERTICAL_CLIP_DURATION_SHORT_SECONDS,
+    Math.min(total, maxClipDuration, VERTICAL_CLIP_DURATION_LONG_SECONDS)
+  )
   const clipDurations = (
     resolvedSelectionMode === 'story_arc'
-      ? [15, 20, 24, 30, 36, 44, 52, 60]
+      ? [8, 9, 10]
       : resolvedSelectionMode === 'hook_storm'
-        ? [15, 18, 22, 26, 30, 36, 44, 52]
+        ? [8, 8.5, 9, 10]
         : resolvedSelectionMode === 'loop_builder'
-          ? [15, 18, 22, 26, 30, 36, 45, 54]
-          : [15, 18, 22, 26, 30, 35, 45, 60]
-  ).filter((seconds) => seconds <= Math.max(seconds, total) && seconds <= total && seconds <= maxClipDuration)
+          ? [8, 9, 10]
+          : [8, 9, 10]
+  )
+    .filter((seconds) => seconds <= total && seconds <= maxClipDuration)
+    .filter((seconds) => seconds >= minDuration - 0.01)
   const stepSeconds = total >= 3600
     ? 6
     : total >= 1800
@@ -29249,6 +29403,7 @@ const renderVerticalClip = async ({
   enableSoundFx,
   applyStabilization,
   averageLuma,
+  paceMultiplier,
   autoZoomMax,
   watermarkEnabled,
   watermarkImagePath,
@@ -29275,6 +29430,7 @@ const renderVerticalClip = async ({
   enableSoundFx: boolean
   applyStabilization: boolean
   averageLuma?: number | null
+  paceMultiplier?: number
   autoZoomMax: number
   watermarkEnabled?: boolean
   watermarkImagePath?: string | null
@@ -29323,7 +29479,9 @@ const renderVerticalClip = async ({
             withAudio
           })
       })()
-  const clipDuration = Math.max(0.08, roundForFilter(Math.max(0.08, end - start)))
+  const resolvedPaceMultiplier = clamp(Number(paceMultiplier || 1), 0.82, 1.2)
+  const shouldApplyPacing = Math.abs(resolvedPaceMultiplier - 1) >= 0.001
+  const clipDuration = Math.max(0.08, roundForFilter(Math.max(0.08, (end - start) / resolvedPaceMultiplier)))
   const fadeDuration = Number(clamp(clipDuration * 0.1, 0.04, 0.16).toFixed(3))
   const fadeOutStart = Number(Math.max(0, clipDuration - fadeDuration).toFixed(3))
   const subtitleFilter = subtitlePath
@@ -29335,9 +29493,21 @@ const renderVerticalClip = async ({
     : ''
   const graphParts: string[] = [baseFilterComplex]
   let videoLabel = 'outv'
+  let audioLabel = 'outa'
   if (subtitleFilter) {
     graphParts.push(`[${videoLabel}]${subtitleFilter}[vsub]`)
     videoLabel = 'vsub'
+  }
+  if (shouldApplyPacing) {
+    graphParts.push(`[${videoLabel}]setpts=PTS/${toFilterNumber(resolvedPaceMultiplier)}[vpaced]`)
+    videoLabel = 'vpaced'
+    if (withAudio) {
+      const paceAudioChain = buildAtempoChain(resolvedPaceMultiplier)
+      if (paceAudioChain) {
+        graphParts.push(`[${audioLabel}]${paceAudioChain}[apaced]`)
+        audioLabel = 'apaced'
+      }
+    }
   }
   const resolvedZoomProfile = parseVerticalZoomProfile(verticalMode.zoomProfile, DEFAULT_VERTICAL_ZOOM_PROFILE)
   const resolvedZoomIntensity = parseVerticalZoomIntensity(verticalMode.zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
@@ -29370,20 +29540,231 @@ const renderVerticalClip = async ({
   }
   const shouldApplyWatermark = Boolean(watermarkEnabled)
   const shouldOverlayWatermarkImage = shouldApplyWatermark && Boolean(watermarkImagePath)
-  if (shouldOverlayWatermarkImage) {
-    graphParts.push('[1:v]format=rgba,colorchannelmixer=aa=0.92,scale=24:-1[wmraw]')
-    graphParts.push(`[${videoLabel}][wmraw]overlay=x=main_w-overlay_w-10:y=main_h-overlay_h-10:format=auto[vwm]`)
-    videoLabel = 'vwm'
-  } else if (shouldApplyWatermark) {
+  if (shouldApplyWatermark) {
+    const watermarkWindowSeconds = Number(clamp(clipDuration * 0.32, 2.6, 4.8).toFixed(3))
+    const watermarkStart = Number(Math.max(0, clipDuration - watermarkWindowSeconds).toFixed(3))
+    const watermarkEnd = Number(clipDuration.toFixed(3))
+    const watermarkFadeIn = Number(clamp(watermarkWindowSeconds * 0.28, 0.24, 0.58).toFixed(3))
+    const watermarkFadeOut = Number(clamp(watermarkWindowSeconds * 0.22, 0.22, 0.54).toFixed(3))
+    const watermarkFadeOutStart = Number(Math.max(watermarkStart + watermarkFadeIn, watermarkEnd - watermarkFadeOut).toFixed(3))
+    const watermarkAlphaExpr = (
+      `if(lt(t,${toFilterNumber(watermarkStart)}),0,` +
+      `if(lt(t,${toFilterNumber(watermarkStart + watermarkFadeIn)}),(t-${toFilterNumber(watermarkStart)})/${toFilterNumber(watermarkFadeIn)}*0.98,` +
+      `if(lt(t,${toFilterNumber(watermarkFadeOutStart)}),0.98,` +
+      `if(lt(t,${toFilterNumber(watermarkEnd)}),(${toFilterNumber(watermarkEnd)}-t)/${toFilterNumber(watermarkFadeOut)}*0.98,0))))`
+    )
+
     const watermarkFont = getSystemFontFile()
     const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
+    const brandText = escapeFfmpegDrawtextText('A U T O E D I T O R . A P P')
+    const fallbackBrandText = escapeFfmpegDrawtextText('AUTOEDITOR.APP')
+    const taglineText = escapeFfmpegDrawtextText('E D I T   S M A R T E R')
+    const particleGlyph = escapeFfmpegDrawtextText('.')
+    const centerLogoY = Math.round(outputHeight * 0.36)
+    const logoBaseWidth = Math.round(clamp(outputWidth * 0.34, 220, 760))
+    const logoPulseAmplitude = Math.round(clamp(logoBaseWidth * 0.04, 8, 32))
+    const logoSweepTop = Math.round(clamp(centerLogoY - outputHeight * 0.12, 0, outputHeight - 10))
+    const logoSweepHeight = Math.round(clamp(outputHeight * 0.24, 120, 520))
+    const brandTextY = Math.round(outputHeight * 0.57)
+    const taglineTextY = brandTextY + Math.round(clamp(outputHeight * 0.068, 52, 168))
+    const fallbackLogoSize = Math.round(clamp(outputWidth * 0.056, 34, 96))
+    const brandGlowSize = Math.round(clamp(outputWidth * 0.048, 30, 94))
+    const brandMainSize = Math.round(clamp(outputWidth * 0.043, 28, 84))
+    const taglineGlowSize = Math.round(clamp(outputWidth * 0.034, 22, 62))
+    const taglineMainSize = Math.round(clamp(outputWidth * 0.03, 20, 54))
+    const particleSizeA = Math.round(clamp(outputWidth * 0.16, 95, 240))
+    const particleSizeB = Math.round(clamp(outputWidth * 0.21, 120, 320))
+    const particleSizeC = Math.round(clamp(outputWidth * 0.18, 104, 280))
+    const glintCycleSeconds = 3
+    const glintTravelSeconds = Number(clamp(glintCycleSeconds * 0.24, 0.58, 0.86).toFixed(3))
+    const glintActivePhase = Number(clamp(glintTravelSeconds / glintCycleSeconds, 0.16, 0.34).toFixed(4))
+    const glintPhaseExpr = (
+      `((t-${toFilterNumber(watermarkStart)})/${toFilterNumber(glintCycleSeconds)}` +
+      `-floor((t-${toFilterNumber(watermarkStart)})/${toFilterNumber(glintCycleSeconds)}))`
+    )
+    const glintXExpr = (
+      `-iw*0.2+(iw*1.4)*(((t-${toFilterNumber(watermarkStart)})/${toFilterNumber(glintTravelSeconds)})` +
+      `-floor((t-${toFilterNumber(watermarkStart)})/${toFilterNumber(glintTravelSeconds)}))`
+    )
+
     graphParts.push(
-      `[${videoLabel}]drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=12:fontcolor=white@0.72[vwm]`
+      `[${videoLabel}]drawbox=` +
+      `x=0:y=0:w=iw:h=ih:` +
+      `color=0x03060b@0.54:t=fill:` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+      `[vwmcin0]`
+    )
+    videoLabel = 'vwmcin0'
+    graphParts.push(
+      `[${videoLabel}]drawbox=` +
+      `x=0:y=0:w=iw:h=ih*0.54:` +
+      `color=0x0f1725@0.23:t=fill:` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+      `[vwmcin1]`
+    )
+    videoLabel = 'vwmcin1'
+    graphParts.push(
+      `[${videoLabel}]drawbox=` +
+      `x=0:y=ih*0.54:w=iw:h=ih*0.46:` +
+      `color=0x02040a@0.3:t=fill:` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+      `[vwmcin2]`
+    )
+    videoLabel = 'vwmcin2'
+    graphParts.push(
+      `[${videoLabel}]drawtext=` +
+      `text='${particleGlyph}'${watermarkFontArg}:` +
+      `fontsize=${particleSizeA}:` +
+      `fontcolor=0x9db7d4@0.13:` +
+      `x='w*0.05+30*sin((t-${toFilterNumber(watermarkStart)})*0.55)':` +
+      `y='h*0.08+26*cos((t-${toFilterNumber(watermarkStart)})*0.42)':` +
+      `alpha='(${watermarkAlphaExpr})*0.55'` +
+      `[vwmcin3]`
+    )
+    videoLabel = 'vwmcin3'
+    graphParts.push(
+      `[${videoLabel}]drawtext=` +
+      `text='${particleGlyph}'${watermarkFontArg}:` +
+      `fontsize=${particleSizeB}:` +
+      `fontcolor=0x89a6c7@0.11:` +
+      `x='w*0.88+34*sin((t-${toFilterNumber(watermarkStart)})*0.43)':` +
+      `y='h*0.2+30*sin((t-${toFilterNumber(watermarkStart)})*0.36)':` +
+      `alpha='(${watermarkAlphaExpr})*0.5'` +
+      `[vwmcin4]`
+    )
+    videoLabel = 'vwmcin4'
+    graphParts.push(
+      `[${videoLabel}]drawtext=` +
+      `text='${particleGlyph}'${watermarkFontArg}:` +
+      `fontsize=${particleSizeC}:` +
+      `fontcolor=0x95acc5@0.11:` +
+      `x='w*0.09+22*sin((t-${toFilterNumber(watermarkStart)})*0.37)':` +
+      `y='h*0.79+24*cos((t-${toFilterNumber(watermarkStart)})*0.48)':` +
+      `alpha='(${watermarkAlphaExpr})*0.46'` +
+      `[vwmcin5]`
+    )
+    videoLabel = 'vwmcin5'
+
+    if (shouldOverlayWatermarkImage) {
+      graphParts.push(
+        `[1:v]format=rgba,` +
+        `scale=w='${logoBaseWidth}+${logoPulseAmplitude}*sin((t-${toFilterNumber(watermarkStart)})*2.1)':h=-1:eval=frame,` +
+        `eq=saturation=0.22:contrast=1.18:brightness=0.02,` +
+        `colorchannelmixer=aa=0.96,` +
+        `fade=t=in:st=${toFilterNumber(watermarkStart)}:d=${toFilterNumber(watermarkFadeIn)}:alpha=1,` +
+        `fade=t=out:st=${toFilterNumber(watermarkFadeOutStart)}:d=${toFilterNumber(watermarkFadeOut)}:alpha=1` +
+        `[wmcinlogo]`
+      )
+      graphParts.push(
+        `[${videoLabel}][wmcinlogo]overlay=` +
+        `x='(main_w-overlay_w)/2':` +
+        `y='${centerLogoY}-overlay_h/2':` +
+        `format=auto:` +
+        `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+        `[vwmlogo]`
+      )
+      videoLabel = 'vwmlogo'
+    } else {
+      graphParts.push(
+        `[${videoLabel}]drawtext=` +
+        `text='${fallbackBrandText}'${watermarkFontArg}:` +
+        `x='(w-tw)/2':` +
+        `y='${centerLogoY}-th/2':` +
+        `fontsize=${fallbackLogoSize}:` +
+        `fontcolor=0xdce4ee:` +
+        `shadowcolor=0x000000@0.55:` +
+        `shadowx=0:shadowy=3:` +
+        `alpha='(${watermarkAlphaExpr})*(0.9+0.08*sin((t-${toFilterNumber(watermarkStart)})*1.8))':` +
+        `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+        `[vwmfallbacklogo]`
+      )
+      videoLabel = 'vwmfallbacklogo'
+    }
+
+    graphParts.push(
+      `[${videoLabel}]drawbox=` +
+      `x='${glintXExpr}':` +
+      `y=${logoSweepTop}:` +
+      `w='iw*0.16':` +
+      `h=${logoSweepHeight}:` +
+      `color=0xffffff@0.1:t=fill:` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})*lt(${glintPhaseExpr},${toFilterNumber(glintActivePhase, 4)})'` +
+      `[vwmsweep0]`
+    )
+    videoLabel = 'vwmsweep0'
+    graphParts.push(
+      `[${videoLabel}]drawbox=` +
+      `x='${glintXExpr}+iw*0.028':` +
+      `y=${logoSweepTop}:` +
+      `w='iw*0.04':` +
+      `h=${logoSweepHeight}:` +
+      `color=0xffffff@0.18:t=fill:` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})*lt(${glintPhaseExpr},${toFilterNumber(glintActivePhase, 4)})'` +
+      `[vwmsweep1]`
+    )
+    videoLabel = 'vwmsweep1'
+
+    if (shouldOverlayWatermarkImage) {
+      graphParts.push(
+        `[${videoLabel}]drawtext=` +
+        `text='${brandText}'${watermarkFontArg}:` +
+        `x='(w-tw)/2':` +
+        `y=${brandTextY}:` +
+        `fontsize=${brandGlowSize}:` +
+        `fontcolor=0xffffff@0.16:` +
+        `shadowcolor=0xffffff@0.1:` +
+        `shadowx=0:shadowy=0:` +
+        `alpha='(${watermarkAlphaExpr})*0.66':` +
+        `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+        `[vwmbrandglow]`
+      )
+      videoLabel = 'vwmbrandglow'
+      graphParts.push(
+        `[${videoLabel}]drawtext=` +
+        `text='${brandText}'${watermarkFontArg}:` +
+        `x='(w-tw)/2':` +
+        `y=${brandTextY}:` +
+        `fontsize=${brandMainSize}:` +
+        `fontcolor=0xdbe5ef:` +
+        `shadowcolor=0x000000@0.5:` +
+        `shadowx=0:shadowy=2:` +
+        `alpha='(${watermarkAlphaExpr})*(0.88+0.04*sin((t-${toFilterNumber(watermarkStart)})*1.4))':` +
+        `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+        `[vwmbrand]`
+      )
+      videoLabel = 'vwmbrand'
+    }
+
+    graphParts.push(
+      `[${videoLabel}]drawtext=` +
+      `text='${taglineText}'${watermarkFontArg}:` +
+      `x='(w-tw)/2':` +
+      `y=${taglineTextY}:` +
+      `fontsize=${taglineGlowSize}:` +
+      `fontcolor=0xffffff@0.2:` +
+      `shadowcolor=0xffffff@0.1:` +
+      `shadowx=0:shadowy=0:` +
+      `alpha='(${watermarkAlphaExpr})*0.64':` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+      `[vwmtagglow]`
+    )
+    videoLabel = 'vwmtagglow'
+    graphParts.push(
+      `[${videoLabel}]drawtext=` +
+      `text='${taglineText}'${watermarkFontArg}:` +
+      `x='(w-tw)/2':` +
+      `y=${taglineTextY}:` +
+      `fontsize=${taglineMainSize}:` +
+      `fontcolor=0xf6fbff:` +
+      `shadowcolor=0x000000@0.44:` +
+      `shadowx=0:shadowy=2:` +
+      `alpha='(${watermarkAlphaExpr})*0.92':` +
+      `enable='between(t,${toFilterNumber(watermarkStart)},${toFilterNumber(watermarkEnd)})'` +
+      `[vwm]`
     )
     videoLabel = 'vwm'
   }
   const shouldPolishAudio = withAudio && audioFilters.length > 0
-  let audioLabel = 'outa'
   if (withAudio) {
     if (shouldPolishAudio) {
       graphParts.push(`[${audioLabel}]${audioFilters.join(',')}[apolished]`)
@@ -29633,6 +30014,13 @@ const buildVerticalVoiceFilters = (preset: VerticalVoicePreset): string[] => {
     'equalizer=f=2600:t=q:w=1.1:g=2.2',
     'acompressor=threshold=-24dB:ratio=4.2:attack=6:release=95:makeup=2'
   ]
+}
+
+const resolveVerticalPacingMultiplier = (preset: VerticalPacingPreset): number => {
+  const resolved = parseVerticalPacingPreset(preset) || 'normal'
+  if (resolved === 'fast') return 1.12
+  if (resolved === 'slow') return 0.92
+  return 1
 }
 
 const RETENTION_RENDER_THRESHOLD = 58
@@ -32252,7 +32640,8 @@ const processJob = async (
     features.watermark,
     runtimeControls?.watermarkOverride
   )
-  const renderWatermarkEnabled = Boolean(watermarkEnabled && !skipWatermarkForFastHorizontal)
+  const freeTierWatermarkEnabled = Boolean(watermarkEnabled && effectiveTier === 'free')
+  const renderWatermarkEnabled = Boolean(freeTierWatermarkEnabled && !skipWatermarkForFastHorizontal)
 
   await updateJob(jobId, {
     requestedQuality: desiredQuality,
@@ -32506,11 +32895,12 @@ const processJob = async (
         path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
         path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
       ].filter(Boolean)
-      const watermarkImagePath = watermarkEnabled
+      const verticalClipWatermarkEnabled = freeTierWatermarkEnabled
+      const watermarkImagePath = verticalClipWatermarkEnabled
         ? (watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || '')
         : ''
-      await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: watermarkEnabled })
-      await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: watermarkEnabled })
+      await updateJob(jobId, { status: 'story', progress: 55, watermarkApplied: verticalClipWatermarkEnabled })
+      await updateJob(jobId, { status: 'subtitling', progress: 62, watermarkApplied: verticalClipWatermarkEnabled })
       const shouldGenerateVerticalTranscript = (
         options.autoCaptions ||
         (shouldApplyVerticalCaptionOverlays && verticalCaptionConfig.autoGenerate)
@@ -32527,7 +32917,7 @@ const processJob = async (
           verticalSourceCues = parseTranscriptCues(generatedVerticalSubtitlePath)
         }
       }
-      await updateJob(jobId, { status: 'audio', progress: 68, watermarkApplied: watermarkEnabled })
+      await updateJob(jobId, { status: 'audio', progress: 68, watermarkApplied: verticalClipWatermarkEnabled })
       const verticalPreScan = buildLongFormPreScanSummary({
         durationSeconds,
         windows: verticalWindows,
@@ -32536,7 +32926,7 @@ const processJob = async (
         nicheProfile: verticalNicheProfile,
         editorMode: editorModeForRender
       })
-      await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: watermarkEnabled })
+      await updateJob(jobId, { status: 'retention', progress: 72, watermarkApplied: verticalClipWatermarkEnabled })
       const verticalContentFormatForRuntime = inferRetentionContentFormat({
         runtimeSeconds: durationSeconds,
         windows: verticalWindows,
@@ -32555,7 +32945,10 @@ const processJob = async (
           longFormClarityVsSpeed: options.longFormClarityVsSpeed ?? null
         })
         const minVerticalEditedRuntimeSeconds = durationSeconds * (minVerticalEditedRuntimeRatio > 0 ? minVerticalEditedRuntimeRatio : 0.5)
-        const clipDurationBudget = Math.max(15, Number(renderConfig.verticalClipDurationSeconds || DEFAULT_VERTICAL_CLIP_DURATION_SECONDS))
+        const clipDurationBudget = Math.max(
+          VERTICAL_CLIP_DURATION_SHORT_SECONDS,
+          Number(renderConfig.verticalClipDurationSeconds || DEFAULT_VERTICAL_CLIP_DURATION_SECONDS)
+        )
         const requiredClipCount = Math.ceil(minVerticalEditedRuntimeSeconds / clipDurationBudget)
         const adjustedClipCount = Math.round(clamp(requiredClipCount, MIN_VERTICAL_CLIPS, MAX_VERTICAL_CLIPS))
         if (adjustedClipCount > verticalRequestedClipCount) {
@@ -32672,7 +33065,7 @@ const processJob = async (
         startedAt: toIsoNow(),
         lastError: null
       })
-      await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: watermarkEnabled })
+      await updateJob(jobId, { status: 'rendering', progress: 80, watermarkApplied: verticalClipWatermarkEnabled })
 
       const verticalClipCaptionOverlays: VerticalClipCaptionOverlay[][] = []
       for (let idx = 0; idx < clipRanges.length; idx += 1) {
@@ -32809,8 +33202,9 @@ const processJob = async (
           enableSoundFx: options.soundFx,
           applyStabilization: applyClipStabilization,
           averageLuma: clipAverageLuma,
+          paceMultiplier: resolveVerticalPacingMultiplier(clipCaptionConfig.pacingPreset),
           autoZoomMax: options.autoZoomMax,
-          watermarkEnabled,
+          watermarkEnabled: verticalClipWatermarkEnabled,
           watermarkImagePath,
           subtitlePath: clipSubtitlePath,
           subtitleIsAss: clipSubtitleIsAss,
@@ -33144,7 +33538,7 @@ const processJob = async (
         progress: 100,
         outputPath: outputPaths[0],
         finalQuality,
-        watermarkApplied: watermarkEnabled,
+        watermarkApplied: verticalClipWatermarkEnabled,
         retentionScore: verticalPredictedRetention,
         optimizationNotes: [
           `Vertical candidate pool: ${verticalSelection.accepted.length} accepted, ${verticalSelection.rejectedCount} rejected below ${MIN_PREDICTED_COMPLETION_PERCENT}%.`,
@@ -40930,6 +41324,51 @@ router.get('/:id/local-output', async (req: any, res) => {
     stream.pipe(res)
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/open-output-folder', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    if (job.status !== 'completed') return res.status(403).json({ error: 'not_ready' })
+
+    const outputPaths = getOutputPathsForJob(job)
+    const requestedClip = Number.parseInt(String(req.body?.clip ?? req.query?.clip ?? '1'), 10)
+    const clipIndex = outputPaths.length
+      ? (Number.isFinite(requestedClip) ? clamp(requestedClip - 1, 0, outputPaths.length - 1) : 0)
+      : 0
+    const localOutDir = path.join(process.cwd(), 'outputs', job.userId, job.id)
+    const localOutput = getLocalOutputFileInfo(job, clipIndex)
+    const hasDirectory = fs.existsSync(localOutDir)
+    if (!localOutput && !hasDirectory) {
+      return res.status(404).json({ error: 'local_output_not_found' })
+    }
+
+    const launch = openLocalPathInExplorer({
+      directoryPath: localOutDir,
+      filePath: localOutput?.filePath || null
+    })
+
+    return res.json({
+      ok: true,
+      clip: clipIndex + 1,
+      selectedPath: localOutput?.filePath || null,
+      directoryPath: localOutDir,
+      command: launch.command,
+      args: launch.args
+    })
+  } catch (err: any) {
+    const message = String(err?.message || '')
+    if (/explorer_not_supported/i.test(message)) {
+      return res.status(501).json({ error: 'explorer_not_supported' })
+    }
+    if (/ENOENT/i.test(message)) {
+      return res.status(500).json({ error: 'explorer_binary_missing' })
+    }
+    console.warn('open output folder failed', err)
+    return res.status(500).json({ error: 'open_output_folder_failed' })
   }
 })
 

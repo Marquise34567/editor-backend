@@ -265,6 +265,7 @@ type TranscriptSummary = {
   segmentCount: number
   excerpt: string
   language: string | null
+  transcriptPath?: string | null
 }
 
 type LlamaRetentionOutput = {
@@ -1923,7 +1924,8 @@ const readTranscriptSummary = async (
       segments,
       segmentCount: segments.length,
       excerpt,
-      language: typeof parsed?.language === 'string' ? parsed.language : null
+      language: typeof parsed?.language === 'string' ? parsed.language : null,
+      transcriptPath
     }
   } catch (error) {
     console.warn('vibecut transcript parse failed', error)
@@ -3159,17 +3161,19 @@ const runHorizontalPipeline = async ({
 const runVerticalMoviepyPipeline = async ({
   inputPath,
   outputDir,
-  segments
+  segments,
+  transcriptPath
 }: {
   inputPath: string
   outputDir: string
   segments: TimelineSegment[]
+  transcriptPath?: string | null
 }) => {
   if (!fs.existsSync(VIBECUT_MOVIEPY_PIPELINE_SCRIPT)) {
     return { ok: false, clipPaths: [] as string[] }
   }
 
-  const result = await runProcess(PYTHON_BIN, [
+  const args = [
     VIBECUT_MOVIEPY_PIPELINE_SCRIPT,
     '--input',
     inputPath,
@@ -3179,7 +3183,12 @@ const runVerticalMoviepyPipeline = async ({
     'vertical',
     '--segments-json',
     JSON.stringify(segments)
-  ])
+  ]
+  if (transcriptPath && fs.existsSync(transcriptPath)) {
+    args.push('--transcript-json', transcriptPath)
+  }
+
+  const result = await runProcess(PYTHON_BIN, args)
 
   if (result.code !== 0) {
     console.warn('moviepy pipeline failed', result.stderr || result.stdout)
@@ -3229,7 +3238,8 @@ const runVerticalPipeline = async ({
   segments,
   ffmpegCommands,
   workDir,
-  config
+  config,
+  transcriptPath
 }: {
   inputPath: string
   outputPath: string
@@ -3237,6 +3247,7 @@ const runVerticalPipeline = async ({
   ffmpegCommands: string[]
   workDir: string
   config: CreativePipelineConfig
+  transcriptPath?: string | null
 }) => {
   const audioEnabled = shouldOutputAudio(config)
   const clipDir = path.join(workDir, 'clips')
@@ -3246,7 +3257,8 @@ const runVerticalPipeline = async ({
   const moviepyResult = await runVerticalMoviepyPipeline({
     inputPath,
     outputDir: clipDir,
-    segments
+    segments,
+    transcriptPath
   })
 
   if (moviepyResult.ok) {
@@ -3732,7 +3744,8 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
         segments,
         ffmpegCommands,
         workDir: jobDir,
-        config: creativeConfig
+        config: creativeConfig,
+        transcriptPath: transcript.transcriptPath || null
       })
     } else {
       await runHorizontalPipeline({
