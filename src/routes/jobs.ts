@@ -29778,7 +29778,9 @@ const renderVerticalClip = async ({
   }
   const resolvedZoomProfile = parseVerticalZoomProfile(verticalMode.zoomProfile, DEFAULT_VERTICAL_ZOOM_PROFILE)
   const resolvedZoomIntensity = parseVerticalZoomIntensity(verticalMode.zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
-  const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none'
+  // Applying zoom after a stacked composite shifts/crops the top webcam strip.
+  // Keep stacked layout geometry stable so the webcam fully occupies the top section.
+  const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none' && layout !== 'stacked'
   const shouldApplyClipTransitions = Boolean(enableTransitions)
   const enhancementFx = buildVerticalEnhancementFilters({
     applyStabilization: Boolean(applyStabilization),
@@ -37793,6 +37795,12 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       if (!skipAnalyzeForRecoveredJob) {
         await analyzeJob(jobId, analyzeOptions, requestId)
       } else {
+        if (status === 'queued' || status === 'uploading') {
+          const resumeProgress = Number.isFinite(progress)
+            ? Math.max(15, Math.min(90, Math.round(progress)))
+            : 15
+          await updateJob(jobId, { status: 'analyzing', progress: resumeProgress })
+        }
         console.warn(`[queue] recovered job ${jobId} resumed at process stage (analyze skipped)`)
       }
       throwIfLeaseLost()
