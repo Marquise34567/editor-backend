@@ -28765,10 +28765,10 @@ const normalizeVerticalCropToSource = ({
     w: defaultWidth,
     h: defaultHeight
   }
-  let x = 0
-  let y = defaultY
-  let w = sourceWidth
-  let h = defaultHeight
+  let x = fallbackCrop.x
+  let y = fallbackCrop.y
+  let w = fallbackCrop.w
+  let h = fallbackCrop.h
 
   if (crop) {
     const rawValues = [crop.x, crop.y, crop.w, crop.h]
