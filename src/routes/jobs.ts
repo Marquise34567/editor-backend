@@ -865,6 +865,15 @@ type VerticalLayoutMode = 'stacked' | 'single' | 'auto'
 type VerticalSelectionMode = 'best_moments' | 'story_arc' | 'hook_storm' | 'loop_builder'
 type VerticalZoomProfile = 'none' | 'smooth' | 'punch' | 'kinetic'
 type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
+type VerticalVariantCaptionKey = 'instagram' | 'youtube' | 'tiktok'
+type VerticalVariantCaptionPosition = { x: number; y: number }
+type VerticalVariantCaptionPositions = Partial<Record<VerticalVariantCaptionKey, VerticalVariantCaptionPosition>>
+type VerticalManualClipRange = {
+  start: number
+  end: number
+  variant?: VerticalVariantCaptionKey | null
+  version?: number | null
+}
 type VerticalModeSettings = {
   enabled: boolean
   output: { width: number; height: number }
@@ -876,6 +885,7 @@ type VerticalModeSettings = {
   bottomCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
   bottomFit: VerticalFitMode
+  manualClipRanges: VerticalManualClipRange[] | null
 }
 type RenderMode = 'horizontal' | 'vertical'
 type RenderConfig = {
@@ -1772,6 +1782,7 @@ type VerticalCaptionConfig = {
   boxColor: string
   positionX: number
   positionY: number
+  variantPositions: VerticalVariantCaptionPositions | null
 }
 type VerticalClipCaptionOverlay = {
   text: string
@@ -4937,6 +4948,113 @@ const parseVerticalWebcamCrop = (value?: any): VerticalWebcamCrop | null => {
   }
 }
 
+const parseVerticalVariantCaptionKey = (value: any): VerticalVariantCaptionKey | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (normalized === 'instagram' || normalized === 'ig' || normalized === 'reels' || normalized === 'instagram_reels') {
+    return 'instagram'
+  }
+  if (normalized === 'youtube' || normalized === 'yt' || normalized === 'shorts' || normalized === 'youtube_shorts') {
+    return 'youtube'
+  }
+  if (normalized === 'tiktok' || normalized === 'tt') {
+    return 'tiktok'
+  }
+  return null
+}
+
+const parseVerticalVariantCaptionPositions = (value?: any): VerticalVariantCaptionPositions | null => {
+  if (!value || typeof value !== 'object') return null
+  const record = value as Record<string, any>
+  const out: VerticalVariantCaptionPositions = {}
+  const keys: VerticalVariantCaptionKey[] = ['instagram', 'youtube', 'tiktok']
+  for (const key of keys) {
+    const raw = record[key]
+    if (!raw || typeof raw !== 'object') continue
+    const parsedX = parseVerticalCaptionPosition((raw as any).x)
+    const parsedY = parseVerticalCaptionPosition((raw as any).y)
+    if (parsedX === null || parsedY === null) continue
+    out[key] = {
+      x: parsedX,
+      y: parsedY
+    }
+  }
+  return Object.keys(out).length ? out : null
+}
+
+const VERTICAL_VARIANT_ORDER: VerticalVariantCaptionKey[] = ['instagram', 'youtube', 'tiktok']
+
+const resolveVerticalVariantCaptionKeyForClip = ({
+  clipIndex,
+  clipCount,
+  explicitVariant
+}: {
+  clipIndex: number
+  clipCount: number
+  explicitVariant?: any
+}): VerticalVariantCaptionKey => {
+  const parsedExplicit = parseVerticalVariantCaptionKey(explicitVariant)
+  if (parsedExplicit) return parsedExplicit
+  const normalizedClipIndex = Math.max(0, Math.round(Number(clipIndex) || 0))
+  const normalizedClipCount = Math.max(1, Math.round(Number(clipCount) || 1))
+  if (normalizedClipCount <= VERTICAL_VARIANT_ORDER.length) {
+    return VERTICAL_VARIANT_ORDER[Math.min(VERTICAL_VARIANT_ORDER.length - 1, normalizedClipIndex)]
+  }
+  const clipsPerVariant = Math.max(1, Math.ceil(normalizedClipCount / VERTICAL_VARIANT_ORDER.length))
+  const variantIndex = Math.min(
+    VERTICAL_VARIANT_ORDER.length - 1,
+    Math.floor(normalizedClipIndex / clipsPerVariant)
+  )
+  return VERTICAL_VARIANT_ORDER[variantIndex]
+}
+
+const parseVerticalManualClipRanges = (value?: any): VerticalManualClipRange[] | null => {
+  if (!Array.isArray(value)) return null
+  const ranges: VerticalManualClipRange[] = []
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object') continue
+    const row = entry as Record<string, any>
+    const startRaw = pickFirstDefinedValue(
+      row.start,
+      row.startSec,
+      row.start_sec,
+      row.cueStart,
+      row.cue_start,
+      row.from
+    )
+    const endRaw = pickFirstDefinedValue(
+      row.end,
+      row.endSec,
+      row.end_sec,
+      row.cueEnd,
+      row.cue_end,
+      row.to
+    )
+    const durationRaw = pickFirstDefinedValue(row.duration, row.durationSec, row.duration_sec)
+    const start = Number(startRaw)
+    let end = Number(endRaw)
+    if (!Number.isFinite(end) && Number.isFinite(start)) {
+      const duration = Number(durationRaw)
+      if (Number.isFinite(duration) && duration > 0) {
+        end = start + duration
+      }
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start + 0.04) continue
+    const variant = parseVerticalVariantCaptionKey(
+      pickFirstDefinedValue(row.variant, row.variantKey, row.variant_key, row.platform)
+    )
+    const versionRaw = Number(pickFirstDefinedValue(row.version, row.variantVersion, row.variant_version))
+    const version = Number.isFinite(versionRaw) && versionRaw > 0 ? Math.round(versionRaw) : null
+    ranges.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      ...(variant ? { variant } : {}),
+      ...(version !== null ? { version } : {})
+    })
+  }
+  return ranges.length ? ranges : null
+}
+
 const parseVerticalOutput = (value?: any) => {
   if (!value || typeof value !== 'object') {
     return { width: DEFAULT_VERTICAL_OUTPUT_WIDTH, height: DEFAULT_VERTICAL_OUTPUT_HEIGHT }
@@ -4955,6 +5073,12 @@ const parseVerticalOutput = (value?: any) => {
 const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> | null => {
   if (!value || typeof value !== 'object') return null
   const topHeightPxRaw = Number((value as any).topHeightPx)
+  const manualClipRanges = parseVerticalManualClipRanges(
+    (value as any).manualClipRanges ??
+    (value as any).manual_clip_ranges ??
+    (value as any).variantMoments ??
+    (value as any).variant_moments
+  )
   return {
     enabled: (value as any).enabled !== false,
     output: parseVerticalOutput((value as any).output),
@@ -4974,7 +5098,8 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
     bottomCrop: parseVerticalWebcamCrop((value as any).bottomCrop ?? (value as any).contentCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
-    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover')
+    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover'),
+    manualClipRanges
   }
 }
 
@@ -4998,7 +5123,8 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   webcamCrop: null,
   bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
-  bottomFit: 'cover'
+  bottomFit: 'cover',
+  manualClipRanges: null
 })
 
 const buildVerticalModeSettings = ({
@@ -5058,10 +5184,22 @@ const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
     }
   }
   const legacyCrop = parseLegacyVerticalCrop(body?.webcamCrop)
-  const verticalMode = buildVerticalModeSettings({
+  const manualClipRangesFromPayload = parseVerticalManualClipRanges(
+    body?.verticalVariantMoments ??
+    body?.vertical_variant_moments ??
+    body?.variantMoments ??
+    body?.variant_moments
+  )
+  const verticalModeBase = buildVerticalModeSettings({
     value: body?.verticalMode,
     legacyCrop
   })
+  const verticalMode: VerticalModeSettings = manualClipRangesFromPayload && !verticalModeBase.manualClipRanges
+    ? {
+        ...verticalModeBase,
+        manualClipRanges: manualClipRangesFromPayload
+      }
+    : verticalModeBase
   const fallbackClipCount = getVerticalSelectionDefaultClipCount(verticalMode.selectionMode)
   return {
     mode: 'vertical',
@@ -6274,6 +6412,14 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     nested?.positionY,
     nested?.position_y
   )
+  const variantPositionsCandidate = pickFirstDefinedValue(
+    (payload as any).verticalVariantCaptionPositions,
+    (payload as any).vertical_variant_caption_positions,
+    (payload as any).variantCaptionPositions,
+    (payload as any).variant_caption_positions,
+    nested?.variantPositions,
+    nested?.variant_positions
+  )
   const autoGenerateCandidate = parseBooleanFlag(
     pickFirstDefinedValue(
       (payload as any).autoGenerate,
@@ -6384,6 +6530,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     voicePresetCandidate === undefined &&
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
+    variantPositionsCandidate === undefined &&
     autoGenerateCandidate === null &&
     enabledCandidate === null &&
     shadowEnabledCandidate === null &&
@@ -6412,6 +6559,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedVoicePreset = parseVerticalVoicePreset(voicePresetCandidate)
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
+  const parsedVariantPositions = parseVerticalVariantCaptionPositions(variantPositionsCandidate)
   return {
     ...(textCandidate === undefined ? {} : { text: normalizeVerticalCaptionTextInput(textCandidate) }),
     ...(parsedPreset ? { preset: parsedPreset } : {}),
@@ -6437,6 +6585,7 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(removeFillersCandidate === null ? {} : { removeFillers: removeFillersCandidate }),
     ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
     ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
+    ...(parsedVariantPositions ? { variantPositions: parsedVariantPositions } : {}),
     ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
     ...(enabledCandidate === null ? {} : { enabled: enabledCandidate })
   }
@@ -6757,6 +6906,7 @@ const resolveVerticalCaptionConfig = (
   const fallbackText = normalizeVerticalCaptionTextInput(defaults?.text ?? '')
   const fallbackPositionX = parseVerticalCaptionPosition(defaults?.positionX) ?? 0.5
   const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? 0.84
+  const fallbackVariantPositions = parseVerticalVariantCaptionPositions((defaults as any)?.variantPositions)
   const overrideAnimation = parseVerticalCaptionAnimationMode((override as any)?.animation)
   const overrideAnimationEnabled = typeof override.animationEnabled === 'boolean'
     ? override.animationEnabled
@@ -6797,7 +6947,8 @@ const resolveVerticalCaptionConfig = (
     autoEmoji: typeof override.autoEmoji === 'boolean' ? override.autoEmoji : styleBaseline.autoEmoji,
     removeFillers: typeof override.removeFillers === 'boolean' ? override.removeFillers : styleBaseline.removeFillers,
     positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
-    positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY
+    positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY,
+    variantPositions: parseVerticalVariantCaptionPositions((override as any).variantPositions) || fallbackVariantPositions || null
   }
 }
 
@@ -6829,7 +6980,8 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     boxEnabled: false,
     boxColor: '000000',
     positionX: 0.5,
-    positionY: 0.82
+    positionY: 0.82,
+    variantPositions: null
   })
 }
 
@@ -6895,7 +7047,8 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     boxEnabled: typeof config.boxEnabled === 'boolean' ? config.boxEnabled : defaults.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(config.boxColor) || defaults.boxColor,
     positionX: parseVerticalCaptionPosition(config.positionX) ?? defaults.positionX,
-    positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY
+    positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY,
+    variantPositions: parseVerticalVariantCaptionPositions((config as any).variantPositions) || null
   }
   const animationMode: VerticalClipCaptionAnimation = normalized.animation
   return {
@@ -6938,7 +7091,9 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       boxEnabled: normalized.boxEnabled,
       boxColor: normalized.boxColor,
       positionX: normalized.positionX,
-      positionY: normalized.positionY
+      positionY: normalized.positionY,
+      variantPositions: normalized.variantPositions,
+      variant_positions: normalized.variantPositions
     },
     verticalCaptionEnabled: normalized.enabled,
     vertical_caption_enabled: normalized.enabled,
@@ -6993,7 +7148,9 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     verticalCaptionPositionX: normalized.positionX,
     vertical_caption_position_x: normalized.positionX,
     verticalCaptionPositionY: normalized.positionY,
-    vertical_caption_position_y: normalized.positionY
+    vertical_caption_position_y: normalized.positionY,
+    verticalVariantCaptionPositions: normalized.variantPositions,
+    vertical_variant_caption_positions: normalized.variantPositions
   }
 }
 
@@ -32256,10 +32413,10 @@ const processJob = async (
           const inferredAreaRatio =
             (inferredVerticalWebcamCrop.w * inferredVerticalWebcamCrop.h) /
             Math.max(1, sourceStream.width * sourceStream.height)
-          const rejectLowerHalf = inferredCenterY > (sourceStream.height * 0.7)
-          const rejectOversized = inferredAreaRatio > 0.16
-          const rejectTooWide = inferredWidthRatio > 0.32
-          const rejectTooTall = inferredHeightRatio > 0.5
+          const rejectLowerHalf = inferredCenterY > (sourceStream.height * 0.9)
+          const rejectOversized = inferredAreaRatio > 0.28
+          const rejectTooWide = inferredWidthRatio > 0.58
+          const rejectTooTall = inferredHeightRatio > 0.78
           if (rejectLowerHalf || rejectOversized || rejectTooWide || rejectTooTall) {
             console.warn(`[${requestId || 'noid'}] rejected inferred vertical webcam crop`, {
               centerY: Math.round(inferredCenterY),
@@ -32431,11 +32588,66 @@ const processJob = async (
       })
       const requestedVerticalClipCount = verticalSelection.requestedCount
       const targetRenderCount = verticalSelection.outputTarget
-      const selectedVerticalCandidates = verticalSelection.accepted.slice(0, targetRenderCount)
-      const clipRanges = selectedVerticalCandidates.map((candidate) => ({
+      const manualClipRangesRaw = Array.isArray(resolvedVerticalMode.manualClipRanges)
+        ? resolvedVerticalMode.manualClipRanges
+        : []
+      const manualMaxClipDuration = parseVerticalClipDurationSeconds(
+        renderConfig.verticalClipDurationSeconds,
+        DEFAULT_VERTICAL_CLIP_DURATION_SECONDS
+      )
+      const normalizedManualClipRanges = manualClipRangesRaw
+        .map((entry) => {
+          const start = Number(entry?.start)
+          const endRaw = Number(entry?.end)
+          if (!Number.isFinite(start) || !Number.isFinite(endRaw)) return null
+          const normalizedStart = clamp(start, 0, Math.max(0, durationSeconds - 0.2))
+          const boundedEnd = Math.min(endRaw, normalizedStart + manualMaxClipDuration)
+          const normalizedEnd = clamp(boundedEnd, normalizedStart + 0.2, durationSeconds)
+          if (!Number.isFinite(normalizedEnd) || normalizedEnd <= normalizedStart + 0.04) return null
+          return {
+            start: Number(normalizedStart.toFixed(3)),
+            end: Number(normalizedEnd.toFixed(3)),
+            variant: parseVerticalVariantCaptionKey(entry?.variant) || null,
+            version: Number.isFinite(Number(entry?.version)) ? Math.max(1, Math.round(Number(entry?.version))) : null
+          }
+        })
+        .filter((entry): entry is {
+          start: number
+          end: number
+          variant: VerticalVariantCaptionKey | null
+          version: number | null
+        } => Boolean(entry))
+        .slice(0, MAX_VERTICAL_CLIPS)
+      let selectedVerticalCandidates = verticalSelection.accepted.slice(0, targetRenderCount)
+      let clipRanges = selectedVerticalCandidates.map((candidate) => ({
         start: Number(candidate.range.start.toFixed(3)),
         end: Number(candidate.range.end.toFixed(3))
       }))
+      if (normalizedManualClipRanges.length > 0) {
+        selectedVerticalCandidates = normalizedManualClipRanges.map((entry, index) =>
+          buildSyntheticVerticalRetentionCandidate({
+            range: {
+              start: entry.start,
+              end: entry.end
+            },
+            predictedCompletion: MIN_PREDICTED_COMPLETION_PERCENT + 3 + (index % 3) * 0.6,
+            reason: `Manual transcript moment #${index + 1} selected for variant export.`
+          })
+        )
+        clipRanges = normalizedManualClipRanges.map((entry) => ({
+          start: entry.start,
+          end: entry.end
+        }))
+      }
+      const clipVariantHints = normalizedManualClipRanges.length > 0
+        ? normalizedManualClipRanges.map((entry) => ({
+            variant: entry.variant,
+            version: entry.version
+          }))
+        : clipRanges.map(() => ({
+            variant: null as VerticalVariantCaptionKey | null,
+            version: null as number | null
+          }))
       if (!clipRanges.length) {
         throw new QualityGateError(
           `Vertical retention gate rejected all clips (${MIN_PREDICTED_COMPLETION_PERCENT}%+ required).`,
@@ -32469,6 +32681,19 @@ const processJob = async (
         let clipSubtitlePath: string | null = null
         let clipSubtitleIsAss = false
         let clipSubtitleStyle = subtitleStyle
+        const clipVariantKey = resolveVerticalVariantCaptionKeyForClip({
+          clipIndex: idx,
+          clipCount: clipRanges.length,
+          explicitVariant: clipVariantHints[idx]?.variant
+        })
+        const clipVariantPosition = verticalCaptionConfig.variantPositions?.[clipVariantKey] || null
+        const clipCaptionConfig: VerticalCaptionConfig = clipVariantPosition
+          ? {
+              ...verticalCaptionConfig,
+              positionX: clipVariantPosition.x,
+              positionY: clipVariantPosition.y
+            }
+          : verticalCaptionConfig
         const clipSegment: Segment = {
           start: Number(range.start.toFixed(3)),
           end: Number(range.end.toFixed(3)),
@@ -32484,14 +32709,14 @@ const processJob = async (
               windows: verticalWindows,
               userCaptionText: verticalCaptionTextInput,
               transcriptCues: verticalSourceCues,
-              captionPreset: verticalCaptionConfig.preset,
-              dynamicMode: verticalCaptionConfig.dynamicMode,
-              animationEnabled: verticalCaptionConfig.animationEnabled,
-              animationMode: verticalCaptionConfig.animation,
-              autoGenerateFromTranscript: verticalCaptionConfig.autoGenerate,
-              autoEmphasis: verticalCaptionConfig.autoEmphasis,
-              autoEmoji: verticalCaptionConfig.autoEmoji,
-              removeFillers: verticalCaptionConfig.removeFillers,
+              captionPreset: clipCaptionConfig.preset,
+              dynamicMode: clipCaptionConfig.dynamicMode,
+              animationEnabled: clipCaptionConfig.animationEnabled,
+              animationMode: clipCaptionConfig.animation,
+              autoGenerateFromTranscript: clipCaptionConfig.autoGenerate,
+              autoEmphasis: clipCaptionConfig.autoEmphasis,
+              autoEmoji: clipCaptionConfig.autoEmoji,
+              removeFillers: clipCaptionConfig.removeFillers,
               editorMode: editorModeForRender,
               styleProfile: verticalStyleProfile,
               nicheProfile: verticalNicheProfile
@@ -32500,9 +32725,9 @@ const processJob = async (
         verticalClipCaptionOverlays.push(clipCaptionOverlays)
 
         const clipOverlayCues = overlaysToTranscriptCues(clipCaptionOverlays, {
-          autoEmphasis: verticalCaptionConfig.autoEmphasis,
-          autoEmoji: verticalCaptionConfig.autoEmoji,
-          removeFillers: verticalCaptionConfig.removeFillers
+          autoEmphasis: clipCaptionConfig.autoEmphasis,
+          autoEmoji: clipCaptionConfig.autoEmoji,
+          removeFillers: clipCaptionConfig.removeFillers
         })
         const clipCueLayers: TranscriptCue[][] = []
         if (options.autoCaptions && verticalSourceCues.length && !shouldApplyVerticalCaptionOverlays) {
@@ -32523,7 +32748,7 @@ const processJob = async (
               workingDir: workDir,
               basename: `vertical-clip-${idx + 1}-captions`,
               style: clipSubtitleStyle,
-              config: verticalCaptionConfig
+              config: clipCaptionConfig
             })
             if (clipAssPath) {
               clipSubtitlePath = clipAssPath
@@ -32733,11 +32958,20 @@ const processJob = async (
       })
       const verticalClipDetails = selectedVerticalCandidates.map((candidate, index) => {
         const range = candidate.range
+        const variant = resolveVerticalVariantCaptionKeyForClip({
+          clipIndex: index,
+          clipCount: clipRanges.length,
+          explicitVariant: clipVariantHints[index]?.variant
+        })
+        const clipsPerVariant = Math.max(1, Math.ceil(Math.max(1, clipRanges.length) / VERTICAL_VARIANT_ORDER.length))
+        const inferredVersion = (index % clipsPerVariant) + 1
         return {
           clip: index + 1,
           start: Number(range.start.toFixed(3)),
           end: Number(range.end.toFixed(3)),
           duration: Number(Math.max(0, range.end - range.start).toFixed(3)),
+          variant,
+          version: clipVariantHints[index]?.version ?? inferredVersion,
           predictedCompletion: Number(candidate.predictedCompletion.toFixed(2)),
           reason: candidate.reason,
           predictorBreakdown: candidate.predictorBreakdown,
