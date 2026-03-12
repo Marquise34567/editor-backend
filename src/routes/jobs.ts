@@ -32841,6 +32841,7 @@ const processJob = async (
   const requestedVideoCrfOverride = parseVideoCrfOverride(options.videoCrf)
   const requestedAudioBitrateKbpsOverride = parseAudioBitrateKbpsOverride(options.audioBitrateKbps)
   const renderFastHorizontalMode = renderFastMode && renderConfig.mode === 'horizontal'
+  const renderFastVerticalMode = renderFastMode && renderConfig.mode === 'vertical'
   const renderFastHorizontalCutOnly = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_CUT_ONLY
   const skipWatermarkForFastHorizontal = renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_WATERMARK
   const renderCodecThreads = renderFastMode
@@ -33041,6 +33042,7 @@ const processJob = async (
       let inferredVerticalWebcamCrop: VerticalWebcamCrop | null = null
       const shouldTryAutoWebcamCrop = (
         resolvedVerticalMode.autoWebcamCrop !== false &&
+        !renderFastVerticalMode &&
         isLikelyDefaultVerticalWebcamCrop({
           crop: resolvedVerticalMode.webcamCrop,
           sourceWidth: sourceStream.width,
@@ -33433,16 +33435,20 @@ const processJob = async (
             }
           }
         }
-        const applyClipStabilization = shouldApplyVerticalStabilization({
-          windows: verticalWindows,
-          start: range.start,
-          end: range.end
-        })
-        const clipAverageLuma = await probeVerticalClipAverageLuma({
-          inputPath: tmpIn,
-          start: range.start,
-          end: range.end
-        })
+        const applyClipStabilization = renderFastVerticalMode
+          ? false
+          : shouldApplyVerticalStabilization({
+              windows: verticalWindows,
+              start: range.start,
+              end: range.end
+            })
+        const clipAverageLuma = renderFastVerticalMode
+          ? null
+          : await probeVerticalClipAverageLuma({
+              inputPath: tmpIn,
+              start: range.start,
+              end: range.end
+            })
         await renderVerticalClip({
           inputPath: tmpIn,
           outputPath: localClipPath,
@@ -38626,7 +38632,7 @@ const handleCreateJob = async (req: any, res: any) => {
     }
     const effectiveFastMode = typeof requestedFastMode === 'boolean'
       ? requestedFastMode
-      : editorModeOverride === 'ultra'
+      : (editorModeOverride === 'ultra' || renderConfig.mode === 'vertical')
     const renderLimitViolation = await getRenderLimitViolation({
       userId,
       email: req.user?.email,
@@ -39695,7 +39701,19 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedManualTimestampConfig = promptAppliedAnalyze.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
     const requestedContinuityFirstMode = promptAppliedAnalyze.continuityFirstMode ?? requestedContinuityFirstModeBase
     const analyzeRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
-    const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra' ? true : analyzeRequestedFastMode
+    const analyzePersistedRenderConfig = parsePersistedRenderConfig({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'analyze:fast-mode-default'
+    })
+    const effectiveAnalyzeFastMode = requestedEditorMode === 'ultra'
+      ? true
+      : (
+        analyzeRequestedFastMode !== null
+          ? analyzeRequestedFastMode
+          : (analyzePersistedRenderConfig.mode === 'vertical' ? true : null)
+      )
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: promptAppliedAnalyze.retentionAggressionLevel,
@@ -39946,7 +39964,19 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedManualTimestampConfig = promptAppliedProcess.manualTimestampConfig ?? getManualTimestampConfigFromJob(job)
     const requestedContinuityFirstMode = promptAppliedProcess.continuityFirstMode ?? requestedContinuityFirstModeBase
     const processRequestedFastMode = parseBooleanFlag(req.body?.fastMode)
-    const effectiveProcessFastMode = requestedEditorMode === 'ultra' ? true : processRequestedFastMode
+    const processPersistedRenderConfig = parsePersistedRenderConfig({
+      analysis: (job.analysis as any) || {},
+      renderSettings: (job as any)?.renderSettings,
+      jobId: job.id,
+      context: 'process:fast-mode-default'
+    })
+    const effectiveProcessFastMode = requestedEditorMode === 'ultra'
+      ? true
+      : (
+        processRequestedFastMode !== null
+          ? processRequestedFastMode
+          : (processPersistedRenderConfig.mode === 'vertical' ? true : null)
+      )
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
       retentionAggressionLevel: promptAppliedProcess.retentionAggressionLevel,
