@@ -39663,14 +39663,19 @@ const handleCompleteUpload = async (req: any, res: any) => {
       return res.status(403).json(renderLimitViolation.payload)
     }
 
+    const queueSeedStatus = JOB_PROCESSOR_ENABLED ? 'analyzing' : 'queued'
+    const queueSeedProgress = JOB_PROCESSOR_ENABLED ? 10 : 1
     await updateJob(id, {
       inputPath,
-      status: 'analyzing',
-      progress: 10,
+      status: queueSeedStatus,
+      progress: queueSeedProgress,
       requestedQuality: requestedQuality || job.requestedQuality,
       renderSettings: nextRenderSettings,
       analysis: nextAnalysis
     })
+    if (!JOB_PROCESSOR_ENABLED) {
+      console.warn(`[queue] processor disabled in this API process; persisted ${id} as queued for external workers`)
+    }
 
     res.json({ ok: true })
     enqueuePipeline({
