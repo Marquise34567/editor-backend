@@ -28804,6 +28804,30 @@ const normalizeVerticalCropToSource = ({
   }
 }
 
+const isLikelyDefaultVerticalWebcamCrop = ({
+  crop,
+  sourceWidth,
+  sourceHeight
+}: {
+  crop: VerticalWebcamCrop | null
+  sourceWidth: number
+  sourceHeight: number
+}) => {
+  if (!crop) return true
+  const normalized = normalizeVerticalCropToSource({ crop, sourceWidth, sourceHeight })
+  const defaultWidth = Math.round(clamp(sourceWidth * 0.42, 48, sourceWidth))
+  const defaultHeight = Math.round(clamp(sourceHeight * 0.4, 48, sourceHeight))
+  const defaultX = Math.round(clamp(sourceWidth - defaultWidth - sourceWidth * 0.03, 0, Math.max(0, sourceWidth - defaultWidth)))
+  const defaultY = Math.round(clamp(sourceHeight * 0.04, 0, Math.max(0, sourceHeight - defaultHeight)))
+  const tolerance = Math.max(4, Math.round(Math.min(sourceWidth, sourceHeight) * 0.012))
+  return (
+    Math.abs(normalized.x - defaultX) <= tolerance &&
+    Math.abs(normalized.y - defaultY) <= tolerance &&
+    Math.abs(normalized.w - defaultWidth) <= tolerance &&
+    Math.abs(normalized.h - defaultHeight) <= tolerance
+  )
+}
+
 const buildVerticalBottomFilter = (fit: VerticalFitMode, outWidth: number, outHeight: number) => {
   if (fit === 'contain') {
     return [
@@ -32198,10 +32222,25 @@ const processJob = async (
         sourceWidth: sourceStream.width,
         sourceHeight: sourceStream.height
       })
+      let inferredVerticalWebcamCrop: VerticalWebcamCrop | null = null
+      const shouldTryAutoWebcamCrop = isLikelyDefaultVerticalWebcamCrop({
+        crop: resolvedVerticalMode.webcamCrop,
+        sourceWidth: sourceStream.width,
+        sourceHeight: sourceStream.height
+      })
+      if (shouldTryAutoWebcamCrop) {
+        inferredVerticalWebcamCrop = await inferVerticalWebcamCropViaMediapipe({
+          inputPath: tmpIn,
+          sourceWidth: sourceStream.width,
+          sourceHeight: sourceStream.height,
+          requestId
+        })
+      }
+      const resolvedVerticalWebcamCrop = inferredVerticalWebcamCrop || fixedVerticalWebcamCrop
       const resolvedVerticalModeForRender: VerticalModeSettings = {
         ...resolvedVerticalMode,
         layout: 'stacked',
-        webcamCrop: fixedVerticalWebcamCrop
+        webcamCrop: resolvedVerticalWebcamCrop
       }
       const renderedClipPaths: string[] = []
       const outputPaths: string[] = []
