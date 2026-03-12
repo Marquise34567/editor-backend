@@ -288,6 +288,17 @@ class JobCanceledError extends Error {
   }
 }
 
+class PipelineLeaseLostError extends Error {
+  jobId?: string
+  workerId?: string
+  constructor(jobId?: string, workerId?: string) {
+    super('pipeline_lease_lost')
+    this.name = 'PipelineLeaseLostError'
+    this.jobId = jobId
+    this.workerId = workerId
+  }
+}
+
 class HookGateError extends Error {
   reason: string
   details: any
@@ -37673,6 +37684,17 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
     const pipelineWorkerId = `${process.pid}-${crypto.randomUUID().slice(0, 8)}`
     let heartbeatTimer: NodeJS.Timeout | null = null
     let latestJobSnapshot: any = null
+    let leaseLost = false
+    const markLeaseLost = () => {
+      if (leaseLost) return
+      leaseLost = true
+      markPipelineCanceled(jobId)
+      killJobFfmpegProcesses(jobId)
+      console.warn(`[queue] pipeline lease lost for ${jobId}; worker ${pipelineWorkerId} yielding`)
+    }
+    const throwIfLeaseLost = () => {
+      if (leaseLost) throw new PipelineLeaseLostError(jobId, pipelineWorkerId)
+    }
     const stopHeartbeat = () => {
       if (!heartbeatTimer) return
       clearInterval(heartbeatTimer)
@@ -37721,7 +37743,10 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         return
       }
       heartbeatTimer = setInterval(() => {
-        void touchLease('running')
+        void (async () => {
+          const ok = await touchLease('running')
+          if (!ok) markLeaseLost()
+        })()
       }, PIPELINE_HEARTBEAT_INTERVAL_MS)
       if (typeof (heartbeatTimer as any).unref === 'function') {
         ;(heartbeatTimer as any).unref()
@@ -37730,6 +37755,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         await updateJob(jobId, { status: 'failed', error: 'ffmpeg_missing' })
         throw new Error('ffmpeg_missing')
       }
+      throwIfLeaseLost()
       const { options: analyzeOptions } = await getEditOptionsForUser(user.id, {
         retentionAggressionLevel: getRetentionAggressionFromJob(existing),
         retentionStrategyProfile: getRetentionStrategyFromJob(existing),
@@ -37762,12 +37788,14 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       }, user.email)
       const styleBlendOverride = parseStyleArchetypeBlendFromPayload((existing.analysis as any) || {})
       if (styleBlendOverride) analyzeOptions.styleArchetypeBlend = styleBlendOverride
+      throwIfLeaseLost()
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       if (!skipAnalyzeForRecoveredJob) {
         await analyzeJob(jobId, analyzeOptions, requestId)
       } else {
         console.warn(`[queue] recovered job ${jobId} resumed at process stage (analyze skipped)`)
       }
+      throwIfLeaseLost()
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       const latestBeforeProcess = await prisma.job.findUnique({ where: { id: jobId } })
       if (!latestBeforeProcess) throw new Error('not_found')
@@ -37804,9 +37832,15 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       }, user.email)
       const processStyleBlendOverride = parseStyleArchetypeBlendFromPayload((latestBeforeProcess.analysis as any) || {})
       if (processStyleBlendOverride) processOptions.styleArchetypeBlend = processStyleBlendOverride
+      throwIfLeaseLost()
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       await processJob(jobId, user, requestedQuality, processOptions, requestId)
+      throwIfLeaseLost()
     } catch (err: any) {
+      if (err instanceof PipelineLeaseLostError || leaseLost) {
+        console.warn(`[queue] worker takeover acknowledged for ${jobId}; local worker exited pipeline`)
+        return
+      }
       if (err instanceof PlanLimitError) {
         const planLimitDetails = [
           err.code || 'PLAN_LIMIT_EXCEEDED',
@@ -37933,8 +37967,8 @@ const MAX_PIPELINES = (() => {
 })()
 const QUEUE_RECOVERY_INTERVAL_MS = (() => {
   const envVal = Number(process.env.JOB_QUEUE_RECOVERY_INTERVAL_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 5000) return envVal
-  return 10_000
+  if (Number.isFinite(envVal) && envVal >= 1_000) return Math.round(envVal)
+  return 3_000
 })()
 const STALE_PIPELINE_MS = (() => {
   const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
@@ -37943,13 +37977,13 @@ const STALE_PIPELINE_MS = (() => {
 })()
 const PIPELINE_HEARTBEAT_INTERVAL_MS = (() => {
   const envVal = Number(process.env.PIPELINE_HEARTBEAT_INTERVAL_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 10_000) return Math.round(envVal)
-  return 25_000
+  if (Number.isFinite(envVal) && envVal >= 2_000) return Math.round(envVal)
+  return 4_000
 })()
 const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_HEARTBEAT_GRACE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
-  return Math.max(90_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
+  if (Number.isFinite(envVal) && envVal >= 6_000) return Math.round(envVal)
+  return Math.max(12_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
 })()
 const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
@@ -37959,8 +37993,13 @@ const PIPELINE_LEASE_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
 )
 const PIPELINE_LEASE_STALE_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_LEASE_STALE_GRACE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
-  return Math.max(120_000, PIPELINE_HEARTBEAT_GRACE_MS + 15_000)
+  if (Number.isFinite(envVal) && envVal >= 8_000) return Math.round(envVal)
+  return Math.max(15_000, PIPELINE_HEARTBEAT_GRACE_MS + 3_000)
+})()
+const PIPELINE_NO_LEASE_STALE_GRACE_MS = (() => {
+  const envVal = Number(process.env.PIPELINE_NO_LEASE_STALE_GRACE_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 8_000) return Math.round(envVal)
+  return Math.max(15_000, PIPELINE_LEASE_STALE_GRACE_MS)
 })()
 const QUEUE_RECOVERY_SKIP_ANALYZE = !/^(0|false|no)$/i.test(
   String(process.env.QUEUE_RECOVERY_SKIP_ANALYZE || 'true').trim()
@@ -38181,8 +38220,44 @@ const updatePipelineRuntimeLease = async ({
   const status = String(snapshot.status || '').toLowerCase()
   if (status === 'completed' || status === 'failed') return false
   const nowIso = toIsoNow()
+  const nowMs = Date.now()
   const analysis = getAnalysisRecord(snapshot.analysis)
   const previousLease = getPipelineRuntimeLease(analysis) || {}
+  const previousState = String(previousLease.state || '').toLowerCase()
+  const previousWorkerId = String(previousLease.workerId || '').trim()
+  const currentWorkerId = String(workerId || '').trim()
+  const previousHeartbeatMs = toTimeMs(previousLease.heartbeatAt)
+  const previousLeaseFresh = (
+    previousState === 'running' &&
+    previousHeartbeatMs > 0 &&
+    (nowMs - previousHeartbeatMs) <= PIPELINE_HEARTBEAT_GRACE_MS
+  )
+  const hasDifferentActiveWorker = (
+    previousWorkerId.length > 0 &&
+    currentWorkerId.length > 0 &&
+    previousWorkerId !== currentWorkerId
+  )
+
+  if (state === 'running') {
+    // Heartbeats can only extend a currently-running lease.
+    if (!markStarted && previousState !== 'running') {
+      return false
+    }
+    // A fresh active lease owned by another worker cannot be stolen.
+    if (markStarted && hasDifferentActiveWorker && previousLeaseFresh) {
+      return false
+    }
+    // Non-owner workers cannot heartbeat another active lease.
+    if (!markStarted && hasDifferentActiveWorker) {
+      return false
+    }
+  }
+
+  // Do not let another worker mark someone else's lease as finished.
+  if (markFinished && hasDifferentActiveWorker) {
+    return false
+  }
+
   const nextLease: PipelineRuntimeLease = {
     ...previousLease,
     state,
@@ -38303,7 +38378,7 @@ const recoverQueuedJobs = async () => {
       )
       const noLeaseTimeout = (
         !runtimeLease &&
-        elapsedSinceUpdateMs >= Math.max(120_000, PIPELINE_LEASE_STALE_GRACE_MS)
+        elapsedSinceUpdateMs >= PIPELINE_NO_LEASE_STALE_GRACE_MS
       )
       const leaseExpiredRecoverable = (
         PIPELINE_LEASE_RECOVERY_ENABLED &&
