@@ -1,6 +1,7 @@
 const { execSync } = require('child_process')
 const { existsSync, readdirSync, statSync } = require('fs')
 const path = require('path')
+const { startWorkerSupervisor } = require('./worker-supervisor')
 
 const parseBool = (value) => /^(1|true|yes)$/i.test(String(value || '').trim())
 
@@ -62,7 +63,12 @@ const hasDatabaseUrl = Boolean(String(process.env.DATABASE_URL || '').trim())
 const skipMigrations = parseBool(process.env.SKIP_PRISMA_MIGRATIONS)
 const shouldBuildOnStartup = parseBool(process.env.BUILD_ON_STARTUP)
 const shouldGeneratePrismaOnStartup = parseBool(process.env.PRISMA_GENERATE_ON_STARTUP)
-const shouldInstallCaptionRuntimeOnStartup = parseBool(process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP)
+const rawCaptionRuntimeInstallToggle = String(
+  process.env.INSTALL_CAPTION_RUNTIME_ON_STARTUP ??
+  process.env.INSTALL_CAPTION_RUNTIME ??
+  ''
+).trim()
+const shouldInstallCaptionRuntimeOnStartup = !/^(0|false|no|off)$/i.test(rawCaptionRuntimeInstallToggle)
 const distEntryPath = path.resolve(process.cwd(), 'dist', 'worker.js')
 const sourceMtimeMs = Math.max(
   getLatestMtimeMs(path.resolve(process.cwd(), 'src')),
@@ -98,5 +104,8 @@ if (!hasDatabaseUrl) {
   run('Applying Prisma migrations', 'prisma migrate deploy', { allowFailure: true })
 }
 
-console.log('[startup] Starting pipeline worker')
-require('../dist/worker.js')
+console.log('[startup] Starting pipeline worker supervisor')
+startWorkerSupervisor({
+  workerEntryPath: distEntryPath,
+  label: 'pipeline worker'
+})

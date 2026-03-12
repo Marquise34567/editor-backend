@@ -4,7 +4,9 @@ loadEnv()
 
 const start = async () => {
   await import('./routes/jobs')
-  console.log('[worker] background job processor started')
+  const replicaLabel = String(process.env.WORKER_REPLICA || '').trim()
+  const suffix = replicaLabel ? ` replica=${replicaLabel}` : ''
+  console.log(`[worker] background job processor started (pid=${process.pid}${suffix})`)
 
   // Keep process alive; jobs module runs queue recovery + pipeline execution.
   setInterval(() => {

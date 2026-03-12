@@ -1,6 +1,7 @@
 const { execSync } = require('child_process')
 const { existsSync, readdirSync, statSync } = require('fs')
 const path = require('path')
+const { startWorkerSupervisor } = require('./worker-supervisor')
 
 const parseBool = (value) => /^(1|true|yes)$/i.test(String(value || '').trim())
 
@@ -108,8 +109,11 @@ if (!hasDatabaseUrl) {
 }
 
 if (shouldStartWorker) {
-  console.log('[startup] Starting pipeline worker')
-  require('../dist/worker.js')
+  console.log('[startup] Starting pipeline worker supervisor')
+  startWorkerSupervisor({
+    workerEntryPath: workerDistEntryPath,
+    label: 'pipeline worker'
+  })
 } else {
   console.log('[startup] Starting API server')
   require('../dist/index.js')
