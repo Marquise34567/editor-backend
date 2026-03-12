@@ -28316,6 +28316,117 @@ const summarizeVerticalRejections = (reasons: string[]) => {
     .map(([reason, count]) => `${reason}:${count}`)
 }
 
+const EMOTIONAL_CLIP_KEYWORD_PATTERNS: RegExp[] = [
+  /\b(funny|laugh|hilarious|lol|lmao|joke|comedy|roast)\b/i,
+  /\b(awkward|cringe|embarrass(?:ed|ing)?|uncomfortable|silence)\b/i,
+  /\b(crazy|insane|wild|chaos|wtf|no way|shocking|unreal)\b/i,
+  /\b(dramatic|intense|tense|suspense|cliffhanger|plot twist|reveal)\b/i,
+  /\b(angry|rage|sad|cry|tears|fear|panic|emotional|heartbreaking)\b/i
+]
+
+const computeTranscriptEmotionKeywordSignal = ({
+  transcriptCues,
+  start,
+  end
+}: {
+  transcriptCues: TranscriptCue[]
+  start: number
+  end: number
+}) => {
+  if (!Array.isArray(transcriptCues) || !transcriptCues.length) return 0
+  const relevant = transcriptCues.filter((cue) => cue.end > start && cue.start < end)
+  if (!relevant.length) return 0
+  let aggregate = 0
+  let keywordHitCount = 0
+  for (const cue of relevant) {
+    const text = String(cue.text || '').toLowerCase()
+    const keywordHits = EMOTIONAL_CLIP_KEYWORD_PATTERNS.reduce((sum, pattern) => (
+      pattern.test(text) ? sum + 1 : sum
+    ), 0)
+    if (keywordHits > 0) keywordHitCount += 1
+    const cueSignal = clamp01(
+      0.42 * clamp01(keywordHits / 2) +
+      0.28 * clamp01(Number(cue.emotionalIntensity ?? 0)) +
+      0.18 * clamp01(Number(cue.interestingness ?? 0)) +
+      0.12 * clamp01(Number(cue.hookTypeStrength ?? 0))
+    )
+    aggregate += cueSignal
+  }
+  return clamp01(
+    0.68 * (aggregate / Math.max(1, relevant.length)) +
+    0.32 * clamp01(keywordHitCount / Math.max(1, Math.ceil(relevant.length * 0.45)))
+  )
+}
+
+const computeClipEmotionPeakSignal = ({
+  windows,
+  start,
+  end
+}: {
+  windows: EngagementWindow[]
+  start: number
+  end: number
+}) => {
+  const averageSignal = averageWindowMetric(windows, start, end, (window) => (
+    0.36 * window.emotionIntensity +
+    0.26 * clamp01(window.emotionalSpike > 0 ? 1 : 0) +
+    0.2 * window.vocalExcitement +
+    0.1 * (window.actionSpike ?? 0) +
+    0.08 * (window.curiosityTrigger ?? 0)
+  ))
+  let peakSignal = 0
+  for (const window of windows) {
+    if (window.time < start || window.time >= end) continue
+    const signal = clamp01(
+      0.38 * window.emotionIntensity +
+      0.28 * clamp01(window.emotionalSpike > 0 ? 1 : 0) +
+      0.18 * window.vocalExcitement +
+      0.1 * (window.actionSpike ?? 0) +
+      0.06 * (window.curiosityTrigger ?? 0)
+    )
+    if (signal > peakSignal) peakSignal = signal
+  }
+  return clamp01(0.58 * averageSignal + 0.42 * peakSignal)
+}
+
+const computeHookAnchorSignal = ({
+  start,
+  end,
+  hookCandidates
+}: {
+  start: number
+  end: number
+  hookCandidates: HookCandidate[]
+}) => {
+  if (!Array.isArray(hookCandidates) || !hookCandidates.length) return 0
+  const clipDuration = Math.max(0.2, end - start)
+  const clipCenter = start + clipDuration * 0.5
+  let best = 0
+  for (const hook of hookCandidates.slice(0, 8)) {
+    const hookStart = Number(hook.start || 0)
+    const hookDuration = Math.max(0.2, Number(hook.duration || HOOK_MIN))
+    const hookEnd = hookStart + hookDuration
+    const overlap = Math.max(0, Math.min(end, hookEnd) - Math.max(start, hookStart))
+    const overlapRatio = clamp01(overlap / Math.max(0.2, Math.min(clipDuration, hookDuration)))
+    const hookCenter = hookStart + hookDuration * 0.5
+    const distance = Math.abs(clipCenter - hookCenter)
+    const distanceAllowance = Math.max(6, Math.min(28, clipDuration * 0.72 + hookDuration * 0.68))
+    const proximity = clamp01(1 - (distance / distanceAllowance))
+    const confidence = clamp01(
+      0.56 * Number(hook.score || 0) +
+      0.34 * Number(hook.auditScore || 0) +
+      0.1 * Number(Boolean(hook.auditPassed))
+    )
+    const signal = clamp01(
+      0.46 * overlapRatio +
+      0.42 * proximity +
+      0.12 * confidence
+    )
+    if (signal > best) best = signal
+  }
+  return best
+}
+
 const buildSyntheticVerticalRetentionCandidate = ({
   range,
   reason,
@@ -28447,6 +28558,8 @@ const buildVerticalRetentionCandidates = ({
   durationSeconds,
   requestedCount,
   windows,
+  transcriptCues,
+  hookCandidates,
   platformProfile,
   strategyProfile,
   editorMode,
@@ -28458,6 +28571,8 @@ const buildVerticalRetentionCandidates = ({
   durationSeconds: number
   requestedCount: number
   windows: EngagementWindow[]
+  transcriptCues?: TranscriptCue[]
+  hookCandidates?: HookCandidate[]
   platformProfile?: PlatformProfile
   strategyProfile?: RetentionStrategyProfile | null
   editorMode?: EditorModeSelection | null
@@ -28514,6 +28629,18 @@ const buildVerticalRetentionCandidates = ({
     CLIP_CANDIDATE_POOL_MIN,
     CLIP_CANDIDATE_POOL_MAX
   ))
+  const resolvedTranscriptCues = Array.isArray(transcriptCues) ? transcriptCues : []
+  const resolvedHookCandidates = Array.isArray(hookCandidates)
+    ? hookCandidates
+        .filter((candidate) => Number.isFinite(Number(candidate.start)) && Number.isFinite(Number(candidate.duration)))
+        .slice()
+        .sort((a, b) => (
+          Number(Boolean(b.auditPassed)) - Number(Boolean(a.auditPassed)) ||
+          Number(b.auditScore || 0) - Number(a.auditScore || 0) ||
+          Number(b.score || 0) - Number(a.score || 0)
+        ))
+        .slice(0, 10)
+    : []
   if (!windows.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
@@ -28583,11 +28710,73 @@ const buildVerticalRetentionCandidates = ({
         : total >= 300
           ? 6
           : 3
-  const preScored: Array<{ range: TimeRange; score: number }> = []
-  const modeBias = getVerticalModeScoreBias(editorMode, resolvedSelectionMode)
+  const maxAnchorStart = Math.max(0, total - minDuration)
+  const anchorStarts = new Set<number>()
   for (let start = 0; start + minDuration <= total; start += stepSeconds) {
-    const startTime = Number(start.toFixed(3))
+    anchorStarts.add(Number(clamp(start, 0, maxAnchorStart).toFixed(3)))
+  }
+  for (const hook of resolvedHookCandidates.slice(0, 8)) {
+    const anchors = [hook.start - 6, hook.start - 3, hook.start - 1.25, hook.start + 1.1]
+    for (const anchor of anchors) {
+      anchorStarts.add(Number(clamp(anchor, 0, maxAnchorStart).toFixed(3)))
+    }
+  }
+  const emotionAnchorWindows = windows
+    .map((window) => ({
+      time: Number(window.time || 0),
+      signal: clamp01(
+        0.34 * window.emotionIntensity +
+        0.26 * clamp01(window.emotionalSpike > 0 ? 1 : 0) +
+        0.18 * window.vocalExcitement +
+        0.12 * (window.actionSpike ?? 0) +
+        0.1 * (window.curiosityTrigger ?? 0)
+      )
+    }))
+    .filter((window) => Number.isFinite(window.time) && window.time >= 0 && window.signal >= 0.45)
+    .sort((a, b) => b.signal - a.signal || a.time - b.time)
+    .slice(0, 120)
+  const emotionLeadIn = Math.min(12, Math.max(4, minDuration * 0.28))
+  for (const peak of emotionAnchorWindows) {
+    const anchors = [peak.time - emotionLeadIn, peak.time - emotionLeadIn * 0.55, peak.time - 2.2, peak.time - 0.9]
+    for (const anchor of anchors) {
+      anchorStarts.add(Number(clamp(anchor, 0, maxAnchorStart).toFixed(3)))
+    }
+  }
+  const transcriptEmotionAnchors = resolvedTranscriptCues
+    .map((cue) => {
+      const cueStart = Number(cue.start)
+      const cueEndRaw = Number(cue.end)
+      const cueEnd = Number.isFinite(cueEndRaw) && cueEndRaw > cueStart
+        ? cueEndRaw
+        : cueStart + 0.8
+      if (!Number.isFinite(cueStart) || cueStart < 0) return null
+      const signal = computeTranscriptEmotionKeywordSignal({
+        transcriptCues: [cue],
+        start: cueStart,
+        end: cueEnd
+      })
+      if (signal < 0.18) return null
+      return {
+        start: cueStart,
+        end: cueEnd,
+        signal
+      }
+    })
+    .filter((row): row is { start: number; end: number; signal: number } => Boolean(row))
+    .sort((a, b) => b.signal - a.signal || a.start - b.start)
+    .slice(0, 140)
+  for (const cue of transcriptEmotionAnchors) {
+    const anchors = [cue.start - 8, cue.start - 4, cue.start - 1.5]
+    for (const anchor of anchors) {
+      anchorStarts.add(Number(clamp(anchor, 0, maxAnchorStart).toFixed(3)))
+    }
+  }
+  const anchorList = Array.from(anchorStarts.values()).sort((a, b) => a - b)
+  const preScoredMap = new Map<string, { range: TimeRange; score: number }>()
+  const modeBias = getVerticalModeScoreBias(editorMode, resolvedSelectionMode)
+  for (const anchorStart of anchorList) {
     for (const duration of clipDurations) {
+      const startTime = Number(clamp(anchorStart, 0, Math.max(0, total - duration)).toFixed(3))
       const endTime = Number((startTime + duration).toFixed(3))
       if (endTime > total) continue
       const intro = averageWindowMetric(windows, startTime, Math.min(endTime, startTime + 3), (window) => (
@@ -28643,11 +28832,43 @@ const buildVerticalRetentionCandidates = ({
         0.12 * window.audioEnergy +
         0.12 * (window.visualImpact ?? window.score)
       ))
+      const clipCenter = startTime + duration * 0.5
+      let emotionAnchorProximity = 0
+      for (const peak of emotionAnchorWindows) {
+        const distance = Math.abs(clipCenter - peak.time)
+        const allowance = Math.max(8, Math.min(26, duration * 0.45))
+        const proximity = clamp01(1 - (distance / allowance))
+        const weighted = proximity * peak.signal
+        if (weighted > emotionAnchorProximity) emotionAnchorProximity = weighted
+      }
+      const emotionalMomentBoost = clamp01(
+        0.72 * computeClipEmotionPeakSignal({ windows, start: startTime, end: endTime }) +
+        0.28 * emotionAnchorProximity
+      )
+      const hookAnchorBoost = computeHookAnchorSignal({
+        start: startTime,
+        end: endTime,
+        hookCandidates: resolvedHookCandidates
+      })
+      let transcriptEmotionSignal = 0
+      for (const cue of transcriptEmotionAnchors) {
+        const overlap = Math.max(0, Math.min(endTime, cue.end) - Math.max(startTime, cue.start))
+        const overlapRatio = clamp01(overlap / Math.max(0.5, Math.min(duration, cue.end - cue.start)))
+        const cueMid = cue.start + (cue.end - cue.start) * 0.5
+        const distance = Math.abs(clipCenter - cueMid)
+        const allowance = Math.max(8, Math.min(24, duration * 0.42))
+        const proximity = clamp01(1 - (distance / allowance))
+        const signal = cue.signal * clamp01(0.62 * overlapRatio + 0.38 * proximity)
+        if (signal > transcriptEmotionSignal) transcriptEmotionSignal = signal
+      }
       const score = clamp01(
-        0.4 * entertainmentImpact +
-        0.3 * nicheRelevance +
-        0.2 * retentionPotential +
+        0.33 * entertainmentImpact +
+        0.22 * nicheRelevance +
+        0.18 * retentionPotential +
         0.1 * visualAudioStrength +
+        0.09 * emotionalMomentBoost +
+        0.08 * hookAnchorBoost +
+        0.05 * transcriptEmotionSignal +
         0.05 * modeBias.hook +
         0.05 * modeBias.interrupt +
         0.04 * modeBias.ending +
@@ -28655,9 +28876,17 @@ const buildVerticalRetentionCandidates = ({
         0.03 * modeBias.caption
       )
       if (duration > 35 && score < 0.72) continue
-      preScored.push({ range: { start: startTime, end: endTime }, score })
+      const key = `${startTime.toFixed(3)}:${endTime.toFixed(3)}`
+      const existing = preScoredMap.get(key)
+      if (!existing || score > existing.score) {
+        preScoredMap.set(key, {
+          range: { start: startTime, end: endTime },
+          score
+        })
+      }
     }
   }
+  const preScored = Array.from(preScoredMap.values())
   if (!preScored.length) {
     const fallbackRanges = buildVerticalPaddingRanges({
       durationSeconds: total,
@@ -32988,6 +33217,8 @@ const processJob = async (
         requestedCount: verticalRequestedClipCount,
         clipDurationMaxSeconds: renderConfig.verticalClipDurationSeconds,
         windows: verticalWindows,
+        transcriptCues: verticalSourceCues,
+        hookCandidates: getHookCandidatesFromAnalysis(verticalAnalysis),
         platformProfile: platformProfileId,
         strategyProfile,
         editorMode: editorModeForRender,
