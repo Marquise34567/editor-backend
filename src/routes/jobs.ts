@@ -6413,6 +6413,42 @@ const parseVerticalCaptionOverlayToneBySlot = (value?: any): Record<string, Vert
   return Object.keys(out).length ? out : null
 }
 
+const applyVerticalCaptionOverlayTone = (
+  config: VerticalCaptionConfig,
+  tone?: VerticalCaptionOverlayTone | null
+): VerticalCaptionConfig => {
+  const resolvedTone = parseVerticalCaptionOverlayTone(tone) || 'none'
+  if (resolvedTone === 'white') {
+    return {
+      ...config,
+      boxEnabled: true,
+      boxColor: 'FFFFFF',
+      textColor: '111111',
+      accentColor: '111111',
+      outlineColor: '111111',
+      outlineWidth: 2,
+      shadowEnabled: false,
+      shadowBlur: 0,
+      shadowColor: '000000'
+    }
+  }
+  if (resolvedTone === 'black') {
+    return {
+      ...config,
+      boxEnabled: true,
+      boxColor: '000000',
+      textColor: 'FFFFFF',
+      accentColor: 'FFFFFF',
+      outlineColor: '000000',
+      outlineWidth: 2,
+      shadowEnabled: false,
+      shadowBlur: 0,
+      shadowColor: '000000'
+    }
+  }
+  return config
+}
+
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).verticalCaptions
@@ -6770,6 +6806,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     positionXCandidate === undefined &&
     positionYCandidate === undefined &&
     variantPositionsCandidate === undefined &&
+    clipTextBySlotCandidate === undefined &&
+    clipOverlayToneBySlotCandidate === undefined &&
     autoGenerateCandidate === null &&
     enabledCandidate === null &&
     shadowEnabledCandidate === null &&
@@ -6800,6 +6838,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
   const parsedPositionX = parseVerticalCaptionPosition(positionXCandidate)
   const parsedPositionY = parseVerticalCaptionPosition(positionYCandidate)
   const parsedVariantPositions = parseVerticalVariantCaptionPositions(variantPositionsCandidate)
+  const parsedClipTextBySlot = parseVerticalCaptionTextBySlot(clipTextBySlotCandidate)
+  const parsedClipOverlayToneBySlot = parseVerticalCaptionOverlayToneBySlot(clipOverlayToneBySlotCandidate)
   return {
     ...(textCandidate === undefined ? {} : { text: normalizeVerticalCaptionTextInput(textCandidate) }),
     ...(parsedPreset ? { preset: parsedPreset } : {}),
@@ -6827,6 +6867,8 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     ...(parsedPositionX !== null ? { positionX: parsedPositionX } : {}),
     ...(parsedPositionY !== null ? { positionY: parsedPositionY } : {}),
     ...(parsedVariantPositions ? { variantPositions: parsedVariantPositions } : {}),
+    ...(clipTextBySlotCandidate === undefined ? {} : { clipTextBySlot: parsedClipTextBySlot }),
+    ...(clipOverlayToneBySlotCandidate === undefined ? {} : { clipOverlayToneBySlot: parsedClipOverlayToneBySlot }),
     ...(autoGenerateCandidate === null ? {} : { autoGenerate: autoGenerateCandidate }),
     ...(enabledCandidate === null ? {} : { enabled: enabledCandidate })
   }
@@ -7160,6 +7202,16 @@ const resolveVerticalCaptionConfig = (
   const fallbackPositionX = parseVerticalCaptionPosition(defaults?.positionX) ?? 0.5
   const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? DEFAULT_VERTICAL_CAPTION_POSITION_Y
   const fallbackVariantPositions = parseVerticalVariantCaptionPositions((defaults as any)?.variantPositions)
+  const fallbackClipTextBySlot = parseVerticalCaptionTextBySlot((defaults as any)?.clipTextBySlot) || null
+  const fallbackClipOverlayToneBySlot = parseVerticalCaptionOverlayToneBySlot((defaults as any)?.clipOverlayToneBySlot) || null
+  const hasOverrideClipTextBySlot = Object.prototype.hasOwnProperty.call(override, 'clipTextBySlot')
+  const hasOverrideClipOverlayToneBySlot = Object.prototype.hasOwnProperty.call(override, 'clipOverlayToneBySlot')
+  const overrideClipTextBySlot = hasOverrideClipTextBySlot
+    ? parseVerticalCaptionTextBySlot((override as any).clipTextBySlot)
+    : undefined
+  const overrideClipOverlayToneBySlot = hasOverrideClipOverlayToneBySlot
+    ? parseVerticalCaptionOverlayToneBySlot((override as any).clipOverlayToneBySlot)
+    : undefined
   const overrideAnimation = parseVerticalCaptionAnimationMode((override as any)?.animation)
   const overrideAnimationEnabled = typeof override.animationEnabled === 'boolean'
     ? override.animationEnabled
@@ -7205,7 +7257,9 @@ const resolveVerticalCaptionConfig = (
     removeFillers: typeof override.removeFillers === 'boolean' ? override.removeFillers : styleBaseline.removeFillers,
     positionX: parseVerticalCaptionPosition(override.positionX) ?? fallbackPositionX,
     positionY: parseVerticalCaptionPosition(override.positionY) ?? fallbackPositionY,
-    variantPositions: parseVerticalVariantCaptionPositions((override as any).variantPositions) || fallbackVariantPositions || null
+    variantPositions: parseVerticalVariantCaptionPositions((override as any).variantPositions) || fallbackVariantPositions || null,
+    clipTextBySlot: overrideClipTextBySlot !== undefined ? overrideClipTextBySlot : fallbackClipTextBySlot,
+    clipOverlayToneBySlot: overrideClipOverlayToneBySlot !== undefined ? overrideClipOverlayToneBySlot : fallbackClipOverlayToneBySlot
   }
 }
 
@@ -7239,7 +7293,9 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     boxColor: '000000',
     positionX: 0.5,
     positionY: DEFAULT_VERTICAL_CAPTION_POSITION_Y,
-    variantPositions: null
+    variantPositions: null,
+    clipTextBySlot: null,
+    clipOverlayToneBySlot: null
   })
 }
 
@@ -7280,6 +7336,8 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
   const dynamicMode = parseVerticalCaptionDynamicMode((config as any).dynamicMode) ?? defaults.dynamicMode
   const voicePreset = parseVerticalVoicePreset((config as any).voicePreset) ?? defaults.voicePreset
   const pacingPreset = parseVerticalPacingPreset((config as any).pacingPreset) ?? defaults.pacingPreset
+  const clipTextBySlot = parseVerticalCaptionTextBySlot((config as any).clipTextBySlot)
+  const clipOverlayToneBySlot = parseVerticalCaptionOverlayToneBySlot((config as any).clipOverlayToneBySlot)
   const normalized: VerticalCaptionConfig = {
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
@@ -7308,7 +7366,9 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     boxColor: parseVerticalCaptionHexColor(config.boxColor) || defaults.boxColor,
     positionX: parseVerticalCaptionPosition(config.positionX) ?? defaults.positionX,
     positionY: parseVerticalCaptionPosition(config.positionY) ?? defaults.positionY,
-    variantPositions: parseVerticalVariantCaptionPositions((config as any).variantPositions) || null
+    variantPositions: parseVerticalVariantCaptionPositions((config as any).variantPositions) || null,
+    clipTextBySlot,
+    clipOverlayToneBySlot
   }
   const animationMode: VerticalClipCaptionAnimation = normalized.animation
   return {
@@ -7357,7 +7417,15 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
       positionX: normalized.positionX,
       positionY: normalized.positionY,
       variantPositions: normalized.variantPositions,
-      variant_positions: normalized.variantPositions
+      variant_positions: normalized.variantPositions,
+      clipTextBySlot: normalized.clipTextBySlot,
+      clip_text_by_slot: normalized.clipTextBySlot,
+      variantClipCaptions: normalized.clipTextBySlot,
+      variant_clip_captions: normalized.clipTextBySlot,
+      clipOverlayToneBySlot: normalized.clipOverlayToneBySlot,
+      clip_overlay_tone_by_slot: normalized.clipOverlayToneBySlot,
+      overlayToneBySlot: normalized.clipOverlayToneBySlot,
+      overlay_tone_by_slot: normalized.clipOverlayToneBySlot
     },
     verticalCaptionEnabled: normalized.enabled,
     vertical_caption_enabled: normalized.enabled,
@@ -7418,7 +7486,17 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     verticalCaptionPositionY: normalized.positionY,
     vertical_caption_position_y: normalized.positionY,
     verticalVariantCaptionPositions: normalized.variantPositions,
-    vertical_variant_caption_positions: normalized.variantPositions
+    vertical_variant_caption_positions: normalized.variantPositions,
+    verticalVariantClipCaptions: normalized.clipTextBySlot,
+    vertical_variant_clip_captions: normalized.clipTextBySlot,
+    verticalClipCaptionTextBySlot: normalized.clipTextBySlot,
+    vertical_clip_caption_text_by_slot: normalized.clipTextBySlot,
+    verticalClipCaptionOverlayBySlot: normalized.clipOverlayToneBySlot,
+    vertical_clip_caption_overlay_by_slot: normalized.clipOverlayToneBySlot,
+    clipCaptionOverlayToneBySlot: normalized.clipOverlayToneBySlot,
+    clip_caption_overlay_tone_by_slot: normalized.clipOverlayToneBySlot,
+    verticalCaptionOverlayToneBySlot: normalized.clipOverlayToneBySlot,
+    vertical_caption_overlay_tone_by_slot: normalized.clipOverlayToneBySlot
   }
 }
 
@@ -33495,18 +33573,6 @@ const processJob = async (
       const shouldApplyVerticalCaptionOverlays = (
         Boolean(verticalCaptionConfig.enabled)
       )
-      const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
-        preset: verticalCaptionConfig.preset,
-        animationEnabled: verticalCaptionConfig.animationEnabled,
-        animation: verticalCaptionConfig.animation,
-        fontId: verticalCaptionConfig.fontId,
-        fontSize: verticalCaptionConfig.fontSize,
-        textColor: verticalCaptionConfig.textColor,
-        accentColor: verticalCaptionConfig.accentColor,
-        outlineColor: verticalCaptionConfig.outlineColor,
-        outlineWidth: verticalCaptionConfig.outlineWidth,
-        fallbackStyle: subtitleStyle
-      })
       const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
       const watermarkImageCandidates = [
         configuredWatermarkImage,
@@ -33705,19 +33771,44 @@ const processJob = async (
         let clipSubtitlePath: string | null = null
         let clipSubtitleIsAss = false
         let clipSubtitleStyle = subtitleStyle
-        const clipVariantKey = resolveVerticalVariantCaptionKeyForClip({
+        const clipSlotMeta = resolveVerticalVariantSlotMetaForClip({
           clipIndex: idx,
           clipCount: clipRanges.length,
-          explicitVariant: clipVariantHints[idx]?.variant
+          explicitVariant: clipVariantHints[idx]?.variant,
+          explicitVersion: clipVariantHints[idx]?.version
         })
-        const clipVariantPosition = verticalCaptionConfig.variantPositions?.[clipVariantKey] || null
-        const clipCaptionConfig: VerticalCaptionConfig = clipVariantPosition
+        const clipVariantPosition = verticalCaptionConfig.variantPositions?.[clipSlotMeta.variant] || null
+        const clipCaptionTextOverride = verticalCaptionConfig.clipTextBySlot?.[clipSlotMeta.slotKey]
+        const clipCaptionTextForClip = normalizeVerticalCaptionTextInput(
+          typeof clipCaptionTextOverride === 'string' ? clipCaptionTextOverride : verticalCaptionTextInput
+        )
+        const clipOverlayTone = parseVerticalCaptionOverlayTone(
+          verticalCaptionConfig.clipOverlayToneBySlot?.[clipSlotMeta.slotKey]
+        ) || 'none'
+        const clipBaseCaptionConfig: VerticalCaptionConfig = clipVariantPosition
           ? {
               ...verticalCaptionConfig,
+              text: clipCaptionTextForClip,
               positionX: clipVariantPosition.x,
               positionY: clipVariantPosition.y
             }
-          : verticalCaptionConfig
+          : {
+              ...verticalCaptionConfig,
+              text: clipCaptionTextForClip
+            }
+        const clipCaptionConfig = applyVerticalCaptionOverlayTone(clipBaseCaptionConfig, clipOverlayTone)
+        const clipOverlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
+          preset: clipCaptionConfig.preset,
+          animationEnabled: clipCaptionConfig.animationEnabled,
+          animation: clipCaptionConfig.animation,
+          fontId: clipCaptionConfig.fontId,
+          fontSize: clipCaptionConfig.fontSize,
+          textColor: clipCaptionConfig.textColor,
+          accentColor: clipCaptionConfig.accentColor,
+          outlineColor: clipCaptionConfig.outlineColor,
+          outlineWidth: clipCaptionConfig.outlineWidth,
+          fallbackStyle: subtitleStyle
+        })
         const clipSegment: Segment = {
           start: Number(range.start.toFixed(3)),
           end: Number(range.end.toFixed(3)),
@@ -33731,7 +33822,7 @@ const processJob = async (
               },
               clipIndex: idx,
               windows: verticalWindows,
-              userCaptionText: verticalCaptionTextInput,
+              userCaptionText: clipCaptionTextForClip,
               transcriptCues: verticalSourceCues,
               captionPreset: clipCaptionConfig.preset,
               dynamicMode: clipCaptionConfig.dynamicMode,
@@ -33762,7 +33853,7 @@ const processJob = async (
         }
         if (clipOverlayCues.length) {
           clipCueLayers.push(clipOverlayCues)
-          clipSubtitleStyle = overlaySubtitleStyle
+          clipSubtitleStyle = clipOverlaySubtitleStyle
         }
         const mergedClipCues = mergeTranscriptCueLayers(clipCueLayers)
         if (mergedClipCues.length) {
