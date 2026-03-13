@@ -82,7 +82,7 @@ export const r2 = {
     Key,
     UploadId,
     PartNumber,
-    expiresIn = 900
+    expiresIn = 7200
   }: {
     Key: string
     UploadId: string

@@ -175,14 +175,25 @@ router.post('/create', async (req: any, res) => {
     const idSegment = resolvedJobId || crypto.randomUUID()
     const key = `uploads/${userId}/${idSegment}/${Date.now()}-${safeName}`
 
-    // Choose part size (start 15MB) and ensure parts <= 10000
+    // Choose part size based on file size and ensure parts <= 10000.
     const MIN_PART_SIZE = 5 * 1024 * 1024
-    let partSize = 15 * 1024 * 1024
+    const selectPartSize = (totalBytes: number) => {
+      if (totalBytes >= 2 * 1024 * MB) return 32 * 1024 * 1024
+      if (totalBytes >= 1024 * MB) return 24 * 1024 * 1024
+      if (totalBytes >= 512 * MB) return 20 * 1024 * 1024
+      if (totalBytes >= 256 * MB) return 16 * 1024 * 1024
+      return 12 * 1024 * 1024
+    }
+    let partSize = Math.max(MIN_PART_SIZE, selectPartSize(sizeBytes))
     let partsCount = Math.ceil(sizeBytes / partSize)
     while (partsCount > 10000) {
       partSize = Math.max(partSize * 2, MIN_PART_SIZE)
       partsCount = Math.ceil(sizeBytes / partSize)
     }
+
+    // Keep part URLs valid for long uploads on slower networks.
+    const estimatedUploadSecondsAt4Mbps = Math.ceil((sizeBytes * 8) / 4_000_000)
+    const presignExpiresInSec = Math.max(900, Math.min(7200, Math.ceil(estimatedUploadSecondsAt4Mbps * 1.6)))
 
     // Initiate multipart upload
     let uploadId: string
@@ -195,18 +206,33 @@ router.post('/create', async (req: any, res) => {
       return res.status(500).json({ error: 'R2_CREATE_FAILED', details: String(e?.message || e) })
     }
 
-    // Generate presigned URLs for each part
+    // Generate presigned URLs for each part with bounded concurrency.
     const presignedParts: { partNumber: number; url: string }[] = []
-    for (let partNumber = 1; partNumber <= partsCount; partNumber++) {
-      try {
-        const url = await r2.getPresignedUploadPartUrl({ Key: key, UploadId: uploadId, PartNumber: partNumber })
+    const signConcurrency = Math.max(2, Math.min(24, partsCount >= 200 ? 24 : partsCount >= 80 ? 16 : 8))
+    let nextPartNumber = 1
+    const signWorker = async () => {
+      while (nextPartNumber <= partsCount) {
+        const partNumber = nextPartNumber
+        nextPartNumber += 1
+        const url = await r2.getPresignedUploadPartUrl({
+          Key: key,
+          UploadId: uploadId,
+          PartNumber: partNumber,
+          expiresIn: presignExpiresInSec
+        })
         presignedParts.push({ partNumber, url })
-      } catch (e: any) {
-        logAwsError('getPresignedUploadPartUrl failed', e)
-        // Abort on failure
-        try { await r2.abortMultipartUpload({ Key: key, UploadId: uploadId }) } catch (e) {}
-        return res.status(500).json({ error: 'R2_SIGN_PARTS_FAILED', details: String(e?.message || e) })
       }
+    }
+    try {
+      await Promise.all(
+        Array.from({ length: Math.min(signConcurrency, partsCount) }, () => signWorker())
+      )
+      presignedParts.sort((a, b) => a.partNumber - b.partNumber)
+    } catch (e: any) {
+      logAwsError('getPresignedUploadPartUrl failed', e)
+      // Abort on failure
+      try { await r2.abortMultipartUpload({ Key: key, UploadId: uploadId }) } catch (e) {}
+      return res.status(500).json({ error: 'R2_SIGN_PARTS_FAILED', details: String(e?.message || e) })
     }
 
     return res.json({
