@@ -29081,10 +29081,23 @@ const buildVerticalRetentionCandidates = ({
       a.range.start - b.range.start
     ))
   const selected: VerticalRetentionCandidate[] = []
+  const getCandidateCenter = (candidate: VerticalRetentionCandidate) => (
+    candidate.range.start + (Math.max(0.2, candidate.range.end - candidate.range.start) * 0.5)
+  )
   const hasMatchingRange = (candidate: VerticalRetentionCandidate) => selected.some((entry) => (
     Math.abs(entry.range.start - candidate.range.start) < 0.01 &&
     Math.abs(entry.range.end - candidate.range.end) < 0.01
   ))
+  const hasOverlapWithSpacing = (candidate: VerticalRetentionCandidate, spacing: number) => selected.some((entry) => (
+    candidate.range.start < entry.range.end + spacing &&
+    candidate.range.end > entry.range.start - spacing
+  ))
+  const trySelectCandidate = (candidate: VerticalRetentionCandidate, spacing: number) => {
+    if (hasMatchingRange(candidate)) return false
+    if (hasOverlapWithSpacing(candidate, spacing)) return false
+    selected.push(candidate)
+    return true
+  }
   const minSpacing = Math.max(2, getVerticalInterruptTargetIntervalSeconds({
     platformProfile,
     strategyProfile,
@@ -29092,14 +29105,38 @@ const buildVerticalRetentionCandidates = ({
     styleProfile,
     selectionMode: resolvedSelectionMode
   }) * 2)
+  const timelineBucketCount = Math.max(1, outputTarget)
+  const timelineBuckets: VerticalRetentionCandidate[][] = Array.from(
+    { length: timelineBucketCount },
+    () => [] as VerticalRetentionCandidate[]
+  )
+  const totalDurationForBuckets = Math.max(0.001, total)
+  for (const candidate of sortedAccepted) {
+    const center = getCandidateCenter(candidate)
+    const bucketIndex = Math.round(clamp(
+      Math.floor((center / totalDurationForBuckets) * timelineBucketCount),
+      0,
+      timelineBucketCount - 1
+    ))
+    timelineBuckets[bucketIndex].push(candidate)
+  }
+  for (const bucket of timelineBuckets) {
+    bucket.sort((a, b) => (
+      b.predictedCompletion - a.predictedCompletion ||
+      b.predictorBreakdown.hookStrength - a.predictorBreakdown.hookStrength ||
+      a.range.start - b.range.start
+    ))
+  }
+  const timelineSeedSpacing = Math.max(0.75, minSpacing * 0.42)
+  for (const bucket of timelineBuckets) {
+    if (selected.length >= outputTarget) break
+    for (const candidate of bucket) {
+      if (trySelectCandidate(candidate, timelineSeedSpacing)) break
+    }
+  }
   for (const candidate of sortedAccepted) {
     if (selected.length >= outputTarget) break
-    const overlaps = selected.some((entry) => (
-      candidate.range.start < entry.range.end + minSpacing &&
-      candidate.range.end > entry.range.start - minSpacing
-    ))
-    if (overlaps) continue
-    selected.push(candidate)
+    trySelectCandidate(candidate, minSpacing)
   }
   if (selected.length < outputTarget) {
     const relaxedSpacings = [Math.max(1.25, minSpacing * 0.55), Math.max(0.5, minSpacing * 0.2), 0]
@@ -29107,15 +29144,7 @@ const buildVerticalRetentionCandidates = ({
       if (selected.length >= outputTarget) break
       for (const candidate of sortedAccepted) {
         if (selected.length >= outputTarget) break
-        if (hasMatchingRange(candidate)) continue
-        if (spacing > 0) {
-          const overlaps = selected.some((entry) => (
-            candidate.range.start < entry.range.end + spacing &&
-            candidate.range.end > entry.range.start - spacing
-          ))
-          if (overlaps) continue
-        }
-        selected.push(candidate)
+        trySelectCandidate(candidate, spacing)
       }
     }
   }
