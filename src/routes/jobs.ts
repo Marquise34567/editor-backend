@@ -26302,6 +26302,16 @@ const MEDIAPIPE_CORNER_SCAN_MIN_CONFIDENCE = (() => {
   if (!Number.isFinite(raw)) return 0.5
   return Number(clamp(raw, 0.05, 0.95).toFixed(3))
 })()
+const AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO = (() => {
+  const raw = Number(process.env.AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO || 0.16)
+  if (!Number.isFinite(raw)) return 0.16
+  return Number(clamp(raw, 0, 0.45).toFixed(3))
+})()
+const AUTO_VERTICAL_WEBCAM_SHIFT_UP_TOP_RATIO = (() => {
+  const raw = Number(process.env.AUTO_VERTICAL_WEBCAM_SHIFT_UP_TOP_RATIO || 0.24)
+  if (!Number.isFinite(raw)) return 0.24
+  return Number(clamp(raw, 0, 0.52).toFixed(3))
+})()
 
 const getLocalCaptionRuntimePythonCandidates = () => {
   const candidates = [
@@ -26748,17 +26758,27 @@ const inferVerticalWebcamCropViaMediapipe = async ({
       sourceWidth,
       sourceHeight
     })
+    const shiftUpRatio = parsed.corner.startsWith('top')
+      ? AUTO_VERTICAL_WEBCAM_SHIFT_UP_TOP_RATIO
+      : AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO
+    const shiftedCrop = shiftVerticalWebcamCropUp({
+      crop: normalizedCrop,
+      sourceWidth,
+      sourceHeight,
+      shiftUpRatio
+    })
     console.log(`[${requestId || 'noid'}] mediapipe corner scan crop selected`, {
       corner: parsed.corner,
       confidence: parsed.confidence,
       detector: parsed.detector,
       fallback: parsed.fallback,
-      x: normalizedCrop.x,
-      y: normalizedCrop.y,
-      w: normalizedCrop.w,
-      h: normalizedCrop.h
+      x: shiftedCrop.x,
+      y: shiftedCrop.y,
+      w: shiftedCrop.w,
+      h: shiftedCrop.h,
+      shiftUpRatio
     })
-    return normalizedCrop
+    return shiftedCrop
   }
   return null
 }
@@ -29393,6 +29413,28 @@ const normalizeVerticalCropToSource = ({
     y: Math.round(y),
     w: Math.round(w),
     h: Math.round(h)
+  }
+}
+
+const shiftVerticalWebcamCropUp = ({
+  crop,
+  sourceWidth,
+  sourceHeight,
+  shiftUpRatio
+}: {
+  crop: VerticalWebcamCrop | null
+  sourceWidth: number
+  sourceHeight: number
+  shiftUpRatio: number
+}): VerticalWebcamCrop => {
+  const normalized = normalizeVerticalCropToSource({ crop, sourceWidth, sourceHeight })
+  const shiftRatio = clamp(shiftUpRatio, 0, 0.55)
+  if (shiftRatio <= 0) return normalized
+  const maxY = Math.max(0, sourceHeight - normalized.h)
+  const shiftedY = Math.round(clamp(normalized.y - (normalized.h * shiftRatio), 0, maxY))
+  return {
+    ...normalized,
+    y: shiftedY
   }
 }
 
@@ -33096,7 +33138,18 @@ const processJob = async (
           }
         }
       }
-      const resolvedVerticalWebcamCrop = inferredVerticalWebcamCrop || fixedVerticalWebcamCrop
+      const resolvedVerticalWebcamCrop = inferredVerticalWebcamCrop
+        ? inferredVerticalWebcamCrop
+        : (
+          shouldTryAutoWebcamCrop
+            ? shiftVerticalWebcamCropUp({
+                crop: fixedVerticalWebcamCrop,
+                sourceWidth: sourceStream.width,
+                sourceHeight: sourceStream.height,
+                shiftUpRatio: AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO
+              })
+            : fixedVerticalWebcamCrop
+        )
       const resolvedVerticalModeForRender: VerticalModeSettings = {
         ...resolvedVerticalMode,
         layout: 'stacked',
@@ -33136,8 +33189,6 @@ const processJob = async (
       const verticalAudioFilters = [...verticalBaseAudioFilters, ...verticalVoiceFilters]
       const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
       const shouldApplyVerticalCaptionOverlays = (
-        CAPTIONS_PIPELINE_ENABLED &&
-        Boolean(options.autoCaptions) &&
         Boolean(verticalCaptionConfig.enabled)
       )
       const overlaySubtitleStyle = buildVerticalCaptionSubtitleStyle({
@@ -37996,6 +38047,9 @@ const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
 const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
 )
+const JOB_RECOVERY_TAKEOVER_ENABLED = !/^(0|false|no)$/i.test(
+  String(process.env.JOB_RECOVERY_TAKEOVER_ENABLED || 'true').trim()
+)
 const PIPELINE_LEASE_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.PIPELINE_LEASE_RECOVERY_ENABLED || 'true').trim()
 )
@@ -38008,6 +38062,11 @@ const PIPELINE_NO_LEASE_STALE_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_NO_LEASE_STALE_GRACE_MS || 0)
   if (Number.isFinite(envVal) && envVal >= 8_000) return Math.round(envVal)
   return Math.max(15_000, PIPELINE_LEASE_STALE_GRACE_MS)
+})()
+const STARTABLE_QUEUE_TAKEOVER_MS = (() => {
+  const envVal = Number(process.env.STARTABLE_QUEUE_TAKEOVER_MS || 0)
+  if (Number.isFinite(envVal) && envVal >= 5_000) return Math.round(envVal)
+  return 45_000
 })()
 const QUEUE_RECOVERY_SKIP_ANALYZE = !/^(0|false|no)$/i.test(
   String(process.env.QUEUE_RECOVERY_SKIP_ANALYZE || 'true').trim()
@@ -38328,9 +38387,13 @@ const processQueue = () => {
   }
 }
 
-export const enqueuePipeline = (item: QueueItem) => {
+export const enqueuePipeline = (
+  item: QueueItem,
+  options?: { allowWhenProcessorDisabled?: boolean }
+) => {
   if (!item?.jobId || !item?.user?.id) return
-  if (!JOB_PROCESSOR_ENABLED) return
+  const allowWhenProcessorDisabled = Boolean(options?.allowWhenProcessorDisabled)
+  if (!JOB_PROCESSOR_ENABLED && !allowWhenProcessorDisabled) return
   if (queuedPipelineJobIds.has(item.jobId) || runningPipelineJobIds.has(item.jobId)) return
   const index = pipelineQueue.findIndex((queued) => queued.priorityLevel > item.priorityLevel)
   if (index === -1) {
@@ -38394,6 +38457,12 @@ const recoverQueuedJobs = async () => {
         (leaseTimedOut || noLeaseTimeout)
       )
       const startable = STARTABLE_QUEUE_STATUSES.has(status)
+      const staleStartableTakeover = (
+        !JOB_PROCESSOR_ENABLED &&
+        JOB_RECOVERY_TAKEOVER_ENABLED &&
+        startable &&
+        elapsedSinceUpdateMs >= STARTABLE_QUEUE_TAKEOVER_MS
+      )
       const staleRecoverable =
         STALE_RECOVERABLE_STATUSES.has(status) &&
         (elapsedSinceUpdateMs >= STALE_PIPELINE_MS || leaseExpiredRecoverable)
@@ -38430,6 +38499,13 @@ const recoverQueuedJobs = async () => {
         }
       }
 
+      const allowTakeoverWhenProcessorDisabled = (
+        !JOB_PROCESSOR_ENABLED &&
+        JOB_RECOVERY_TAKEOVER_ENABLED &&
+        (staleRecoverable || staleStartableTakeover)
+      )
+      if (!JOB_PROCESSOR_ENABLED && !allowTakeoverWhenProcessorDisabled) continue
+
       const requestedQuality = typeof job?.requestedQuality === 'string'
         ? normalizeQuality(job.requestedQuality)
         : undefined
@@ -38438,7 +38514,11 @@ const recoverQueuedJobs = async () => {
         user: { id: userId },
         requestedQuality,
         priorityLevel: Number(job?.priorityLevel ?? 2) || 2
-      })
+      }, { allowWhenProcessorDisabled: allowTakeoverWhenProcessorDisabled })
+      if (allowTakeoverWhenProcessorDisabled) {
+        const reason = staleRecoverable ? 'stale_pipeline_recovery' : 'startable_takeover_timeout'
+        console.warn(`[queue] takeover enqueued ${jobId} (${reason})`)
+      }
     }
   } catch (err) {
     console.error('[queue] recovery sweep failed', err)
@@ -38448,9 +38528,13 @@ const recoverQueuedJobs = async () => {
 }
 
 const startQueueRecoveryLoop = () => {
-  if (!JOB_PROCESSOR_ENABLED) {
-    console.log('[queue] job processor disabled for this process')
+  const recoveryLoopEnabled = JOB_PROCESSOR_ENABLED || JOB_RECOVERY_TAKEOVER_ENABLED
+  if (!recoveryLoopEnabled) {
+    console.log('[queue] job processor and recovery takeover are disabled for this process')
     return
+  }
+  if (!JOB_PROCESSOR_ENABLED && JOB_RECOVERY_TAKEOVER_ENABLED) {
+    console.log('[queue] running in recovery-takeover mode (processor disabled, stalled jobs can be rescued)')
   }
   if (queueRecoveryLoopStarted) return
   queueRecoveryLoopStarted = true
