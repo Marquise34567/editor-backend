@@ -8,8 +8,13 @@ const parseIntEnv = (value, fallback) => {
   return Math.round(parsed)
 }
 
-const resolveDefaultReplicaCount = () => {
-  const cpuCount = Array.isArray(os.cpus()) && os.cpus().length > 0 ? os.cpus().length : 1
+const getCpuCount = () => {
+  const cpuInfo = os.cpus()
+  if (!Array.isArray(cpuInfo) || cpuInfo.length <= 0) return 1
+  return cpuInfo.length
+}
+
+const resolveDefaultReplicaCount = (cpuCount) => {
   if (cpuCount <= 1) return 1
   return 2
 }
@@ -19,14 +24,25 @@ const startWorkerSupervisor = ({
   label = 'worker'
 }) => {
   const resolvedEntryPath = path.resolve(workerEntryPath)
+  const cpuCount = getCpuCount()
+  const defaultReplicas = resolveDefaultReplicaCount(cpuCount)
   const workerReplicas = parseIntEnv(
     process.env.JOB_WORKER_REPLICAS,
-    resolveDefaultReplicaCount()
+    defaultReplicas
   )
   const restartDelayMs = Math.max(100, parseIntEnv(process.env.JOB_WORKER_RESTART_DELAY_MS, 500))
   const shutdownGraceMs = Math.max(500, parseIntEnv(process.env.JOB_WORKER_SHUTDOWN_GRACE_MS, 5_000))
   let shuttingDown = false
   const childrenBySlot = new Map()
+
+  console.log(
+    `[startup] ${label} supervisor config: replicas=${workerReplicas} (cpu=${cpuCount}, default=${defaultReplicas})`
+  )
+  if (workerReplicas < 2) {
+    console.warn(
+      `[startup] ${label} redundancy is single-replica; set JOB_WORKER_REPLICAS=2+ for crash failover coverage`
+    )
+  }
 
   const spawnWorker = (slot, reason) => {
     if (shuttingDown) return
@@ -99,4 +115,3 @@ const startWorkerSupervisor = ({
 }
 
 module.exports = { startWorkerSupervisor }
-
