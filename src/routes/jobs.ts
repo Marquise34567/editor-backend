@@ -161,7 +161,50 @@ const ensureBucket = async (name: string, isPublic: boolean) => {
   return bucketChecks[name]
 }
 
+const resolveReadableLocalInputPath = (value: unknown) => {
+  const raw = String(value || '').trim()
+  if (!raw) return null
+
+  const candidates: string[] = []
+  if (path.isAbsolute(raw)) {
+    candidates.push(raw)
+  }
+  if (/^file:\/\//i.test(raw)) {
+    try {
+      const parsed = new URL(raw)
+      if (parsed.protocol === 'file:') {
+        let filePath = decodeURIComponent(parsed.pathname || '')
+        if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(filePath)) {
+          filePath = filePath.slice(1)
+        }
+        if (path.isAbsolute(filePath)) {
+          candidates.push(filePath)
+        }
+      }
+    } catch {
+      // ignore malformed file URL
+    }
+  }
+
+  for (const candidate of candidates) {
+    try {
+      const stats = fs.statSync(candidate)
+      if (stats.isFile()) return candidate
+    } catch {
+      // ignore missing local file candidates
+    }
+  }
+  return null
+}
+
 const downloadObjectToFile = async ({ key, destPath }: { key: string; destPath: string }) => {
+  const localInputPath = resolveReadableLocalInputPath(key)
+  if (localInputPath) {
+    await withRetries(`local_copy:${localInputPath}`, 2, async () => {
+      fs.copyFileSync(localInputPath, destPath)
+    })
+    return
+  }
   if (r2.isConfigured) {
     try {
       await withRetries(`r2_download:${key}`, 3, async () => {
@@ -26081,9 +26124,7 @@ const buildVerticalCaptionAss = ({
       ...cue,
       text: phrase
     }
-    const maxWordsPerBatch = config.preset === 'rage_mode'
-      ? MAX_VERTICAL_CAPTION_WORDS_PER_CUE
-      : Math.max(MAX_VERTICAL_CAPTION_WORDS_PER_CUE, cueWords.length || 1)
+    const maxWordsPerBatch = MAX_VERTICAL_CAPTION_WORDS_PER_CUE
     const cueBatches = splitVerticalCueIntoWordBatches({
       cue: cueForRenderBase,
       words: cueWords,
@@ -28416,11 +28457,12 @@ const summarizeVerticalRejections = (reasons: string[]) => {
 }
 
 const EMOTIONAL_CLIP_KEYWORD_PATTERNS: RegExp[] = [
-  /\b(funny|laugh|hilarious|lol|lmao|joke|comedy|roast)\b/i,
+  /\b(funny|laugh|hilarious|lol|lmao|joke|comedy|roast|meme)\b/i,
   /\b(awkward|cringe|embarrass(?:ed|ing)?|uncomfortable|silence)\b/i,
-  /\b(crazy|insane|wild|chaos|wtf|no way|shocking|unreal)\b/i,
+  /\b(crazy|insane|wild|chaos|wtf|no way|shocking|unreal|nasty|brutal)\b/i,
   /\b(dramatic|intense|tense|suspense|cliffhanger|plot twist|reveal)\b/i,
-  /\b(angry|rage|sad|cry|tears|fear|panic|emotional|heartbreaking)\b/i
+  /\b(angry|rage|sad|cry|tears|fear|panic|emotional|heartbreaking)\b/i,
+  /\b(why|how|what if|wait|secret|mystery|curious|curiosity|guess|prove|watch this)\b/i
 ]
 
 const computeTranscriptEmotionKeywordSignal = ({
@@ -28442,18 +28484,20 @@ const computeTranscriptEmotionKeywordSignal = ({
     const keywordHits = EMOTIONAL_CLIP_KEYWORD_PATTERNS.reduce((sum, pattern) => (
       pattern.test(text) ? sum + 1 : sum
     ), 0)
+    const punctuationBoost = /[!?]/.test(text) ? 1 : 0
     if (keywordHits > 0) keywordHitCount += 1
     const cueSignal = clamp01(
-      0.42 * clamp01(keywordHits / 2) +
-      0.28 * clamp01(Number(cue.emotionalIntensity ?? 0)) +
-      0.18 * clamp01(Number(cue.interestingness ?? 0)) +
-      0.12 * clamp01(Number(cue.hookTypeStrength ?? 0))
+      0.48 * clamp01(keywordHits / 3) +
+      0.24 * clamp01(Number(cue.emotionalIntensity ?? 0)) +
+      0.14 * clamp01(Number(cue.interestingness ?? 0)) +
+      0.1 * clamp01(Number(cue.hookTypeStrength ?? 0)) +
+      0.04 * punctuationBoost
     )
     aggregate += cueSignal
   }
   return clamp01(
-    0.68 * (aggregate / Math.max(1, relevant.length)) +
-    0.32 * clamp01(keywordHitCount / Math.max(1, Math.ceil(relevant.length * 0.45)))
+    0.62 * (aggregate / Math.max(1, relevant.length)) +
+    0.38 * clamp01(keywordHitCount / Math.max(1, Math.ceil(relevant.length * 0.45)))
   )
 }
 
@@ -28960,19 +29004,28 @@ const buildVerticalRetentionCandidates = ({
         const signal = cue.signal * clamp01(0.62 * overlapRatio + 0.38 * proximity)
         if (signal > transcriptEmotionSignal) transcriptEmotionSignal = signal
       }
+      const transcriptEmotionWindowSignal = computeTranscriptEmotionKeywordSignal({
+        transcriptCues: resolvedTranscriptCues,
+        start: startTime,
+        end: endTime
+      })
+      const combinedTranscriptEmotionSignal = clamp01(
+        0.62 * transcriptEmotionSignal +
+        0.38 * transcriptEmotionWindowSignal
+      )
       const score = clamp01(
-        0.33 * entertainmentImpact +
-        0.22 * nicheRelevance +
-        0.18 * retentionPotential +
-        0.1 * visualAudioStrength +
-        0.09 * emotionalMomentBoost +
-        0.08 * hookAnchorBoost +
-        0.05 * transcriptEmotionSignal +
+        0.27 * entertainmentImpact +
+        0.2 * nicheRelevance +
+        0.16 * retentionPotential +
+        0.08 * visualAudioStrength +
+        0.17 * emotionalMomentBoost +
+        0.07 * hookAnchorBoost +
+        0.11 * combinedTranscriptEmotionSignal +
         0.05 * modeBias.hook +
         0.05 * modeBias.interrupt +
-        0.04 * modeBias.ending +
-        0.03 * modeBias.energy +
-        0.03 * modeBias.caption
+        0.03 * modeBias.ending +
+        0.02 * modeBias.energy +
+        0.02 * modeBias.caption
       )
       if (duration > 35 && score < 0.72) continue
       const key = `${startTime.toFixed(3)}:${endTime.toFixed(3)}`
