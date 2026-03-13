@@ -2685,7 +2685,7 @@ const FREE_DAILY_RERENDER_LIMIT = PLAN_CONFIG.free.maxRerendersPerDay || 3
 const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
 const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
-const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.5
+const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.44
 const VERTICAL_OUTPUT_FPS = 60
 const HOOK_SELECTION_MAX_CANDIDATES = EDITOR_RETENTION_CONFIG.hookSelectionMaxCandidates
 const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
@@ -5125,7 +5125,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
     bottomCrop: parseVerticalWebcamCrop((value as any).bottomCrop ?? (value as any).contentCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
-    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'contain'),
+    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover'),
     manualClipRanges
   }
 }
@@ -5151,7 +5151,7 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   webcamCrop: null,
   bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
-  bottomFit: 'contain',
+  bottomFit: 'cover',
   manualClipRanges: null
 })
 
@@ -29809,7 +29809,7 @@ const renderVerticalClip = async ({
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
   const layoutCandidate = parseVerticalLayoutMode(verticalMode.layout, 'single')
   const layout: Exclude<VerticalLayoutMode, 'auto'> = layoutCandidate === 'auto' ? 'single' : layoutCandidate
-  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'contain')
+  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
   const baseFilterComplex = layout === 'single'
     ? buildVerticalSingleFilterGraph({
         start,
@@ -42358,3 +42358,4 @@ export const __retentionTestUtils = {
 }
 
 export default router
+
