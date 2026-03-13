@@ -26360,8 +26360,8 @@ const MEDIAPIPE_CORNER_SCAN_MIN_CONFIDENCE = (() => {
   return Number(clamp(raw, 0.05, 0.95).toFixed(3))
 })()
 const AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO = (() => {
-  const raw = Number(process.env.AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO || 0.16)
-  if (!Number.isFinite(raw)) return 0.16
+  const raw = Number(process.env.AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO || 0)
+  if (!Number.isFinite(raw)) return 0
   return Number(clamp(raw, 0, 0.45).toFixed(3))
 })()
 const AUTO_VERTICAL_WEBCAM_SHIFT_UP_TOP_RATIO = (() => {
@@ -33148,6 +33148,13 @@ const processJob = async (
             }
           }
         : defaultVerticalModeSettings()
+      const resolvedVerticalLayoutCandidate = parseVerticalLayoutMode(resolvedVerticalMode.layout, 'stacked')
+      const resolvedVerticalLayout: Exclude<VerticalLayoutMode, 'auto'> = (
+        resolvedVerticalLayoutCandidate === 'auto'
+          ? 'stacked'
+          : resolvedVerticalLayoutCandidate
+      )
+      const shouldRenderStackedLayout = resolvedVerticalLayout === 'stacked'
       const fixedVerticalWebcamCrop = normalizeVerticalCropToSource({
         crop: resolvedVerticalMode.webcamCrop,
         sourceWidth: sourceStream.width,
@@ -33155,6 +33162,7 @@ const processJob = async (
       })
       let inferredVerticalWebcamCrop: VerticalWebcamCrop | null = null
       const shouldTryAutoWebcamCrop = (
+        shouldRenderStackedLayout &&
         resolvedVerticalMode.autoWebcamCrop !== false &&
         !renderFastVerticalMode &&
         isLikelyDefaultVerticalWebcamCrop({
@@ -33197,21 +33205,25 @@ const processJob = async (
           }
         }
       }
-      const resolvedVerticalWebcamCrop = inferredVerticalWebcamCrop
-        ? inferredVerticalWebcamCrop
-        : (
-          shouldTryAutoWebcamCrop
-            ? shiftVerticalWebcamCropUp({
-                crop: fixedVerticalWebcamCrop,
-                sourceWidth: sourceStream.width,
-                sourceHeight: sourceStream.height,
-                shiftUpRatio: AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO
-              })
-            : fixedVerticalWebcamCrop
+      const resolvedVerticalWebcamCrop = shouldRenderStackedLayout
+        ? (
+          inferredVerticalWebcamCrop
+            ? inferredVerticalWebcamCrop
+            : (
+              shouldTryAutoWebcamCrop
+                ? shiftVerticalWebcamCropUp({
+                    crop: fixedVerticalWebcamCrop,
+                    sourceWidth: sourceStream.width,
+                    sourceHeight: sourceStream.height,
+                    shiftUpRatio: AUTO_VERTICAL_WEBCAM_SHIFT_UP_RATIO
+                  })
+                : fixedVerticalWebcamCrop
+            )
         )
+        : fixedVerticalWebcamCrop
       const resolvedVerticalModeForRender: VerticalModeSettings = {
         ...resolvedVerticalMode,
-        layout: 'stacked',
+        layout: resolvedVerticalLayout,
         webcamCrop: resolvedVerticalWebcamCrop
       }
       const renderedClipPaths: string[] = []
@@ -38085,8 +38097,8 @@ const MAX_PIPELINES = (() => {
 })()
 const QUEUE_RECOVERY_INTERVAL_MS = (() => {
   const envVal = Number(process.env.JOB_QUEUE_RECOVERY_INTERVAL_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 1_000) return Math.round(envVal)
-  return 3_000
+  if (Number.isFinite(envVal) && envVal >= 5_000) return Math.round(envVal)
+  return 10_000
 })()
 const STALE_PIPELINE_MS = (() => {
   const envVal = Number(process.env.STALE_PIPELINE_MS || 0)
@@ -38095,13 +38107,14 @@ const STALE_PIPELINE_MS = (() => {
 })()
 const PIPELINE_HEARTBEAT_INTERVAL_MS = (() => {
   const envVal = Number(process.env.PIPELINE_HEARTBEAT_INTERVAL_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 2_000) return Math.round(envVal)
-  return 4_000
+  if (Number.isFinite(envVal) && envVal >= 10_000) return Math.round(envVal)
+  return 25_000
 })()
 const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_HEARTBEAT_GRACE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 6_000) return Math.round(envVal)
-  return Math.max(12_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
+  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
+  // Conservative defaults prevent false lease-loss takeovers during heavy ffmpeg/transcript work.
+  return Math.max(90_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
 })()
 const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
@@ -38114,13 +38127,13 @@ const PIPELINE_LEASE_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
 )
 const PIPELINE_LEASE_STALE_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_LEASE_STALE_GRACE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 8_000) return Math.round(envVal)
-  return Math.max(15_000, PIPELINE_HEARTBEAT_GRACE_MS + 3_000)
+  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
+  return Math.max(120_000, PIPELINE_HEARTBEAT_GRACE_MS + 15_000)
 })()
 const PIPELINE_NO_LEASE_STALE_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_NO_LEASE_STALE_GRACE_MS || 0)
-  if (Number.isFinite(envVal) && envVal >= 8_000) return Math.round(envVal)
-  return Math.max(15_000, PIPELINE_LEASE_STALE_GRACE_MS)
+  if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
+  return Math.max(120_000, PIPELINE_LEASE_STALE_GRACE_MS)
 })()
 const STARTABLE_QUEUE_TAKEOVER_MS = (() => {
   const envVal = Number(process.env.STARTABLE_QUEUE_TAKEOVER_MS || 0)
@@ -38167,6 +38180,7 @@ const CANCELABLE_PIPELINE_STATUSES = new Set([
 ])
 let queueRecoveryRunning = false
 let queueRecoveryLoopStarted = false
+let queueRuntimeConfigLogged = false
 const DEFAULT_QUEUE_SLOT_SECONDS = (() => {
   const envVal = Number(process.env.JOB_QUEUE_SLOT_SECONDS || 0)
   if (Number.isFinite(envVal) && envVal >= 20) return Math.round(envVal)
@@ -38587,6 +38601,21 @@ const recoverQueuedJobs = async () => {
 }
 
 const startQueueRecoveryLoop = () => {
+  if (!queueRuntimeConfigLogged) {
+    queueRuntimeConfigLogged = true
+    console.log('[queue] runtime config', {
+      jobProcessorEnabled: JOB_PROCESSOR_ENABLED,
+      recoveryTakeoverEnabled: JOB_RECOVERY_TAKEOVER_ENABLED,
+      maxPipelines: MAX_PIPELINES,
+      queueRecoveryIntervalMs: QUEUE_RECOVERY_INTERVAL_MS,
+      heartbeatIntervalMs: PIPELINE_HEARTBEAT_INTERVAL_MS,
+      heartbeatGraceMs: PIPELINE_HEARTBEAT_GRACE_MS,
+      leaseStaleGraceMs: PIPELINE_LEASE_STALE_GRACE_MS,
+      noLeaseStaleGraceMs: PIPELINE_NO_LEASE_STALE_GRACE_MS,
+      startableTakeoverMs: STARTABLE_QUEUE_TAKEOVER_MS,
+      stalePipelineMs: STALE_PIPELINE_MS
+    })
+  }
   const recoveryLoopEnabled = JOB_PROCESSOR_ENABLED || JOB_RECOVERY_TAKEOVER_ENABLED
   if (!recoveryLoopEnabled) {
     console.log('[queue] job processor and recovery takeover are disabled for this process')
