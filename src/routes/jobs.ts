@@ -2202,6 +2202,8 @@ const VERTICAL_CAPTION_OUTLINE_WIDTH_MIN = 0
 const VERTICAL_CAPTION_OUTLINE_WIDTH_MAX = 24
 const VERTICAL_CAPTION_SHADOW_BLUR_MIN = 0
 const VERTICAL_CAPTION_SHADOW_BLUR_MAX = 42
+const DEFAULT_VERTICAL_CAPTION_POSITION_Y = Number((1300 / 1920).toFixed(4))
+const MAX_VERTICAL_CAPTION_WORDS_PER_CUE = 2
 const EFFECT_PREVIEW_DURATION_DEFAULT_SEC = 12
 const EFFECT_PREVIEW_DURATION_MIN_SEC = 5
 const EFFECT_PREVIEW_DURATION_MAX_SEC = 15
@@ -2683,7 +2685,8 @@ const FREE_DAILY_RERENDER_LIMIT = PLAN_CONFIG.free.maxRerendersPerDay || 3
 const MIN_WEBCAM_CROP_RATIO = 0.03
 const DEFAULT_VERTICAL_OUTPUT_WIDTH = 1080
 const DEFAULT_VERTICAL_OUTPUT_HEIGHT = 1920
-const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.4
+const DEFAULT_VERTICAL_TOP_HEIGHT_PCT = 0.5
+const VERTICAL_OUTPUT_FPS = 60
 const HOOK_SELECTION_MAX_CANDIDATES = EDITOR_RETENTION_CONFIG.hookSelectionMaxCandidates
 const HOOK_CALIBRATION_LOOKBACK_JOBS = (() => {
   const envValue = Number(process.env.HOOK_CALIBRATION_LOOKBACK_JOBS || 24)
@@ -5122,7 +5125,7 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
     webcamCrop: parseVerticalWebcamCrop((value as any).webcamCrop),
     bottomCrop: parseVerticalWebcamCrop((value as any).bottomCrop ?? (value as any).contentCrop),
     topHeightPx: Number.isFinite(topHeightPxRaw) && topHeightPxRaw > 0 ? Math.round(topHeightPxRaw) : null,
-    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'cover'),
+    bottomFit: parseVerticalFitMode((value as any).bottomFit, 'contain'),
     manualClipRanges
   }
 }
@@ -5148,7 +5151,7 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   webcamCrop: null,
   bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
-  bottomFit: 'cover',
+  bottomFit: 'contain',
   manualClipRanges: null
 })
 
@@ -6724,17 +6727,17 @@ const resolveVerticalCaptionConfig = (
     if (preset === 'rage_mode') {
       return {
         fontId: 'impact' as SubtitleFontId,
-        textColor: 'FFFFFF',
-        accentColor: 'FFFFFF',
+        textColor: 'FFFF00',
+        accentColor: 'FFFF00',
         outlineColor: '000000',
-        outlineWidth: 12,
+        outlineWidth: 15,
         shadowEnabled: true,
         shadowColor: '000000',
-        shadowBlur: 14,
+        shadowBlur: 6,
         boxEnabled: false,
         boxColor: '000000',
-        animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation,
+        animationEnabled: true,
+        animation: 'pop' as VerticalClipCaptionAnimation,
         animationSpeed: 1,
         dynamicMode: 'karaoke_word' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
@@ -6972,7 +6975,7 @@ const resolveVerticalCaptionConfig = (
   const fallbackEnabled = typeof defaults?.enabled === 'boolean' ? defaults.enabled : true
   const fallbackText = normalizeVerticalCaptionTextInput(defaults?.text ?? '')
   const fallbackPositionX = parseVerticalCaptionPosition(defaults?.positionX) ?? 0.5
-  const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? 0.84
+  const fallbackPositionY = parseVerticalCaptionPosition(defaults?.positionY) ?? DEFAULT_VERTICAL_CAPTION_POSITION_Y
   const fallbackVariantPositions = parseVerticalVariantCaptionPositions((defaults as any)?.variantPositions)
   const overrideAnimation = parseVerticalCaptionAnimationMode((override as any)?.animation)
   const overrideAnimationEnabled = typeof override.animationEnabled === 'boolean'
@@ -7029,8 +7032,8 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     enabled: true,
     autoGenerate: true,
     preset,
-    animationEnabled: false,
-    animation: 'none',
+    animationEnabled: true,
+    animation: 'pop',
     animationSpeed: 1,
     dynamicMode: 'karaoke_word',
     voicePreset: 'none',
@@ -7042,17 +7045,17 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     fontId: 'impact',
     fontSize: VERTICAL_CAPTION_FONT_SIZE_DEFAULT,
     text: '',
-    textColor: 'FFFFFF',
-    accentColor: 'FFE500',
+    textColor: 'FFFF00',
+    accentColor: 'FFFF00',
     outlineColor: '000000',
-    outlineWidth: 12,
+    outlineWidth: 15,
     shadowEnabled: true,
     shadowColor: '000000',
-    shadowBlur: 7,
+    shadowBlur: 5,
     boxEnabled: false,
     boxColor: '000000',
     positionX: 0.5,
-    positionY: 0.82,
+    positionY: DEFAULT_VERTICAL_CAPTION_POSITION_Y,
     variantPositions: null
   })
 }
@@ -25544,12 +25547,13 @@ const applyStoryStructure = (
 }
 
 const resolveSubtitleFontName = (fontId?: SubtitleFontId) => {
+  if (fontId === 'impact') return 'Komika Axis'
   if (fontId === 'sans_bold') return 'DejaVu Sans'
   if (fontId === 'condensed') return 'DejaVu Sans Condensed'
   if (fontId === 'serif_bold') return 'DejaVu Serif'
   if (fontId === 'display_black') return 'DejaVu Sans'
   if (fontId === 'mono_bold') return 'DejaVu Sans Mono'
-  return 'Impact'
+  return 'Komika Axis'
 }
 
 const toAssColorFromHex = (value?: string | null) => {
@@ -25859,11 +25863,11 @@ const buildVerticalCaptionSubtitleStyle = ({
     }
     if (preset === 'rage_mode') {
       return {
-        textColor: 'FFFFFF',
-        accentColor: 'FFFFFF',
+        textColor: 'FFFF00',
+        accentColor: 'FFFF00',
         outlineColor: '000000',
-        outlineWidth: 12,
-        animation: 'none' as const
+        outlineWidth: 15,
+        animation: 'pop' as const
       }
     }
     if (preset === 'ice_pop') {
@@ -25955,6 +25959,43 @@ const toAssColorFromHexWithAlpha = (value?: string | null, alpha = 0x00) => {
   return `&H${aa.toString(16).padStart(2, '0').toUpperCase()}${bb}${gg}${rr}`
 }
 
+const splitVerticalCueIntoWordBatches = ({
+  cue,
+  words,
+  maxWordsPerBatch
+}: {
+  cue: TranscriptCue
+  words: TranscriptWord[]
+  maxWordsPerBatch: number
+}): Array<{ cue: TranscriptCue; words: TranscriptWord[] }> => {
+  const normalizedMaxWords = Math.max(1, Math.min(6, Math.round(maxWordsPerBatch || 1)))
+  if (!Array.isArray(words) || words.length <= normalizedMaxWords) {
+    return [{ cue, words }]
+  }
+  const batches: Array<{ cue: TranscriptCue; words: TranscriptWord[] }> = []
+  for (let index = 0; index < words.length; index += normalizedMaxWords) {
+    const batch = words.slice(index, index + normalizedMaxWords)
+    if (!batch.length) continue
+    const batchStart = Number.isFinite(batch[0]?.start) ? Number(batch[0].start) : Number(cue.start)
+    const tail = batch[batch.length - 1]
+    const batchEnd = Number.isFinite(tail?.end)
+      ? Number(tail.end)
+      : Math.max(batchStart + 0.06, Number(cue.end))
+    const resolvedText = sanitizeCaptionPhrase(String(formatCueTextFromWords(batch) || cue.text || ''))
+    batches.push({
+      cue: {
+        ...cue,
+        start: Number(batchStart.toFixed(3)),
+        end: Number(Math.max(batchStart + 0.06, batchEnd).toFixed(3)),
+        text: resolvedText || cue.text,
+        words: batch
+      },
+      words: batch
+    })
+  }
+  return batches.length ? batches : [{ cue, words }]
+}
+
 const buildVerticalCaptionAss = ({
   cues,
   workingDir,
@@ -25984,7 +26025,7 @@ const buildVerticalCaptionAss = ({
   const borderStyle = boxEnabled ? 3 : 1
   const backColor = boxEnabled ? boxColor : shadowColor
   const posX = Math.round(clamp(config.positionX ?? 0.5, 0, 1) * 1080)
-  const posY = Math.round(clamp(config.positionY ?? 0.84, 0, 1) * 1920)
+  const posY = Math.round(clamp(config.positionY ?? DEFAULT_VERTICAL_CAPTION_POSITION_Y, 0, 1) * 1920)
   const animationMode = parseVerticalCaptionAnimationMode(config.animation) ||
     (config.animationEnabled ? 'pop' : 'none')
   const effectiveAnimationMode: VerticalClipCaptionAnimation = (
@@ -26025,7 +26066,7 @@ const buildVerticalCaptionAss = ({
     const start = Number.isFinite(cue.start) ? cue.start : 0
     const end = Number.isFinite(cue.end) ? cue.end : start + 0.8
     if (end <= start + 0.03) continue
-    const words = resolveCueWordsForAss({
+    const cueWords = resolveCueWordsForAss({
       cue,
       removeFillers,
       autoEmphasis,
@@ -26033,46 +26074,62 @@ const buildVerticalCaptionAss = ({
     })
     const phraseSource = preserveManualText
       ? normalizeVerticalCaptionCueText(cue.text)
-      : sanitizeCaptionPhrase(String(formatCueTextFromWords(words) || cue.text || ''))
+      : sanitizeCaptionPhrase(String(formatCueTextFromWords(cueWords) || cue.text || ''))
     const phrase = String(phraseSource || '').trim()
     if (!phrase) continue
-    const cueForRender: TranscriptCue = {
+    const cueForRenderBase: TranscriptCue = {
       ...cue,
       text: phrase
     }
-    const text = buildAssCueText({
-      cue: cueForRender,
-      words,
-      highlightWords,
-      dynamicMode: config.dynamicMode,
-      autoEmoji,
-      uppercase: useUppercase,
-      animationSpeed,
-      primaryColor,
-      emphasisColor: secondaryColor
+    const maxWordsPerBatch = config.preset === 'rage_mode'
+      ? MAX_VERTICAL_CAPTION_WORDS_PER_CUE
+      : Math.max(MAX_VERTICAL_CAPTION_WORDS_PER_CUE, cueWords.length || 1)
+    const cueBatches = splitVerticalCueIntoWordBatches({
+      cue: cueForRenderBase,
+      words: cueWords,
+      maxWordsPerBatch
     })
-    if (!text) continue
-    const animationTag = (() => {
-      if (effectiveAnimationMode === 'none') {
-        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
-      }
-      if (effectiveAnimationMode === 'slide') {
-        return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,${scaledMs(180)})\\bord${outlineWidth}}`
-      }
-      if (effectiveAnimationMode === 'fade') {
-        return `{\\an5\\pos(${posX},${posY})\\fad(${scaledMs(80)},${scaledMs(70)})\\bord${outlineWidth}}`
-      }
-      if (effectiveAnimationMode === 'bounce') {
-        return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx110\\fscy110)\\t(${scaledMs(120)},${scaledMs(240)},\\fscx100\\fscy100)}`
-      }
-      if (effectiveAnimationMode === 'glitch') {
-        return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,${scaledMs(80)},\\frz-2)\\t(${scaledMs(80)},${scaledMs(160)},\\frz1.4)\\t(${scaledMs(160)},${scaledMs(260)},\\frz0)}`
-      }
-      return `{\\an5\\pos(${posX},${posY})\\fscx84\\fscy84\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx100\\fscy100)}`
-    })()
-    assLines.push(
-      `Dialogue: 0,${toAssTimestamp(start)},${toAssTimestamp(end)},Viral,,0,0,0,,${animationTag}${text}`
-    )
+    for (const batch of cueBatches) {
+      const batchCue = batch.cue
+      const batchStart = Number.isFinite(batchCue.start) ? Number(batchCue.start) : start
+      const batchEnd = Number.isFinite(batchCue.end) ? Number(batchCue.end) : end
+      if (batchEnd <= batchStart + 0.03) continue
+      const text = buildAssCueText({
+        cue: batchCue,
+        words: batch.words,
+        highlightWords,
+        dynamicMode: config.dynamicMode,
+        autoEmoji,
+        uppercase: useUppercase,
+        animationSpeed,
+        primaryColor,
+        emphasisColor: secondaryColor
+      })
+      if (!text) continue
+      const animationTag = (() => {
+        if (effectiveAnimationMode === 'none') {
+          return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}}`
+        }
+        if (effectiveAnimationMode === 'slide') {
+          return `{\\an5\\move(${posX + 72},${posY},${posX},${posY},0,${scaledMs(180)})\\bord${outlineWidth}}`
+        }
+        if (effectiveAnimationMode === 'fade') {
+          return `{\\an5\\pos(${posX},${posY})\\fad(${scaledMs(80)},${scaledMs(70)})\\bord${outlineWidth}}`
+        }
+        if (effectiveAnimationMode === 'bounce') {
+          return `{\\an5\\pos(${posX},${posY})\\fscx90\\fscy90\\bord${outlineWidth}\\t(0,${scaledMs(120)},\\fscx110\\fscy110)\\t(${scaledMs(120)},${scaledMs(240)},\\fscx100\\fscy100)}`
+        }
+        if (effectiveAnimationMode === 'glitch') {
+          return `{\\an5\\pos(${posX},${posY})\\bord${outlineWidth}\\fsp1\\t(0,${scaledMs(80)},\\frz-2)\\t(${scaledMs(80)},${scaledMs(160)},\\frz1.4)\\t(${scaledMs(160)},${scaledMs(260)},\\frz0)}`
+        }
+        const popPeakMs = scaledMs(90)
+        const popSettleMs = scaledMs(150)
+        return `{\\an5\\pos(${posX},${posY})\\fscx0\\fscy0\\bord${outlineWidth}\\t(0,${popPeakMs},\\fscx120\\fscy120)\\t(${popPeakMs},${popSettleMs},\\fscx100\\fscy100)}`
+      })()
+      assLines.push(
+        `Dialogue: 0,${toAssTimestamp(batchStart)},${toAssTimestamp(batchEnd)},Viral,,0,0,0,,${animationTag}${text}`
+      )
+    }
   }
   if (assLines.length <= 13) return null
   const assPath = path.join(workingDir, `${basename}.ass`)
@@ -29752,7 +29809,7 @@ const renderVerticalClip = async ({
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
   const layoutCandidate = parseVerticalLayoutMode(verticalMode.layout, 'single')
   const layout: Exclude<VerticalLayoutMode, 'auto'> = layoutCandidate === 'auto' ? 'single' : layoutCandidate
-  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
+  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'contain')
   const baseFilterComplex = layout === 'single'
     ? buildVerticalSingleFilterGraph({
         start,
@@ -30128,6 +30185,8 @@ const renderVerticalClip = async ({
     String(Math.max(1, Math.round(Number(codecThreads || RENDER_CODEC_THREADS)))),
     '-pix_fmt',
     'yuv420p',
+    '-r',
+    String(VERTICAL_OUTPUT_FPS),
     '-filter_complex',
     filterComplex,
     '-map',
