@@ -29809,7 +29809,8 @@ const renderVerticalClip = async ({
   const outputHeight = Math.round(clamp(verticalMode.output.height, 426, 7680))
   const layoutCandidate = parseVerticalLayoutMode(verticalMode.layout, 'single')
   const layout: Exclude<VerticalLayoutMode, 'auto'> = layoutCandidate === 'auto' ? 'single' : layoutCandidate
-  const fit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
+  const requestedBottomFit = parseVerticalFitMode(verticalMode.bottomFit, 'cover')
+  const fit: VerticalFitMode = layout === 'stacked' ? 'cover' : requestedBottomFit
   const baseFilterComplex = layout === 'single'
     ? buildVerticalSingleFilterGraph({
         start,
@@ -33148,11 +33149,16 @@ const processJob = async (
             }
           }
         : defaultVerticalModeSettings()
-      const resolvedVerticalLayoutCandidate = parseVerticalLayoutMode(resolvedVerticalMode.layout, 'stacked')
+      const autoResolvedVerticalLayout = resolveAutoVerticalLayoutMode({
+        layout: resolvedVerticalMode.layout,
+        sourceWidth: sourceStream.width,
+        sourceHeight: sourceStream.height,
+        windows: verticalWindows
+      })
       const resolvedVerticalLayout: Exclude<VerticalLayoutMode, 'auto'> = (
-        resolvedVerticalLayoutCandidate === 'auto'
-          ? 'stacked'
-          : resolvedVerticalLayoutCandidate
+        autoResolvedVerticalLayout === 'auto'
+          ? 'single'
+          : autoResolvedVerticalLayout
       )
       const shouldRenderStackedLayout = resolvedVerticalLayout === 'stacked'
       const fixedVerticalWebcamCrop = normalizeVerticalCropToSource({
