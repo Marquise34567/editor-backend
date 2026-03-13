@@ -916,6 +916,7 @@ type HorizontalModeSettings = {
 }
 type VerticalFitMode = 'cover' | 'contain'
 type VerticalLayoutMode = 'stacked' | 'single' | 'auto'
+type VerticalWebcamPosition = 'top' | 'bottom'
 type VerticalSelectionMode = 'best_moments' | 'story_arc' | 'hook_storm' | 'loop_builder'
 type VerticalZoomProfile = 'none' | 'smooth' | 'punch' | 'kinetic'
 type VerticalWebcamCrop = { x: number; y: number; w: number; h: number }
@@ -939,6 +940,7 @@ type VerticalModeSettings = {
   webcamCrop: VerticalWebcamCrop | null
   bottomCrop: VerticalWebcamCrop | null
   topHeightPx: number | null
+  webcamPosition?: VerticalWebcamPosition
   bottomFit: VerticalFitMode
   manualClipRanges: VerticalManualClipRange[] | null
 }
@@ -1800,6 +1802,7 @@ type VerticalClipCaptionAnimation = 'pop' | 'fade' | 'slide' | 'bounce' | 'glitc
 type VerticalCaptionDynamicMode = 'classic' | 'karaoke_word' | 'kinetic_word'
 type VerticalVoicePreset = 'none' | 'deep' | 'helium' | 'radio' | 'robot'
 type VerticalPacingPreset = 'normal' | 'fast' | 'slow'
+type VerticalCaptionOverlayTone = 'none' | 'white' | 'black'
 type VerticalCaptionPreset =
   | 'basic_clean'
   | 'mrbeast_animated'
@@ -1840,6 +1843,8 @@ type VerticalCaptionConfig = {
   positionX: number
   positionY: number
   variantPositions: VerticalVariantCaptionPositions | null
+  clipTextBySlot: Record<string, string> | null
+  clipOverlayToneBySlot: Record<string, VerticalCaptionOverlayTone> | null
 }
 type VerticalClipCaptionOverlay = {
   text: string
@@ -4782,6 +4787,16 @@ const parseVerticalLayoutMode = (value?: any, fallback: VerticalLayoutMode = 'au
   return fallback
 }
 
+const parseVerticalWebcamPosition = (
+  value?: any,
+  fallback: VerticalWebcamPosition = 'top'
+): VerticalWebcamPosition => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw === 'bottom' || raw === 'bottom_strip') return 'bottom'
+  if (raw === 'top' || raw === 'top_strip') return 'top'
+  return fallback
+}
+
 const parseVerticalSelectionMode = (
   value?: any,
   fallback: VerticalSelectionMode = DEFAULT_VERTICAL_SELECTION_MODE
@@ -5069,6 +5084,60 @@ const resolveVerticalVariantCaptionKeyForClip = ({
   return VERTICAL_VARIANT_ORDER[variantIndex]
 }
 
+const buildVerticalVariantSlotKey = ({
+  variant,
+  version
+}: {
+  variant: VerticalVariantCaptionKey
+  version: number
+}) => `${variant}:${Math.max(1, Math.round(Number(version) || 1))}`
+
+const parseVerticalVariantSlotKey = (value: any): {
+  variant: VerticalVariantCaptionKey
+  version: number
+  slotKey: string
+} | null => {
+  const raw = String(value ?? '').trim().toLowerCase()
+  if (!raw) return null
+  const match = raw.match(/^(instagram|youtube|tiktok)\s*[:_#-]\s*(\d{1,3})$/)
+  if (!match) return null
+  const variant = parseVerticalVariantCaptionKey(match[1])
+  const version = Number(match[2])
+  if (!variant || !Number.isFinite(version) || version <= 0) return null
+  return {
+    variant,
+    version: Math.max(1, Math.round(version)),
+    slotKey: buildVerticalVariantSlotKey({ variant, version })
+  }
+}
+
+const resolveVerticalVariantSlotMetaForClip = ({
+  clipIndex,
+  clipCount,
+  explicitVariant,
+  explicitVersion
+}: {
+  clipIndex: number
+  clipCount: number
+  explicitVariant?: any
+  explicitVersion?: any
+}) => {
+  const variant = resolveVerticalVariantCaptionKeyForClip({
+    clipIndex,
+    clipCount,
+    explicitVariant
+  })
+  const explicitVersionNumber = Number(explicitVersion)
+  const resolvedVersion = Number.isFinite(explicitVersionNumber) && explicitVersionNumber > 0
+    ? Math.max(1, Math.round(explicitVersionNumber))
+    : Math.floor(Math.max(0, Math.round(Number(clipIndex) || 0)) / Math.max(1, VERTICAL_VARIANT_ORDER.length)) + 1
+  return {
+    variant,
+    version: resolvedVersion,
+    slotKey: buildVerticalVariantSlotKey({ variant, version: resolvedVersion })
+  }
+}
+
 const parseVerticalManualClipRanges = (value?: any): VerticalManualClipRange[] | null => {
   if (!Array.isArray(value)) return null
   const ranges: VerticalManualClipRange[] = []
@@ -5156,6 +5225,15 @@ const parseVerticalModeSettings = (value?: any): Partial<VerticalModeSettings> |
       (value as any).selectionMode ?? (value as any).selection_mode,
       DEFAULT_VERTICAL_SELECTION_MODE
     ),
+    webcamPosition: parseVerticalWebcamPosition(
+      pickFirstDefinedValue(
+        (value as any).webcamPosition,
+        (value as any).webcam_position,
+        (value as any).webcamPlacement?.position,
+        (value as any).webcam_placement?.position
+      ),
+      'top'
+    ),
     ...(autoWebcamCropRaw === null ? {} : { autoWebcamCrop: autoWebcamCropRaw }),
     zoomProfile: parseVerticalZoomProfile(
       (value as any).zoomProfile ?? (value as any).zoom_profile,
@@ -5194,6 +5272,7 @@ const defaultVerticalModeSettings = (): VerticalModeSettings => ({
   webcamCrop: null,
   bottomCrop: null,
   topHeightPx: Math.round(DEFAULT_VERTICAL_OUTPUT_HEIGHT * DEFAULT_VERTICAL_TOP_HEIGHT_PCT),
+  webcamPosition: 'top',
   bottomFit: 'cover',
   manualClipRanges: null
 })
@@ -6297,6 +6376,43 @@ const parseVerticalPacingPreset = (value: any): VerticalPacingPreset | null => {
   return null
 }
 
+const parseVerticalCaptionOverlayTone = (value: any): VerticalCaptionOverlayTone | null => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (!normalized) return null
+  if (['none', 'off', 'clear', 'default'].includes(normalized)) return 'none'
+  if (['white', 'light'].includes(normalized)) return 'white'
+  if (['black', 'dark'].includes(normalized)) return 'black'
+  return null
+}
+
+const parseVerticalCaptionTextBySlot = (value?: any): Record<string, string> | null => {
+  if (!value || typeof value !== 'object') return null
+  const input = value as Record<string, any>
+  const out: Record<string, string> = {}
+  for (const [rawKey, rawText] of Object.entries(input)) {
+    const parsedSlot = parseVerticalVariantSlotKey(rawKey)
+    if (!parsedSlot) continue
+    const normalizedText = normalizeVerticalCaptionTextInput(rawText)
+    if (!normalizedText) continue
+    out[parsedSlot.slotKey] = normalizedText
+  }
+  return Object.keys(out).length ? out : null
+}
+
+const parseVerticalCaptionOverlayToneBySlot = (value?: any): Record<string, VerticalCaptionOverlayTone> | null => {
+  if (!value || typeof value !== 'object') return null
+  const input = value as Record<string, any>
+  const out: Record<string, VerticalCaptionOverlayTone> = {}
+  for (const [rawKey, rawTone] of Object.entries(input)) {
+    const parsedSlot = parseVerticalVariantSlotKey(rawKey)
+    if (!parsedSlot) continue
+    const parsedTone = parseVerticalCaptionOverlayTone(rawTone)
+    if (!parsedTone) continue
+    out[parsedSlot.slotKey] = parsedTone
+  }
+  return Object.keys(out).length ? out : null
+}
+
 const getVerticalCaptionTextFromPayload = (payload?: any): string | null => {
   if (!payload || typeof payload !== 'object') return null
   const nested = (payload as any).verticalCaptions
@@ -6517,6 +6633,30 @@ const getVerticalCaptionConfigFromPayload = (payload?: any): Partial<VerticalCap
     (payload as any).variant_caption_positions,
     nested?.variantPositions,
     nested?.variant_positions
+  )
+  const clipTextBySlotCandidate = pickFirstDefinedValue(
+    (payload as any).verticalVariantClipCaptions,
+    (payload as any).vertical_variant_clip_captions,
+    (payload as any).verticalClipCaptionTextBySlot,
+    (payload as any).vertical_clip_caption_text_by_slot,
+    (payload as any).clipCaptionTextBySlot,
+    (payload as any).clip_caption_text_by_slot,
+    nested?.clipTextBySlot,
+    nested?.clip_text_by_slot,
+    nested?.variantClipCaptions,
+    nested?.variant_clip_captions
+  )
+  const clipOverlayToneBySlotCandidate = pickFirstDefinedValue(
+    (payload as any).verticalClipCaptionOverlayBySlot,
+    (payload as any).vertical_clip_caption_overlay_by_slot,
+    (payload as any).clipCaptionOverlayToneBySlot,
+    (payload as any).clip_caption_overlay_tone_by_slot,
+    (payload as any).verticalCaptionOverlayToneBySlot,
+    (payload as any).vertical_caption_overlay_tone_by_slot,
+    nested?.clipOverlayToneBySlot,
+    nested?.clip_overlay_tone_by_slot,
+    nested?.overlayToneBySlot,
+    nested?.overlay_tone_by_slot
   )
   const autoGenerateCandidate = parseBooleanFlag(
     pickFirstDefinedValue(
@@ -29627,6 +29767,7 @@ const buildVerticalStackedFilterGraph = ({
   outputHeight,
   topHeight,
   bottomFit,
+  webcamPosition,
   withAudio
 }: {
   start: number
@@ -29637,8 +29778,10 @@ const buildVerticalStackedFilterGraph = ({
   outputHeight: number
   topHeight: number
   bottomFit: VerticalFitMode
+  webcamPosition?: VerticalWebcamPosition
   withAudio: boolean
 }) => {
+  const resolvedWebcamPosition = parseVerticalWebcamPosition(webcamPosition, 'top')
   const bottomHeight = Math.max(1, outputHeight - topHeight)
   const filters = [
     `[0:v]trim=start=${start}:end=${end},setpts=PTS-STARTPTS,split=2[vfull][vweb]`,
@@ -29656,9 +29799,12 @@ const buildVerticalStackedFilterGraph = ({
       `[vfull]crop=w=${bottomCrop.w}:h=${bottomCrop.h}:x=${bottomCrop.x}:y=${bottomCrop.y}[vfullbottomsrc]`
     )
   }
+  const stackChain = resolvedWebcamPosition === 'bottom'
+    ? '[bottom][top]vstack=inputs=2[outv]'
+    : '[top][bottom]vstack=inputs=2[outv]'
   filters.push(
     `[${bottomSourceLabel}]${buildVerticalBottomFilter(bottomFit, outputWidth, bottomHeight)}[bottom]`,
-    '[top][bottom]vstack=inputs=2[outv]'
+    stackChain
   )
   if (withAudio) {
     filters.push('[0:a]atrim=start=' + start + ':end=' + end + ',asetpts=PTS-STARTPTS,aformat=sample_rates=48000:channel_layouts=stereo[outa]')
@@ -29924,9 +30070,10 @@ const renderVerticalClip = async ({
           outputWidth,
           outputHeight,
           topHeight,
-            bottomFit: fit,
-            withAudio
-          })
+          bottomFit: fit,
+          webcamPosition: verticalMode.webcamPosition,
+          withAudio
+        })
       })()
   const resolvedPaceMultiplier = clamp(Number(paceMultiplier || 1), 0.82, 1.2)
   const shouldApplyPacing = Math.abs(resolvedPaceMultiplier - 1) >= 0.001
@@ -29960,9 +30107,7 @@ const renderVerticalClip = async ({
   }
   const resolvedZoomProfile = parseVerticalZoomProfile(verticalMode.zoomProfile, DEFAULT_VERTICAL_ZOOM_PROFILE)
   const resolvedZoomIntensity = parseVerticalZoomIntensity(verticalMode.zoomIntensity, DEFAULT_VERTICAL_ZOOM_INTENSITY)
-  // Applying zoom after a stacked composite shifts/crops the top webcam strip.
-  // Keep stacked layout geometry stable so the webcam fully occupies the top section.
-  const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none' && layout !== 'stacked'
+  const shouldApplySmartZoom = Boolean(enableSmartZoom) && resolvedZoomProfile !== 'none'
   const shouldApplyClipTransitions = Boolean(enableTransitions)
   const enhancementFx = buildVerticalEnhancementFilters({
     applyStabilization: Boolean(applyStabilization),
