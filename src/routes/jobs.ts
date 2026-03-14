@@ -6892,8 +6892,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 0,
         boxEnabled: true,
         boxColor: '020617',
-        animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation,
+        animationEnabled: true,
+        animation: 'fade' as VerticalClipCaptionAnimation,
         animationSpeed: 1,
         dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
@@ -6938,8 +6938,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 4,
         boxEnabled: true,
         boxColor: 'FFFFFF',
-        animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation,
+        animationEnabled: true,
+        animation: 'fade' as VerticalClipCaptionAnimation,
         animationSpeed: 1,
         dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
@@ -7053,8 +7053,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 8,
         boxEnabled: true,
         boxColor: '1F172A',
-        animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation,
+        animationEnabled: true,
+        animation: 'slide' as VerticalClipCaptionAnimation,
         animationSpeed: 0.92,
         dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
@@ -7076,8 +7076,8 @@ const resolveVerticalCaptionConfig = (
         shadowBlur: 24,
         boxEnabled: false,
         boxColor: '000000',
-        animationEnabled: false,
-        animation: 'none' as VerticalClipCaptionAnimation,
+        animationEnabled: true,
+        animation: 'bounce' as VerticalClipCaptionAnimation,
         animationSpeed: 1,
         dynamicMode: 'classic' as VerticalCaptionDynamicMode,
         voicePreset: 'none' as VerticalVoicePreset,
@@ -7134,17 +7134,17 @@ const resolveVerticalCaptionConfig = (
       (defaults as any)?.caption_animation_enabled
     )
   )
-  let resolvedFallbackAnimation = fallbackAnimationFromDefaults
+  let resolvedFallbackAnimation: VerticalClipCaptionAnimation = fallbackAnimationFromDefaults
     ? fallbackAnimationFromDefaults
     : fallbackAnimationEnabledFromDefaults === false
       ? 'none'
       : fallbackPresetStyle.animation
-  if (resolvedFallbackAnimation === 'none') {
+  if (String(resolvedFallbackAnimation) === 'none') {
     resolvedFallbackAnimation = fallbackPresetStyle.animation === 'none'
       ? 'pop'
       : fallbackPresetStyle.animation
   }
-  if (resolvedFallbackAnimation === 'none') {
+  if (String(resolvedFallbackAnimation) === 'none') {
     resolvedFallbackAnimation = 'pop'
   }
   const fallbackStyle = {
@@ -7159,7 +7159,7 @@ const resolveVerticalCaptionConfig = (
     boxEnabled: typeof defaults?.boxEnabled === 'boolean' ? defaults.boxEnabled : fallbackPresetStyle.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(defaults?.boxColor) || fallbackPresetStyle.boxColor,
     animation: resolvedFallbackAnimation,
-    animationEnabled: resolvedFallbackAnimation !== 'none',
+    animationEnabled: String(resolvedFallbackAnimation) !== 'none',
     animationSpeed: parseVerticalCaptionAnimationSpeed(defaults?.animationSpeed) ?? fallbackPresetStyle.animationSpeed,
     dynamicMode: parseVerticalCaptionDynamicMode(
       pickFirstDefinedValue(
@@ -26122,7 +26122,7 @@ const buildVerticalCaptionSubtitleStyle = ({
         accentColor: 'F8FAFC',
         outlineColor: '0F172A',
         outlineWidth: 3,
-        animation: 'none' as const
+        animation: 'fade' as const
       }
     }
     if (preset === 'neon_glow') {
@@ -26140,7 +26140,7 @@ const buildVerticalCaptionSubtitleStyle = ({
         accentColor: '0B0D12',
         outlineColor: '0B0D12',
         outlineWidth: 1,
-        animation: 'none' as const
+        animation: 'fade' as const
       }
     }
     if (preset === 'rage_mode') {
@@ -26185,7 +26185,7 @@ const buildVerticalCaptionSubtitleStyle = ({
         accentColor: 'FFD166',
         outlineColor: '1A1203',
         outlineWidth: 7,
-        animation: 'none' as const
+        animation: 'slide' as const
       }
     }
     if (preset === 'shadow_strike') {
@@ -26194,7 +26194,7 @@ const buildVerticalCaptionSubtitleStyle = ({
         accentColor: 'FFFFFF',
         outlineColor: '000000',
         outlineWidth: 9,
-        animation: 'none' as const
+        animation: 'bounce' as const
       }
     }
     return {
@@ -26217,7 +26217,7 @@ const buildVerticalCaptionSubtitleStyle = ({
       ? 'pop'
       : typeof animationEnabled === 'boolean'
         ? (animationEnabled ? 'pop' : 'none')
-        : (defaultStyleByPreset.animation === 'none' ? 'none' : 'pop')
+        : (String(defaultStyleByPreset.animation) === 'none' ? 'none' : 'pop')
   return serializeSubtitleStyleConfig({
     ...base,
     preset: stylePreset,
