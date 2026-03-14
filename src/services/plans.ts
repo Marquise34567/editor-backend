@@ -6,10 +6,16 @@ export const isActiveSubscriptionStatus = (status?: string | null) =>
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const FREE_TRIAL_PRICE_ID = 'manual_free_trial_3d'
+const MANUAL_REFERRAL_PRICE_PREFIX = 'manual_referral_reward_'
 const FREE_TRIAL_DAYS = (() => {
   const value = Number(process.env.FREE_TRIAL_DAYS || 3)
   if (!Number.isFinite(value)) return 3
   return Math.min(14, Math.max(1, Math.round(value)))
+})()
+const REFERRAL_REWARD_DAYS_PER_MONTH = (() => {
+  const value = Number(process.env.REFERRAL_REWARD_DAYS_PER_MONTH || 30)
+  if (!Number.isFinite(value)) return 30
+  return Math.min(31, Math.max(28, Math.round(value)))
 })()
 
 type TrialInfo = {
@@ -62,16 +68,31 @@ const parseEpoch = (value?: Date | string | null) => {
   return Number.isFinite(parsed) ? parsed : null
 }
 
+const resolveTrialWindowDays = (priceId?: string | null) => {
+  const rawPriceId = String(priceId || '').toLowerCase()
+  if (!rawPriceId) return FREE_TRIAL_DAYS
+  if (rawPriceId === FREE_TRIAL_PRICE_ID) return FREE_TRIAL_DAYS
+  if (rawPriceId.startsWith(MANUAL_REFERRAL_PRICE_PREFIX)) {
+    const match = rawPriceId.match(/manual_referral_reward_(\d+)m/)
+    const months = Number(match?.[1] || 1)
+    const safeMonths = Number.isFinite(months) ? Math.min(12, Math.max(1, Math.round(months))) : 1
+    return safeMonths * REFERRAL_REWARD_DAYS_PER_MONTH
+  }
+  return FREE_TRIAL_DAYS
+}
+
 const buildSubscriptionTrialInfo = (
   currentPeriodEnd?: Date | string | null,
   trialTier?: PlanTier,
-  startedAt?: Date | string | null
+  startedAt?: Date | string | null,
+  priceId?: string | null
 ): TrialInfo => {
   const now = Date.now()
   const configuredTier = resolveTrialTier(trialTier)
   const stripeEndMs = parseEpoch(currentPeriodEnd)
   const startMs = parseEpoch(startedAt)
-  const maxWindowEndMs = startMs !== null ? startMs + FREE_TRIAL_DAYS * DAY_MS : null
+  const trialWindowDays = resolveTrialWindowDays(priceId)
+  const maxWindowEndMs = startMs !== null ? startMs + trialWindowDays * DAY_MS : null
   let endMs = stripeEndMs
   if (endMs !== null && maxWindowEndMs !== null) {
     endMs = Math.min(endMs, maxWindowEndMs)
@@ -114,7 +135,8 @@ export const activateManualFreeTrial = async (userId: string): Promise<ActivateM
     const existingTrialInfo = buildSubscriptionTrialInfo(
       existing?.currentPeriodEnd ?? null,
       resolveTrialTier(existing?.planTier),
-      existing?.updatedAt ?? null
+      existing?.updatedAt ?? null,
+      existing?.priceId ?? null
     )
     const alreadyActive = existing?.status === 'trialing' && existingTrialInfo.active
     return {
@@ -155,7 +177,7 @@ export const activateManualFreeTrial = async (userId: string): Promise<ActivateM
     alreadyActive: false,
     alreadyUsed: false,
     tier: unlockTier,
-    trial: buildSubscriptionTrialInfo(endsAt, unlockTier, now)
+    trial: buildSubscriptionTrialInfo(endsAt, unlockTier, now, FREE_TRIAL_PRICE_ID)
   }
 }
 
@@ -174,7 +196,8 @@ export const getUserPlan = async (userId: string): Promise<UserPlanResult> => {
       const trial = buildSubscriptionTrialInfo(
         subscription.currentPeriodEnd ?? null,
         trialTier,
-        subscription.updatedAt ?? null
+        subscription.updatedAt ?? null,
+        subscription.priceId ?? null
       )
       if (trial.active) {
         return {

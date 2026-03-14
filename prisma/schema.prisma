@@ -374,3 +374,16 @@ model DailyEngagementSubscription {
   @@index([enabled, nextSendAt], map: "idx_daily_engagement_subscriptions_due")
   @@map("daily_engagement_subscriptions")
 }
+
+model PasswordReset {
+  id        String   @id @default(uuid())
+  email     String
+  token     String   @unique
+  expiresAt DateTime @map("expires_at")
+  used      Boolean  @default(false)
+  usedAt    DateTime? @map("used_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email, expiresAt], map: "idx_password_resets_email_expires")
+  @@map("password_resets")
+}

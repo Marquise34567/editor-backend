@@ -20,6 +20,7 @@ import {
   getCreatorStyleProfile,
   runMultiPassRefinementWithModel
 } from '../services/editorIntelligence'
+import { sendVideoReadyEmail } from '../services/videoReadyEmail'
 
 const router = express.Router()
 
@@ -3849,12 +3850,13 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       intensity: Number(clamp((point.watchedPct - 8) / 91, 0.06, 1).toFixed(3))
     }))
     const hookRangeLabel = '8-second dopamine-trap opener'
+    const outputVideoUrl = toOutputUrl(outputVideoPath)
 
     updateJobState(jobId, {
       status: 'completed',
       progress: 100,
       outputVideoPath,
-      outputVideoUrl: toOutputUrl(outputVideoPath),
+      outputVideoUrl,
       clipUrls,
       thumbnails,
       ffmpegCommands,
@@ -3910,6 +3912,20 @@ const processRenderJob = async (jobId: string, userId: string, payload: RenderRe
       },
       errorMessage: null
     })
+
+    void (async () => {
+      try {
+        const owner = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } })
+        await sendVideoReadyEmail({
+          email: owner?.email,
+          jobId,
+          title: source.fileName || null,
+          outputUrl: outputVideoUrl
+        })
+      } catch (error) {
+        console.warn(`vibecut video ready email failed for ${jobId}`, error)
+      }
+    })()
   } catch (error: any) {
     console.error('vibecut render pipeline failed', error)
     updateJobState(jobId, {

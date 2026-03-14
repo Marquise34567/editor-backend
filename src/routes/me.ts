@@ -4,6 +4,7 @@ import { getUserPlan } from '../services/plans'
 import { getUsageForMonth } from '../services/usage'
 import { getRenderModeUsageForMonth } from '../services/renderModeUsage'
 import { getRerenderUsageForDay } from '../services/rerenderUsage'
+import { applyReferralCodeForUser, getReferralOverviewForUser } from '../services/referrals'
 import { getMonthKey } from '../shared/planConfig'
 import { getPlanFeatures } from '../lib/planFeatures'
 import { SUBTITLE_PRESET_REGISTRY } from '../shared/subtitlePresets'
@@ -29,6 +30,7 @@ router.get('/', async (req: any, res) => {
   const horizontalModeUsage = await getRenderModeUsageForMonth(id, 'horizontal')
   const verticalModeUsage = await getRenderModeUsageForMonth(id, 'vertical')
   const rerenderUsageDaily = await getRerenderUsageForDay(id)
+  const referral = await getReferralOverviewForUser(id, req.user?.email)
   const devAccess = await resolveDevAdminAccess(user.id, user.email)
   const isDev = devAccess.emailAuthorized
   const clientTier = isDev ? 'studio' : tier
@@ -46,7 +48,7 @@ router.get('/', async (req: any, res) => {
     : null
 
   res.json({
-    user: { id: user.id, email: user.email, createdAt: user.createdAt },
+    user: { id: user.id, email: user.email, createdAt: user.createdAt, referralCode: referral.referralCode },
     subscription: subscription
       ? {
           tier: clientTier,
@@ -87,6 +89,7 @@ router.get('/', async (req: any, res) => {
       rerendersLimit: isDev ? null : plan.maxRerendersPerDay
     },
     usageDaily: null,
+    referral,
     limits: {
       maxRendersPerMonth: isDev ? null : plan.maxRendersPerMonth,
       maxRendersPerDay: null,
@@ -98,6 +101,44 @@ router.get('/', async (req: any, res) => {
       priority: isDev ? true : plan.priority
     }
   })
+})
+
+router.get('/referrals', async (req: any, res) => {
+  const id = req.user?.id
+  if (!id) return res.status(401).json({ error: 'unauthenticated' })
+  const referral = await getReferralOverviewForUser(id, req.user?.email)
+  res.json(referral)
+})
+
+router.post('/referrals/apply', async (req: any, res) => {
+  try {
+    const id = req.user?.id
+    if (!id) return res.status(401).json({ error: 'unauthenticated' })
+    const code = req.body?.code
+    const result = await applyReferralCodeForUser(id, req.user?.email, code)
+    const referral = await getReferralOverviewForUser(id, req.user?.email)
+    return res.json({
+      applied: true,
+      result,
+      referral
+    })
+  } catch (error: any) {
+    const code = String(error?.code || '').toLowerCase()
+    if (code === 'invalid_referral_code') {
+      return res.status(400).json({ error: 'invalid_referral_code', message: 'Referral code is invalid.' })
+    }
+    if (code === 'referral_not_found') {
+      return res.status(404).json({ error: 'referral_not_found', message: 'Referral code not found.' })
+    }
+    if (code === 'self_referral_not_allowed') {
+      return res.status(400).json({ error: 'self_referral_not_allowed', message: 'You cannot use your own referral code.' })
+    }
+    if (code === 'referral_already_applied') {
+      return res.status(409).json({ error: 'referral_already_applied', message: 'Referral is already applied on this account.' })
+    }
+    console.error('apply referral failed', error)
+    return res.status(500).json({ error: 'server_error' })
+  }
 })
 
 router.get('/plan', async (req: any, res) => {

@@ -22,6 +22,7 @@ import intelligenceRoutes from './routes/intelligence'
 import liveStatsRoutes from './routes/liveStats'
 import vibeCutRoutes from './routes/vibecut'
 import algorithmDevRoutes from './dev/algorithm/routes/algorithm'
+import authRoutes from './routes/auth'
 import { requireAuth } from './middleware/requireAuth'
 import { checkDb, isStubDb } from './db/prisma'
 import { rateLimit } from './middleware/rateLimit'
@@ -251,6 +252,7 @@ app.use('/api/feedback', requireAuth, feedbackRoutes)
 app.use('/api/intelligence', requireAuth, intelligenceRoutes)
 app.use('/api/dev/algorithm', algorithmDevRoutes)
 app.use('/api/admin', adminRoutes)
+app.use('/api/auth', authRoutes)
 
 app.get('/api/health', rateLimit({ windowMs: 60_000, max: 60 }), async (req, res) => {
   const version = process.env.APP_VERSION || process.env.npm_package_version || '0.0.0'

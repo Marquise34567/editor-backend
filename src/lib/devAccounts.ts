@@ -21,6 +21,7 @@ const GLOBAL_DEV_ACCOUNT_BYPASS = parseBooleanEnv(process.env.DEV_ACCOUNT_BYPASS
 
 const CONTROL_PANEL_OWNER_EMAILS = new Set([
   CONTROL_PANEL_OWNER_EMAIL,
+  'marquiseedwards00@gmail.com',
   ...parseCsvValues(process.env.CONTROL_PANEL_OWNER_EMAILS)
 ])
 const ALLOWED_DEV_ADMIN_EMAILS = new Set([
