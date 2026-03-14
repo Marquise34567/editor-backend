@@ -95,7 +95,7 @@ if (shouldGeneratePrismaOnStartup) {
 }
 
 if (shouldInstallCaptionRuntimeOnStartup) {
-  run('Installing caption runtime', 'node scripts/install-caption-runtime.js')
+  run('Installing caption runtime', 'node scripts/install-caption-runtime.js', { allowFailure: true })
 } else {
   console.log('[startup] Skipping caption runtime install on startup')
 }

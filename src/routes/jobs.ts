@@ -73,6 +73,7 @@ import { getCaptionEngineStatus } from '../lib/captionEngine'
 import { chooseConfigForJobCreation, computeAndStoreRenderQualityMetric } from '../dev/algorithm/integration/pipelineIntegration'
 import { runFeedbackLoop } from '../dev/algorithm/feedbackLoop/feedbackLoopService'
 import { buildFullAutoYoutubePreset, parseFullAutoYoutubeRequest } from '../services/fullAutoYoutube'
+import { sendVideoReadyEmail } from '../services/videoReadyEmail'
 import {
   derivePerSecondRewardSignal,
   getActiveBoundaryCriticModel,
@@ -123,6 +124,11 @@ const AUTO_DELETE_DOWNLOAD_OUTPUT_DELAY_MS = (() => {
   const envValue = Number(process.env.AUTO_DELETE_DOWNLOAD_OUTPUT_DELAY_MS || 60_000)
   if (!Number.isFinite(envValue) || envValue < 10_000) return 60_000
   return Math.round(envValue)
+})()
+const VIDEO_READY_EMAIL_URL_EXPIRES_SECONDS = (() => {
+  const raw = Number(process.env.VIDEO_READY_EMAIL_URL_EXPIRES_SECONDS || 60 * 60 * 24 * 7)
+  if (!Number.isFinite(raw)) return 60 * 60 * 24 * 7
+  return Math.max(600, Math.min(60 * 60 * 24 * 30, Math.round(raw)))
 })()
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -11037,9 +11043,17 @@ const inferContentStyleProfile = ({
     metricSupportByStyle.reaction >= 0.62 &&
     (spikeRatio >= 0.2 || avgEmotion >= 0.6)
   )
-  if (reactionDominantSignal) {
-    scores.reaction = clamp01(scores.reaction + 0.05)
-    scores.story = clamp01(scores.story - 0.04)
+  const reactionHighEnergySignal = (
+    !reactionDominantSignal &&
+    keywordSupportByStyle.reaction >= 0.25 &&
+    avgEmotion >= 0.78 &&
+    avgScene >= 0.5
+  )
+  if (reactionDominantSignal || reactionHighEnergySignal) {
+    const reactionBoost = reactionDominantSignal ? 0.05 : 0.08
+    const storyPenalty = reactionDominantSignal ? 0.04 : 0.05
+    scores.reaction = clamp01(scores.reaction + reactionBoost)
+    scores.story = clamp01(scores.story - storyPenalty)
   }
   const ranked = (Object.keys(scores) as ContentStyle[])
     .map((style) => ({ style, score: scores[style] }))
@@ -37962,6 +37976,36 @@ const processJob = async (
       }),
       analysis: nextAnalysis
     })
+
+    const emailLabel = (() => {
+      const fromInput = String(job?.inputPath || '').trim()
+      if (fromInput) return path.basename(fromInput)
+      if (outputPaths.length > 0) return path.basename(outputPaths[0])
+      return null
+    })()
+    void (async () => {
+      try {
+        let signedOutputUrl: string | null = null
+        if (outputPaths.length > 0) {
+          try {
+            signedOutputUrl = await getSignedOutputUrl({
+              key: outputPaths[0],
+              expiresIn: VIDEO_READY_EMAIL_URL_EXPIRES_SECONDS
+            })
+          } catch (error) {
+            console.warn(`[${requestId || 'noid'}] video ready signed URL failed`, error)
+          }
+        }
+        await sendVideoReadyEmail({
+          email: user.email,
+          jobId,
+          title: emailLabel,
+          outputUrl: signedOutputUrl
+        })
+      } catch (error) {
+        console.warn(`[${requestId || 'noid'}] video ready email failed for ${jobId}`, error)
+      }
+    })()
 
     try {
       await computeAndStoreRenderQualityMetric({

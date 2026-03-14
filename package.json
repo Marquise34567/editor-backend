@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node scripts/start.js",
     "start:worker": "node scripts/start-worker.js",
-    "postinstall": "prisma generate && node scripts/install-caption-runtime.js",
+    "postinstall": "node scripts/postinstall.js",
     "prisma:migrate": "prisma migrate dev --name init",
     "prisma:generate": "prisma generate",
     "prisma:seed": "ts-node prisma/seed.ts",
