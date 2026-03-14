@@ -5344,7 +5344,7 @@ const parseRenderConfigFromRequest = (body?: any): RenderConfig => {
     value: body?.verticalMode,
     legacyCrop
   })
-  const verticalMode: VerticalModeSettings = manualClipRangesFromPayload && !verticalModeBase.manualClipRanges
+  const verticalMode: VerticalModeSettings = manualClipRangesFromPayload
     ? {
         ...verticalModeBase,
         manualClipRanges: manualClipRangesFromPayload
