@@ -2247,7 +2247,7 @@ const VERTICAL_CAPTION_FONT_SIZE_MIN = 32
 const VERTICAL_CAPTION_FONT_SIZE_MAX = 220
 const VERTICAL_CAPTION_FONT_SIZE_DEFAULT = 110
 const VERTICAL_CAPTION_OUTLINE_WIDTH_MIN = 0
-const VERTICAL_CAPTION_OUTLINE_WIDTH_MAX = 24
+const VERTICAL_CAPTION_OUTLINE_WIDTH_MAX = 10
 const VERTICAL_CAPTION_SHADOW_BLUR_MIN = 0
 const VERTICAL_CAPTION_SHADOW_BLUR_MAX = 42
 const DEFAULT_VERTICAL_CAPTION_POSITION_Y = Number((1300 / 1920).toFixed(4))
@@ -6955,10 +6955,10 @@ const resolveVerticalCaptionConfig = (
         textColor: 'FFFF00',
         accentColor: 'FFFF00',
         outlineColor: '000000',
-        outlineWidth: 15,
+        outlineWidth: 6,
         shadowEnabled: true,
         shadowColor: '000000',
-        shadowBlur: 6,
+        shadowBlur: 3,
         boxEnabled: false,
         boxColor: '000000',
         animationEnabled: true,
@@ -7092,10 +7092,10 @@ const resolveVerticalCaptionConfig = (
       textColor: 'FFE500',
       accentColor: 'FFF173',
       outlineColor: '050505',
-      outlineWidth: 18,
+      outlineWidth: 6,
       shadowEnabled: true,
       shadowColor: '050505',
-      shadowBlur: 8,
+      shadowBlur: 3,
       boxEnabled: false,
       boxColor: '000000',
       animationEnabled: true,
@@ -7134,11 +7134,19 @@ const resolveVerticalCaptionConfig = (
       (defaults as any)?.caption_animation_enabled
     )
   )
-  const resolvedFallbackAnimation = fallbackAnimationFromDefaults
+  let resolvedFallbackAnimation = fallbackAnimationFromDefaults
     ? fallbackAnimationFromDefaults
     : fallbackAnimationEnabledFromDefaults === false
       ? 'none'
       : fallbackPresetStyle.animation
+  if (resolvedFallbackAnimation === 'none') {
+    resolvedFallbackAnimation = fallbackPresetStyle.animation === 'none'
+      ? 'pop'
+      : fallbackPresetStyle.animation
+  }
+  if (resolvedFallbackAnimation === 'none') {
+    resolvedFallbackAnimation = 'pop'
+  }
   const fallbackStyle = {
     fontId: parseVerticalCaptionFontId(defaults?.fontId) || fallbackPresetStyle.fontId,
     textColor: parseVerticalCaptionHexColor(defaults?.textColor) || fallbackPresetStyle.textColor,
@@ -7218,8 +7226,13 @@ const resolveVerticalCaptionConfig = (
     : null
   let resolvedAnimation = overrideAnimation || styleBaseline.animation
   if (overrideAnimationEnabled === false) {
-    resolvedAnimation = 'none'
+    resolvedAnimation = styleBaseline.animation === 'none'
+      ? 'pop'
+      : styleBaseline.animation
   } else if (overrideAnimationEnabled === true && resolvedAnimation === 'none') {
+    resolvedAnimation = 'pop'
+  }
+  if (resolvedAnimation === 'none') {
     resolvedAnimation = 'pop'
   }
   const resolvedAnimationSpeed = parseVerticalCaptionAnimationSpeed(override.animationSpeed) ?? styleBaseline.animationSpeed
@@ -7245,7 +7258,7 @@ const resolveVerticalCaptionConfig = (
     shadowBlur: parseVerticalCaptionShadowBlur(override.shadowBlur) ?? styleBaseline.shadowBlur,
     boxEnabled: typeof override.boxEnabled === 'boolean' ? override.boxEnabled : styleBaseline.boxEnabled,
     boxColor: parseVerticalCaptionHexColor(override.boxColor) || styleBaseline.boxColor,
-    animationEnabled: resolvedAnimation !== 'none',
+    animationEnabled: true,
     animation: resolvedAnimation,
     animationSpeed: resolvedAnimationSpeed,
     dynamicMode: resolvedDynamicMode,
@@ -7285,10 +7298,10 @@ const getDefaultVerticalCaptionConfig = (): VerticalCaptionConfig => {
     textColor: 'FFFF00',
     accentColor: 'FFFF00',
     outlineColor: '000000',
-    outlineWidth: 15,
+    outlineWidth: 6,
     shadowEnabled: true,
     shadowColor: '000000',
-    shadowBlur: 5,
+    shadowBlur: 3,
     boxEnabled: false,
     boxColor: '000000',
     positionX: 0.5,
@@ -7328,8 +7341,13 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     : null
   let resolvedAnimation = requestedAnimation || defaults.animation
   if (requestedAnimationEnabled === false) {
-    resolvedAnimation = 'none'
+    resolvedAnimation = defaults.animation === 'none'
+      ? 'pop'
+      : defaults.animation
   } else if (requestedAnimationEnabled === true && resolvedAnimation === 'none') {
+    resolvedAnimation = 'pop'
+  }
+  if (resolvedAnimation === 'none') {
     resolvedAnimation = 'pop'
   }
   const animationSpeed = parseVerticalCaptionAnimationSpeed(config.animationSpeed) ?? defaults.animationSpeed
@@ -7342,7 +7360,7 @@ const buildVerticalCaptionPersistenceFields = (config: VerticalCaptionConfig) =>
     enabled: Boolean(config.enabled),
     autoGenerate: Boolean(config.autoGenerate),
     preset,
-    animationEnabled: resolvedAnimation !== 'none',
+    animationEnabled: true,
     animation: resolvedAnimation,
     animationSpeed,
     dynamicMode,
@@ -26000,7 +26018,10 @@ const buildMrBeastAnimatedAss = ({
   const primaryColor = toAssColorFromHex(config.textColor)
   const secondaryColor = toAssColorFromHex(config.accentColor)
   const outlineColor = toAssColorFromHex(config.outlineColor)
-  const outlineWidth = Math.max(1, Math.min(24, Math.round(Number(config.outlineWidth || 20))))
+  const outlineWidth = Math.max(
+    1,
+    Math.min(VERTICAL_CAPTION_OUTLINE_WIDTH_MAX, Math.round(Number(config.outlineWidth || 20)))
+  )
   const fontSize = Math.max(36, Math.min(220, Math.round(Number(config.fontSize || 96))))
   const animationSpeed = 1.16
   const scaleInA = Math.max(35, Math.round(130 / animationSpeed))
@@ -26127,7 +26148,7 @@ const buildVerticalCaptionSubtitleStyle = ({
         textColor: 'FFFF00',
         accentColor: 'FFFF00',
         outlineColor: '000000',
-        outlineWidth: 15,
+        outlineWidth: 6,
         animation: 'pop' as const
       }
     }
@@ -26180,7 +26201,7 @@ const buildVerticalCaptionSubtitleStyle = ({
       textColor: 'FFE500',
       accentColor: 'FFF173',
       outlineColor: '050505',
-      outlineWidth: 18,
+      outlineWidth: 6,
       animation: 'pop' as const
     }
   })()
@@ -26205,7 +26226,7 @@ const buildVerticalCaptionSubtitleStyle = ({
     textColor: resolvedTextColor,
     accentColor: resolvedAccentColor,
     outlineColor: resolvedOutlineColor,
-    outlineWidth: Math.max(1, Math.min(24, resolvedOutlineWidth || 1)),
+    outlineWidth: Math.max(1, Math.min(VERTICAL_CAPTION_OUTLINE_WIDTH_MAX, resolvedOutlineWidth || 1)),
     animation: resolvedAnimation
   })
 }
@@ -26277,7 +26298,10 @@ const buildVerticalCaptionAss = ({
   const primaryColor = toAssColorFromHex(config.textColor || styleConfig.textColor)
   const secondaryColor = toAssColorFromHex(config.accentColor || styleConfig.accentColor)
   const outlineColor = toAssColorFromHex(config.outlineColor || styleConfig.outlineColor)
-  const outlineWidth = Math.max(0, Math.min(24, Math.round(Number(config.outlineWidth ?? styleConfig.outlineWidth ?? 6))))
+  const outlineWidth = Math.max(
+    0,
+    Math.min(VERTICAL_CAPTION_OUTLINE_WIDTH_MAX, Math.round(Number(config.outlineWidth ?? styleConfig.outlineWidth ?? 6)))
+  )
   const shadowBlur = Math.max(0, Math.min(12, Number((Number(config.shadowBlur || 0) / 5).toFixed(2))))
   const shadowEnabled = Boolean(config.shadowEnabled && shadowBlur > 0)
   const boxEnabled = Boolean(config.boxEnabled)
@@ -42711,4 +42735,3 @@ export const __retentionTestUtils = {
 }
 
 export default router
-
