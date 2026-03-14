@@ -11032,6 +11032,15 @@ const inferContentStyleProfile = ({
     gaming: clamp01(0.34 * keywordSupportByStyle.gaming + 0.44 * metricSupportByStyle.gaming + 0.22 * contentSignalStrength),
     story: clamp01(0.26 + 0.22 * avgEmotion + 0.2 * avgSpeech + 0.16 * clamp01(1 - Math.abs(avgScene - 0.34)) + 0.16 * clamp01(1 - Math.abs(spikeRatio - 0.18)))
   }
+  const reactionDominantSignal = (
+    keywordSupportByStyle.reaction >= 0.38 &&
+    metricSupportByStyle.reaction >= 0.62 &&
+    (spikeRatio >= 0.2 || avgEmotion >= 0.6)
+  )
+  if (reactionDominantSignal) {
+    scores.reaction = clamp01(scores.reaction + 0.05)
+    scores.story = clamp01(scores.story - 0.04)
+  }
   const ranked = (Object.keys(scores) as ContentStyle[])
     .map((style) => ({ style, score: scores[style] }))
     .sort((a, b) => b.score - a.score)
