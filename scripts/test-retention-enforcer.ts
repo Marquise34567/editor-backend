@@ -411,6 +411,7 @@ const run = () => {
     aggressionLevel: 'medium' as any,
     hasTranscript: Boolean(repeatFixture.hasTranscript),
     signalStrength: computeContentSignalStrength(repeatFixture.engagementWindows),
+    strictFailClosed: true,
     windows: repeatFixture.engagementWindows,
     transcriptCues: [] as any[],
     segments: repeatFixture.segments,
