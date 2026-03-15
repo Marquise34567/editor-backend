@@ -4013,42 +4013,47 @@ type LongFormPresetConfig = {
 }
 const LONG_FORM_PRESET_CONFIG: Record<ConcreteLongFormPreset, LongFormPresetConfig> = {
   balanced: {
-    maxSilenceSeconds: 0.28,
-    maxGapBetweenMeaningfulMoments: 4,
-    boredomCandidateThreshold: 0.75,
-    boredomHardCutThreshold: 0.86,
-    targetCutsPerMinute: { min: 10, max: 18 },
-    compressionSpeed: { min: 1.03, max: 1.1 },
+    maxSilenceSeconds: 0.32,
+    maxGapBetweenMeaningfulMoments: 4.4,
+    boredomCandidateThreshold: 0.78,
+    boredomHardCutThreshold: 0.88,
+    targetCutsPerMinute: { min: 8, max: 15 },
+    compressionSpeed: { min: 1.02, max: 1.08 },
     compressionIntensity: 'rare',
-    maxTalkingHeadShotSeconds: 6,
+    maxTalkingHeadShotSeconds: 6.5,
     enforceFillerRemoval: true,
     sentenceTightening: true
   },
   aggressive: {
-    maxSilenceSeconds: 0.18,
-    maxGapBetweenMeaningfulMoments: 3,
-    boredomCandidateThreshold: 0.65,
-    boredomHardCutThreshold: 0.8,
-    targetCutsPerMinute: { min: 18, max: 28 },
-    compressionSpeed: { min: 1.07, max: 1.15 },
+    maxSilenceSeconds: 0.22,
+    maxGapBetweenMeaningfulMoments: 3.5,
+    boredomCandidateThreshold: 0.68,
+    boredomHardCutThreshold: 0.82,
+    targetCutsPerMinute: { min: 15, max: 24 },
+    compressionSpeed: { min: 1.05, max: 1.12 },
     compressionIntensity: 'moderate',
-    maxTalkingHeadShotSeconds: 4.5,
+    maxTalkingHeadShotSeconds: 5,
     enforceFillerRemoval: true,
     sentenceTightening: true
   },
   ultra: {
-    maxSilenceSeconds: 0.12,
-    maxGapBetweenMeaningfulMoments: 2.4,
-    boredomCandidateThreshold: 0.55,
-    boredomHardCutThreshold: 0.74,
-    targetCutsPerMinute: { min: 28, max: 40 },
-    compressionSpeed: { min: 1.12, max: 1.2 },
+    maxSilenceSeconds: 0.15,
+    maxGapBetweenMeaningfulMoments: 2.8,
+    boredomCandidateThreshold: 0.58,
+    boredomHardCutThreshold: 0.77,
+    targetCutsPerMinute: { min: 24, max: 34 },
+    compressionSpeed: { min: 1.1, max: 1.18 },
     compressionIntensity: 'heavy',
-    maxTalkingHeadShotSeconds: 3.2,
+    maxTalkingHeadShotSeconds: 3.7,
     enforceFillerRemoval: true,
     sentenceTightening: true
   }
 }
+const LONG_FORM_PACING_SCALE = (() => {
+  const envValue = Number(process.env.LONG_FORM_PACING_SCALE || '')
+  if (!Number.isFinite(envValue) || envValue <= 0) return 1
+  return clamp(envValue, 0.6, 1.6)
+})()
 type LongFormRuntimeTuning = LongFormPresetConfig & {
   preset: LongFormPreset
   aggression: number
@@ -4148,6 +4153,20 @@ const resolveLongFormRuntimeTuning = ({
     Math.max(compressionMin + 0.01, 1.02),
     LONG_FORM_SPEED_CAP_MAX
   )
+  const pacingScale = LONG_FORM_PACING_SCALE
+  const scaledSilence = clamp(blendedSilence * pacingScale, 0.08, 0.55)
+  const scaledGap = clamp(blendedGap * pacingScale, 2.1, 6)
+  const scaledCompressionMin = clamp(compressionMin / pacingScale, 1, 1.14)
+  const scaledCompressionMax = clamp(
+    compressionMax / pacingScale,
+    Math.max(scaledCompressionMin + 0.01, 1.02),
+    LONG_FORM_SPEED_CAP_MAX
+  )
+  const scaledTalkingHeadShotSeconds = clamp(
+    (presetConfig.maxTalkingHeadShotSeconds - 1.3 * aggressionBias + 0.5 * (safeClarity / 100)) * pacingScale,
+    2.6,
+    7.2
+  )
   return {
     ...presetConfig,
     preset: resolvedPreset,
@@ -4155,8 +4174,8 @@ const resolveLongFormRuntimeTuning = ({
     clarityVsSpeed: safeClarity,
     tangentKiller: Boolean(tangentKiller),
     isLongForm: Number(durationSeconds || 0) >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS,
-    maxSilenceSeconds: Number(blendedSilence.toFixed(3)),
-    maxGapBetweenMeaningfulMoments: Number(blendedGap.toFixed(3)),
+    maxSilenceSeconds: Number(scaledSilence.toFixed(3)),
+    maxGapBetweenMeaningfulMoments: Number(scaledGap.toFixed(3)),
     boredomCandidateThreshold: Number(clamp(
       presetConfig.boredomCandidateThreshold - blendedThresholdDrop,
       0.45,
@@ -4168,14 +4187,10 @@ const resolveLongFormRuntimeTuning = ({
       0.93
     ).toFixed(3)),
     compressionSpeed: {
-      min: Number(compressionMin.toFixed(3)),
-      max: Number(compressionMax.toFixed(3))
+      min: Number(scaledCompressionMin.toFixed(3)),
+      max: Number(scaledCompressionMax.toFixed(3))
     },
-    maxTalkingHeadShotSeconds: Number(clamp(
-      presetConfig.maxTalkingHeadShotSeconds - 1.3 * aggressionBias + 0.5 * (safeClarity / 100),
-      2.6,
-      6.4
-    ).toFixed(3))
+    maxTalkingHeadShotSeconds: Number(scaledTalkingHeadShotSeconds.toFixed(3))
   }
 }
 const resolveAdaptiveSilenceDbThreshold = ({
@@ -4203,6 +4218,24 @@ const resolveAdaptiveSilenceDbThreshold = ({
     3.4 * onlyCutsBias
   return Number(clamp(SILENCE_DB + sensitivityLift, -30, -18).toFixed(1))
 }
+const DEFAULT_LONGFORM_AGGRESSION = (() => {
+  const envValue = Number(
+    process.env.DEFAULT_LONGFORM_AGGRESSION ||
+    process.env.PACING_LONGFORM_AGGRESSION ||
+    ''
+  )
+  if (!Number.isFinite(envValue)) return 50
+  return Math.round(clamp(envValue, LONG_FORM_AGGRESSION_MIN, LONG_FORM_AGGRESSION_MAX))
+})()
+const DEFAULT_LONGFORM_CLARITY_VS_SPEED = (() => {
+  const envValue = Number(
+    process.env.DEFAULT_LONGFORM_CLARITY_VS_SPEED ||
+    process.env.PACING_LONGFORM_CLARITY_VS_SPEED ||
+    ''
+  )
+  if (!Number.isFinite(envValue)) return 70
+  return Math.round(clamp(envValue, LONG_FORM_CLARITY_MIN, LONG_FORM_CLARITY_MAX))
+})()
 const DEFAULT_EDIT_OPTIONS: EditOptions = {
   autoHookMove: true,
   removeBoring: true,
@@ -4225,8 +4258,8 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   creativeVariant: 'balanced',
   hookSelectionMode: 'auto',
   longFormPreset: 'auto',
-  longFormAggression: 50,
-  longFormClarityVsSpeed: 70,
+  longFormAggression: DEFAULT_LONGFORM_AGGRESSION,
+  longFormClarityVsSpeed: DEFAULT_LONGFORM_CLARITY_VS_SPEED,
   tangentKiller: true,
   coldStartAutopilot: false,
   continuityFirstMode: false,
