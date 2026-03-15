@@ -114,6 +114,10 @@ type FfmpegRunResult = {
   stdout: string
   stderr: string
 }
+type FfmpegRunOptions = {
+  timeoutMs?: number
+  label?: string
+}
 
 const bucketChecks: Record<string, Promise<void> | null> = {}
 const RETRY_BASE_DELAY_MS = 350
@@ -405,7 +409,7 @@ const killJobFfmpegProcesses = (jobId: string) => {
   return killed
 }
 
-const runFfmpegProcess = (args: string[]) => {
+const runFfmpegProcess = (args: string[], options: FfmpegRunOptions = {}) => {
   return new Promise<FfmpegRunResult>((resolve, reject) => {
     const proc = spawn(FFMPEG_PATH, args, { stdio: 'pipe' })
     const jobId = getPipelineJobId()
@@ -427,14 +431,43 @@ const runFfmpegProcess = (args: string[]) => {
     let stdout = ''
     let stderr = ''
     let finished = false
+    const timeoutMs = Number(options.timeoutMs || 0)
+    let timeoutId: NodeJS.Timeout | null = null
     const cleanup = () => {
-      if (finished) return
+      if (finished) return false
       finished = true
-      if (!jobId) return
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+        timeoutId = null
+      }
+      if (!jobId) return true
       const set = ffmpegProcessesByJobId.get(jobId)
-      if (!set) return
+      if (!set) return true
       set.delete(proc)
       if (set.size === 0) ffmpegProcessesByJobId.delete(jobId)
+      return true
+    }
+    if (timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        if (finished) return
+        try {
+          proc.kill('SIGKILL')
+        } catch (e) {
+          // ignore
+        }
+        cleanup()
+        const label = options.label ? `:${options.label}` : ''
+        const err: any = new Error(`ffmpeg_timeout${label}`)
+        err.timeoutMs = timeoutMs
+        err.command = formatFfmpegCommand(args)
+        err.stdout = stdout
+        err.stderr = stderr
+        err.timedOut = true
+        reject(err)
+      }, timeoutMs)
+      if (typeof (timeoutId as any).unref === 'function') {
+        ;(timeoutId as any).unref()
+      }
     }
     proc.stdout.on('data', (data) => {
       if (stdout.length >= FFMPEG_LOG_LIMIT) return
@@ -445,7 +478,7 @@ const runFfmpegProcess = (args: string[]) => {
       stderr += data.toString()
     })
     proc.on('error', (err) => {
-      cleanup()
+      if (!cleanup()) return
       const wrapped: any = new Error(`ffmpeg_spawn_error:${String((err as any)?.code || err?.message || 'unknown')}`)
       wrapped.cause = err
       wrapped.command = formatFfmpegCommand(args)
@@ -454,18 +487,18 @@ const runFfmpegProcess = (args: string[]) => {
       reject(wrapped)
     })
     proc.on('close', (exitCode, signal) => {
-      cleanup()
+      if (!cleanup()) return
       resolve({ exitCode, signal, stdout, stderr })
     })
   })
 }
 
-const runFfmpeg = async (args: string[]) => {
+const runFfmpeg = async (args: string[], options?: FfmpegRunOptions) => {
   const jobId = getPipelineJobId()
   if (isPipelineCanceled(jobId)) {
     throw new JobCanceledError(jobId || undefined)
   }
-  const result = await runFfmpegProcess(args)
+  const result = await runFfmpegProcess(args, options)
   if (result.exitCode === 0) {
     if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId || undefined)
     return result
@@ -2515,6 +2548,24 @@ const resolveAnalysisWindowSeconds = (durationSeconds: number) => {
     return baseline
   }
   return Math.max(45, Math.min(baseline, AUTO_FAST_RUNTIME_PROFILE_ANALYZE_CAP_SECONDS))
+}
+const resolveAnalysisTaskTimeoutMs = (
+  durationSeconds: number,
+  {
+    multiplier = 3,
+    baseMs = 15_000,
+    minMs = 45_000,
+    maxMs = 10 * 60_000
+  }: {
+    multiplier?: number
+    baseMs?: number
+    minMs?: number
+    maxMs?: number
+  } = {}
+) => {
+  const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
+  const raw = analyzeSeconds * 1000 * multiplier + baseMs
+  return Math.round(clamp(raw, minMs, maxMs))
 }
 const ANALYSIS_DISABLE_FACE_DETECTION = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_FACE_DETECTION || '').trim())
 const ANALYSIS_DISABLE_TEXT_DENSITY = /^(1|true|yes)$/i.test(String(process.env.ANALYSIS_DISABLE_TEXT_DENSITY || '').trim())
@@ -10294,8 +10345,8 @@ const getRerenderLimitViolation = async ({
   return null
 }
 
-const runFfmpegCapture = async (args: string[]) => {
-  const result = await runFfmpeg(args)
+const runFfmpegCapture = async (args: string[], options?: FfmpegRunOptions) => {
+  const result = await runFfmpeg(args, options)
   return [result.stderr, result.stdout].filter(Boolean).join('\n')
 }
 
@@ -10738,7 +10789,19 @@ const detectAudioEnergy = async (filePath: string, durationSeconds: number) => {
     '-f', 'null',
     '-'
   ]
-  const output = await runFfmpegCapture(args)
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 3,
+    baseMs: 15_000,
+    minMs: 45_000,
+    maxMs: 8 * 60_000
+  })
+  let output = ''
+  try {
+    output = await runFfmpegCapture(args, { timeoutMs, label: 'analysis_audio_energy' })
+  } catch (err: any) {
+    console.warn('[analysis] audio energy capture failed', { reason: err?.message || err })
+    return [] as { time: number; rms: number }[]
+  }
   const lines = output.split(/\r?\n/)
   const sampleMap = new Map<number, number>()
   for (const line of lines) {
@@ -10770,7 +10833,19 @@ const detectSceneChanges = async (filePath: string, durationSeconds: number) => 
     '-f', 'null',
     '-'
   ]
-  const output = await runFfmpegCapture(args)
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 3,
+    baseMs: 15_000,
+    minMs: 45_000,
+    maxMs: 8 * 60_000
+  })
+  let output = ''
+  try {
+    output = await runFfmpegCapture(args, { timeoutMs, label: 'analysis_scene_changes' })
+  } catch (err: any) {
+    console.warn('[analysis] scene change scan failed', { reason: err?.message || err })
+    return [] as number[]
+  }
   const times = new Set<number>()
   for (const line of output.split(/\r?\n/)) {
     if (!line.includes('pts_time:')) continue
@@ -10818,7 +10893,13 @@ const extractFramesEveryHalfSecond = async (
     framePattern
   ]
   try {
-    await runFfmpeg(args)
+    const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+      multiplier: 6,
+      baseMs: 30_000,
+      minMs: 60_000,
+      maxMs: 12 * 60_000
+    })
+    await runFfmpeg(args, { timeoutMs, label: 'analysis_frame_extract' })
   } catch (err) {
     return [] as string[]
   }
@@ -19970,7 +20051,19 @@ const detectSilences = async (
     '-f', 'null',
     '-'
   ]
-  const output = await runFfmpegCapture(args)
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 3,
+    baseMs: 15_000,
+    minMs: 45_000,
+    maxMs: 8 * 60_000
+  })
+  let output = ''
+  try {
+    output = await runFfmpegCapture(args, { timeoutMs, label: 'analysis_silence_detect' })
+  } catch (err: any) {
+    console.warn('[analysis] silence detection failed', { reason: err?.message || err })
+    return [] as TimeRange[]
+  }
   const lines = output.split(/\r?\n/)
   const silences: TimeRange[] = []
   let currentStart: number | null = null
@@ -20034,7 +20127,17 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
     '-f', 'null',
     '-'
   ]
-  const output = await runFfmpegCapture(args).catch(() => '')
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 3.5,
+    baseMs: 20_000,
+    minMs: 45_000,
+    maxMs: 9 * 60_000
+  })
+  const output = await runFfmpegCapture(args, { timeoutMs, label: 'analysis_face_detect' })
+    .catch((err: any) => {
+      console.warn('[analysis] face detection failed', { reason: err?.message || err })
+      return ''
+    })
   const lines = output.split(/\r?\n/)
   const sampleMap = new Map<number, {
     count: number
@@ -20109,37 +20212,87 @@ const detectFacePresence = async (filePath: string, durationSeconds: number) => 
   })
 }
 
+const runExternalModelCapture = ({
+  command,
+  args,
+  timeoutMs,
+  label
+}: {
+  command: string
+  args: string[]
+  timeoutMs: number
+  label: string
+}) => {
+  return new Promise<string>((resolve) => {
+    let stdout = ''
+    let finished = false
+    let timeoutId: NodeJS.Timeout | null = null
+    const proc = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    const finalize = (value: string) => {
+      if (finished) return
+      finished = true
+      if (timeoutId) {
+        clearTimeout(timeoutId)
+        timeoutId = null
+      }
+      resolve(value)
+    }
+    if (timeoutMs > 0) {
+      timeoutId = setTimeout(() => {
+        if (finished) return
+        try {
+          proc.kill('SIGKILL')
+        } catch {
+          // ignore
+        }
+        console.warn(`[analysis] ${label} timed out`, { timeoutMs })
+        finalize('')
+      }, timeoutMs)
+      if (typeof (timeoutId as any).unref === 'function') {
+        ;(timeoutId as any).unref()
+      }
+    }
+    proc.stdout.on('data', (chunk) => {
+      stdout = appendBoundedOutput(stdout, chunk, SCRIPT_STDIO_LIMIT)
+    })
+    proc.on('error', () => finalize(''))
+    proc.on('close', () => finalize(stdout))
+  })
+}
+
 const detectEmotionModelSignals = async (filePath: string, durationSeconds: number) => {
   const modelBin = process.env.EMOTION_MODEL_BIN
   if (!modelBin) return [] as { time: number; intensity: number }[]
   const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
-  return new Promise<{ time: number; intensity: number }[]>((resolve) => {
-    let stdout = ''
-    const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
-    proc.stdout.on('data', (chunk) => {
-      stdout = appendBoundedOutput(stdout, chunk, SCRIPT_STDIO_LIMIT)
-    })
-    proc.on('error', () => resolve([]))
-    proc.on('close', () => {
-      try {
-        const parsed = JSON.parse(stdout)
-        if (!Array.isArray(parsed)) return resolve([])
-        const out = parsed
-          .map((entry: any) => ({
-            time: Number(entry?.time),
-            intensity: Number(entry?.intensity)
-          }))
-          .filter((entry: any) => Number.isFinite(entry.time) && Number.isFinite(entry.intensity))
-          .map((entry: any) => ({
-            time: entry.time,
-            intensity: clamp01(entry.intensity)
-          }))
-        resolve(out)
-      } catch {
-        resolve([])
-      }
-    })
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 4,
+    baseMs: 20_000,
+    minMs: 45_000,
+    maxMs: 8 * 60_000
   })
+  const stdout = await runExternalModelCapture({
+    command: modelBin,
+    args: [filePath, String(analyzeSeconds)],
+    timeoutMs,
+    label: 'emotion-model'
+  })
+  try {
+    const parsed = JSON.parse(stdout)
+    if (!Array.isArray(parsed)) return [] as { time: number; intensity: number }[]
+    const out = parsed
+      .map((entry: any) => ({
+        time: Number(entry?.time),
+        intensity: Number(entry?.intensity)
+      }))
+      .filter((entry: any) => Number.isFinite(entry.time) && Number.isFinite(entry.intensity))
+      .map((entry: any) => ({
+        time: entry.time,
+        intensity: clamp01(entry.intensity)
+      }))
+    return out
+  } catch {
+    return [] as { time: number; intensity: number }[]
+  }
 }
 
 let cachedTesseractBin: string | null | undefined
@@ -20189,7 +20342,13 @@ const detectTextDensityWithTesseract = async (filePath: string, durationSeconds:
     framePattern
   ]
   try {
-    await runFfmpeg(frameArgs)
+    const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+      multiplier: 6,
+      baseMs: 30_000,
+      minMs: 60_000,
+      maxMs: 12 * 60_000
+    })
+    await runFfmpeg(frameArgs, { timeoutMs, label: 'analysis_text_density_frames' })
   } catch {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true })
@@ -20251,48 +20410,53 @@ const detectTextDensity = async (filePath: string, durationSeconds: number) => {
     return [] as { time: number; density: number; confidence?: number }[]
   }
   const analyzeSeconds = resolveAnalysisWindowSeconds(durationSeconds)
-  return new Promise<{ time: number; density: number; confidence?: number }[]>((resolve) => {
-    let stdout = ''
-    const proc = spawn(modelBin, [filePath, String(analyzeSeconds)], { stdio: ['ignore', 'pipe', 'pipe'] })
-    proc.stdout.on('data', (chunk) => {
-      stdout = appendBoundedOutput(stdout, chunk, SCRIPT_STDIO_LIMIT)
-    })
-    proc.on('error', () => resolve([]))
-    proc.on('close', () => {
-      try {
-        const parsed = JSON.parse(stdout)
-        const list = Array.isArray(parsed)
-          ? parsed
-          : Array.isArray(parsed?.samples)
-            ? parsed.samples
-            : []
-        if (!Array.isArray(list)) return resolve([])
-        const output = list
-          .map((entry: any) => ({
-            time: Number(entry?.time ?? entry?.second ?? entry?.t),
-            density: Number(entry?.density ?? entry?.textDensity ?? entry?.value),
-            confidence: Number(entry?.confidence ?? entry?.score ?? entry?.textConfidence)
-          }))
-          .filter((entry: any) => Number.isFinite(entry.time) && Number.isFinite(entry.density))
-          .map((entry: any) => ({
-            time: entry.time,
-            density: clamp01(entry.density),
-            confidence: Number.isFinite(entry.confidence) ? clamp01(entry.confidence) : undefined
-          }))
-        if (!output.length && String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
-          void detectTextDensityWithTesseract(filePath, durationSeconds).then(resolve).catch(() => resolve([]))
-          return
-        }
-        resolve(output)
-      } catch {
-        if (String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
-          void detectTextDensityWithTesseract(filePath, durationSeconds).then(resolve).catch(() => resolve([]))
-          return
-        }
-        resolve([] as { time: number; density: number; confidence?: number }[])
-      }
-    })
+  const timeoutMs = resolveAnalysisTaskTimeoutMs(durationSeconds, {
+    multiplier: 4,
+    baseMs: 20_000,
+    minMs: 45_000,
+    maxMs: 8 * 60_000
   })
+  const stdout = await runExternalModelCapture({
+    command: modelBin,
+    args: [filePath, String(analyzeSeconds)],
+    timeoutMs,
+    label: 'text-density-model'
+  })
+  try {
+    const parsed = JSON.parse(stdout)
+    const list = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.samples)
+        ? parsed.samples
+        : []
+    if (!Array.isArray(list)) {
+      if (String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+        return detectTextDensityWithTesseract(filePath, durationSeconds)
+      }
+      return [] as { time: number; density: number; confidence?: number }[]
+    }
+    const output = list
+      .map((entry: any) => ({
+        time: Number(entry?.time ?? entry?.second ?? entry?.t),
+        density: Number(entry?.density ?? entry?.textDensity ?? entry?.value),
+        confidence: Number(entry?.confidence ?? entry?.score ?? entry?.textConfidence)
+      }))
+      .filter((entry: any) => Number.isFinite(entry.time) && Number.isFinite(entry.density))
+      .map((entry: any) => ({
+        time: entry.time,
+        density: clamp01(entry.density),
+        confidence: Number.isFinite(entry.confidence) ? clamp01(entry.confidence) : undefined
+      }))
+    if (!output.length && String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+      return detectTextDensityWithTesseract(filePath, durationSeconds)
+    }
+    return output
+  } catch {
+    if (String(process.env.TEXT_DENSITY_ENABLE_TESSERACT || '').toLowerCase() === '1') {
+      return detectTextDensityWithTesseract(filePath, durationSeconds)
+    }
+    return [] as { time: number; density: number; confidence?: number }[]
+  }
 }
 
 const isRangeCoveredBySegments = (start: number, end: number, segments: Segment[]) => {
