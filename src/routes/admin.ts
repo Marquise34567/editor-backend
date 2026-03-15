@@ -39,6 +39,7 @@ import { PLAN_CONFIG } from '../shared/planConfig'
 import { getFounderAvailability } from '../services/founder'
 import { summarizeRequestMetrics } from '../services/requestMetrics'
 import { getFeatureLabControls, updateFeatureLabControls } from '../services/featureLab'
+import { isDevAccount } from '../lib/devAccounts'
 
 const router = express.Router()
 
@@ -67,6 +68,42 @@ const IMPRESSION_EVENT_PATTERN = /(page[_:\-]?view|impression)/i
 const SUBSCRIPTION_CANCEL_REASON_MAX_LEN = 240
 const ADMIN_REASON_MAX_LEN = 300
 const PLAN_TIERS = new Set(['starter', 'creator', 'studio', 'founder'])
+const QUEUE_PRIORITY_BUCKETS = [
+  { level: 0, label: 'dev' },
+  { level: 1, label: 'founder' },
+  { level: 2, label: 'studio' },
+  { level: 3, label: 'creator' },
+  { level: 4, label: 'standard' }
+]
+
+const parsePositiveInt = (value: unknown) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return null
+  return Math.round(parsed)
+}
+
+const resolveWorkerReplicaCount = () => {
+  const explicit = parsePositiveInt(process.env.JOB_WORKER_REPLICAS)
+  if (explicit) return explicit
+  const supervised = String(process.env.WORKER_SUPERVISED || '').trim() === '1' ||
+    Boolean(String(process.env.WORKER_REPLICA || '').trim())
+  if (!supervised) return 1
+  const cpuCount = os.cpus()?.length ?? 1
+  return cpuCount <= 1 ? 1 : 2
+}
+
+const resolveMaxPipelines = (workerReplicas: number, targetConcurrency: number | null, override: number | null) => {
+  if (override && override > 0) return override
+  if (targetConcurrency && targetConcurrency > 0) {
+    const replicas = Math.max(1, workerReplicas)
+    return Math.max(1, Math.ceil(targetConcurrency / replicas))
+  }
+  const cpus = os.cpus()?.length ?? 1
+  if (cpus <= 1) return 1
+  if (cpus === 2) return 2
+  if (cpus >= 4) return Math.max(2, Math.min(4, cpus - 1))
+  return cpus
+}
 
 type FeedbackSentiment = 'positive' | 'negative' | 'bug' | 'request'
 type FeedbackItem = {
@@ -1311,6 +1348,43 @@ const buildCommandCenterPayload = async () => {
   const activeSubscriptions = subscriptions.filter((sub) =>
     isActiveSubscriptionStatus(String(sub?.status || '').toLowerCase())
   )
+  const userEmailById = new Map(
+    users.map((user: any) => [String(user?.id || '').trim(), String(user?.email || '').trim() || null])
+  )
+  const planTierByUserId = activeSubscriptions.reduce((map, sub) => {
+    const userId = String((sub as any)?.userId || '').trim()
+    if (!userId) return map
+    map.set(userId, coercePlanTier(String((sub as any)?.planTier || 'free')))
+    return map
+  }, new Map<string, ReturnType<typeof coercePlanTier>>())
+  const queueJobs = await prisma.job
+    .findMany({
+      where: { status: { in: Array.from(QUEUE_STATUSES) } },
+      select: { userId: true, priorityLevel: true }
+    })
+    .catch(() => [] as any[])
+  const priorityCounts = queueJobs.reduce((map: Map<number, number>, job: any) => {
+    const userId = String(job?.userId || '').trim()
+    const email = userEmailById.get(userId) || null
+    const isDev = userId ? isDevAccount(userId, email) : false
+    const tier = isDev ? 'dev' : (planTierByUserId.get(userId) || 'free')
+    const level =
+      tier === 'dev' ? 0 :
+      tier === 'founder' ? 1 :
+      tier === 'studio' ? 2 :
+      tier === 'creator' ? 3 :
+      4
+    map.set(level, (map.get(level) || 0) + 1)
+    return map
+  }, new Map<number, number>())
+  const priorityDistribution = QUEUE_PRIORITY_BUCKETS.map((bucket) => ({
+    ...bucket,
+    count: priorityCounts.get(bucket.level) || 0
+  }))
+  const workerReplicas = resolveWorkerReplicaCount()
+  const targetConcurrency = parsePositiveInt(process.env.JOB_TARGET_CONCURRENCY)
+  const jobConcurrencyOverride = parsePositiveInt(process.env.JOB_CONCURRENCY)
+  const maxPipelines = resolveMaxPipelines(workerReplicas, targetConcurrency, jobConcurrencyOverride)
   const activeByTier = activeSubscriptions.reduce((map, sub) => {
     const tier = String((sub as any)?.planTier || 'free').toLowerCase()
     map[tier] = (map[tier] || 0) + 1
@@ -2372,6 +2446,14 @@ const buildCommandCenterPayload = async () => {
       activeJobsInQueue: queueLength,
       avgProcessingTimeSec: avgRenderTimeSec,
       failedRenders: failedReasons,
+      queueRuntime: {
+        maxPipelines,
+        targetConcurrency: targetConcurrency ?? null,
+        workerReplicas,
+        jobConcurrencyOverride: jobConcurrencyOverride ?? null,
+        queueDepth: queueJobs.length,
+        priorityDistribution
+      },
       workerHealth: {
         online: true,
         status: queueLength > 0 ? 'online_busy' : 'online_idle',

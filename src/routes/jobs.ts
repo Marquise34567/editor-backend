@@ -33494,7 +33494,7 @@ const processJob = async (
     finalQuality,
     watermarkApplied: renderWatermarkEnabled,
     priority: features.priorityQueue,
-    priorityLevel: features.priorityQueue ? 1 : 2
+    priorityLevel: resolveQueuePriorityLevel(effectiveTier, devBypass)
   })
 
   await ensureBucket(INPUT_BUCKET, true)
@@ -38649,13 +38649,44 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
 }
 
 type QueueItem = { jobId: string; user: { id: string; email?: string }; requestedQuality?: ExportQuality; requestId?: string; priorityLevel: number }
+// Lower number == higher queue priority. Standard tiers share the same level.
+const QUEUE_PRIORITY_LEVEL_BY_TIER: Record<PlanTier, number> = {
+  founder: 1,
+  studio: 2,
+  creator: 3,
+  starter: 4,
+  free: 4
+}
+const DEV_QUEUE_PRIORITY_LEVEL = 0
+const resolveQueuePriorityLevel = (tier: PlanTier, devBypass: boolean) => {
+  if (devBypass) return DEV_QUEUE_PRIORITY_LEVEL
+  return QUEUE_PRIORITY_LEVEL_BY_TIER[tier] ?? QUEUE_PRIORITY_LEVEL_BY_TIER.free
+}
 const pipelineQueue: QueueItem[] = []
 const queuedPipelineJobIds = new Set<string>()
 const runningPipelineJobIds = new Set<string>()
 let activePipelines = 0
+const JOB_TARGET_CONCURRENCY = (() => {
+  const envVal = Number(process.env.JOB_TARGET_CONCURRENCY || 0)
+  if (!Number.isFinite(envVal) || envVal <= 0) return 0
+  return Math.round(envVal)
+})()
+const WORKER_REPLICA_COUNT = (() => {
+  const envVal = Number(process.env.JOB_WORKER_REPLICAS || 0)
+  if (Number.isFinite(envVal) && envVal > 0) return Math.round(envVal)
+  const supervised = String(process.env.WORKER_SUPERVISED || '').trim() === '1' ||
+    Boolean(String(process.env.WORKER_REPLICA || '').trim())
+  if (!supervised) return 1
+  const cpuCount = os.cpus()?.length ?? 1
+  return cpuCount <= 1 ? 1 : 2
+})()
 const MAX_PIPELINES = (() => {
   const envVal = Number(process.env.JOB_CONCURRENCY || 0)
-  if (envVal && Number.isFinite(envVal) && envVal > 0) return envVal
+  if (envVal && Number.isFinite(envVal) && envVal > 0) return Math.round(envVal)
+  if (JOB_TARGET_CONCURRENCY > 0) {
+    const replicaCount = Math.max(1, WORKER_REPLICA_COUNT)
+    return Math.max(1, Math.ceil(JOB_TARGET_CONCURRENCY / replicaCount))
+  }
   const cpus = os.cpus() ? os.cpus().length : 1
   if (cpus <= 1) return 1
   if (cpus === 2) return 2
@@ -39197,6 +39228,8 @@ const startQueueRecoveryLoop = () => {
       jobProcessorEnabled: JOB_PROCESSOR_ENABLED,
       recoveryTakeoverEnabled: JOB_RECOVERY_TAKEOVER_ENABLED,
       maxPipelines: MAX_PIPELINES,
+      targetConcurrency: JOB_TARGET_CONCURRENCY || null,
+      workerReplicas: WORKER_REPLICA_COUNT,
       queueRecoveryIntervalMs: QUEUE_RECOVERY_INTERVAL_MS,
       heartbeatIntervalMs: PIPELINE_HEARTBEAT_INTERVAL_MS,
       heartbeatGraceMs: PIPELINE_HEARTBEAT_GRACE_MS,
@@ -39533,7 +39566,8 @@ const handleCreateJob = async (req: any, res: any) => {
         inputPath,
         progress: 0,
         requestedQuality: desiredQuality,
-        priorityLevel: effectivePlan.priority ? 1 : 2,
+        priority: effectivePlan.priority,
+        priorityLevel: resolveQueuePriorityLevel(effectiveTier, devBypass),
         renderSettings: {
           ...buildPersistedRenderSettings(renderConfig, {
             retentionAggressionLevel,
