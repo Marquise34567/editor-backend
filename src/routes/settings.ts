@@ -1,6 +1,6 @@
 import express from 'express'
 import { isStubDb, prisma } from '../db/prisma'
-import { clampQualityForTier, normalizeQuality } from '../lib/gating'
+import { clampQualityForTier, normalizeQuality, type ExportQuality, type PlanTier } from '../lib/gating'
 import { getOrCreateUser } from '../services/users'
 import { getUserPlan } from '../services/plans'
 import {
@@ -45,6 +45,11 @@ const DEFAULT_SETTINGS = {
   musicDuck: true,
   subtitleStyle: DEFAULT_SUBTITLE_PRESET,
   autoZoomMax: 1.1
+}
+
+const resolveDefaultExportQuality = (tier: PlanTier): ExportQuality => {
+  const baseline: ExportQuality = tier === 'free' ? '720p' : '1080p'
+  return clampQualityForTier(baseline, tier)
 }
 
 const coerceAutoZoomMax = (value: any, maxValue: number) => {
@@ -123,7 +128,7 @@ router.get('/', async (req: any, res) => {
       const created = {
         userId,
         watermarkEnabled: features.watermark,
-        exportQuality: features.maxResolution ?? '720p',
+        exportQuality: resolveDefaultExportQuality(effectiveTier),
         autoCaptions: subtitlesEnabled ? false : false,
         autoHookMove: true,
         removeBoring: true,

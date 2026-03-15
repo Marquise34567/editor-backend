@@ -133,6 +133,8 @@ const VIDEO_READY_EMAIL_URL_EXPIRES_SECONDS = (() => {
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
+
 const withRetries = async <T>(label: string, attempts: number, run: () => Promise<T>): Promise<T> => {
   let lastError: any = null
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -2679,11 +2681,11 @@ const HOOK_SELECTION_MIN_SCORE = 0.8
 const STRICT_INTERRUPT_MAX_GAP_SECONDS = 5
 const STRICT_INTERRUPT_MIN_GAP_SECONDS = 3
 const RETENTION_2026_WEIGHTS = {
-  introHold: 0.4,
-  interruptDensity: 0.25,
-  endingReplayPotential: 0.15,
-  energyCurve: 0.1,
-  silentCaptionViability: 0.1
+  introHold: 0.38,
+  interruptDensity: 0.27,
+  endingReplayPotential: 0.14,
+  energyCurve: 0.12,
+  silentCaptionViability: 0.09
 } as const
 const LONG_FORM_RESCUE_MIN_DURATION = 120
 const LONG_FORM_MIN_EDIT_RATIO = 0.035
@@ -2724,8 +2726,8 @@ const BOUNDARY_PATHOLOGY_HARD_FAIL_WORST = 0.82
 const BOUNDARY_PATHOLOGY_HARD_FAIL_PER_MIN = 3
 const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
 const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
-const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 90
-const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 150
+const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 60
+const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 120
 const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_auto_defaults_2026_03_04'
 const MANDATORY_VARIANT_MIN = 3
 const MANDATORY_VARIANT_MAX = 5
@@ -2968,11 +2970,11 @@ const resolvePipelinePowerModePlaybook = (
     return {
       id: 'retention_king',
       label: 'Quality',
-      prompt: ULTRA_MODE_PLAYBOOK_PROMPT,
+      prompt: RETENTION_KING_PLAYBOOK_PROMPT,
       notes: [
-        'Quality mode playbook active: aggressive binge-cut profile enabled.',
+        'Quality mode playbook active: retention-engineering binge profile enabled.',
         'Quality mode keeps transcript-assisted hook and cut analysis enabled for stronger opener selection.',
-        'Quality mode favors better edit decisions over the absolute fastest turnaround.',
+        'Quality mode prioritizes watch-time stability, mid-roll rehooks, and narrative cohesion.',
         'Quality mode enforces arc order: hook -> build-up -> payout -> cliffhanger.'
       ]
     }
@@ -3048,11 +3050,11 @@ const RETENTION_STYLE_REFERENCE_PRESETS: Record<RetentionStrategyProfile, Retent
     referenceAnchors: ['longform_reaction_commentary', 'cinematic_lifestyle_archive', 'energetic_vlog'],
     autoHookMove: true,
     removeBoring: true,
-    smartZoom: false,
+    smartZoom: true,
     jumpCuts: true,
     transitions: false,
     soundFx: false,
-    emotionalBoost: false,
+    emotionalBoost: true,
     aggressiveMode: false,
     musicDuck: true
   },
@@ -3452,8 +3454,8 @@ const resolveHookCandidateTarget = (durationSeconds: number) => {
   return 20
 }
 const resolveLongFormMinHookSourceStart = (durationSeconds: number) => {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 8
-  return Number(clamp(durationSeconds * 0.08, 8, 24).toFixed(3))
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return 6
+  return Number(clamp(durationSeconds * 0.06, 6, 18).toFixed(3))
 }
 const resolveClipCandidateTarget = ({
   durationSeconds,
@@ -3644,14 +3646,14 @@ const resolveV3PacingGovernorCaps = ({
   const contextHeavyMode = editorMode === 'education' || editorMode === 'podcast' || editorMode === 'commentary'
   const autoMode = !editorMode || editorMode === 'auto'
   const tightenedGap = clamp(
-    maxGapSeconds - (contextHeavyMode ? 0.22 : autoMode ? 0.36 : 0.48),
-    1.9,
-    5
+    maxGapSeconds - (contextHeavyMode ? 0.18 : autoMode ? 0.5 : 0.65),
+    1.6,
+    4.2
   )
   const tightenedTalkingHead = clamp(
-    maxTalkingHeadShotSeconds - (contextHeavyMode ? 0.18 : autoMode ? 0.42 : 0.58),
-    2.2,
-    6
+    maxTalkingHeadShotSeconds - (contextHeavyMode ? 0.14 : autoMode ? 0.6 : 0.78),
+    1.9,
+    5.0
   )
   return {
     maxGapSeconds: Number(tightenedGap.toFixed(3)),
@@ -4013,38 +4015,38 @@ type LongFormPresetConfig = {
 }
 const LONG_FORM_PRESET_CONFIG: Record<ConcreteLongFormPreset, LongFormPresetConfig> = {
   balanced: {
-    maxSilenceSeconds: 0.32,
-    maxGapBetweenMeaningfulMoments: 4.4,
-    boredomCandidateThreshold: 0.78,
-    boredomHardCutThreshold: 0.88,
-    targetCutsPerMinute: { min: 8, max: 15 },
-    compressionSpeed: { min: 1.02, max: 1.08 },
+    maxSilenceSeconds: 0.26,
+    maxGapBetweenMeaningfulMoments: 3.8,
+    boredomCandidateThreshold: 0.74,
+    boredomHardCutThreshold: 0.84,
+    targetCutsPerMinute: { min: 10, max: 18 },
+    compressionSpeed: { min: 1.03, max: 1.1 },
     compressionIntensity: 'rare',
-    maxTalkingHeadShotSeconds: 6.5,
+    maxTalkingHeadShotSeconds: 5.8,
     enforceFillerRemoval: true,
     sentenceTightening: true
   },
   aggressive: {
-    maxSilenceSeconds: 0.22,
-    maxGapBetweenMeaningfulMoments: 3.5,
-    boredomCandidateThreshold: 0.68,
-    boredomHardCutThreshold: 0.82,
-    targetCutsPerMinute: { min: 15, max: 24 },
-    compressionSpeed: { min: 1.05, max: 1.12 },
+    maxSilenceSeconds: 0.18,
+    maxGapBetweenMeaningfulMoments: 3.0,
+    boredomCandidateThreshold: 0.64,
+    boredomHardCutThreshold: 0.78,
+    targetCutsPerMinute: { min: 18, max: 26 },
+    compressionSpeed: { min: 1.06, max: 1.14 },
     compressionIntensity: 'moderate',
-    maxTalkingHeadShotSeconds: 5,
+    maxTalkingHeadShotSeconds: 4.4,
     enforceFillerRemoval: true,
     sentenceTightening: true
   },
   ultra: {
-    maxSilenceSeconds: 0.15,
-    maxGapBetweenMeaningfulMoments: 2.8,
-    boredomCandidateThreshold: 0.58,
-    boredomHardCutThreshold: 0.77,
-    targetCutsPerMinute: { min: 24, max: 34 },
-    compressionSpeed: { min: 1.1, max: 1.18 },
+    maxSilenceSeconds: 0.12,
+    maxGapBetweenMeaningfulMoments: 2.4,
+    boredomCandidateThreshold: 0.56,
+    boredomHardCutThreshold: 0.74,
+    targetCutsPerMinute: { min: 26, max: 38 },
+    compressionSpeed: { min: 1.12, max: 1.2 },
     compressionIntensity: 'heavy',
-    maxTalkingHeadShotSeconds: 3.7,
+    maxTalkingHeadShotSeconds: 3.3,
     enforceFillerRemoval: true,
     sentenceTightening: true
   }
@@ -4310,7 +4312,6 @@ const applyRetentionStyleReferencePreset = ({
   }
 }
 
-const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 type EmotionalTuningProfile = {
   thresholdOffset: number
   spacingMultiplier: number
@@ -4694,7 +4695,14 @@ const truncateErrorText = (value: unknown, max = 360) => {
 const getDefaultCrfForQuality = (quality: ExportQuality) => {
   if (quality === '4k') return 18
   if (quality === '1080p') return 20
-  return 22
+  return 18
+}
+
+const resolveVideoBitrateArgs = (quality: ExportQuality, fastMode: boolean): string[] => {
+  if (fastMode) return []
+  if (quality === '720p') return ['-maxrate', '10M', '-bufsize', '20M']
+  if (quality === '1080p') return ['-maxrate', '18M', '-bufsize', '36M']
+  return []
 }
 
 const resolveAudioSampleRate = (value: unknown, fallback: number) => {
@@ -18975,7 +18983,7 @@ const pickTopHookCandidates = ({
         0.03 * dynamicLift.peakDensity -
         0.1 * deadLeadPenalty -
         0.14 * transcriptRangeTrustPenalty -
-        0.1 * longFormStartPenalty -
+        0.06 * longFormStartPenalty -
         0.07 * earlyResolutionPenalty -
         0.08 * weakConversationalPenalty -
         0.13 * tunedContextPenalty * modeHookProfile.contextPenaltyMultiplier * creativeVariantHookProfile.contextPenaltyMultiplier -
@@ -19896,10 +19904,14 @@ const applyLongFormMicroRehooks = ({
   for (const anchor of dedupedAnchors) {
     const anchorSegment = out.find((segment) => segment.start <= anchor && segment.end >= anchor)
     if (!anchorSegment) continue
+    const alreadyEmphasized = Boolean((anchorSegment as any).emphasize)
+    const zoomBoost = alreadyEmphasized ? 0.01 : 0.014
+    const brightnessBoost = alreadyEmphasized ? 0.012 : 0.018
+    const sfxBoost = alreadyEmphasized ? 0.06 : 0.1
     const currentZoom = Number(anchorSegment.zoom ?? 0)
-    anchorSegment.zoom = Number(clamp(currentZoom + 0.018, 0, ZOOM_HARD_MAX - 1).toFixed(3))
-    anchorSegment.brightness = Number(clamp(Number(anchorSegment.brightness ?? 0) + 0.02, -0.2, 0.25).toFixed(3))
-    anchorSegment.soundFxLevel = Number(clamp(Number(anchorSegment.soundFxLevel ?? 0) + 0.14, 0, 0.9).toFixed(3))
+    anchorSegment.zoom = Number(clamp(currentZoom + zoomBoost, 0, ZOOM_HARD_MAX - 1).toFixed(3))
+    anchorSegment.brightness = Number(clamp(Number(anchorSegment.brightness ?? 0) + brightnessBoost, -0.2, 0.25).toFixed(3))
+    anchorSegment.soundFxLevel = Number(clamp(Number(anchorSegment.soundFxLevel ?? 0) + sfxBoost, 0, 0.9).toFixed(3))
     anchorSegment.emphasize = true
     applied += 1
   }
@@ -22365,9 +22377,10 @@ const buildLongFormMicroRehookAnchors = ({
     LONG_FORM_MICRO_REHOOK_MIN_SECONDS,
     LONG_FORM_MICRO_REHOOK_MAX_SECONDS
   )
+  const maxAnchors = clamp(Math.round(durationSeconds / 75), 12, 60)
   for (
     let cursor = baseInterval;
-    cursor < Math.max(baseInterval + 10, durationSeconds - 20) && anchors.length < 24;
+    cursor < Math.max(baseInterval + 10, durationSeconds - 20) && anchors.length < maxAnchors;
     cursor += baseInterval
   ) {
     anchors.push(Number(cursor.toFixed(3)))
@@ -23118,38 +23131,38 @@ const inferPacingProfile = (
   const profiles: Record<PacingNiche, Omit<PacingProfile, 'niche'>> = {
     high_energy: {
       minLen: 4.2,
-      maxLen: 8.4,
-      earlyTarget: 5,
-      middleTarget: 5.7,
-      lateTarget: 5.2,
-      jitter: 0.3,
+      maxLen: 7.8,
+      earlyTarget: 4.8,
+      middleTarget: 5.3,
+      lateTarget: 5,
+      jitter: 0.34,
       speedCap: 1.38
     },
     education: {
       minLen: 4.9,
-      maxLen: 9.6,
-      earlyTarget: 5.6,
-      middleTarget: 6.4,
-      lateTarget: 5.8,
-      jitter: 0.22,
+      maxLen: 9,
+      earlyTarget: 5.3,
+      middleTarget: 6,
+      lateTarget: 5.5,
+      jitter: 0.26,
       speedCap: 1.3
     },
     talking_head: {
       minLen: 5.4,
-      maxLen: 10.2,
-      earlyTarget: 5.9,
-      middleTarget: 6.9,
-      lateTarget: 6.1,
-      jitter: 0.18,
+      maxLen: 9.4,
+      earlyTarget: 5.5,
+      middleTarget: 6.4,
+      lateTarget: 5.7,
+      jitter: 0.24,
       speedCap: 1.26
     },
     story: {
       minLen: 4.8,
-      maxLen: 9.8,
-      earlyTarget: 5.5,
-      middleTarget: 6.5,
-      lateTarget: 5.9,
-      jitter: 0.24,
+      maxLen: 9,
+      earlyTarget: 5.2,
+      middleTarget: 6,
+      lateTarget: 5.5,
+      jitter: 0.28,
       speedCap: 1.32
     }
   }
@@ -23376,8 +23389,15 @@ const applyPacingPattern = (
       if (speech > 0.62 && profile.niche !== 'high_energy') target += 0.35
       if (excitement > 0.7) target -= 0.55
       if (aggressiveMode) target -= 0.65
+      const inProtectedPhase = phase < 0.12 || phase > 0.9
+      let rhythmShift = 0
+      if (!inProtectedPhase) {
+        if (patternIdx % 6 === 0 && (engagement > 0.58 || excitement > 0.62)) rhythmShift += 0.45
+        if (patternIdx % 5 === 2 && engagement < 0.42) rhythmShift -= 0.35
+        if (speech > 0.6 && engagement > 0.55 && patternIdx % 4 === 1) rhythmShift += 0.2
+      }
       const jitter = patternIdx % 2 === 0 ? -profile.jitter : profile.jitter
-      const desired = Math.max(minLen, Math.min(maxLen, target + jitter))
+      const desired = Math.max(minLen, Math.min(maxLen, target + jitter + rhythmShift))
       const nextEnd = Math.min(end, cursor + desired)
       const speed = pickPacingSpeed(cursor, nextEnd)
       out.push({ ...seg, start: cursor, end: nextEnd, speed })
@@ -25634,10 +25654,29 @@ const buildConcatFilter = (
     targetHeight: number
     fit: HorizontalFitMode
     enableFades?: boolean
+    enhanceVideo?: {
+      enableColor: boolean
+      enableDenoise: boolean
+      enableSharpen: boolean
+      enableStabilization: boolean
+    }
   }
 ) => {
   const parts: string[] = []
   const scalePad = buildFrameFitFilter(opts.fit, opts.targetWidth, opts.targetHeight)
+  const enhanceVideo = opts.enhanceVideo ?? {
+    enableColor: false,
+    enableDenoise: false,
+    enableSharpen: false,
+    enableStabilization: false
+  }
+  const canStabilize = Boolean(enhanceVideo.enableStabilization && hasFfmpegFilter('deshake'))
+  const videoEnhanceChain = buildHorizontalEnhancementFilters({
+    enableColor: enhanceVideo.enableColor,
+    enableDenoise: enhanceVideo.enableDenoise,
+    enableSharpen: enhanceVideo.enableSharpen
+  })
+  const vEnhance = videoEnhanceChain ? `,${videoEnhanceChain}` : ''
   const durations: number[] = []
   const canGenerateNoiseFx = opts.withAudio && hasFfmpegFilter('anoisesrc')
   const nonZoomIndexes = segments
@@ -25670,6 +25709,9 @@ const buildConcatFilter = (
     const zoom = seg.zoom && seg.zoom > 0 ? seg.zoom : 0
     const brightness = seg.brightness && seg.brightness !== 0 ? seg.brightness : 0
     const segDuration = Math.max(0.01, roundForFilter((seg.end - seg.start) / speed))
+    const vStabilize = canStabilize && segDuration >= 1.2
+      ? ',deshake=x=24:y=24:w=48:h=48:rx=12:ry=12:edge=mirror'
+      : ''
     durations.push(segDuration)
     const vTrim = `trim=start=${toFilterNumber(seg.start)}:end=${toFilterNumber(seg.end)}`
     const vSpeed = speed !== 1 ? `,setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : ',setpts=PTS-STARTPTS'
@@ -25685,9 +25727,9 @@ const buildConcatFilter = (
     const vBright = brightness !== 0 ? `,eq=brightness=${brightness}:saturation=1.05` : ''
     const nonZoomLabel = nonZoomSourceLabels.get(idx)
     if (nonZoomLabel) {
-      parts.push(`[${nonZoomLabel}]${vTrim}${vSpeed}${vBright}[v${idx}]`)
+      parts.push(`[${nonZoomLabel}]${vTrim}${vStabilize}${vSpeed}${vBright}${vEnhance}[v${idx}]`)
     } else {
-      parts.push(`[0:v]${vTrim}${vSpeed}${vZoom}${vBright},${scalePad}[v${idx}]`)
+      parts.push(`[0:v]${vTrim}${vStabilize}${vSpeed}${vZoom}${vBright},${scalePad}${vEnhance}[v${idx}]`)
     }
 
     if (opts.withAudio) {
@@ -30123,17 +30165,52 @@ const buildVerticalAutoColorFilter = (averageLuma?: number | null) => {
 
 const buildVerticalEnhancementFilters = ({
   applyStabilization,
-  averageLuma
+  averageLuma,
+  enableDenoise,
+  enableSharpen
 }: {
   applyStabilization: boolean
   averageLuma?: number | null
+  enableDenoise?: boolean
+  enableSharpen?: boolean
 }) => {
   const filters: string[] = []
   if (applyStabilization && hasFfmpegFilter('deshake')) {
     filters.push('deshake=x=24:y=24:w=48:h=48:rx=12:ry=12:edge=mirror')
   }
   filters.push(buildVerticalAutoColorFilter(averageLuma))
+  if (enableDenoise && hasFfmpegFilter('hqdn3d')) {
+    filters.push('hqdn3d=1.2:1.2:3:3')
+  }
+  if (enableSharpen && hasFfmpegFilter('unsharp')) {
+    filters.push('unsharp=5:5:0.6:3:3:0.0')
+  }
   return filters
+}
+
+const buildHorizontalEnhancementFilters = ({
+  enableColor,
+  enableDenoise,
+  enableSharpen
+}: {
+  enableColor: boolean
+  enableDenoise: boolean
+  enableSharpen: boolean
+}) => {
+  const filters: string[] = []
+  if (enableColor) {
+    filters.push(`eq=brightness=${toFilterNumber(0.01)}:contrast=${toFilterNumber(1.04)}:saturation=${toFilterNumber(1.03)}`)
+  }
+  if (enableDenoise && hasFfmpegFilter('hqdn3d')) {
+    filters.push('hqdn3d=1.2:1.2:3:3')
+  }
+  if (enableSharpen && hasFfmpegFilter('unsharp')) {
+    filters.push('unsharp=5:5:0.6:3:3:0.0')
+  }
+  if (filters.length) {
+    filters.push('format=yuv420p')
+  }
+  return filters.join(',')
 }
 
 const renderVerticalClip = async ({
@@ -30147,6 +30224,7 @@ const renderVerticalClip = async ({
   withAudio,
   videoPreset,
   videoCrf,
+  videoBitrateArgs,
   audioBitrate,
   audioSampleRate,
   audioFilters,
@@ -30155,6 +30233,7 @@ const renderVerticalClip = async ({
   enableSoundFx,
   applyStabilization,
   averageLuma,
+  enhanceVideo,
   paceMultiplier,
   autoZoomMax,
   watermarkEnabled,
@@ -30174,6 +30253,7 @@ const renderVerticalClip = async ({
   withAudio: boolean
   videoPreset: string
   videoCrf: string
+  videoBitrateArgs?: string[]
   audioBitrate: string
   audioSampleRate: string
   audioFilters: string[]
@@ -30182,6 +30262,7 @@ const renderVerticalClip = async ({
   enableSoundFx: boolean
   applyStabilization: boolean
   averageLuma?: number | null
+  enhanceVideo?: { enableDenoise: boolean; enableSharpen: boolean }
   paceMultiplier?: number
   autoZoomMax: number
   watermarkEnabled?: boolean
@@ -30269,7 +30350,9 @@ const renderVerticalClip = async ({
   const shouldApplyClipTransitions = Boolean(enableTransitions)
   const enhancementFx = buildVerticalEnhancementFilters({
     applyStabilization: Boolean(applyStabilization),
-    averageLuma
+    averageLuma,
+    enableDenoise: Boolean(enhanceVideo?.enableDenoise),
+    enableSharpen: Boolean(enhanceVideo?.enableSharpen)
   })
   if (enhancementFx.length || shouldApplySmartZoom || shouldApplyClipTransitions) {
     const videoFx: string[] = [...enhancementFx]
@@ -30567,6 +30650,7 @@ const renderVerticalClip = async ({
     videoPreset,
     '-crf',
     videoCrf,
+    ...(videoBitrateArgs ?? []),
     '-threads',
     String(Math.max(1, Math.round(Number(codecThreads || RENDER_CODEC_THREADS)))),
     '-pix_fmt',
@@ -30687,11 +30771,13 @@ const buildAudioFilters = ({
     filters.push('dynaudnorm=f=85:g=11:p=0.88:m=9')
   }
   filters.push(
-    `acompressor=threshold=-17dB:ratio=${toFilterNumber(compressionRatio)}:attack=${toFilterNumber(attackMs)}:release=${toFilterNumber(releaseMs)}:makeup=2`,
-    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.2:LRA=9`
+    `acompressor=threshold=-17dB:ratio=${toFilterNumber(compressionRatio)}:attack=${toFilterNumber(attackMs)}:release=${toFilterNumber(releaseMs)}:makeup=2`
   )
+  if (hasFfmpegFilter('loudnorm')) {
+    filters.push(`loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.5:LRA=9`)
+  }
   if (hasFfmpegFilter('alimiter')) {
-    filters.push('alimiter=limit=0.97:level=true')
+    filters.push('alimiter=limit=0.85:level=true')
   }
   return filters
 }
@@ -30716,8 +30802,7 @@ const buildFastModeAudioFilters = ({
   const filters: string[] = [
     'highpass=f=72',
     'lowpass=f=17500',
-    'acompressor=threshold=-18dB:ratio=2.6:attack=14:release=180:makeup=1.8',
-    `loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.2:LRA=10`
+    'acompressor=threshold=-18dB:ratio=2.6:attack=14:release=180:makeup=1.8'
   ]
   if (sourceIsMono) {
     if (hasFfmpegFilter('haas')) {
@@ -30726,8 +30811,11 @@ const buildFastModeAudioFilters = ({
       filters.push('extrastereo=m=1.35:c=0.0')
     }
   }
+  if (hasFfmpegFilter('loudnorm')) {
+    filters.push(`loudnorm=I=${toFilterNumber(targetLoudness)}:TP=-1.5:LRA=10`)
+  }
   if (hasFfmpegFilter('alimiter')) {
-    filters.push('alimiter=limit=0.97:level=true')
+    filters.push('alimiter=limit=0.85:level=true')
   }
   return filters
 }
@@ -32468,13 +32556,13 @@ const getEditOptionsForUser = async (
     tangentKiller = true
     resolvedFastMode = true
   } else if (retentionKingModeRequested) {
-    requestedStrategy = 'viral'
-    requestedAggression = 'viral'
-    longFormPreset = 'ultra'
-    longFormAggression = Math.max(longFormAggression, 92)
-    longFormClarityVsSpeed = Math.min(longFormClarityVsSpeed, 36)
+    if (requestedStrategy === 'safe') requestedStrategy = 'balanced'
+    if (requestedAggression === 'low') requestedAggression = 'medium'
+    longFormPreset = longFormPreset === 'ultra' ? 'aggressive' : longFormPreset
+    longFormAggression = Math.max(longFormAggression, 72)
+    longFormClarityVsSpeed = Math.max(longFormClarityVsSpeed, 70)
     tangentKiller = true
-    resolvedFastMode = true
+    resolvedFastMode = false
   }
   const modeBypassesAdvancedCap = ultraModeRequested || retentionKingModeRequested
   const allowedAggression: RetentionAggressionLevel =
@@ -33364,6 +33452,7 @@ const processJob = async (
     : resolveAudioBitrateArg(process.env.FFMPEG_AUDIO_BITRATE, platformProfile.audioBitrateKbps)
   const ffPreset = requestedVideoPresetOverride || ffPresetBase
   const ffCrf = requestedVideoCrfOverride === null ? ffCrfBase : String(requestedVideoCrfOverride)
+  const ffVideoBitrateArgs = resolveVideoBitrateArgs(finalQuality, renderFastMode)
   const ffAudioBitrate = requestedAudioBitrateKbpsOverride === null
     ? ffAudioBitrateBase
     : `${requestedAudioBitrateKbpsOverride}k`
@@ -33999,6 +34088,7 @@ const processJob = async (
           withAudio: hasInputAudio,
           videoPreset: ffPreset,
           videoCrf: ffCrf,
+          videoBitrateArgs: ffVideoBitrateArgs,
           audioBitrate: ffAudioBitrate,
           audioSampleRate: ffAudioSampleRate,
           codecThreads: renderCodecThreads,
@@ -34008,6 +34098,10 @@ const processJob = async (
           enableSoundFx: options.soundFx,
           applyStabilization: applyClipStabilization,
           averageLuma: clipAverageLuma,
+          enhanceVideo: {
+            enableDenoise: !renderFastVerticalMode,
+            enableSharpen: !renderFastVerticalMode
+          },
           paceMultiplier: resolveVerticalPacingMultiplier(clipCaptionConfig.pacingPreset),
           autoZoomMax: options.autoZoomMax,
           watermarkEnabled: verticalClipWatermarkEnabled,
@@ -34083,15 +34177,16 @@ const processJob = async (
               '+faststart',
               '-c:v',
               'libx264',
-              '-preset',
-              ffPreset,
-              '-crf',
-              ffCrf,
-              '-threads',
-              String(renderCodecThreads),
-              '-pix_fmt',
-              'yuv420p'
-            ]
+                '-preset',
+                ffPreset,
+                '-crf',
+                ffCrf,
+                ...ffVideoBitrateArgs,
+                '-threads',
+                String(renderCodecThreads),
+                '-pix_fmt',
+                'yuv420p'
+              ]
             if (hasInputAudio) {
               concatEncodeArgs.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
             }
@@ -36211,6 +36306,17 @@ const processJob = async (
         )
       }
       audioFiltersForAnalysis = audioFilters.slice()
+      const horizontalEnhanceProfile = {
+        enableColor: true,
+        enableDenoise: !renderFastMode,
+        enableSharpen: !renderFastMode,
+        enableStabilization: !renderFastMode
+      }
+      const horizontalEnhanceChain = buildHorizontalEnhancementFilters(horizontalEnhanceProfile)
+      const horizontalEnhanceSuffix = horizontalEnhanceChain ? `,${horizontalEnhanceChain}` : ''
+      const horizontalStabilizeEnabled = Boolean(
+        horizontalEnhanceProfile.enableStabilization && hasFfmpegFilter('deshake')
+      )
       await updateJob(jobId, { status: 'retention', progress: 72 })
 
       const plannedSegmentCount = finalSegments.length
@@ -36773,6 +36879,7 @@ const processJob = async (
         ffPreset,
         '-crf',
         ffCrf,
+        ...ffVideoBitrateArgs,
         '-threads',
         String(renderCodecThreads),
         '-pix_fmt',
@@ -36978,21 +37085,25 @@ const processJob = async (
               '+faststart',
               '-c:v',
               'libx264',
-              '-preset',
-              ffPreset,
-              '-crf',
-              ffCrf,
-              '-threads',
-              String(renderCodecThreads),
-              '-pix_fmt',
-              'yuv420p'
-            ]
+                '-preset',
+                ffPreset,
+                '-crf',
+                ffCrf,
+                ...ffVideoBitrateArgs,
+                '-threads',
+                String(renderCodecThreads),
+                '-pix_fmt',
+                'yuv420p'
+              ]
             if (withAudio) {
               segmentArgsBase.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
             }
             const vTrim = `trim=start=${toFilterNumber(relativeStart)}:end=${toFilterNumber(relativeEnd)}`
             const vSpeed = speed !== 1 ? `setpts=(PTS-STARTPTS)/${toFilterNumber(speed)}` : 'setpts=PTS-STARTPTS'
-            const vChain = `[0:v]${vTrim},${vSpeed},${buildFrameFitFilter(horizontalFit, target.width, target.height)}[vout]`
+            const vStabilize = horizontalStabilizeEnabled && (relativeEnd - relativeStart) >= 1.2
+              ? ',deshake=x=24:y=24:w=48:h=48:rx=12:ry=12:edge=mirror'
+              : ''
+            const vChain = `[0:v]${vTrim}${vStabilize},${vSpeed},${buildFrameFitFilter(horizontalFit, target.width, target.height)}${horizontalEnhanceSuffix}[vout]`
             const filterParts = [vChain]
             if (withAudio) {
               const segDuration = Math.max(0.01, roundForFilter((relativeEnd - relativeStart) / speed))
@@ -37114,6 +37225,7 @@ const processJob = async (
                 ffPreset,
                 '-crf',
                 ffCrf,
+                ...ffVideoBitrateArgs,
                 '-threads',
                 String(renderCodecThreads),
                 '-pix_fmt',
@@ -37208,7 +37320,8 @@ const processJob = async (
               targetWidth: target.width,
               targetHeight: target.height,
               fit: horizontalFit,
-              enableFades
+              enableFades,
+              enhanceVideo: horizontalEnhanceProfile
             })
             const filterParts: string[] = [concatFilter]
             if (videoChain) {
@@ -37294,10 +37407,14 @@ const processJob = async (
             }
           }
         } else {
+          const fallbackFilter = [
+            buildFrameFitFilter(horizontalFit, target.width, target.height),
+            horizontalEnhanceChain || ''
+          ].filter(Boolean).join(',')
           const fallbackArgs = [
             ...argsBase,
             '-vf',
-            buildFrameFitFilter(horizontalFit, target.width, target.height),
+            fallbackFilter,
             tmpOut
           ]
           try {
@@ -37324,7 +37441,8 @@ const processJob = async (
               targetWidth: target.width,
               targetHeight: target.height,
               fit: horizontalFit,
-              enableFades: false
+              enableFades: false,
+              enhanceVideo: horizontalEnhanceProfile
             })
             const emergencyMapArgs = ['-map', '[outv]']
             if (withAudio) emergencyMapArgs.push('-map', '[outa]')
@@ -38063,6 +38181,11 @@ const processJob = async (
     safeUnlink(tmpIn)
     safeUnlink(tmpOut)
     safeUnlink(subtitlePath)
+    try {
+      fs.rmSync(workDir, { recursive: true, force: true })
+    } catch (e) {
+      // ignore temp cleanup failures
+    }
   }
 }
 
@@ -38243,6 +38366,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
     let heartbeatTimer: NodeJS.Timeout | null = null
     let latestJobSnapshot: any = null
     let leaseLost = false
+    let heartbeatFailures = 0
     const markLeaseLost = () => {
       if (leaseLost) return
       leaseLost = true
@@ -38303,7 +38427,16 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       heartbeatTimer = setInterval(() => {
         void (async () => {
           const ok = await touchLease('running')
-          if (!ok) markLeaseLost()
+          if (ok) {
+            heartbeatFailures = 0
+            return
+          }
+          heartbeatFailures += 1
+          if (heartbeatFailures >= PIPELINE_HEARTBEAT_FAILURE_LIMIT) {
+            markLeaseLost()
+          } else {
+            console.warn(`[queue] pipeline lease heartbeat missed for ${jobId} (${heartbeatFailures}/${PIPELINE_HEARTBEAT_FAILURE_LIMIT})`)
+          }
         })()
       }, PIPELINE_HEARTBEAT_INTERVAL_MS)
       if (typeof (heartbeatTimer as any).unref === 'function') {
@@ -38550,20 +38683,40 @@ const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
   // Conservative defaults prevent false lease-loss takeovers during heavy ffmpeg/transcript work.
   return Math.max(90_000, PIPELINE_HEARTBEAT_INTERVAL_MS * 3)
 })()
-const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
-  String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
+const PIPELINE_HEARTBEAT_FAILURE_LIMIT = (() => {
+  const envVal = Number(process.env.PIPELINE_HEARTBEAT_FAILURE_LIMIT || 0)
+  if (Number.isFinite(envVal) && envVal >= 1) return Math.min(10, Math.round(envVal))
+  return 3
+})()
+const parseBoolEnv = (value: unknown): boolean | null => {
+  if (value === null || value === undefined) return null
+  const raw = String(value).trim()
+  if (!raw) return null
+  if (/^(1|true|yes|on)$/i.test(raw)) return true
+  if (/^(0|false|no|off)$/i.test(raw)) return false
+  return null
+}
+const resolveBoolEnv = (value: unknown, fallback: boolean) => {
+  const parsed = parseBoolEnv(value)
+  return parsed === null ? fallback : parsed
+}
+const IS_WORKER_PROCESS =
+  String(process.env.WORKER_SUPERVISED || '').trim() === '1' ||
+  Boolean(String(process.env.WORKER_REPLICA || '').trim())
+const JOB_PROCESSOR_ENABLED = resolveBoolEnv(process.env.JOB_PROCESSOR_ENABLED, IS_WORKER_PROCESS)
+const JOB_RECOVERY_TAKEOVER_ENABLED = resolveBoolEnv(
+  process.env.JOB_RECOVERY_TAKEOVER_ENABLED,
+  JOB_PROCESSOR_ENABLED
+)
+const PIPELINE_LEASE_RECOVERY_ENABLED = resolveBoolEnv(
+  process.env.PIPELINE_LEASE_RECOVERY_ENABLED,
+  JOB_PROCESSOR_ENABLED
 )
 export const getQueueSeedState = () => ({
   status: JOB_PROCESSOR_ENABLED ? 'analyzing' : 'queued',
   progress: JOB_PROCESSOR_ENABLED ? 10 : 1,
   processorEnabled: JOB_PROCESSOR_ENABLED
 })
-const JOB_RECOVERY_TAKEOVER_ENABLED = !/^(0|false|no)$/i.test(
-  String(process.env.JOB_RECOVERY_TAKEOVER_ENABLED || 'true').trim()
-)
-const PIPELINE_LEASE_RECOVERY_ENABLED = !/^(0|false|no)$/i.test(
-  String(process.env.PIPELINE_LEASE_RECOVERY_ENABLED || 'true').trim()
-)
 const PIPELINE_LEASE_STALE_GRACE_MS = (() => {
   const envVal = Number(process.env.PIPELINE_LEASE_STALE_GRACE_MS || 0)
   if (Number.isFinite(envVal) && envVal >= 30_000) return Math.round(envVal)
@@ -38579,9 +38732,7 @@ const STARTABLE_QUEUE_TAKEOVER_MS = (() => {
   if (Number.isFinite(envVal) && envVal >= 5_000) return Math.round(envVal)
   return 45_000
 })()
-const QUEUE_RECOVERY_SKIP_ANALYZE = !/^(0|false|no)$/i.test(
-  String(process.env.QUEUE_RECOVERY_SKIP_ANALYZE || 'true').trim()
-)
+const QUEUE_RECOVERY_SKIP_ANALYZE = resolveBoolEnv(process.env.QUEUE_RECOVERY_SKIP_ANALYZE, true)
 const STARTABLE_QUEUE_STATUSES = new Set(['queued', 'uploading'])
 const STALE_RECOVERABLE_STATUSES = new Set([
   'analyzing',
@@ -39516,7 +39667,30 @@ const handleCreateJob = async (req: any, res: any) => {
     })
 
     if (!r2.isConfigured) {
-      return res.json({ job, uploadUrl: null, inputPath, bucket: INPUT_BUCKET })
+      try {
+        const { data, error } = await supabaseAdmin.storage
+          .from(INPUT_BUCKET)
+          .createSignedUploadUrl(inputPath, { upsert: true })
+        if (error || !data?.signedUrl) {
+          throw error || new Error('signed_upload_failed')
+        }
+        return res.json({
+          job,
+          uploadUrl: data.signedUrl,
+          inputPath,
+          bucket: INPUT_BUCKET,
+          uploadProvider: 'supabase'
+        })
+      } catch (e) {
+        console.warn('createSignedUploadUrl failed, falling back to proxy uploads', e)
+        return res.json({
+          job,
+          uploadUrl: null,
+          inputPath,
+          bucket: INPUT_BUCKET,
+          uploadProvider: 'supabase'
+        })
+      }
     }
 
     try {
@@ -39525,10 +39699,10 @@ const handleCreateJob = async (req: any, res: any) => {
         ? contentType.trim()
         : 'video/mp4'
       const uploadUrl = await r2.generateUploadUrl(inputPath, uploadContentType)
-      return res.json({ job, uploadUrl, inputPath, bucket: r2.bucket })
+      return res.json({ job, uploadUrl, inputPath, bucket: r2.bucket, uploadProvider: 'r2' })
     } catch (e) {
       console.warn('generateUploadUrl failed, returning job only', e)
-      return res.json({ job, uploadUrl: null, inputPath, bucket: r2.bucket })
+      return res.json({ job, uploadUrl: null, inputPath, bucket: r2.bucket, uploadProvider: 'r2' })
     }
   } catch (err: any) {
     if (err instanceof PlanLimitError) {
