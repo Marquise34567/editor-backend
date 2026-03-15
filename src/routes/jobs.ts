@@ -4225,8 +4225,8 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   creativeVariant: 'balanced',
   hookSelectionMode: 'auto',
   longFormPreset: 'auto',
-  longFormAggression: 72,
-  longFormClarityVsSpeed: 52,
+  longFormAggression: 50,
+  longFormClarityVsSpeed: 70,
   tangentKiller: true,
   coldStartAutopilot: false,
   continuityFirstMode: false,
@@ -25516,9 +25516,9 @@ const alignSegmentsToTranscriptBoundariesForRender = (
       continue
     }
     const span = Math.max(MIN_RENDER_SEGMENT_SECONDS, normalized.end - normalized.start)
-    const maxShift = clamp(span * 0.2, 0.04, 0.2)
-    const sentenceEndShift = clamp(maxShift * 1.9, 0.06, 0.45)
-    const sentenceForwardShift = clamp(Math.max(span * 1.8, 0.7), 0.7, 4.5)
+    const maxShift = clamp(span * 0.28, 0.06, 0.32)
+    const sentenceEndShift = clamp(maxShift * 2.4, 0.1, 0.8)
+    const sentenceForwardShift = clamp(Math.max(span * 2.2, 0.9), 0.9, 5.5)
     const snappedStartCandidate = snapTimeToNearestTranscriptBoundary(normalized.start, startBoundaries, maxShift)
     const snappedEndSentence = snapSegmentEndToSentenceBoundary(
       normalized.end,
@@ -38520,6 +38520,11 @@ const PIPELINE_HEARTBEAT_GRACE_MS = (() => {
 const JOB_PROCESSOR_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.JOB_PROCESSOR_ENABLED || 'true').trim()
 )
+export const getQueueSeedState = () => ({
+  status: JOB_PROCESSOR_ENABLED ? 'analyzing' : 'queued',
+  progress: JOB_PROCESSOR_ENABLED ? 10 : 1,
+  processorEnabled: JOB_PROCESSOR_ENABLED
+})
 const JOB_RECOVERY_TAKEOVER_ENABLED = !/^(0|false|no)$/i.test(
   String(process.env.JOB_RECOVERY_TAKEOVER_ENABLED || 'true').trim()
 )
@@ -40244,8 +40249,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       return res.status(403).json(renderLimitViolation.payload)
     }
 
-    const queueSeedStatus = JOB_PROCESSOR_ENABLED ? 'analyzing' : 'queued'
-    const queueSeedProgress = JOB_PROCESSOR_ENABLED ? 10 : 1
+    const { status: queueSeedStatus, progress: queueSeedProgress, processorEnabled } = getQueueSeedState()
     await updateJob(id, {
       inputPath,
       status: queueSeedStatus,
@@ -40254,7 +40258,7 @@ const handleCompleteUpload = async (req: any, res: any) => {
       renderSettings: nextRenderSettings,
       analysis: nextAnalysis
     })
-    if (!JOB_PROCESSOR_ENABLED) {
+    if (!processorEnabled) {
       console.warn(`[queue] processor disabled in this API process; persisted ${id} as queued for external workers`)
     }
 

@@ -2,7 +2,7 @@ import express from 'express'
 import { prisma } from '../db/prisma'
 import { r2 } from '../lib/r2'
 import crypto from 'crypto'
-import { enqueuePipeline, updateJob } from './jobs'
+import { enqueuePipeline, getQueueSeedState, updateJob } from './jobs'
 import bodyParser from 'body-parser'
 import { supabaseAdmin } from '../supabaseClient'
 import { getFeatureLabControls } from '../services/featureLab'
@@ -129,7 +129,8 @@ router.post('/complete', async (req: any, res) => {
 
     // Mark as analyzing immediately and enqueue in-process for reliability.
     // Avoid setImmediate here because short-lived workers can drop deferred queue kicks.
-    await updateJob(resolvedJobId, { inputPath: key, status: 'analyzing', progress: 10 })
+    const { status: queueSeedStatus, progress: queueSeedProgress } = getQueueSeedState()
+    await updateJob(resolvedJobId, { inputPath: key, status: queueSeedStatus, progress: queueSeedProgress })
     try {
       enqueuePipeline({ jobId: resolvedJobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
     } catch (e) {
@@ -335,7 +336,8 @@ router.post('/proxy', bodyParser.raw({ type: '*/*', limit: '3gb' }), async (req:
         return res.status(500).json({ error: 'PROXY_UPLOAD_FAILED', details: String(error.message || error) })
       }
     }
-    await updateJob(jobId, { inputPath: key, status: 'analyzing', progress: 10 })
+    const { status: queueSeedStatus, progress: queueSeedProgress } = getQueueSeedState()
+    await updateJob(jobId, { inputPath: key, status: queueSeedStatus, progress: queueSeedProgress })
     try {
       enqueuePipeline({ jobId, user: { id: userId, email: req.user?.email }, priorityLevel: job.priorityLevel ?? 2 })
     } catch (e) {
