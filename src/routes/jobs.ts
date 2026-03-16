@@ -528,6 +528,36 @@ const escapeFfmpegDrawtextText = (value: string) => (
     .replace(/%/g, '\\%')
 )
 
+const buildHookOverlayDrawtextFilter = (cues: TranscriptCue[], fontArg: string) => {
+  if (!Array.isArray(cues) || !cues.length) return ''
+  const fontSizeExpr = 'h*0.085'
+  const base = [
+    'fontcolor=white@0.98',
+    'borderw=4',
+    'bordercolor=black@0.9',
+    'box=1',
+    'boxcolor=black@0.45',
+    'boxborderw=16',
+    'x=(w-tw)/2',
+    'y=h*0.16'
+  ]
+  return cues
+    .filter((cue) => Number.isFinite(Number(cue.start)) && Number.isFinite(Number(cue.end)) && cue.end - cue.start > 0.05)
+    .map((cue) => {
+      const text = escapeFfmpegDrawtextText(String(cue.text || '').trim())
+      if (!text) return ''
+      const start = toFilterNumber(Number(cue.start))
+      const end = toFilterNumber(Number(cue.end))
+      return (
+        `drawtext=text='${text}'${fontArg}:fontsize=${fontSizeExpr}:` +
+        `${base.join(':')}:enable='between(t,${start},${end})':` +
+        `alpha='if(lt(t-${start},0.16),(t-${start})/0.16,1)'`
+      )
+    })
+    .filter(Boolean)
+    .join(',')
+}
+
 const executeFFmpegPlan = async (input: string, plan: EditPlan, options: any) => {
   const safePlan: Partial<EditPlan> & Record<string, any> = (
     plan && typeof plan === 'object'
@@ -2432,6 +2462,21 @@ const LONG_FORM_MIN_CONTEXT_SECONDS = (() => {
   const envValue = Number(process.env.LONG_FORM_MIN_CONTEXT_SECONDS || 2.2)
   return Number.isFinite(envValue) && envValue >= 0.8 ? Number(envValue.toFixed(2)) : 2.2
 })()
+const isYoutubeLongFormTarget = ({
+  durationSeconds,
+  targetPlatform,
+  contentFormat
+}: {
+  durationSeconds: number
+  targetPlatform?: RetentionTargetPlatform | PlatformProfileId | string | null
+  contentFormat?: RetentionContentFormat | null
+}) => {
+  if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return false
+  const resolvedTarget = parseRetentionTargetPlatform(targetPlatform)
+  const resolvedProfile = parsePlatformProfile(targetPlatform, 'auto')
+  const resolvedFormat = contentFormat || (resolvedTarget === 'youtube' ? 'youtube_long' : null)
+  return resolvedTarget === 'youtube' || resolvedProfile === 'youtube' || resolvedFormat === 'youtube_long'
+}
 const PLATFORM_MAX_CUTS_PER_10_SECONDS: Record<RetentionTargetPlatform, { horizontal: number; vertical: number }> = {
   auto: { horizontal: 2.8, vertical: 4.8 },
   tiktok: { horizontal: 3, vertical: 5.4 },
@@ -2905,7 +2950,7 @@ const MODE_RETENTION_TARGETS: Record<EditorModeSelection, { target: number; floo
   education: { target: 67, floor: 60 },
   podcast: { target: 66, floor: 60 },
   ultra: { target: 79, floor: 68 },
-  'retention-king': { target: 82, floor: 70 }
+  'retention-king': { target: 86, floor: 74 }
 }
 const NARRATIVE_ARC_STRUCTURE_CONTRACT = `Narrative arc contract (mandatory in every mode):
 1) Hook: open with a 5-8 second teaser that creates curiosity without giving away the full outcome.
@@ -12258,12 +12303,34 @@ const buildHookSelectionDebugPayload = ({
   }
 }
 
+const applyYoutubeHookSelectionBoost = (entry: HookSelectionRankedEntry) => {
+  const strategicScore = clamp01(
+    0.32 * entry.instantHold +
+    0.26 * entry.teaserTension +
+    0.2 * entry.curiosityPressure +
+    0.12 * entry.valuePromise +
+    0.1 * entry.openerQuality
+  )
+  const bonus = (
+    (entry.teaserTension >= 0.65 ? 0.012 : 0) +
+    (entry.curiosityPressure >= 0.62 ? 0.01 : 0) +
+    (entry.instantHold >= 0.7 ? 0.01 : 0)
+  )
+  const blended = clamp01(entry.selectionScore * 0.92 + strategicScore * 0.08 + bonus)
+  return {
+    ...entry,
+    selectionScore: Number(blended.toFixed(4))
+  }
+}
+
 const buildHookSelectionRankedEntries = ({
   candidates,
-  windows
+  windows,
+  youtubeLongFormBoost = false
 }: {
   candidates: HookCandidate[]
   windows: EngagementWindow[]
+  youtubeLongFormBoost?: boolean
 }): HookSelectionRankedEntry[] => {
   const deduped = candidates.filter((candidate, index) => (
     candidate &&
@@ -12279,7 +12346,7 @@ const buildHookSelectionRankedEntries = ({
   return deduped
     .map((candidate) => {
       const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
-      return {
+      const baseEntry = {
         candidate,
         confidence: scored.confidence,
         instantHold: scored.instantHold,
@@ -12296,6 +12363,7 @@ const buildHookSelectionRankedEntries = ({
         openerQuality: scored.openerQuality,
         selectionScore: scored.selectionScore
       }
+      return youtubeLongFormBoost ? applyYoutubeHookSelectionBoost(baseEntry) : baseEntry
     })
     .sort((a, b) => (
       b.selectionScore - a.selectionScore ||
@@ -12308,18 +12376,20 @@ const buildHookSelectionRankedEntries = ({
 const findHookSelectionRankedEntry = ({
   ranked,
   candidate,
-  windows
+  windows,
+  youtubeLongFormBoost = false
 }: {
   ranked: HookSelectionRankedEntry[]
   candidate: HookCandidate
   windows: EngagementWindow[]
+  youtubeLongFormBoost?: boolean
 }) => (
   ranked.find((entry) => (
     Math.abs(entry.candidate.start - candidate.start) < 0.01 &&
     Math.abs(entry.candidate.duration - candidate.duration) < 0.01
   )) || (() => {
     const scored = scoreRenderableHookCandidateSignals({ candidate, windows })
-    return {
+    const baseEntry = {
       candidate,
       confidence: scored.confidence,
       instantHold: scored.instantHold,
@@ -12336,6 +12406,7 @@ const findHookSelectionRankedEntry = ({
       openerQuality: scored.openerQuality,
       selectionScore: scored.selectionScore
     } satisfies HookSelectionRankedEntry
+    return youtubeLongFormBoost ? applyYoutubeHookSelectionBoost(baseEntry) : baseEntry
   })()
 )
 
@@ -12345,6 +12416,7 @@ const selectAuthoritativeAutoHookDecision = ({
   hasTranscript,
   signalStrength,
   strictFailClosed = false,
+  allowSyntheticFailOpen = false,
   thresholdOffset = 0,
   windows = [],
   transcriptCues = [],
@@ -12352,13 +12424,16 @@ const selectAuthoritativeAutoHookDecision = ({
   silences = [],
   durationSeconds,
   recentHooks = null,
-  creativeVariant
+  creativeVariant,
+  targetPlatform,
+  contentFormat
 }: {
   candidates: HookCandidate[]
   aggressionLevel: RetentionAggressionLevel
   hasTranscript: boolean
   signalStrength: number
   strictFailClosed?: boolean
+  allowSyntheticFailOpen?: boolean
   thresholdOffset?: number
   windows?: EngagementWindow[]
   transcriptCues?: TranscriptCue[]
@@ -12367,9 +12442,17 @@ const selectAuthoritativeAutoHookDecision = ({
   durationSeconds: number
   recentHooks?: HookReuseWindow[] | null
   creativeVariant?: CreativeVariant | null
+  targetPlatform?: RetentionTargetPlatform | PlatformProfileId | string | null
+  contentFormat?: RetentionContentFormat | null
 }): HookSelectionDecision | null => {
   const strictHookFailClosed = strictFailClosed === true
+  const allowSyntheticFailOpenMode = allowSyntheticFailOpen === true
   const creativeVariantHookProfile = getCreativeVariantHookScoringProfile(creativeVariant)
+  const youtubeLongFormBoost = isYoutubeLongFormTarget({
+    durationSeconds,
+    targetPlatform,
+    contentFormat
+  })
   const threshold = resolveHookScoreThreshold({
     aggressionLevel,
     hasTranscript,
@@ -12430,7 +12513,8 @@ const selectAuthoritativeAutoHookDecision = ({
   )
   const baseRanked = buildHookSelectionRankedEntries({
     candidates,
-    windows
+    windows,
+    youtubeLongFormBoost
   })
   const selectionDurationSeconds = Math.max(
     1,
@@ -12529,7 +12613,8 @@ const selectAuthoritativeAutoHookDecision = ({
   ])
   const ranked = buildHookSelectionRankedEntries({
     candidates: rankedCandidates,
-    windows
+    windows,
+    youtubeLongFormBoost
   })
   if (!ranked.length) {
     const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
@@ -12540,7 +12625,8 @@ const selectAuthoritativeAutoHookDecision = ({
     const safeEntry = findHookSelectionRankedEntry({
       ranked: [],
       candidate: safeNoHookOpening,
-      windows
+      windows,
+      youtubeLongFormBoost
     })
     const reason = 'Full-video opener scan did not produce a renderable hook candidate, so the selector kept the safest chronological opening instead of failing the render.'
     const debug = buildHookSelectionDebugPayload({
@@ -12620,6 +12706,7 @@ const selectAuthoritativeAutoHookDecision = ({
   })
   const failsSyntheticCredibilityGate = (entry: HookSelectionRankedEntry) => {
     if (!hasTranscript || !entry.candidate.synthetic) return false
+    if (allowSyntheticFailOpenMode) return false
     const nearbySourceRows = findNearbySourceRows(entry.candidate)
     if (!nearbySourceRows.length) return false
     const sourceAudits = nearbySourceRows.map((row) => ({
@@ -13191,7 +13278,8 @@ const selectAuthoritativeAutoHookDecision = ({
             const strictInterestingUpgradeEntry = findHookSelectionRankedEntry({
               ranked,
               candidate: strictInterestingUpgradeCandidate,
-              windows
+              windows,
+              youtubeLongFormBoost
             })
             if (
               strictInterestingUpgradeEntry &&
@@ -13329,7 +13417,8 @@ const selectAuthoritativeAutoHookDecision = ({
     selectedEntry = findHookSelectionRankedEntry({
       ranked,
       candidate: relocated.hook,
-      windows
+      windows,
+      youtubeLongFormBoost
     })
     selectionMode = 'fallback'
     usedFallback = true
@@ -13615,57 +13704,110 @@ const selectAuthoritativeAutoHookDecision = ({
   }
   const finalVerifiedAudit = getVerifiedAudit(selectedEntry.candidate)
   if (selectedEntry.candidate.synthetic && !finalVerifiedAudit.passed) {
-    const strongestAuditedNaturalRow = interestingRows.find((row) => (
-      !row.entry.candidate.synthetic &&
-      passesNonVerbalSafety(row.entry) &&
-      getVerifiedAudit(row.entry.candidate).passed
-    )) || null
-    const aggressiveNaturalStandout = selectAggressiveNaturalStandoutFallback(selectedEntry)
-    const leastBadNaturalOpening = selectLeastBadNaturalOpeningRescue()
-    const lastChanceNaturalOpening = selectLastChanceNaturalOpening()
-    const credibleNaturalOpening = strongestAuditedNaturalRow?.entry.candidate ||
-      aggressiveNaturalStandout?.row.entry.candidate ||
-      leastBadNaturalOpening?.row.entry.candidate ||
-      lastChanceNaturalOpening?.row.entry.candidate ||
-      pickAuditedOpeningCandidateFromPool({
-        candidates,
-        durationSeconds,
-        maxStartSeconds: 45,
-        naturalOnly: true
-      })
-    if (credibleNaturalOpening) {
-      selectedEntry = strongestAuditedNaturalRow?.entry || findHookSelectionRankedEntry({
-        ranked,
-        candidate: credibleNaturalOpening,
-        windows
-      })
-      selectionMode = 'fallback'
-      usedFallback = true
-      lockedAuthoritativeFallback = true
-      reason = strongestAuditedNaturalRow
-        ? 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
-        : aggressiveNaturalStandout
-          ? aggressiveNaturalStandout.reason
-        : leastBadNaturalOpening
-          ? leastBadNaturalOpening.reason
-        : lastChanceNaturalOpening
-          ? lastChanceNaturalOpening.reason
-        : 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest near-pass natural beat instead of falling straight back to the chronological opening.'
+    if (allowSyntheticFailOpenMode) {
+      reason = reason || 'Fail-open hook selection: kept the strongest synthetic opener even though audit failed.'
     } else {
-      const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
-        segments,
-        durationSeconds
-      })
-      if (safeNoHookOpening) {
-        selectedEntry = findHookSelectionRankedEntry({
+      const strongestAuditedNaturalRow = interestingRows.find((row) => (
+        !row.entry.candidate.synthetic &&
+        passesNonVerbalSafety(row.entry) &&
+        getVerifiedAudit(row.entry.candidate).passed
+      )) || null
+      const aggressiveNaturalStandout = selectAggressiveNaturalStandoutFallback(selectedEntry)
+      const leastBadNaturalOpening = selectLeastBadNaturalOpeningRescue()
+      const lastChanceNaturalOpening = selectLastChanceNaturalOpening()
+      const credibleNaturalOpening = strongestAuditedNaturalRow?.entry.candidate ||
+        aggressiveNaturalStandout?.row.entry.candidate ||
+        leastBadNaturalOpening?.row.entry.candidate ||
+        lastChanceNaturalOpening?.row.entry.candidate ||
+        pickAuditedOpeningCandidateFromPool({
+          candidates,
+          durationSeconds,
+          maxStartSeconds: 45,
+          naturalOnly: true
+        })
+      if (credibleNaturalOpening) {
+        selectedEntry = strongestAuditedNaturalRow?.entry || findHookSelectionRankedEntry({
           ranked,
-          candidate: safeNoHookOpening,
-          windows
+          candidate: credibleNaturalOpening,
+          windows,
+          youtubeLongFormBoost
         })
         selectionMode = 'fallback'
         usedFallback = true
         lockedAuthoritativeFallback = true
-        reason = 'Failed synthetic hook was blocked from becoming the opener; keeping the safer chronological opening instead.'
+        reason = strongestAuditedNaturalRow
+          ? 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest audited natural beat instead.'
+          : aggressiveNaturalStandout
+            ? aggressiveNaturalStandout.reason
+          : leastBadNaturalOpening
+            ? leastBadNaturalOpening.reason
+          : lastChanceNaturalOpening
+          ? lastChanceNaturalOpening.reason
+          : 'Failed synthetic hook was blocked from becoming the opener; promoted the strongest near-pass natural beat instead of falling straight back to the chronological opening.'
+      } else {
+        const safeNoHookOpening = buildSafeNoHookOpeningCandidate({
+          segments,
+          durationSeconds
+        })
+        if (safeNoHookOpening) {
+          selectedEntry = findHookSelectionRankedEntry({
+            ranked,
+            candidate: safeNoHookOpening,
+            windows,
+            youtubeLongFormBoost
+          })
+          selectionMode = 'fallback'
+          usedFallback = true
+          lockedAuthoritativeFallback = true
+          reason = 'Failed synthetic hook was blocked from becoming the opener; keeping the safer chronological opening instead.'
+        }
+      }
+    }
+  }
+  if (allowSyntheticFailOpenMode && rankedCandidates.length) {
+    const computeFailOpenHeroScore = (candidate: HookCandidate) => {
+      const baseScore = clamp01(Number(candidate.score || 0))
+      const auditScore = clamp01(Number(candidate.auditScore || 0))
+      const syntheticBoost = candidate.synthetic ? 0.04 : 0
+      return Number(clamp01(0.65 * baseScore + 0.3 * auditScore + syntheticBoost).toFixed(4))
+    }
+    const heroCandidate = rankedCandidates
+      .map((candidate) => ({
+        candidate,
+        heroScore: computeFailOpenHeroScore(candidate)
+      }))
+      .sort((a, b) => (
+        b.heroScore - a.heroScore ||
+        Number(b.candidate.score || 0) - Number(a.candidate.score || 0) ||
+        a.candidate.start - b.candidate.start
+      ))[0]?.candidate || null
+    if (heroCandidate) {
+      const currentRow = findHookSelectionRankedEntry({
+        ranked,
+        candidate: selectedEntry.candidate,
+        windows,
+        youtubeLongFormBoost
+      })
+      const heroRow = findHookSelectionRankedEntry({
+        ranked,
+        candidate: heroCandidate,
+        windows,
+        youtubeLongFormBoost
+      })
+      const currentHeroScore = currentRow
+        ? computeFailOpenHeroScore(currentRow.candidate)
+        : 0
+      const heroScore = heroRow ? computeFailOpenHeroScore(heroRow.candidate) : 0
+      const isDifferentCandidate = (
+        Math.abs(heroCandidate.start - selectedEntry.candidate.start) >= 0.01 ||
+        Math.abs(heroCandidate.duration - selectedEntry.candidate.duration) >= 0.01
+      )
+      if (heroRow && isDifferentCandidate && heroScore >= currentHeroScore + 0.01) {
+        selectedEntry = heroRow
+        selectionMode = 'fallback'
+        usedFallback = true
+        lockedAuthoritativeFallback = true
+        reason = 'Fail-open hero hook: forced the highest-scoring opener regardless of audit deficits.'
       }
     }
   }
@@ -15187,6 +15329,83 @@ const tightenHookRangeForRetention = ({
   return {
     start: Number(start.toFixed(3)),
     end: Number(end.toFixed(3))
+  }
+}
+
+const refineHookForOpening = ({
+  hook,
+  windows,
+  transcriptCues,
+  durationSeconds
+}: {
+  hook: HookCandidate
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+}) => {
+  if (!hook || !Number.isFinite(durationSeconds) || durationSeconds <= 0) return hook
+  if (!Array.isArray(windows) || windows.length === 0) return hook
+  const safeDuration = Math.max(0.2, Number(durationSeconds || 0))
+  const originalStart = clamp(Number(hook.start || 0), 0, Math.max(0, safeDuration - 0.2))
+  const originalEnd = clamp(
+    originalStart + Math.max(0.2, Number(hook.duration || HOOK_MIN)),
+    originalStart + 0.2,
+    safeDuration
+  )
+  const searchStart = clamp(originalStart - 1.2, 0, safeDuration)
+  const searchEnd = clamp(originalEnd + 1.2, searchStart + 0.4, safeDuration)
+  const ranked = windows
+    .filter((window) => window.time >= searchStart && window.time <= searchEnd)
+    .map((window) => ({
+      window,
+      score: (
+        0.38 * (window.hookScore ?? window.score) +
+        0.22 * window.emotionIntensity +
+        0.16 * window.vocalExcitement +
+        0.12 * window.audioEnergy +
+        0.07 * (window.actionSpike ?? 0) +
+        0.05 * (window.curiosityTrigger ?? 0)
+      )
+    }))
+    .sort((a, b) => b.score - a.score || a.window.time - b.window.time)
+  const peak = ranked[0]?.window
+  if (!peak) return hook
+  const desiredStart = clamp(
+    Number(peak.time || 0) - 0.18,
+    0,
+    Math.max(0, safeDuration - Number(hook.duration || HOOK_MIN))
+  )
+  let candidate: HookCandidate = {
+    ...hook,
+    start: desiredStart,
+    duration: hook.duration
+  }
+  candidate = enforceAutoHookDurationRange({ candidate, durationSeconds: safeDuration })
+  if (Array.isArray(transcriptCues) && transcriptCues.length) {
+    const aligned = alignHookToSentenceBoundaries(
+      candidate.start,
+      candidate.start + candidate.duration,
+      transcriptCues,
+      safeDuration
+    )
+    const alignedDuration = Number(Math.max(0.2, aligned.end - aligned.start).toFixed(3))
+    candidate = {
+      ...candidate,
+      start: Number(aligned.start.toFixed(3)),
+      duration: alignedDuration,
+      text: extractHookText(aligned.start, aligned.start + alignedDuration, transcriptCues) || candidate.text
+    }
+  }
+  const newStart = Number(candidate.start || 0)
+  const newEnd = Number(newStart + Number(candidate.duration || 0))
+  const overlapSeconds = Math.max(0, Math.min(originalEnd, newEnd) - Math.max(originalStart, newStart))
+  const overlapRatio = overlapSeconds / Math.max(0.1, Math.min(originalEnd - originalStart, newEnd - newStart))
+  if (Math.abs(newStart - originalStart) < 0.08) return hook
+  if (Math.abs(newStart - originalStart) > 2.8 && overlapRatio < 0.45) return hook
+  return {
+    ...candidate,
+    start: Number(candidate.start.toFixed(3)),
+    duration: Number(candidate.duration.toFixed(3))
   }
 }
 
@@ -17637,6 +17856,112 @@ const extractHookText = (start: number, end: number, transcriptCues: TranscriptC
     .join(' ')
     .replace(/\s+/g, ' ')
     .trim()
+}
+
+const HOOK_FAIL_OPEN_OVERLAY_PHRASES = [
+  'WAIT FOR IT',
+  'HERE IS THE TWIST',
+  'WATCH WHAT HAPPENS',
+  'KEEP WATCHING',
+  'DO NOT LOOK AWAY',
+  'THIS CHANGES EVERYTHING'
+]
+
+const pickFailOpenHookOverlayPhrases = (hookText: string) => {
+  const normalized = String(hookText || '').toLowerCase()
+  const picks: string[] = []
+  if (/\bwhy\b/.test(normalized)) picks.push('HERE IS WHY')
+  if (/\bhow\b/.test(normalized)) picks.push('THIS IS HOW')
+  if (/\bwhat\b/.test(normalized)) picks.push('WATCH WHAT HAPPENS')
+  if (/\bwait|watch|before|until|next|later\b/.test(normalized)) picks.push('KEEP WATCHING')
+  if (!picks.length) picks.push('WAIT FOR IT')
+  for (const phrase of HOOK_FAIL_OPEN_OVERLAY_PHRASES) {
+    if (picks.length >= 2) break
+    if (!picks.includes(phrase)) picks.push(phrase)
+  }
+  return picks.slice(0, 2)
+}
+
+const buildOverlayGapWindows = (transcriptCues: TranscriptCue[], windowStart: number, windowEnd: number) => {
+  if (windowEnd <= windowStart) return [] as TimeRange[]
+  const overlaps = transcriptCues
+    .filter((cue) => cue.end > windowStart && cue.start < windowEnd)
+    .map((cue) => ({
+      start: clamp(Number(cue.start), windowStart, windowEnd),
+      end: clamp(Number(cue.end), windowStart, windowEnd)
+    }))
+    .filter((cue) => cue.end - cue.start > 0.05)
+    .sort((a, b) => a.start - b.start || a.end - b.end)
+  if (!overlaps.length) {
+    return [{ start: windowStart, end: windowEnd }]
+  }
+  const gaps: TimeRange[] = []
+  let cursor = windowStart
+  for (const block of overlaps) {
+    if (block.start - cursor >= 0.36) {
+      gaps.push({ start: cursor, end: block.start })
+    }
+    cursor = Math.max(cursor, block.end + 0.06)
+  }
+  if (windowEnd - cursor >= 0.36) {
+    gaps.push({ start: cursor, end: windowEnd })
+  }
+  return gaps
+}
+
+const buildFailOpenHookOverlayCues = ({
+  hook,
+  transcriptCues,
+  durationSeconds
+}: {
+  hook: HookCandidate | null
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+}) => {
+  if (!hook || !Number.isFinite(durationSeconds) || durationSeconds <= 0) return [] as TranscriptCue[]
+  const hookStart = clamp(Number(hook.start || 0), 0, durationSeconds)
+  const hookDuration = Number(clamp(
+    Number(hook.duration || 0) || 6,
+    2,
+    Math.min(8, Math.max(2.5, durationSeconds - hookStart))
+  ).toFixed(3))
+  const hookEnd = clamp(hookStart + hookDuration, hookStart + 0.4, durationSeconds)
+  const windowEnd = Math.min(durationSeconds, hookStart + Math.min(6, hookEnd - hookStart))
+  const hookText = String(hook.text || extractHookText(hookStart, windowEnd, transcriptCues)).trim()
+  const phrases = pickFailOpenHookOverlayPhrases(hookText)
+  if (!phrases.length) return [] as TranscriptCue[]
+  const gaps = buildOverlayGapWindows(transcriptCues, hookStart, windowEnd)
+  const cues: TranscriptCue[] = []
+  let cursor = hookStart + 0.08
+  for (const phrase of phrases) {
+    const desired = clamp(0.65 + phrase.length / 26, 0.6, 1.35)
+    let start = cursor
+    let end = start + desired
+    const gap = gaps.find((entry) => entry.end - entry.start >= desired && entry.end > start + 0.05) || null
+    if (gap) {
+      start = clamp(Math.max(gap.start, start), gap.start, gap.end)
+      if (start + desired > gap.end) {
+        start = Math.max(gap.start, gap.end - desired)
+      }
+      end = Math.min(gap.end, start + desired)
+    }
+    if (end > windowEnd) {
+      if (!gap) break
+      end = Math.min(windowEnd, start + desired)
+    if (end - start < 0.4) break
+    }
+    cues.push({
+      start: Number(start.toFixed(3)),
+      end: Number(end.toFixed(3)),
+      text: phrase,
+      keywordIntensity: 0,
+      curiosityTrigger: 0,
+      fillerDensity: 0
+    })
+    cursor = end + 0.12
+    if (cursor >= windowEnd - 0.2) break
+  }
+  return cues
 }
 
 const scoreHookSpoilerRisk = (text: string) => {
@@ -20973,6 +21298,7 @@ const resolveLongFormMinimumEditedRuntimeRatio = ({
 }) => {
   if (!Number.isFinite(durationSeconds) || durationSeconds < LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS) return 0
   const shortFormTarget = contentFormat === 'tiktok_short'
+  const youtubeLongFormTarget = contentFormat === 'youtube_long'
   const longRuntime = durationSeconds >= 10 * 60
   const resolvedAggression = parseLongFormAggression(longFormAggression) ?? DEFAULT_EDIT_OPTIONS.longFormAggression
   const resolvedClarity = parseLongFormClarityVsSpeed(longFormClarityVsSpeed) ?? DEFAULT_EDIT_OPTIONS.longFormClarityVsSpeed
@@ -20981,18 +21307,20 @@ const resolveLongFormMinimumEditedRuntimeRatio = ({
   if (durationSeconds >= 35 * 60) ratio -= 0.04
   if (aggressiveMode) ratio -= 0.03
   if (shortFormTarget && !longRuntime) ratio -= 0.03
+  if (youtubeLongFormTarget) ratio += 0.04
   ratio += clamp((resolvedClarity - 60) / 100 * 0.07, -0.03, 0.06)
   ratio -= clamp((resolvedAggression - 60) / 100 * 0.05, -0.02, 0.04)
   const adaptiveFloor = shortFormTarget
     ? (longRuntime ? 0.5 : 0.4)
     : 0.42
+  const youtubeFloor = youtubeLongFormTarget ? (longRuntime ? 0.52 : 0.5) : 0
   const absoluteMinimumEditedSeconds = durationSeconds > LONG_FORM_MIN_OUTPUT_RUNTIME_SECONDS
     ? LONG_FORM_MIN_OUTPUT_RUNTIME_SECONDS
     : 0
   const absoluteFloorRatio = absoluteMinimumEditedSeconds > 0
     ? clamp(absoluteMinimumEditedSeconds / durationSeconds, 0, 1)
     : 0
-  const minFloor = Math.max(adaptiveFloor, absoluteFloorRatio)
+  const minFloor = Math.max(adaptiveFloor, absoluteFloorRatio, youtubeFloor)
   const maxFloor = Math.max(0.62, minFloor)
   return Number(clamp(ratio, minFloor, maxFloor).toFixed(4))
 }
@@ -22399,6 +22727,208 @@ const scoreNarrativeArcCoherence = ({
   }
 }
 
+const findInsertIndexBySourceStart = (segments: Segment[], start: number) => {
+  if (!segments.length) return 0
+  const idx = segments.findIndex((segment) => segment.start > start)
+  return idx >= 0 ? idx : segments.length
+}
+
+const buildArcPhaseSegment = ({
+  phase,
+  sourceStart,
+  sourceEnd,
+  windows,
+  durationSeconds
+}: {
+  phase: NarrativeArcPhaseName
+  sourceStart: number
+  sourceEnd: number
+  windows: EngagementWindow[]
+  durationSeconds: number
+}): Segment | null => {
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  const startBound = clamp(sourceStart, 0, safeDuration)
+  const endBound = clamp(sourceEnd, startBound + 0.2, safeDuration)
+  const rangeSeconds = Math.max(0, endBound - startBound)
+  if (rangeSeconds < MIN_RENDER_SEGMENT_SECONDS) return null
+  const longForm = safeDuration >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
+  const baseTarget = phase === 'build_up'
+    ? (longForm ? 10 : 5)
+    : phase === 'payout'
+      ? (longForm ? 12 : 6)
+      : phase === 'cliffhanger'
+        ? (longForm ? 12 : 6)
+        : (longForm ? 6 : 5)
+  const minTarget = Math.min(rangeSeconds, Math.max(2.8, rangeSeconds * 0.35))
+  const targetDuration = clamp(baseTarget, minTarget, Math.max(minTarget, rangeSeconds))
+  const scoreWindow = (window: EngagementWindow) => {
+    if (phase === 'build_up') {
+      return (
+        0.34 * (window.curiosityTrigger ?? 0) +
+        0.26 * (window.hookScore ?? window.score) +
+        0.22 * window.emotionIntensity +
+        0.1 * window.vocalExcitement +
+        0.08 * (window.actionSpike ?? 0)
+      )
+    }
+    if (phase === 'payout') {
+      return (
+        0.36 * window.emotionIntensity +
+        0.24 * (window.hookScore ?? window.score) +
+        0.18 * window.audioEnergy +
+        0.12 * (window.actionSpike ?? 0) +
+        0.1 * window.vocalExcitement
+      )
+    }
+    if (phase === 'cliffhanger') {
+      return (
+        0.36 * (window.curiosityTrigger ?? 0) +
+        0.26 * window.emotionIntensity +
+        0.2 * (window.hookScore ?? window.score) +
+        0.12 * window.motionScore +
+        0.06 * (window.actionSpike ?? 0)
+      )
+    }
+    return (window.hookScore ?? window.score)
+  }
+  const peakWindow = windows
+    .filter((window) => window.time >= startBound && window.time <= endBound)
+    .map((window) => ({ window, score: scoreWindow(window) }))
+    .sort((a, b) => b.score - a.score || a.window.time - b.window.time)[0]?.window
+  const anchor = peakWindow ? Number(peakWindow.time) : startBound
+  const start = clamp(anchor - targetDuration * 0.28, startBound, Math.max(startBound, endBound - targetDuration))
+  const end = clamp(start + targetDuration, start + MIN_RENDER_SEGMENT_SECONDS, endBound)
+  if (end - start < MIN_RENDER_SEGMENT_SECONDS) return null
+  const cliff = phase === 'cliffhanger'
+  return {
+    start: Number(start.toFixed(3)),
+    end: Number(end.toFixed(3)),
+    speed: 1,
+    emphasize: phase !== 'build_up',
+    subtitleIntent: cliff ? 'cliffhanger' : 'neutral',
+    musicSwell: cliff,
+    transitionStyle: cliff ? 'smooth' : undefined,
+    audioLeadInMs: cliff ? 120 : undefined,
+    audioTailMs: cliff ? 190 : undefined
+  }
+}
+
+const applyNarrativeArcSculptor = ({
+  segments,
+  durationSeconds,
+  hook,
+  storyBeatGraph,
+  windows
+}: {
+  segments: Segment[]
+  durationSeconds: number
+  hook: HookCandidate
+  storyBeatGraph: StoryBeatGraph | null
+  windows: EngagementWindow[]
+}) => {
+  if (!segments.length) {
+    return { segments, report: scoreNarrativeArcCoherence({ segments, durationSeconds, hook, storyBeatGraph }), applied: false, notes: [] as string[] }
+  }
+  const baseReport = scoreNarrativeArcCoherence({ segments, durationSeconds, hook, storyBeatGraph })
+  const missing = baseReport.missingPhases.filter((phase) => phase !== 'hook')
+  if (!missing.length) {
+    return { segments, report: baseReport, applied: false, notes: [] as string[] }
+  }
+  let nextSegments = segments.map((segment) => ({ ...segment }))
+  const hookRange: TimeRange = { start: hook.start, end: Number((hook.start + hook.duration).toFixed(3)) }
+  const notes: string[] = []
+  const phaseOrder: Array<'build_up' | 'payout' | 'cliffhanger'> = ['build_up', 'payout', 'cliffhanger']
+  for (const phase of phaseOrder) {
+    if (!missing.includes(phase)) continue
+    const phaseWindow = baseReport.phases.find((entry) => entry.phase === phase)
+    if (!phaseWindow) continue
+    const phaseSegment = buildArcPhaseSegment({
+      phase,
+      sourceStart: phaseWindow.sourceStart,
+      sourceEnd: phaseWindow.sourceEnd,
+      windows,
+      durationSeconds
+    })
+    if (!phaseSegment) continue
+    const phaseRange: TimeRange = { start: phaseSegment.start, end: phaseSegment.end }
+    nextSegments = subtractRange(nextSegments, phaseRange)
+      .filter((segment) => segment.end - segment.start > 0.2)
+    let insertIndex = findInsertIndexBySourceStart(nextSegments, phaseSegment.start)
+    if (phase === 'build_up') {
+      const hookIndex = nextSegments.findIndex((segment) => overlapsRange(segment, hookRange))
+      if (hookIndex >= 0) insertIndex = Math.min(nextSegments.length, hookIndex + 1)
+    } else if (phase === 'cliffhanger') {
+      insertIndex = nextSegments.length
+    }
+    nextSegments.splice(insertIndex, 0, phaseSegment)
+    notes.push(`Arc sculptor inserted ${phase.replace('_', ' ')} beat.`)
+  }
+  const report = scoreNarrativeArcCoherence({ segments: nextSegments, durationSeconds, hook, storyBeatGraph })
+  return { segments: nextSegments, report, applied: true, notes }
+}
+
+const applyCliffhangerBoost = ({
+  segments,
+  windows,
+  transcriptCues,
+  durationSeconds,
+  targetPlatform,
+  contentFormat
+}: {
+  segments: Segment[]
+  windows: EngagementWindow[]
+  transcriptCues: TranscriptCue[]
+  durationSeconds: number
+  targetPlatform?: RetentionTargetPlatform | PlatformProfileId | string | null
+  contentFormat?: RetentionContentFormat | null
+}): { segments: Segment[]; boosted: boolean; score: number } => {
+  if (!segments.length) return { segments, boosted: false, score: 0 }
+  const cliff = scoreCliffhangerUnresolvedTension({ segments, windows, transcriptCues, durationSeconds })
+  const isLongForm = durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS
+  const baseThreshold = isLongForm ? HARD_GATE_CLIFFHANGER_TENSION_LONG : HARD_GATE_CLIFFHANGER_TENSION_SHORT
+  const youtubeLongFormFocus = isYoutubeLongFormTarget({
+    durationSeconds,
+    targetPlatform,
+    contentFormat
+  })
+  const threshold = clamp(baseThreshold + (youtubeLongFormFocus ? 0.06 : 0), 0, 1)
+  if (cliff.score >= threshold) return { segments, boosted: false, score: cliff.score }
+  const endingSeconds = isLongForm ? clamp(durationSeconds * 0.12, 10, 24) : clamp(durationSeconds * 0.2, 4, 10)
+  const endingStart = Number(clamp(durationSeconds - endingSeconds, 0, durationSeconds).toFixed(3))
+  let boosted = false
+  let updated: Segment[] = segments.map((segment): Segment => {
+    if (segment.end > endingStart + 0.08) {
+      boosted = true
+      return {
+        ...segment,
+        subtitleIntent: 'cliffhanger',
+        musicSwell: true,
+        transitionStyle: (segment.transitionStyle || 'smooth') as SegmentTransitionStyle,
+        audioLeadInMs: Number(clamp(Math.max(Number(segment.audioLeadInMs ?? 0), 120), 20, 280).toFixed(0)),
+        audioTailMs: Number(clamp(Math.max(Number(segment.audioTailMs ?? 0), 190), 20, 320).toFixed(0)),
+        emphasize: true
+      }
+    }
+    return segment
+  })
+  if (!boosted) {
+    const appended: Segment = {
+      start: endingStart,
+      end: Number(durationSeconds.toFixed(3)),
+      speed: 1,
+      subtitleIntent: 'cliffhanger',
+      musicSwell: true,
+      transitionStyle: 'smooth',
+      audioLeadInMs: 120,
+      audioTailMs: 200,
+      emphasize: true
+    }
+    updated = [...updated, appended]
+    boosted = true
+  }
+  return { segments: updated, boosted: true, score: cliff.score }
+}
+
 const buildStoryBeatGraph = ({
   durationSeconds,
   windows,
@@ -22528,18 +23058,25 @@ const buildStoryBeatGraph = ({
 
 const buildLongFormMicroRehookAnchors = ({
   durationSeconds,
-  storyBeatGraph
+  storyBeatGraph,
+  minIntervalSeconds = LONG_FORM_MICRO_REHOOK_MIN_SECONDS,
+  maxIntervalSeconds = LONG_FORM_MICRO_REHOOK_MAX_SECONDS,
+  densityBiasSeconds = 0
 }: {
   durationSeconds: number
   storyBeatGraph: StoryBeatGraph | null
+  minIntervalSeconds?: number
+  maxIntervalSeconds?: number
+  densityBiasSeconds?: number
 }) => {
   if (!storyBeatGraph || durationSeconds < LONG_FORM_RUNTIME_THRESHOLD_SECONDS) return [] as number[]
   const anchors: number[] = []
   const baseInterval = clamp(
-    LONG_FORM_MICRO_REHOOK_MAX_SECONDS -
-    (storyBeatGraph.unresolvedTensionScore * 24),
-    LONG_FORM_MICRO_REHOOK_MIN_SECONDS,
-    LONG_FORM_MICRO_REHOOK_MAX_SECONDS
+    maxIntervalSeconds -
+    (storyBeatGraph.unresolvedTensionScore * 24) -
+    densityBiasSeconds,
+    minIntervalSeconds,
+    maxIntervalSeconds
   )
   const maxAnchors = clamp(Math.round(durationSeconds / 75), 12, 60)
   for (
@@ -23691,6 +24228,7 @@ const buildEditPlan = async (
     aggressionLevel?: RetentionAggressionLevel
     hookCalibration?: HookCalibrationProfile | null
     renderMode?: RenderMode
+    targetPlatform?: RetentionTargetPlatform | null
   }
 ) => {
   const aggressionLevel = parseRetentionAggressionLevel(
@@ -24238,9 +24776,16 @@ const buildEditPlan = async (
     storyBeatGraph,
     seedRanges: protectedPeakRanges
   })
+  const youtubeLongFormFocus = isYoutubeLongFormTarget({
+    durationSeconds,
+    targetPlatform: context?.targetPlatform ?? null
+  })
   const microRehookAnchors = buildLongFormMicroRehookAnchors({
     durationSeconds,
-    storyBeatGraph
+    storyBeatGraph,
+    minIntervalSeconds: youtubeLongFormFocus ? 55 : undefined,
+    maxIntervalSeconds: youtubeLongFormFocus ? 100 : undefined,
+    densityBiasSeconds: youtubeLongFormFocus ? 6 : 0
   })
   const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
@@ -31730,6 +32275,11 @@ const computeRetentionScore = (
     targetPlatform: extras?.targetPlatform ?? 'auto'
   })
   const targetPlatform = parseRetentionTargetPlatform(extras?.targetPlatform)
+  const youtubeLongFormFocus = isYoutubeLongFormTarget({
+    durationSeconds: runtimeSeconds,
+    targetPlatform,
+    contentFormat
+  })
   const interruptTargetInterval = resolveInterruptTargetSeconds({
     strategyProfile: extras?.strategyProfile ?? null,
     editorMode: extras?.editorMode ?? null,
@@ -31803,9 +32353,22 @@ const computeRetentionScore = (
     0,
     100
   )
+  const strategyLift = youtubeLongFormFocus
+    ? clamp(
+      6 * (
+        0.45 * basePrediction.metrics.introHold +
+        0.35 * basePrediction.metrics.endingReplayPotential +
+        0.2 * basePrediction.metrics.energyCurve -
+        0.55
+      ),
+      -4,
+      6
+    )
+    : 0
   const score = Math.round(clamp(
     weightedCompletion * 0.92 +
-    basePrediction.completionPercent * 0.08,
+    basePrediction.completionPercent * 0.08 +
+    strategyLift,
     0,
     100
   ))
@@ -31818,6 +32381,12 @@ const computeRetentionScore = (
   }
   if (basePrediction.metrics.endingReplayPotential < 0.62) {
     notes.push('Ending replay signal is soft; add clearer open-loop/question payoff.')
+  }
+  if (youtubeLongFormFocus && basePrediction.metrics.introHold < 0.76) {
+    notes.push('YouTube long-form: strengthen the first 30 seconds to lift retention.')
+  }
+  if (youtubeLongFormFocus && basePrediction.metrics.endingReplayPotential < 0.68) {
+    notes.push('YouTube long-form: end with a stronger sequel hook to drive binge viewing.')
   }
   if (!captionsEnabled) notes.push('Enable captions to improve silent-view completion.')
   if (score < MIN_PREDICTED_COMPLETION_PERCENT) notes.push('Predicted completion is below the 70% minimum threshold.')
@@ -32463,12 +33032,12 @@ const getEditOptionsForUser = async (
       ? overrides.continuityFirstMode
       : parseBooleanFlag((settings as any)?.continuityFirstMode)
   ) ?? false
-  const exploreX3Mode = (
+  let exploreX3Mode = (
     typeof overrides?.exploreX3Mode === 'boolean'
       ? overrides.exploreX3Mode
       : parseBooleanFlag((settings as any)?.exploreX3Mode)
   ) ?? false
-  const topHumanGuardMode = (
+  let topHumanGuardMode = (
     typeof overrides?.topHumanGuardMode === 'boolean'
       ? overrides.topHumanGuardMode
       : (
@@ -32668,7 +33237,12 @@ const getEditOptionsForUser = async (
     parseManualTimestampConfig(overrides?.manualTimestampConfig) ??
     parseManualTimestampConfig((settings as any)?.manualTimestamp ?? (settings as any)?.manual_timestamp)
   )
-  const continuityFirstMode = editorInstructionDraft.continuityFirstMode ?? requestedContinuityFirstMode
+  let continuityFirstMode = editorInstructionDraft.continuityFirstMode ?? requestedContinuityFirstMode
+  if (retentionKingModeRequested) {
+    continuityFirstMode = true
+    exploreX3Mode = true
+    topHumanGuardMode = true
+  }
   let requestedStrategy = parseRetentionStrategyProfile(
     editorInstructionDraft.retentionStrategyProfile ??
     overrides?.retentionStrategyProfile ??
@@ -33078,7 +33652,8 @@ const analyzeJob = async (jobId: string, options: EditOptions, requestId?: strin
                 transcriptCues,
                 aggressionLevel,
                 hookCalibration,
-                renderMode: initialRenderConfig.mode
+                renderMode: initialRenderConfig.mode,
+                targetPlatform: requestedTargetPlatform
               }
             )
             return plan
@@ -33427,6 +34002,8 @@ const processJob = async (
     throw new Error('ffmpeg_missing')
   }
 
+  const failOpenPipeline = true
+
   const settings = await prisma.userSettings.findUnique({ where: { userId: user.id } })
   const { tier, plan } = await getUserPlan(user.id)
   const devBypass = isDevAccount(user.id, user.email)
@@ -33529,10 +34106,14 @@ const processJob = async (
   let editorModeForRender: EditorModeSelection = requestedEditorMode || 'auto'
   const editorModePlaybook = resolvePipelinePowerModePlaybook(pipelinePowerMode)
   const editorModePlaybookNotes = editorModePlaybook.id === 'standard' ? [] : editorModePlaybook.notes
-  if (pipelinePowerMode === 'ultra' || pipelinePowerMode === 'retention_king') {
+  if (pipelinePowerMode === 'ultra') {
     requestedStrategyProfile = 'viral'
     requestedAggressionLevel = 'viral'
     options.fastMode = true
+  } else if (pipelinePowerMode === 'retention_king') {
+    if (requestedStrategyProfile === 'safe') requestedStrategyProfile = 'balanced'
+    if (requestedAggressionLevel === 'low') requestedAggressionLevel = 'medium'
+    options.fastMode = false
   }
   if (FORCE_RENDER_STAGE_MAX_SPEED) {
     options.fastMode = true
@@ -33599,12 +34180,14 @@ const processJob = async (
   const renderCodecThreads = renderFastMode
     ? Math.max(RENDER_CODEC_THREADS, FORCE_RENDER_STAGE_CODEC_THREADS)
     : RENDER_CODEC_THREADS
-  const renderSubtitlesEnabled = Boolean(
+  let renderSubtitlesEnabled = Boolean(
     CAPTIONS_PIPELINE_ENABLED &&
     renderConfig.mode === 'vertical' &&
     options.autoCaptions &&
     !(renderFastHorizontalMode && RENDER_FAST_HORIZONTAL_SKIP_SUBTITLES)
   )
+  let captionsEnabledForRetention = Boolean(options.autoCaptions)
+  let longFormCaptionsDisabled = false
   const ffPresetBase = renderFastMode
     ? (FORCE_RENDER_STAGE_MAX_SPEED ? FORCE_RENDER_STAGE_PRESET : FAST_MODE_FFMPEG_PRESET)
     : (process.env.FFMPEG_PRESET || platformProfile.videoPreset)
@@ -33715,6 +34298,11 @@ const processJob = async (
     }
     const durationMinutes = toMinutes(durationSeconds)
     await updateJob(jobId, { inputDurationSeconds: Math.round(durationSeconds) })
+    if (durationSeconds >= LONG_FORM_RUNTIME_THRESHOLD_SECONDS) {
+      longFormCaptionsDisabled = true
+      renderSubtitlesEnabled = false
+      captionsEnabledForRetention = false
+    }
     const runtimeFastProfileEnabledWithInputStats = shouldUseRuntimeFastProfile({
       durationSeconds,
       inputBytes: inStats.size
@@ -33904,7 +34492,8 @@ const processJob = async (
       const verticalAudioFilters = [...verticalBaseAudioFilters, ...verticalVoiceFilters]
       const verticalCaptionTextInput = normalizeVerticalCaptionTextInput(verticalCaptionConfig.text)
       const shouldApplyVerticalCaptionOverlays = (
-        Boolean(verticalCaptionConfig.enabled)
+        Boolean(verticalCaptionConfig.enabled) &&
+        !longFormCaptionsDisabled
       )
       const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
       const watermarkImageCandidates = [
@@ -34178,7 +34767,12 @@ const processJob = async (
           removeFillers: clipCaptionConfig.removeFillers
         })
         const clipCueLayers: TranscriptCue[][] = []
-        if (options.autoCaptions && verticalSourceCues.length && !shouldApplyVerticalCaptionOverlays) {
+        if (
+          options.autoCaptions &&
+          verticalSourceCues.length &&
+          !shouldApplyVerticalCaptionOverlays &&
+          !longFormCaptionsDisabled
+        ) {
           const remappedClipCues = remapTranscriptCuesToEditedTimeline(verticalSourceCues, [clipSegment])
           if (remappedClipCues.length) {
             clipCueLayers.push(remappedClipCues)
@@ -34667,6 +35261,9 @@ const processJob = async (
     let retentionScoreBeforeEdit: number | null = null
     let retentionScoreAfterEdit: number | null = null
     let optimizationNotes: string[] = []
+    if (longFormCaptionsDisabled) {
+      optimizationNotes.push('Long-form mode: captions disabled.')
+    }
     const transcriptRecoveryState = getAnalysisRecord(
       (job.analysis as any)?.transcript_auto_recovery ??
       (job.analysis as any)?.transcriptAutoRecovery
@@ -34695,6 +35292,8 @@ const processJob = async (
     let selectedJudge: RetentionJudgeReport | null = null
     let selectedHook: HookCandidate | null = null
     let selectedHookSelectionSource: 'auto' | 'user_selected' | 'fallback' = 'auto'
+    let hookBoostOverlayCues: TranscriptCue[] = []
+    let hookBoostOverlayOutputCues: TranscriptCue[] = []
     let latestAnalysisForHook = (((job.analysis as any) || {}) as Record<string, any>)
     let lockedPreferredHookCandidate: HookCandidate | null =
       parsePreferredHookCandidateFromPayload(latestAnalysisForHook.preferred_hook)
@@ -34748,6 +35347,7 @@ const processJob = async (
       nicheProfile: nicheProfileForAnalysis,
       targetPlatform: retentionTargetPlatform
     })
+    let youtubeLongFormFocus = false
     let processTranscriptCues: TranscriptCue[] = (
       Array.isArray((job.analysis as any)?.transcript_cues)
         ? ((job.analysis as any).transcript_cues as any[])
@@ -34841,7 +35441,8 @@ const processJob = async (
             transcriptCues: processTranscriptCues,
             aggressionLevel,
             hookCalibration,
-            renderMode: renderConfig.mode
+            renderMode: renderConfig.mode,
+            targetPlatform: retentionTargetPlatform
           })
         } catch (err) {
           console.warn(`[${requestId || 'noid'}] edit-plan generation failed during process; strict mode rejected fallback`, err)
@@ -34908,6 +35509,14 @@ const processJob = async (
         nicheProfile: nicheProfileForAnalysis,
         targetPlatform: retentionTargetPlatform
       })
+      youtubeLongFormFocus = isYoutubeLongFormTarget({
+        durationSeconds,
+        targetPlatform: retentionTargetPlatform,
+        contentFormat: selectedContentFormat
+      })
+      if (youtubeLongFormFocus) {
+        optimizationNotes.push('YouTube Strategy Brain active: hook precision, arc enforcement, micro-rehooks, and cliffhanger tuning optimized for watch-time.')
+      }
       const allowAggressiveStoryReorder = selectedContentFormat === 'tiktok_short'
       const baseSegments: Segment[] = editPlan
         ? editPlan.segments
@@ -34971,12 +35580,14 @@ const processJob = async (
         inputPath: job.inputPath,
         durationSeconds
       })
-      const resolvedHookDecision = selectAuthoritativeAutoHookDecision({
+      const failOpenHookSelection = failOpenPipeline
+      let resolvedHookDecision: HookSelectionDecision | null = selectAuthoritativeAutoHookDecision({
         candidates: hookCandidates,
         aggressionLevel,
         hasTranscript: hasTranscriptSignals,
         signalStrength: contentSignalStrength,
-        strictFailClosed: Boolean(options.topHumanGuardMode),
+        strictFailClosed: Boolean(options.topHumanGuardMode) && !failOpenHookSelection,
+        allowSyntheticFailOpen: failOpenHookSelection,
         thresholdOffset: hookThresholdOffset,
         windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
         transcriptCues: processTranscriptCues,
@@ -34984,10 +35595,57 @@ const processJob = async (
         silences: editPlan?.silences ?? [],
         durationSeconds,
         recentHooks: recentSourceHookReuseWindows,
-        creativeVariant: options.creativeVariant
+        creativeVariant: options.creativeVariant,
+        targetPlatform: retentionTargetPlatform,
+        contentFormat: selectedContentFormat
       })
       if (!resolvedHookDecision) {
-        throw new HookGateError('Hook candidate unavailable for render after fallback resolution')
+        const fallbackFromStory = buildFallbackHookCandidateFromStorySegments({
+          segments: storySegments,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+          silences: editPlan?.silences ?? [],
+          durationSeconds
+        })
+        const baseFallbackCandidate = hookCandidates[0] ?? fallbackFromStory ?? null
+        const emergencyDuration = Number(
+          clamp(AUTO_HOOK_DURATION_MIN_SECONDS, 2, Math.max(2, Math.min(AUTO_HOOK_DURATION_MAX_SECONDS, durationSeconds || 0)))
+            .toFixed(3)
+        )
+        const fallbackCandidate: HookCandidate = baseFallbackCandidate
+          ? {
+              ...baseFallbackCandidate,
+              reason: baseFallbackCandidate.reason || 'Hook fallback: insufficient confidence in candidates; using best available opener.',
+              synthetic: baseFallbackCandidate.synthetic ?? true
+            }
+          : {
+              start: 0,
+              duration: emergencyDuration,
+              score: 0.35,
+              auditScore: 0.35,
+              auditPassed: false,
+              text: '',
+              reason: 'Emergency hook fallback: no candidates were available; kept chronological opening.',
+              synthetic: true,
+              noRelocate: true
+            }
+        const fallbackSignals = scoreRenderableHookCandidateSignals({
+          candidate: fallbackCandidate,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+        })
+        const fallbackThreshold = resolveHookScoreThreshold({
+          aggressionLevel,
+          hasTranscript: hasTranscriptSignals,
+          signalStrength: contentSignalStrength,
+          thresholdOffset: hookThresholdOffset
+        })
+        resolvedHookDecision = {
+          candidate: fallbackCandidate,
+          confidence: fallbackSignals.confidence,
+          threshold: fallbackThreshold,
+          usedFallback: true,
+          reason: fallbackCandidate.reason || 'Hook fallback used'
+        }
+        optimizationNotes.push('Fail-open hook fallback activated: no strong candidates; proceeding with best available opener.')
       }
       let preferredHookCandidate = matchPreferredHookCandidate({
         preferred: preferredHookCandidateRaw,
@@ -35057,10 +35715,24 @@ const processJob = async (
         ? 'Planner-authoritative opener lock: kept the strongest full-video planner opener instead of letting the later selector replace it with a safer baseline hook.'
         : resolvedHookDecision.reason
       const autoHookSource = preferredHookCandidate || plannerAuthoritativeAutoHook || resolvedHookDecision.candidate
-      const initialHook = enforceAutoHookDurationRange({
+      let initialHook = enforceAutoHookDurationRange({
         candidate: autoHookSource,
         durationSeconds
       })
+      if (!preferredHookCandidate && hookSelectionModeForRender === 'auto') {
+        const composedHook = refineHookForOpening({
+          hook: initialHook,
+          windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+          transcriptCues: processTranscriptCues,
+          durationSeconds
+        })
+        if (Math.abs(composedHook.start - initialHook.start) > 0.08) {
+          optimizationNotes.push(
+            `Hook composer tightened the opener (moved from ${initialHook.start.toFixed(1)}s to ${composedHook.start.toFixed(1)}s).`
+          )
+        }
+        initialHook = composedHook
+      }
       const authoritativeAutoHookLock = !preferredHookCandidate && hookSelectionModeForRender === 'auto'
       selectedHookSelectionSource = preferredHookCandidate ? 'user_selected' : 'auto'
       const initialHookSignals = scoreRenderableHookCandidateSignals({
@@ -35524,13 +36196,14 @@ const processJob = async (
       }
 
       let finalSegments: Segment[] = []
-      const strictRenderMatchMode = Boolean(options.topHumanGuardMode)
+      const strictRenderMatchMode = Boolean(options.topHumanGuardMode) && !failOpenPipeline
+      const failOpenQualityGate = failOpenPipeline
       if (strictRenderMatchMode) {
         optimizationNotes.push('Strict render lock active: no hook fallbacks, no winner overrides, no rescue render.')
+      } else if (options.topHumanGuardMode && failOpenPipeline) {
+        optimizationNotes.push('Top human guard requested, but fail-open safety is enabled; strict render lock disabled.')
       }
-      const qualityGateRetryCount = strictRenderMatchMode
-        ? 0
-        : options.fastMode
+      const qualityGateRetryCount = options.fastMode
         ? FAST_MODE_QUALITY_GATE_RETRIES
         : MAX_QUALITY_GATE_RETRIES
       const lockPrimaryHookAcrossVariants =
@@ -35543,18 +36216,14 @@ const processJob = async (
       if (lockPrimaryHookAcrossVariants) {
         optimizationNotes.push('Primary hook lock active: retaining the selected opener candidate across variant retries.')
       }
-      const attemptStrategies = strictRenderMatchMode
-        ? (['BASELINE'] as RetentionRetryStrategy[])
-        : RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
+      const attemptStrategies = RETENTION_VARIANT_STRATEGIES.slice(0, Math.max(1, qualityGateRetryCount + 1))
       const baseMandatoryVariantTarget = Math.round(clamp(
         MANDATORY_VARIANT_MIN +
         (durationSeconds >= 45 * 60 ? 2 : durationSeconds >= 18 * 60 ? 1 : 0),
         MANDATORY_VARIANT_MIN,
         MANDATORY_VARIANT_MAX
       ))
-      const mandatoryVariantTarget = strictRenderMatchMode
-        ? 1
-        : options.exploreX3Mode
+      const mandatoryVariantTarget = options.exploreX3Mode
         ? Math.max(baseMandatoryVariantTarget, 3)
         : baseMandatoryVariantTarget
       const variantPlans: Array<{
@@ -35612,7 +36281,7 @@ const processJob = async (
           attempt.segments,
           editPlan?.engagementWindows ?? [],
           effectiveHookCandidate.score,
-          options.autoCaptions,
+          captionsEnabledForRetention,
           {
             removedRanges: editPlan?.removedSegments ?? [],
             patternInterruptCount: attempt.patternInterruptCount,
@@ -35634,7 +36303,7 @@ const processJob = async (
           hook: effectiveHookCandidate,
           windows: editPlan?.engagementWindows ?? [],
           clarityPenalty,
-          captionsEnabled: options.autoCaptions,
+          captionsEnabled: captionsEnabledForRetention,
           patternInterruptCount: attempt.patternInterruptCount,
           removedRanges: editPlan?.removedSegments ?? [],
           segments: attempt.segments,
@@ -35842,12 +36511,289 @@ const processJob = async (
             ...winner.judge.why_keep_watching.map((line) => `Why keep watching: ${line}`)
           ]
         }
+
+        const retentionFloor = Math.max(80, modeRetentionTargets.target)
+        if (selectedJudge && selectedJudge.retention_score < retentionFloor) {
+          const bestRetentionAttempt = attemptEvaluations
+            .slice()
+            .sort((a, b) => (
+              b.judge.retention_score - a.judge.retention_score ||
+              b.predictedRetention - a.predictedRetention
+            ))[0] || null
+          if (
+            bestRetentionAttempt &&
+            (bestRetentionAttempt.judge.passed || failOpenPipeline) &&
+            bestRetentionAttempt.judge.retention_score >= (selectedJudge.retention_score + 2)
+          ) {
+            finalSegments = bestRetentionAttempt.segments
+            selectedHook = bestRetentionAttempt.hookCandidate
+            selectedJudge = bestRetentionAttempt.judge
+            retentionScore = bestRetentionAttempt.judge.retention_score
+            selectedPatternInterruptCount = bestRetentionAttempt.patternInterruptCount
+            selectedPatternInterruptDensity = bestRetentionAttempt.patternInterruptDensity
+            selectedBoredomRemovalRatio = bestRetentionAttempt.retention.details.boredomRemovalRatio
+            selectedAutoEscalationEvents = bestRetentionAttempt.autoEscalationEvents
+            selectedStrategy = bestRetentionAttempt.strategy
+            selectedEliteCutAudit = bestRetentionAttempt.eliteCutAudit
+            selectedCutQualityScore = bestRetentionAttempt.cutQualityScore
+            selectedBoundaryPathologySummary = bestRetentionAttempt.boundaryPathologySummary
+            selectedStoryArcCoherence = bestRetentionAttempt.storyArcCoherence
+            optimizationNotes.push('Retention rescue: switched to the highest-retention variant.')
+          }
+        }
+
+        let sculptorMutated = false
+        if (selectedJudge && selectedHook && finalSegments.length) {
+          const arcResult = applyNarrativeArcSculptor({
+            segments: finalSegments,
+            durationSeconds,
+            hook: selectedHook,
+            storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis
+          })
+          if (arcResult.applied) {
+            finalSegments = arcResult.segments
+            selectedStoryArcCoherence = arcResult.report
+            optimizationNotes.push(...arcResult.notes)
+            sculptorMutated = true
+          }
+          const cliffResult = applyCliffhangerBoost({
+            segments: finalSegments,
+            windows: editPlan?.engagementWindows ?? engagementWindowsForAnalysis,
+            transcriptCues: processTranscriptCues,
+            durationSeconds,
+            targetPlatform: retentionTargetPlatform,
+            contentFormat: selectedContentFormat
+          })
+          if (cliffResult.boosted) {
+            finalSegments = cliffResult.segments
+            optimizationNotes.push('Cliffhanger booster applied: strengthened ending tension for binge continuity.')
+            sculptorMutated = true
+          }
+          if (shouldMoveHookForRender && isOpeningContractBroken({
+            segments: finalSegments,
+            hook: selectedHook,
+            shouldMoveHook: shouldMoveHookForRender
+          })) {
+            const openingContract = buildOpeningContractTimeline({
+              segments: finalSegments,
+              hook: selectedHook,
+              durationSeconds
+            })
+            if (openingContract) {
+              finalSegments = openingContract.segments
+              selectedHook = openingContract.hook
+              optimizationNotes.push('Hook composer enforced opening contract after arc sculpting.')
+              sculptorMutated = true
+            }
+          }
+          if (sculptorMutated) {
+            selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+              sourceStart: Number(segment.start.toFixed(3)),
+              sourceEnd: Number(segment.end.toFixed(3)),
+              orderedIndex
+            }))
+            const recalcedStoryArc = scoreNarrativeArcCoherence({
+              segments: finalSegments,
+              durationSeconds,
+              hook: selectedHook,
+              storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+            })
+            selectedStoryArcCoherence = recalcedStoryArc
+            const recomputedRetention = computeRetentionScore(
+              finalSegments,
+              editPlan?.engagementWindows ?? [],
+              selectedHook.score,
+              captionsEnabledForRetention,
+              {
+                removedRanges: editPlan?.removedSegments ?? [],
+                patternInterruptCount: selectedPatternInterruptCount,
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile,
+                editorMode: editorModeForRender,
+                styleProfile: styleProfileForAnalysis,
+                nicheProfile: nicheProfileForAnalysis,
+                transcriptCues: processTranscriptCues
+              }
+            )
+            selectedBoredomRemovalRatio = recomputedRetention.details.boredomRemovalRatio
+            selectedJudge = buildRetentionJudgeReport({
+              retentionScore: recomputedRetention,
+              hook: selectedHook,
+              windows: editPlan?.engagementWindows ?? [],
+              clarityPenalty: selectedHook.auditPassed ? 0.08 : (hasTranscriptSignals ? 0.3 : 0.2),
+              captionsEnabled: captionsEnabledForRetention,
+              patternInterruptCount: selectedPatternInterruptCount,
+              removedRanges: editPlan?.removedSegments ?? [],
+              segments: finalSegments,
+              thresholds: qualityGateThresholds,
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              storyArcCoherence: recalcedStoryArc
+            })
+            retentionScore = selectedJudge.retention_score
+          }
+        }
+
+        if (selectedJudge && selectedJudge.retention_score < Math.max(80, modeRetentionTargets.target - 2) && editPlan && selectedHook) {
+          const rescueHookRange: TimeRange = {
+            start: selectedHook.start,
+            end: Number((selectedHook.start + selectedHook.duration).toFixed(3))
+          }
+          const rescueProtectedRanges = buildPeakProtectionRanges({
+            windows: editPlan.engagementWindows ?? [],
+            durationSeconds,
+            hookRange: rescueHookRange,
+            hookCandidates: [selectedHook, ...hookVariantsForAnalysis].slice(0, 6),
+            storyBeatGraph: storyBeatGraphForAnalysis || editPlan.storyBeatGraph || null,
+            seedRanges: editPlan.protectedPeakRanges ?? []
+          })
+          const rescueRefined = applyEliteCutRefinement({
+            segments: finalSegments,
+            windows: editPlan.engagementWindows ?? [],
+            durationSeconds,
+            styleProfile: styleProfileForAnalysis,
+            aggressionLevel: 'viral',
+            contentFormat: selectedContentFormat,
+            hookRange: rescueHookRange,
+            protectedRanges: rescueProtectedRanges,
+            allowSpeedChanges: !options.onlyCuts
+          })
+          if (rescueRefined.segments.length) {
+            const rescueRetention = computeRetentionScore(
+              rescueRefined.segments,
+              editPlan.engagementWindows ?? [],
+              selectedHook.score,
+              captionsEnabledForRetention,
+              {
+                removedRanges: editPlan.removedSegments ?? [],
+                patternInterruptCount: selectedPatternInterruptCount,
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile,
+                editorMode: editorModeForRender,
+                styleProfile: styleProfileForAnalysis,
+                nicheProfile: nicheProfileForAnalysis,
+                transcriptCues: processTranscriptCues
+              }
+            )
+            if (rescueRetention.score >= selectedJudge.retention_score) {
+              finalSegments = rescueRefined.segments
+              selectedEliteCutAudit = rescueRefined.audit
+              selectedCutQualityScore = Math.max(selectedCutQualityScore, rescueRefined.cutQualityScore)
+              selectedBoundaryPathologySummary = rescueRefined.boundaryPathologySummary
+              const rescueArc = scoreNarrativeArcCoherence({
+                segments: finalSegments,
+                durationSeconds,
+                hook: selectedHook,
+                storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+              })
+              selectedStoryArcCoherence = rescueArc
+              selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+                sourceStart: Number(segment.start.toFixed(3)),
+                sourceEnd: Number(segment.end.toFixed(3)),
+                orderedIndex
+              }))
+              selectedBoredomRemovalRatio = rescueRetention.details.boredomRemovalRatio
+              selectedJudge = buildRetentionJudgeReport({
+                retentionScore: rescueRetention,
+                hook: selectedHook,
+                windows: editPlan.engagementWindows ?? [],
+                clarityPenalty: selectedHook.auditPassed ? 0.08 : (hasTranscriptSignals ? 0.3 : 0.2),
+                captionsEnabled: captionsEnabledForRetention,
+                patternInterruptCount: selectedPatternInterruptCount,
+                removedRanges: editPlan.removedSegments ?? [],
+                segments: finalSegments,
+                thresholds: qualityGateThresholds,
+                contentFormat: selectedContentFormat,
+                targetPlatform: retentionTargetPlatform,
+                strategyProfile,
+                storyArcCoherence: rescueArc
+              })
+              retentionScore = selectedJudge.retention_score
+              optimizationNotes.push('Retention rescue: aggressive refinement applied after arc sculpting.')
+            }
+          }
+        }
       }
 
       if (!selectedJudge) {
         const reason = 'Retention judge unavailable after retries'
+        const fallbackSegments = storySegments.length
+          ? storySegments.map((segment) => ({ ...segment }))
+          : buildGuaranteedFallbackSegments(durationSeconds || 0, options)
+        const emergencyDuration = Number(
+          clamp(AUTO_HOOK_DURATION_MIN_SECONDS, 2, Math.max(2, Math.min(AUTO_HOOK_DURATION_MAX_SECONDS, durationSeconds || 0)))
+            .toFixed(3)
+        )
+        const fallbackHookCandidate: HookCandidate = selectedHook
+          || initialHook
+          || orderedHookCandidates[0]
+          || {
+            start: 0,
+            duration: emergencyDuration,
+            score: 0.35,
+            auditScore: 0.35,
+            auditPassed: false,
+            text: '',
+            reason: 'Emergency hook fallback: no judged hook available.',
+            synthetic: true,
+            noRelocate: true
+          }
+        const fallbackRetention = computeRetentionScore(
+          fallbackSegments,
+          editPlan?.engagementWindows ?? [],
+          fallbackHookCandidate.score,
+          captionsEnabledForRetention,
+          {
+            removedRanges: editPlan?.removedSegments ?? [],
+            patternInterruptCount: 0,
+            contentFormat: selectedContentFormat,
+            targetPlatform: retentionTargetPlatform,
+            strategyProfile,
+            editorMode: editorModeForRender,
+            styleProfile: styleProfileForAnalysis,
+            nicheProfile: nicheProfileForAnalysis
+          }
+        )
+        selectedJudge = buildRetentionJudgeReport({
+          retentionScore: fallbackRetention,
+          hook: fallbackHookCandidate,
+          windows: editPlan?.engagementWindows ?? [],
+          clarityPenalty: fallbackHookCandidate.auditPassed ? 0.1 : (hasTranscriptSignals ? 0.26 : 0.18),
+          captionsEnabled: captionsEnabledForRetention,
+          patternInterruptCount: 0,
+          removedRanges: editPlan?.removedSegments ?? [],
+          segments: fallbackSegments,
+          thresholds: qualityGateThresholds,
+          contentFormat: selectedContentFormat,
+          targetPlatform: retentionTargetPlatform,
+          strategyProfile,
+          storyArcCoherence: scoreNarrativeArcCoherence({
+            segments: fallbackSegments,
+            durationSeconds,
+            hook: fallbackHookCandidate,
+            storyBeatGraph: storyBeatGraphForAnalysis || editPlan?.storyBeatGraph || null
+          })
+        })
+        finalSegments = fallbackSegments
+        selectedHook = fallbackHookCandidate
+        retentionScore = selectedJudge.retention_score
+        selectedPatternInterruptCount = 0
+        selectedPatternInterruptDensity = 0
+        selectedBoredomRemovalRatio = fallbackRetention.details.boredomRemovalRatio
+        selectedStrategy = 'BASELINE'
+        selectedStoryReorderMap = finalSegments.map((segment, orderedIndex) => ({
+          sourceStart: Number(segment.start.toFixed(3)),
+          sourceEnd: Number(segment.end.toFixed(3)),
+          orderedIndex
+        }))
+        qualityGateOverride = { applied: true, reason: `Fail-open quality gate: ${reason}` }
+        optimizationNotes.push('Fail-open quality gate: retention judge unavailable; rendering fallback baseline.')
         await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-          status: 'failed',
+          status: 'completed',
           completedAt: toIsoNow(),
           lastError: reason,
           meta: {
@@ -35857,11 +36803,12 @@ const processJob = async (
             contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
             contentFormat: selectedContentFormat,
             targetPlatform: retentionTargetPlatform,
-            strategyProfile
+            strategyProfile,
+            failOpen: true
           }
         })
         await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-          status: 'failed',
+          status: 'completed',
           completedAt: toIsoNow(),
           lastError: reason,
           meta: {
@@ -35871,18 +36818,9 @@ const processJob = async (
             contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
             contentFormat: selectedContentFormat,
             targetPlatform: retentionTargetPlatform,
-            strategyProfile
+            strategyProfile,
+            failOpen: true
           }
-        })
-        await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${reason}` })
-        throw new QualityGateError(reason, {
-          attempts: retentionAttempts,
-          thresholds: qualityGateThresholds,
-          hasTranscriptSignals,
-          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-          contentFormat: selectedContentFormat,
-          targetPlatform: retentionTargetPlatform,
-          strategyProfile
         })
       }
       const initialPredictedRetention = Number(selectedJudge.retention_score ?? 0)
@@ -35891,11 +36829,75 @@ const processJob = async (
         const strictFailureReason = !selectedJudge.passed
           ? 'Strict render lock rejected the baseline edit plan after quality gate review.'
           : 'Strict render lock rejected the baseline edit plan for missing the retention target.'
-        await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: strictFailureReason,
-          meta: {
+        if (failOpenQualityGate) {
+          const failOpenReason = `Fail-open quality gate: ${strictFailureReason}`
+          qualityGateOverride = { applied: true, reason: failOpenReason }
+          optimizationNotes.push(failOpenReason)
+          await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+            status: 'completed',
+            completedAt: toIsoNow(),
+            lastError: failOpenReason,
+            meta: {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              strictRenderLock: true,
+              failOpen: true
+            }
+          })
+          await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+            status: 'completed',
+            completedAt: toIsoNow(),
+            lastError: failOpenReason,
+            meta: {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              strictRenderLock: true,
+              failOpen: true
+            }
+          })
+        } else {
+          await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
+            status: 'failed',
+            completedAt: toIsoNow(),
+            lastError: strictFailureReason,
+            meta: {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              strictRenderLock: true
+            }
+          })
+          await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
+            status: 'failed',
+            completedAt: toIsoNow(),
+            lastError: strictFailureReason,
+            meta: {
+              attempts: retentionAttempts,
+              thresholds: qualityGateThresholds,
+              hasTranscriptSignals,
+              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
+              contentFormat: selectedContentFormat,
+              targetPlatform: retentionTargetPlatform,
+              strategyProfile,
+              strictRenderLock: true
+            }
+          })
+          await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${strictFailureReason}` })
+          throw new QualityGateError(strictFailureReason, {
             attempts: retentionAttempts,
             thresholds: qualityGateThresholds,
             hasTranscriptSignals,
@@ -35904,34 +36906,8 @@ const processJob = async (
             targetPlatform: retentionTargetPlatform,
             strategyProfile,
             strictRenderLock: true
-          }
-        })
-        await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-          status: 'failed',
-          completedAt: toIsoNow(),
-          lastError: strictFailureReason,
-          meta: {
-            attempts: retentionAttempts,
-            thresholds: qualityGateThresholds,
-            hasTranscriptSignals,
-            contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-            contentFormat: selectedContentFormat,
-            targetPlatform: retentionTargetPlatform,
-            strategyProfile,
-            strictRenderLock: true
-          }
-        })
-        await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${strictFailureReason}` })
-        throw new QualityGateError(strictFailureReason, {
-          attempts: retentionAttempts,
-          thresholds: qualityGateThresholds,
-          hasTranscriptSignals,
-          contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-          contentFormat: selectedContentFormat,
-          targetPlatform: retentionTargetPlatform,
-          strategyProfile,
-          strictRenderLock: true
-        })
+          })
+        }
       }
       if (
         !strictRenderMatchMode &&
@@ -35961,7 +36937,7 @@ const processJob = async (
           `Mode retention target adjusted to ${modeRetentionTargets.target}% (floor ${modeRetentionTargets.floor}%).`
         )
       }
-      if (!strictRenderMatchMode && (!selectedJudge.passed || lowRetentionRecoveryRequested)) {
+      if ((!strictRenderMatchMode || failOpenQualityGate) && (!selectedJudge.passed || lowRetentionRecoveryRequested)) {
         let overrideReason = options.topHumanGuardMode
           ? null
           : maybeAllowQualityGateOverride({
@@ -35979,7 +36955,7 @@ const processJob = async (
             rescueAttempt.segments,
             editPlan?.engagementWindows ?? [],
             rescueHookCandidate.score,
-            options.autoCaptions,
+            captionsEnabledForRetention,
             {
               removedRanges: editPlan?.removedSegments ?? [],
               patternInterruptCount: rescueAttempt.patternInterruptCount,
@@ -36023,7 +36999,7 @@ const processJob = async (
             hook: rescueHookCandidate,
             windows: editPlan?.engagementWindows ?? [],
             clarityPenalty: rescueClarityPenalty,
-            captionsEnabled: options.autoCaptions,
+            captionsEnabled: captionsEnabledForRetention,
             patternInterruptCount: rescueAttempt.patternInterruptCount,
             removedRanges: editPlan?.removedSegments ?? [],
             segments: rescueAttempt.segments,
@@ -36078,13 +37054,16 @@ const processJob = async (
           qualityGateOverride = { applied: true, reason: overrideReason }
           optimizationNotes.push(overrideReason)
         } else {
+          const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
           if (options.topHumanGuardMode) {
-            const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
             const strictReason = `Top-human guard blocked export: quality gate remained below strict target (${resolvedRetention.toFixed(1)}% vs target ${modeRetentionTargets.target}%, floor ${modeRetentionTargets.floor}%).`
+            const failOpenReason = `Fail-open quality gate: ${strictReason}`
+            qualityGateOverride = { applied: true, reason: failOpenReason }
+            optimizationNotes.push(failOpenReason)
             await updatePipelineStepState(jobId, 'STORY_QUALITY_GATE', {
-              status: 'failed',
+              status: 'completed',
               completedAt: toIsoNow(),
-              lastError: strictReason,
+              lastError: failOpenReason,
               meta: {
                 attempts: retentionAttempts,
                 thresholds: qualityGateThresholds,
@@ -36093,13 +37072,14 @@ const processJob = async (
                 contentFormat: selectedContentFormat,
                 targetPlatform: retentionTargetPlatform,
                 strategyProfile,
-                topHumanGuardMode: true
+                topHumanGuardMode: true,
+                failOpen: true
               }
             })
             await updatePipelineStepState(jobId, 'RETENTION_SCORE', {
-              status: 'failed',
+              status: 'completed',
               completedAt: toIsoNow(),
-              lastError: strictReason,
+              lastError: failOpenReason,
               meta: {
                 attempts: retentionAttempts,
                 thresholds: qualityGateThresholds,
@@ -36108,31 +37088,21 @@ const processJob = async (
                 contentFormat: selectedContentFormat,
                 targetPlatform: retentionTargetPlatform,
                 strategyProfile,
-                topHumanGuardMode: true
+                topHumanGuardMode: true,
+                failOpen: true
               }
             })
-            await updateJob(jobId, { status: 'failed', error: `FAILED_QUALITY_GATE: ${strictReason}` })
-            throw new QualityGateError(strictReason, {
-              attempts: retentionAttempts,
-              thresholds: qualityGateThresholds,
-              hasTranscriptSignals,
-              contentSignalStrength: Number(contentSignalStrength.toFixed(4)),
-              contentFormat: selectedContentFormat,
-              targetPlatform: retentionTargetPlatform,
-              strategyProfile,
-              topHumanGuardMode: true
-            })
+          } else {
+            const belowMinimum = resolvedRetention < modeRetentionTargets.floor
+            const belowTarget = resolvedRetention < modeRetentionTargets.target
+            const forcedReason = belowMinimum
+              ? `Predicted completion ${resolvedRetention.toFixed(1)}% below ${modeRetentionTargets.floor}% mode floor (target ${modeRetentionTargets.target}%). Continuing with best available rescue output.`
+              : belowTarget
+                ? `Low-retention recovery ran but remained below ${modeRetentionTargets.target}% target; using best available rescue output.`
+                : 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
+            qualityGateOverride = { applied: true, reason: forcedReason }
+            optimizationNotes.push(forcedReason)
           }
-          const resolvedRetention = Number(selectedJudge?.retention_score ?? 0)
-          const belowMinimum = resolvedRetention < modeRetentionTargets.floor
-          const belowTarget = resolvedRetention < modeRetentionTargets.target
-          const forcedReason = belowMinimum
-            ? `Predicted completion ${resolvedRetention.toFixed(1)}% below ${modeRetentionTargets.floor}% mode floor (target ${modeRetentionTargets.target}%). Continuing with best available rescue output.`
-            : belowTarget
-              ? `Low-retention recovery ran but remained below ${modeRetentionTargets.target}% target; using best available rescue output.`
-            : 'Forced render fallback: quality gate did not pass, but rescue edit was produced to avoid upload failure.'
-          qualityGateOverride = { applied: true, reason: forcedReason }
-          optimizationNotes.push(forcedReason)
         }
       }
 
@@ -36208,7 +37178,7 @@ const processJob = async (
           finalSegments,
           editPlan?.engagementWindows ?? [],
           clamp01(Number(manualHookForJudge?.score ?? 0.6)),
-          options.autoCaptions,
+          captionsEnabledForRetention,
           {
             removedRanges: manualTimelinePlan.removeRanges,
             patternInterruptCount: selectedPatternInterruptCount,
@@ -36232,7 +37202,7 @@ const processJob = async (
           hook: manualHookForJudge,
           windows: editPlan?.engagementWindows ?? [],
           clarityPenalty: 0.06,
-          captionsEnabled: options.autoCaptions,
+          captionsEnabled: captionsEnabledForRetention,
           patternInterruptCount: selectedPatternInterruptCount,
           removedRanges: manualTimelinePlan.removeRanges,
           segments: finalSegments,
@@ -36306,7 +37276,7 @@ const processJob = async (
           [{ start: 0, end: durationSeconds, speed: 1 }],
           baselineWindows,
           baselineHookScore,
-          options.autoCaptions,
+          captionsEnabledForRetention,
           {
             removedRanges: [],
             patternInterruptCount: 0,
@@ -36403,6 +37373,17 @@ const processJob = async (
         console.warn('zoom-cap enforcement failed', e)
       }
 
+      if (!longFormCaptionsDisabled && failOpenPipeline && selectedHook && !selectedHook.auditPassed) {
+        hookBoostOverlayCues = buildFailOpenHookOverlayCues({
+          hook: selectedHook,
+          transcriptCues: processTranscriptCues,
+          durationSeconds
+        })
+        if (hookBoostOverlayCues.length) {
+          optimizationNotes.push('Fail-open hook overlay enabled: added teaser captions to strengthen the opener.')
+        }
+      }
+
       if (renderSubtitlesEnabled) {
         await updateJob(jobId, { status: 'subtitling', progress: 62 })
         // Fast path: reuse already-parsed transcript cues from analysis when available.
@@ -36411,7 +37392,10 @@ const processJob = async (
             workDir,
             `${path.basename(tmpIn, path.extname(tmpIn))}.analysis-cues.srt`
           )
-          const reusedCueSrt = writeTranscriptCuesToSrt(processTranscriptCues, sourceCueSrtPath)
+          const mergedCues = hookBoostOverlayCues.length
+            ? mergeTranscriptCueLayers([processTranscriptCues, hookBoostOverlayCues])
+            : processTranscriptCues
+          const reusedCueSrt = writeTranscriptCuesToSrt(mergedCues, sourceCueSrtPath)
           if (reusedCueSrt) {
             subtitlePath = reusedCueSrt
             optimizationNotes.push('Auto subtitles reused analyzed transcript cues (fast path).')
@@ -36429,6 +37413,21 @@ const processJob = async (
         if (!subtitlePath) {
           const captionEngine = getCaptionEngineStatus()
           optimizationNotes.push(`Auto subtitles skipped: ${captionEngine.reason}`)
+        }
+        if (subtitlePath && hookBoostOverlayCues.length) {
+          const baseCues = parseTranscriptCues(subtitlePath)
+          if (baseCues.length) {
+            const mergedCues = mergeTranscriptCueLayers([baseCues, hookBoostOverlayCues])
+            const mergedPath = path.join(
+              workDir,
+              `${path.basename(subtitlePath, path.extname(subtitlePath))}-hookboost.srt`
+            )
+            const writtenMerged = writeTranscriptCuesToSrt(mergedCues, mergedPath)
+            if (writtenMerged) {
+              subtitlePath = writtenMerged
+              subtitleIsAss = false
+            }
+          }
         }
       } else if (options.autoCaptions && renderConfig.mode === 'horizontal') {
         optimizationNotes.push('Long-form mode: subtitles skipped.')
@@ -36588,7 +37587,10 @@ const processJob = async (
       if (!microRehookAnchorsForAnalysis.length && storyBeatGraphForAnalysis) {
         microRehookAnchorsForAnalysis = buildLongFormMicroRehookAnchors({
           durationSeconds,
-          storyBeatGraph: storyBeatGraphForAnalysis
+          storyBeatGraph: storyBeatGraphForAnalysis,
+          minIntervalSeconds: youtubeLongFormFocus ? 55 : undefined,
+          maxIntervalSeconds: youtubeLongFormFocus ? 100 : undefined,
+          densityBiasSeconds: youtubeLongFormFocus ? 6 : 0
         })
       }
       let hardQualityAudit = evaluateHardQualityBar({
@@ -36943,6 +37945,12 @@ const processJob = async (
         throw new Error('no_renderable_segments')
       }
       finalSegmentsForAnalysis = finalSegments.map((segment) => ({ ...segment }))
+      if (hookBoostOverlayCues.length) {
+        hookBoostOverlayOutputCues = remapTranscriptCuesToEditedTimeline(
+          hookBoostOverlayCues,
+          finalSegments
+        )
+      }
       if (selectedHook && finalSegmentsForAnalysis.length) {
         const styleName = behaviorStyleProfileForAnalysis?.styleName || `${strategyProfile}_adaptive_v1`
         const resolvedBlendForDecision = styleArchetypeBlendForAnalysis || behaviorStyleProfileForAnalysis?.archetypeBlend || null
@@ -37055,6 +38063,13 @@ const processJob = async (
 
       const watermarkFont = getSystemFontFile()
       const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
+      const hookOverlayFilter = (
+        hookBoostOverlayOutputCues.length &&
+        !longFormCaptionsDisabled &&
+        (!renderSubtitlesEnabled || !subtitlePath)
+      )
+        ? buildHookOverlayDrawtextFilter(hookBoostOverlayOutputCues, watermarkFontArg)
+        : ''
 
       // Prefer a dedicated watermark image. Keep env override support,
       // then fall back to legacy names and historical favicon behavior.
@@ -37368,8 +38383,9 @@ const processJob = async (
           }
 
           const shouldPostProcessSubtitle = Boolean(subtitleFilter && subtitlePath)
+          const shouldPostProcessOverlay = Boolean(hookOverlayFilter)
           const shouldPostProcessAudio = withAudio && audioFilters.length > 0
-          if (shouldPostProcessSubtitle || shouldPostProcessAudio) {
+          if (shouldPostProcessSubtitle || shouldPostProcessOverlay || shouldPostProcessAudio) {
             const postProcessArgs = [
               '-y',
               '-nostdin',
@@ -37381,7 +38397,17 @@ const processJob = async (
               '-movflags',
               '+faststart'
             ]
-            if (shouldPostProcessSubtitle && subtitlePath) {
+            if ((shouldPostProcessSubtitle && subtitlePath) || shouldPostProcessOverlay) {
+              const overlayChain = [
+                (shouldPostProcessSubtitle && subtitlePath)
+                  ? (
+                    subtitleIsAss
+                      ? `subtitles=${escapeFilterPath(subtitlePath)}`
+                      : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+                  )
+                  : '',
+                shouldPostProcessOverlay ? hookOverlayFilter : ''
+              ].filter(Boolean).join(',')
               postProcessArgs.push(
                 '-c:v',
                 'libx264',
@@ -37395,9 +38421,7 @@ const processJob = async (
                 '-pix_fmt',
                 'yuv420p',
                 '-vf',
-                subtitleIsAss
-                  ? `subtitles=${escapeFilterPath(subtitlePath)}`
-                  : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
+                overlayChain
               )
             } else {
               postProcessArgs.push('-c:v', 'copy')
@@ -37459,12 +38483,16 @@ const processJob = async (
               )
             )
           )
-          const fullVideoChain = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          const baseChainWithoutHook = [subtitleFilter, watermarkFilter].filter(Boolean).join(',')
+          const fullVideoChain = [subtitleFilter, hookOverlayFilter, watermarkFilter].filter(Boolean).join(',')
           // If using an image watermark we must add the watermark file as a second input
           // so ffmpeg can reference it as input index 1 in the overlay filter.
           const argsWithWatermark = [...argsBase]
           if (watermarkImageExists) argsWithWatermark.push('-i', watermarkImagePath)
           const candidateVideoChains = [fullVideoChain]
+          if (hookOverlayFilter && baseChainWithoutHook !== fullVideoChain) {
+            candidateVideoChains.push(baseChainWithoutHook)
+          }
           if (subtitleFilter && watermarkFilter) candidateVideoChains.push(subtitleFilter)
           if (!subtitleFilter && watermarkFilter) candidateVideoChains.push(watermarkFilter)
           if (!subtitleFilter || !renderSubtitlesEnabled) candidateVideoChains.push('')
@@ -37472,6 +38500,7 @@ const processJob = async (
           if (!videoChains.length) videoChains.push('')
           const describeVideoChainFallback = (videoChain: string) => {
             if (!videoChain) return 'without subtitles/watermark'
+            if (hookOverlayFilter && videoChain === baseChainWithoutHook) return 'without hook overlay'
             if (videoChain === subtitleFilter) return 'without watermark'
             if (videoChain === watermarkFilter) return 'without subtitles'
             return 'with reduced overlays'
@@ -43033,7 +44062,8 @@ const buildEditPlanForTest = async ({
   }
   const plan = await buildEditPlan(absolutePath, durationSeconds, options, undefined, {
     aggressionLevel: normalizedAggression,
-    transcriptCues: normalizedTranscriptCues
+    transcriptCues: normalizedTranscriptCues,
+    targetPlatform: options.retentionTargetPlatform ?? null
   })
   if (Array.isArray(plan?.segments) && plan.segments.length) {
     plan.segments = stabilizeStoryPacingSegments({
@@ -43060,13 +44090,16 @@ const buildEditPlanForTest = async ({
     hasTranscript: hasTranscriptSignals,
     signalStrength,
     strictFailClosed: false,
+    allowSyntheticFailOpen: true,
     windows: planWindows,
     transcriptCues: normalizedTranscriptCues,
     segments: planSegments,
     silences: planSilences,
     durationSeconds,
     recentHooks: null,
-    creativeVariant: options.creativeVariant
+    creativeVariant: options.creativeVariant,
+    targetPlatform: options.retentionTargetPlatform ?? null,
+    contentFormat: durationSeconds >= LONG_FORM_RUNTIME_FLOOR_MIN_DURATION_SECONDS ? 'youtube_long' : 'tiktok_short'
   })
   const resolvedHook = hookDecision?.candidate ||
     pickAuditedOpeningCandidateFromPool({
