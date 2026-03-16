@@ -128,7 +128,7 @@ console.log('[startup] Starting API server')
 require('../dist/index.js')
 
 if (shouldGeneratePrismaOnStartup) {
-  runAsync('Generating Prisma client', 'prisma generate')
+  runAsync('Generating Prisma client', 'npx prisma generate')
 } else {
   console.log('[startup] Skipping prisma generate on startup')
 }
@@ -144,5 +144,5 @@ if (!hasDatabaseUrl) {
 } else if (skipMigrations) {
   console.warn('[startup] SKIP_PRISMA_MIGRATIONS is enabled, skipping prisma migrate deploy')
 } else {
-  runAsync('Applying Prisma migrations', 'prisma migrate deploy', { allowFailure: true })
+  runAsync('Applying Prisma migrations', 'npx prisma migrate deploy', { allowFailure: true })
 }
