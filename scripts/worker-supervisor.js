@@ -33,6 +33,8 @@ const startWorkerSupervisor = ({
   const restartDelayMs = Math.max(100, parseIntEnv(process.env.JOB_WORKER_RESTART_DELAY_MS, 500))
   const shutdownGraceMs = Math.max(500, parseIntEnv(process.env.JOB_WORKER_SHUTDOWN_GRACE_MS, 5_000))
   let shuttingDown = false
+  let restarting = false
+  let forceTimer = null
   const childrenBySlot = new Map()
 
   console.log(
@@ -42,6 +44,24 @@ const startWorkerSupervisor = ({
     console.warn(
       `[startup] ${label} redundancy is single-replica; set JOB_WORKER_REPLICAS=2+ for crash failover coverage`
     )
+  }
+
+  const clearForceTimer = () => {
+    if (!forceTimer) return
+    clearTimeout(forceTimer)
+    forceTimer = null
+  }
+
+  const maybeFinishRestart = () => {
+    if (!restarting) return
+    if (childrenBySlot.size > 0) return
+    clearForceTimer()
+    shuttingDown = false
+    restarting = false
+    console.log(`[startup] ${label} restart complete; launching ${workerReplicas} replica(s)`)
+    for (let slot = 0; slot < workerReplicas; slot += 1) {
+      spawnWorker(slot, 'restart')
+    }
   }
 
   const spawnWorker = (slot, reason) => {
@@ -62,7 +82,9 @@ const startWorkerSupervisor = ({
       childrenBySlot.delete(slot)
       const exitLabel = signal ? `signal=${signal}` : `code=${code}`
       if (shuttingDown) {
-        console.log(`[startup] ${label} replica ${replica} exited during shutdown (${exitLabel})`)
+        const exitPhase = restarting ? 'restart' : 'shutdown'
+        console.log(`[startup] ${label} replica ${replica} exited during ${exitPhase} (${exitLabel})`)
+        maybeFinishRestart()
         return
       }
       console.warn(`[startup] ${label} replica ${replica} crashed (${exitLabel}); restarting in ${restartDelayMs}ms`)
@@ -75,12 +97,13 @@ const startWorkerSupervisor = ({
     })
   }
 
-  const shutdown = (signal) => {
+  const shutdown = (signal, options = {}) => {
+    const { exitProcess = true } = options
     if (shuttingDown) return
     shuttingDown = true
     const runningChildren = Array.from(childrenBySlot.values())
     if (!runningChildren.length) {
-      process.exit(0)
+      if (exitProcess) process.exit(0)
       return
     }
     console.log(`[startup] Received ${signal}; stopping ${runningChildren.length} ${label} replica(s)`)
@@ -91,7 +114,8 @@ const startWorkerSupervisor = ({
         // ignore individual child shutdown errors
       }
     }
-    const forceTimer = setTimeout(() => {
+    clearForceTimer()
+    forceTimer = setTimeout(() => {
       for (const child of Array.from(childrenBySlot.values())) {
         try {
           child.kill('SIGKILL')
@@ -99,11 +123,18 @@ const startWorkerSupervisor = ({
           // ignore
         }
       }
-      process.exit(0)
+      if (exitProcess) process.exit(0)
     }, shutdownGraceMs)
-    if (typeof forceTimer.unref === 'function') {
+    if (forceTimer && typeof forceTimer.unref === 'function') {
       forceTimer.unref()
     }
+  }
+
+  const restart = () => {
+    if (restarting || shuttingDown) return
+    restarting = true
+    shutdown('restart', { exitProcess: false })
+    maybeFinishRestart()
   }
 
   for (let slot = 0; slot < workerReplicas; slot += 1) {
@@ -112,6 +143,8 @@ const startWorkerSupervisor = ({
 
   process.on('SIGINT', () => shutdown('SIGINT'))
   process.on('SIGTERM', () => shutdown('SIGTERM'))
+
+  return { shutdown, restart }
 }
 
 module.exports = { startWorkerSupervisor }

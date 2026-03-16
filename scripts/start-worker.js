@@ -1,9 +1,14 @@
 const { execSync } = require('child_process')
-const { existsSync, readdirSync, statSync } = require('fs')
+const { existsSync, readdirSync, statSync, watch } = require('fs')
 const path = require('path')
 const { startWorkerSupervisor } = require('./worker-supervisor')
 
 const parseBool = (value) => /^(1|true|yes)$/i.test(String(value || '').trim())
+const parseIntEnv = (value, fallback) => {
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.round(parsed)
+}
 
 const run = (label, command, options = {}) => {
   const { allowFailure = false } = options
@@ -77,6 +82,13 @@ const sourceMtimeMs = Math.max(
 )
 const distMtimeMs = getLatestMtimeMs(distEntryPath)
 const distStale = sourceMtimeMs > distMtimeMs + 1000
+const shouldWatchWorkerChanges = (() => {
+  if (parseBool(process.env.WATCH_WORKER_CHANGES)) return true
+  if (String(process.env.WATCH_WORKER_CHANGES || '').trim() !== '') return false
+  const env = String(process.env.NODE_ENV || '').trim().toLowerCase()
+  return env !== 'production'
+})()
+const watchDebounceMs = Math.max(100, parseIntEnv(process.env.WATCH_WORKER_DEBOUNCE_MS, 300))
 
 if (shouldBuildOnStartup || !existsSync(distEntryPath) || distStale) {
   run('Building backend', 'npm run build')
@@ -105,7 +117,47 @@ if (!hasDatabaseUrl) {
 }
 
 console.log('[startup] Starting pipeline worker supervisor')
-startWorkerSupervisor({
+const supervisor = startWorkerSupervisor({
   workerEntryPath: distEntryPath,
   label: 'pipeline worker'
 })
+
+if (shouldWatchWorkerChanges) {
+  const distDir = path.dirname(distEntryPath)
+  const distBasename = path.basename(distEntryPath)
+  let lastMtimeMs = getLatestMtimeMs(distEntryPath)
+  let restartTimer = null
+
+  const scheduleRestart = (reason) => {
+    if (restartTimer) return
+    restartTimer = setTimeout(() => {
+      restartTimer = null
+      console.log(`[startup] Detected ${reason} change in dist/worker.js; restarting worker replicas`)
+      if (supervisor && typeof supervisor.restart === 'function') {
+        supervisor.restart()
+      }
+    }, watchDebounceMs)
+    if (restartTimer && typeof restartTimer.unref === 'function') {
+      restartTimer.unref()
+    }
+  }
+
+  try {
+    const watcher = watch(distDir, { persistent: true }, (eventType, filename) => {
+      if (filename && String(filename) !== distBasename) return
+      const nextMtimeMs = getLatestMtimeMs(distEntryPath)
+      if (nextMtimeMs <= lastMtimeMs + 10) return
+      lastMtimeMs = nextMtimeMs
+      scheduleRestart(eventType || 'change')
+    })
+
+    watcher.on('error', (error) => {
+      console.warn(`[startup] Worker watch error: ${error instanceof Error ? error.message : String(error)}`)
+    })
+
+    process.on('exit', () => watcher.close())
+    console.log('[startup] Watching dist/worker.js for changes; set WATCH_WORKER_CHANGES=0 to disable')
+  } catch (error) {
+    console.warn(`[startup] Failed to watch dist/worker.js: ${error instanceof Error ? error.message : String(error)}`)
+  }
+}
