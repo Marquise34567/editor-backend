@@ -111,6 +111,7 @@ const parseOptionalBool = (value: unknown): boolean | null => {
 const GPU_WORKER_URL = String(process.env.GPU_WORKER_URL || '').trim()
 const GPU_WORKER_BASE_URL = GPU_WORKER_URL.replace(/\/+$/, '')
 const GPU_WORKER_SHARED_DIR = String(process.env.GPU_WORKER_SHARED_DIR || '').trim()
+const GPU_WORKER_SHARED_DIR_REMOTE = String(process.env.GPU_WORKER_SHARED_DIR_REMOTE || '').trim()
 const GPU_WORKER_FORCE = parseOptionalBool(process.env.GPU_WORKER_FORCE) ?? false
 const GPU_WORKER_FALLBACK = parseOptionalBool(process.env.GPU_WORKER_FALLBACK) ?? true
 const GPU_WORKER_KEEP_SHARED = parseOptionalBool(process.env.GPU_WORKER_KEEP_SHARED) ?? false
@@ -460,6 +461,13 @@ const pollGpuWorkerJob = async (workerJobId: string, requestId?: string) => {
   throw new Error('gpu_worker_timeout')
 }
 
+const joinGpuWorkerPath = (base: string, ...parts: string[]) => {
+  if (!base) return ''
+  const isWindowsPath = base.includes('\\') || /^[a-zA-Z]:/.test(base)
+  const joiner = isWindowsPath ? path.win32 : path.posix
+  return joiner.join(base, ...parts)
+}
+
 const renderWithGpuWorker = async ({
   jobId,
   requestId,
@@ -489,12 +497,15 @@ const renderWithGpuWorker = async ({
     throw new Error('gpu_worker_missing_config')
   }
   const sharedJobDir = path.join(GPU_WORKER_SHARED_DIR, jobId)
+  const localInputPath = path.join(sharedJobDir, 'input.mp4')
+  const localOutputPath = path.join(sharedJobDir, 'output.mp4')
+  const workerSharedBase = GPU_WORKER_SHARED_DIR_REMOTE || GPU_WORKER_SHARED_DIR
+  const workerInputPath = joinGpuWorkerPath(workerSharedBase, jobId, 'input.mp4')
+  const workerOutputPath = joinGpuWorkerPath(workerSharedBase, jobId, 'output.mp4')
   fs.mkdirSync(sharedJobDir, { recursive: true })
-  const workerInputPath = path.join(sharedJobDir, 'input.mp4')
-  const workerOutputPath = path.join(sharedJobDir, 'output.mp4')
   try {
-    if (path.resolve(inputPath) !== path.resolve(workerInputPath)) {
-      fs.copyFileSync(inputPath, workerInputPath)
+    if (path.resolve(inputPath) !== path.resolve(localInputPath)) {
+      fs.copyFileSync(inputPath, localInputPath)
     }
 
     const segmentPayload = segments.map((seg) => ({
@@ -525,14 +536,14 @@ const renderWithGpuWorker = async ({
     const workerJobId = await postGpuWorkerJob(payload, requestId)
     await pollGpuWorkerJob(workerJobId, requestId)
 
-    if (!fs.existsSync(workerOutputPath)) {
+    if (!fs.existsSync(localOutputPath)) {
       throw new Error('gpu_worker_output_missing')
     }
-    fs.copyFileSync(workerOutputPath, outputPath)
+    fs.copyFileSync(localOutputPath, outputPath)
   } finally {
     if (!GPU_WORKER_KEEP_SHARED) {
-      safeUnlink(workerInputPath)
-      safeUnlink(workerOutputPath)
+      safeUnlink(localInputPath)
+      safeUnlink(localOutputPath)
       try {
         fs.rmSync(sharedJobDir, { recursive: true, force: true })
       } catch (e) {
@@ -38737,6 +38748,7 @@ const processJob = async (
 
         if (gpuWorkerSkipReasons.length && !GPU_WORKER_FORCE) {
           console.log(`[${requestId || 'noid'}] gpu worker skipped`, { reasons: gpuWorkerSkipReasons })
+          optimizationNotes.push(`GPU worker skipped: ${gpuWorkerSkipReasons.join(', ')}`)
         } else {
           try {
             const bitrateKbps = resolveBitrateKbpsFromArgs(ffVideoBitrateArgs)
@@ -38758,6 +38770,7 @@ const processJob = async (
           } catch (err: any) {
             const message = String(err?.message || err || 'gpu_worker_failed')
             console.warn(`[${requestId || 'noid'}] gpu worker render failed`, message)
+            optimizationNotes.push(`GPU worker render failed (${message}); falling back to CPU.`)
             if (!GPU_WORKER_FALLBACK) {
               throw err
             }
