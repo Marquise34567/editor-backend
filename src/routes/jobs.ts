@@ -38765,8 +38765,11 @@ const processJob = async (
         }
       }
 
+      let hasSegments = false
+      let runSegmentFileFallback: ((segments: Segment[]) => Promise<void>) | null = null
+
       if (!processed) {
-        const hasSegments = finalSegments.length >= 1
+        hasSegments = finalSegments.length >= 1
         const heavyLongFormSegmentFallback = shouldPreferHeavyLongFormSegmentFallback({
           renderMode: renderConfig.mode,
           durationSeconds,
@@ -38963,7 +38966,7 @@ const processJob = async (
         }
       }
 
-      const runSegmentFileFallback = async (segments: Segment[]) => {
+      const runSegmentFileFallbackImpl = async (segments: Segment[]) => {
         const segmentFiles: string[] = []
         const concatListPath = path.join(workDir, `segment-list-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.txt`)
         try {
@@ -39203,6 +39206,8 @@ const processJob = async (
         }
       }
 
+      runSegmentFileFallback = runSegmentFileFallbackImpl
+
       try {
         if (hasSegments) {
           const segmentFileFallbackEligible = (
@@ -39277,7 +39282,7 @@ const processJob = async (
           let ran = false
           if (preferSegmentFileFallback) {
             try {
-              await runSegmentFileFallback(finalSegments)
+              await runSegmentFileFallbackImpl(finalSegments)
               ran = true
               optimizationNotes.push(
                 heavyLongFormSegmentFallback
@@ -39330,7 +39335,7 @@ const processJob = async (
           if (!ran) {
             const reason = summarizeFfmpegError(lastErr)
             try {
-              await runSegmentFileFallback(finalSegments)
+              await runSegmentFileFallbackImpl(finalSegments)
               ran = true
               optimizationNotes.push(`Render fallback: segment-file stitch used (${reason}).`)
             } catch (segmentFallbackErr) {
@@ -39395,6 +39400,7 @@ const processJob = async (
       }
       if (
         processed &&
+        runSegmentFileFallback &&
         durationSeconds >= LONG_FORM_RESCUE_MIN_DURATION &&
         fs.existsSync(tmpOut)
       ) {
@@ -39447,6 +39453,9 @@ const processJob = async (
           )
           if (conservativeRuntimeSegments.length) {
             try {
+              if (!runSegmentFileFallback) {
+                throw new Error('segment_fallback_unavailable')
+              }
               await runSegmentFileFallback(conservativeRuntimeSegments)
               const renderedDurationAfterGuard = Number(getDurationSeconds(tmpOut) || 0)
               if (renderedDurationAfterGuard > renderedDurationBeforeGuard + 0.5) {
@@ -39466,7 +39475,7 @@ const processJob = async (
           }
         }
       }
-      if (processed && hasSegments && fs.existsSync(tmpOut)) {
+      if (processed && hasSegments && runSegmentFileFallback && fs.existsSync(tmpOut)) {
         const renderedDurationAfterFloorGuard = Number(getDurationSeconds(tmpOut) || 0)
         const noOpAudit = auditNoOpEditRisk({
           segments: finalSegments,
@@ -39517,6 +39526,9 @@ const processJob = async (
           )
           if (noOpRescueSegments.length) {
             try {
+              if (!runSegmentFileFallback) {
+                throw new Error('segment_fallback_unavailable')
+              }
               await runSegmentFileFallback(noOpRescueSegments)
               const rescueRenderedDuration = Number(getDurationSeconds(tmpOut) || 0)
               const rescueAudit = auditNoOpEditRisk({
@@ -39571,6 +39583,9 @@ const processJob = async (
             if (!contractSatisfied) {
               await updateJob(jobId, { status: 'failed', error: 'opening_contract_broken' })
               throw new Error('opening_contract_broken')
+            }
+            if (!runSegmentFileFallback) {
+              throw new Error('segment_fallback_unavailable')
             }
             await runSegmentFileFallback(enforcedSegments)
             finalSegments = enforcedSegments
