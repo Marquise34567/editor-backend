@@ -556,6 +556,9 @@ class GpuTranscoder {
 
     int ret = 0;
     int video_stream_index = -1;
+    int audio_stream_index = -1;
+    AVStream* input_audio_stream = nullptr;
+    AVStream* output_audio_stream = nullptr;
 
     if ((ret = avformat_open_input(&input_ctx, job.input_path.c_str(), nullptr, nullptr)) < 0) {
       error = "open input: " + AvErrorToString(ret);
@@ -576,6 +579,10 @@ class GpuTranscoder {
 
     AVStream* input_stream = input_ctx->streams[video_stream_index];
     AVCodecParameters* input_params = input_stream->codecpar;
+    audio_stream_index = av_find_best_stream(input_ctx, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    if (audio_stream_index >= 0) {
+      input_audio_stream = input_ctx->streams[audio_stream_index];
+    }
 
     AVCodec* decoder = FindHardwareDecoder(input_params->codec_id);
     if (!decoder) {
@@ -772,6 +779,21 @@ class GpuTranscoder {
     }
     output_stream->codecpar->codec_tag = 0;
 
+    if (input_audio_stream) {
+      output_audio_stream = avformat_new_stream(output_ctx, nullptr);
+      if (!output_audio_stream) {
+        error = "alloc audio stream";
+        ret = AVERROR(ENOMEM);
+        goto cleanup;
+      }
+      if ((ret = avcodec_parameters_copy(output_audio_stream->codecpar, input_audio_stream->codecpar)) < 0) {
+        error = "audio params copy: " + AvErrorToString(ret);
+        goto cleanup;
+      }
+      output_audio_stream->codecpar->codec_tag = 0;
+      output_audio_stream->time_base = input_audio_stream->time_base;
+    }
+
     if (!(output_ctx->oformat->flags & AVFMT_NOFILE)) {
       if ((ret = avio_open(&output_ctx->pb, segment.output_path.c_str(), AVIO_FLAG_WRITE)) < 0) {
         error = "open output file: " + AvErrorToString(ret);
@@ -797,18 +819,55 @@ class GpuTranscoder {
 
     int64_t start_ts = 0;
     int64_t end_ts = INT64_MAX;
+    int64_t audio_start_ts = 0;
+    int64_t audio_end_ts = INT64_MAX;
     if (segment.start_ms > 0) {
       start_ts = av_rescale_q(segment.start_ms, AV_TIME_BASE_Q, input_stream->time_base);
       av_seek_frame(input_ctx, video_stream_index, start_ts, AVSEEK_FLAG_BACKWARD);
       avcodec_flush_buffers(decoder_ctx);
+      if (input_audio_stream) {
+        audio_start_ts = av_rescale_q(segment.start_ms, AV_TIME_BASE_Q, input_audio_stream->time_base);
+      }
     }
     if (segment.duration_ms > 0) {
       int64_t dur_ts = av_rescale_q(segment.duration_ms, AV_TIME_BASE_Q, input_stream->time_base);
       end_ts = start_ts + dur_ts;
+      if (input_audio_stream) {
+        int64_t audio_dur = av_rescale_q(segment.duration_ms, AV_TIME_BASE_Q, input_audio_stream->time_base);
+        audio_end_ts = audio_start_ts + audio_dur;
+      }
     }
 
     bool reached_end = false;
     while (!reached_end && (ret = av_read_frame(input_ctx, packet)) >= 0) {
+      if (packet->stream_index == audio_stream_index && output_audio_stream) {
+        int64_t pts = packet->pts != AV_NOPTS_VALUE ? packet->pts : packet->dts;
+        if (pts != AV_NOPTS_VALUE) {
+          if (pts < audio_start_ts) {
+            av_packet_unref(packet);
+            continue;
+          }
+          if (pts > audio_end_ts) {
+            av_packet_unref(packet);
+            continue;
+          }
+          if (packet->pts != AV_NOPTS_VALUE) {
+            packet->pts -= audio_start_ts;
+          }
+          if (packet->dts != AV_NOPTS_VALUE) {
+            packet->dts -= audio_start_ts;
+          }
+        }
+        packet->stream_index = output_audio_stream->index;
+        av_packet_rescale_ts(packet, input_audio_stream->time_base, output_audio_stream->time_base);
+        if ((ret = av_interleaved_write_frame(output_ctx, packet)) < 0) {
+          error = "write audio frame: " + AvErrorToString(ret);
+          goto cleanup;
+        }
+        av_packet_unref(packet);
+        continue;
+      }
+
       if (packet->stream_index != video_stream_index) {
         av_packet_unref(packet);
         continue;

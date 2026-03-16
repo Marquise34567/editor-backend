@@ -99,6 +99,37 @@ const SCRIPT_STDIO_LIMIT = (() => {
   return Math.max(32_000, Math.min(5_000_000, Math.round(raw)))
 })()
 
+const parseOptionalBool = (value: unknown): boolean | null => {
+  if (value === null || value === undefined) return null
+  const raw = String(value).trim().toLowerCase()
+  if (!raw) return null
+  if (['1', 'true', 'yes', 'on'].includes(raw)) return true
+  if (['0', 'false', 'no', 'off'].includes(raw)) return false
+  return null
+}
+
+const GPU_WORKER_URL = String(process.env.GPU_WORKER_URL || '').trim()
+const GPU_WORKER_BASE_URL = GPU_WORKER_URL.replace(/\/+$/, '')
+const GPU_WORKER_SHARED_DIR = String(process.env.GPU_WORKER_SHARED_DIR || '').trim()
+const GPU_WORKER_FORCE = parseOptionalBool(process.env.GPU_WORKER_FORCE) ?? false
+const GPU_WORKER_FALLBACK = parseOptionalBool(process.env.GPU_WORKER_FALLBACK) ?? true
+const GPU_WORKER_KEEP_SHARED = parseOptionalBool(process.env.GPU_WORKER_KEEP_SHARED) ?? false
+const GPU_WORKER_POLL_INTERVAL_MS = (() => {
+  const raw = Number(process.env.GPU_WORKER_POLL_INTERVAL_MS || 1500)
+  if (!Number.isFinite(raw) || raw <= 200) return 1500
+  return Math.min(10_000, Math.round(raw))
+})()
+const GPU_WORKER_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.GPU_WORKER_TIMEOUT_MS || 60 * 60_000)
+  if (!Number.isFinite(raw) || raw <= 10_000) return 60 * 60_000
+  return Math.min(6 * 60 * 60_000, Math.round(raw))
+})()
+const GPU_WORKER_PARALLEL_SEGMENTS = (() => {
+  const raw = Number(process.env.GPU_WORKER_PARALLEL_SEGMENTS || 2)
+  if (!Number.isFinite(raw) || raw <= 0) return 2
+  return Math.min(8, Math.max(1, Math.round(raw)))
+})()
+
 const appendBoundedOutput = (current: string, chunk: Buffer | string, maxChars: number) => {
   const text = String(chunk || '')
   if (!text) return current
@@ -327,6 +358,187 @@ const hasFfprobe = () => {
     return result.status === 0
   } catch (e) {
     return false
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+const parseBitrateKbps = (value: string | undefined | null) => {
+  if (!value) return 0
+  const raw = String(value).trim().toLowerCase()
+  if (!raw) return 0
+  const match = raw.match(/^([0-9.]+)\s*([kmg])?$/)
+  if (!match) return 0
+  const base = Number(match[1])
+  if (!Number.isFinite(base) || base <= 0) return 0
+  const unit = match[2] || ''
+  if (unit === 'g') return Math.round(base * 1_000_000)
+  if (unit === 'm') return Math.round(base * 1_000)
+  if (unit === 'k') return Math.round(base)
+  return Math.round(base / 1000)
+}
+
+const resolveBitrateKbpsFromArgs = (args: string[]) => {
+  const idx = args.findIndex((item) => item === '-b:v' || item === '-b')
+  if (idx >= 0 && idx + 1 < args.length) {
+    const parsed = parseBitrateKbps(args[idx + 1])
+    if (parsed > 0) return parsed
+  }
+  return 0
+}
+
+const computeCoverCrop = (sourceWidth: number, sourceHeight: number, targetWidth: number, targetHeight: number) => {
+  if (sourceWidth <= 0 || sourceHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+    return { cropX: 0, cropY: 0, cropW: 0, cropH: 0 }
+  }
+  const sourceAspect = sourceWidth / sourceHeight
+  const targetAspect = targetWidth / targetHeight
+  if (Math.abs(sourceAspect - targetAspect) < 0.0001) {
+    return { cropX: 0, cropY: 0, cropW: sourceWidth, cropH: sourceHeight }
+  }
+  if (sourceAspect > targetAspect) {
+    const cropW = Math.round(sourceHeight * targetAspect)
+    const cropX = Math.round((sourceWidth - cropW) / 2)
+    return { cropX, cropY: 0, cropW, cropH: sourceHeight }
+  }
+  const cropH = Math.round(sourceWidth / targetAspect)
+  const cropY = Math.round((sourceHeight - cropH) / 2)
+  return { cropX: 0, cropY, cropW: sourceWidth, cropH }
+}
+
+const postGpuWorkerJob = async (payload: Record<string, any>, requestId?: string) => {
+  if (!GPU_WORKER_BASE_URL) throw new Error('gpu_worker_missing_url')
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 15_000)
+  try {
+    const response = await fetch(`${GPU_WORKER_BASE_URL}/render`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal as any
+    } as any)
+    if (!response.ok) {
+      const detail = await response.text().catch(() => '')
+      throw new Error(`gpu_worker_submit_failed:${response.status}:${detail.slice(0, 240)}`)
+    }
+    const data = (await response.json().catch(() => null)) as any
+    const jobId = String(data?.job_id || data?.jobId || '').trim()
+    if (!jobId) throw new Error('gpu_worker_submit_missing_job_id')
+    console.log(`[${requestId || 'noid'}] gpu worker accepted job`, { workerJobId: jobId })
+    return jobId
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+const pollGpuWorkerJob = async (workerJobId: string, requestId?: string) => {
+  const deadline = Date.now() + GPU_WORKER_TIMEOUT_MS
+  while (Date.now() < deadline) {
+    const controller = new AbortController()
+    const timeoutId = setTimeout(() => controller.abort(), 10_000)
+    try {
+      const response = await fetch(`${GPU_WORKER_BASE_URL}/jobs/${encodeURIComponent(workerJobId)}`, {
+        method: 'GET',
+        signal: controller.signal as any
+      } as any)
+      if (!response.ok) {
+        const detail = await response.text().catch(() => '')
+        throw new Error(`gpu_worker_status_failed:${response.status}:${detail.slice(0, 240)}`)
+      }
+      const data = (await response.json().catch(() => null)) as any
+      const status = String(data?.status || '').toLowerCase()
+      if (status === 'succeeded') return
+      if (status === 'failed') {
+        const err = String(data?.error || 'gpu_worker_failed').slice(0, 240)
+        throw new Error(err)
+      }
+    } finally {
+      clearTimeout(timeoutId)
+    }
+    await sleep(GPU_WORKER_POLL_INTERVAL_MS)
+  }
+  throw new Error('gpu_worker_timeout')
+}
+
+const renderWithGpuWorker = async ({
+  jobId,
+  requestId,
+  inputPath,
+  outputPath,
+  segments,
+  targetWidth,
+  targetHeight,
+  sourceWidth,
+  sourceHeight,
+  horizontalFit,
+  bitrateKbps
+}: {
+  jobId: string
+  requestId?: string
+  inputPath: string
+  outputPath: string
+  segments: Segment[]
+  targetWidth: number
+  targetHeight: number
+  sourceWidth: number
+  sourceHeight: number
+  horizontalFit: HorizontalFitMode
+  bitrateKbps: number
+}) => {
+  if (!GPU_WORKER_BASE_URL || !GPU_WORKER_SHARED_DIR) {
+    throw new Error('gpu_worker_missing_config')
+  }
+  const sharedJobDir = path.join(GPU_WORKER_SHARED_DIR, jobId)
+  fs.mkdirSync(sharedJobDir, { recursive: true })
+  const workerInputPath = path.join(sharedJobDir, 'input.mp4')
+  const workerOutputPath = path.join(sharedJobDir, 'output.mp4')
+  try {
+    if (path.resolve(inputPath) !== path.resolve(workerInputPath)) {
+      fs.copyFileSync(inputPath, workerInputPath)
+    }
+
+    const segmentPayload = segments.map((seg) => ({
+      start_ms: Math.max(0, Math.round(seg.start * 1000)),
+      duration_ms: Math.max(1, Math.round((seg.end - seg.start) * 1000))
+    }))
+
+    const crop = horizontalFit === 'cover'
+      ? computeCoverCrop(sourceWidth, sourceHeight, targetWidth, targetHeight)
+      : { cropX: 0, cropY: 0, cropW: 0, cropH: 0 }
+
+    const payload = {
+      input_path: workerInputPath,
+      output_path: workerOutputPath,
+      codec: 'h264',
+      width: targetWidth,
+      height: targetHeight,
+      bitrate_kbps: bitrateKbps,
+      use_cuda_resize: true,
+      crop_x: crop.cropX,
+      crop_y: crop.cropY,
+      crop_w: crop.cropW,
+      crop_h: crop.cropH,
+      parallel_segments: GPU_WORKER_PARALLEL_SEGMENTS,
+      segments: segmentPayload
+    }
+
+    const workerJobId = await postGpuWorkerJob(payload, requestId)
+    await pollGpuWorkerJob(workerJobId, requestId)
+
+    if (!fs.existsSync(workerOutputPath)) {
+      throw new Error('gpu_worker_output_missing')
+    }
+    fs.copyFileSync(workerOutputPath, outputPath)
+  } finally {
+    if (!GPU_WORKER_KEEP_SHARED) {
+      safeUnlink(workerInputPath)
+      safeUnlink(workerOutputPath)
+      try {
+        fs.rmSync(sharedJobDir, { recursive: true, force: true })
+      } catch (e) {
+        // ignore cleanup errors
+      }
+    }
   }
 }
 
@@ -38500,100 +38712,148 @@ const processJob = async (
         lastError: null
       })
       await updateJob(jobId, { status: 'rendering', progress: 80 })
-
-      const hasSegments = finalSegments.length >= 1
-      const heavyLongFormSegmentFallback = shouldPreferHeavyLongFormSegmentFallback({
-        renderMode: renderConfig.mode,
-        durationSeconds,
-        inputBytes: inStats.size,
-        fastMode: renderFastHorizontalMode,
-        segmentCount: finalSegments.length
-      })
-      const segmentFileFallbackSeekPadSeconds = resolveSegmentFileFallbackSeekPadSeconds({
-        renderMode: renderConfig.mode,
-        durationSeconds,
-        inputBytes: inStats.size,
-        fastMode: renderFastHorizontalMode
-      })
-      const argsBase = [
-        '-y',
-        '-nostdin',
-        '-hide_banner',
-        '-loglevel',
-        'error',
-        '-filter_threads',
-        String(RENDER_FILTER_THREADS),
-        '-i',
-        tmpIn,
-        '-movflags',
-        '+faststart',
-        '-c:v',
-        'libx264',
-        '-preset',
-        ffPreset,
-        '-crf',
-        ffCrf,
-        ...ffVideoBitrateArgs,
-        '-threads',
-        String(renderCodecThreads),
-        '-pix_fmt',
-        'yuv420p'
-      ]
-      if (withAudio) {
-        argsBase.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
-      }
-
-      const watermarkFont = getSystemFontFile()
-      const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
-      const hookOverlayFilter = (
+      const transitionsEnabledForRender = Boolean(options.transitions && !renderFastMode)
+      const hookOverlayEnabled = (
         hookBoostOverlayOutputCues.length &&
         !longFormCaptionsDisabled &&
         (!renderSubtitlesEnabled || !subtitlePath)
       )
-        ? buildHookOverlayDrawtextFilter(hookBoostOverlayOutputCues, watermarkFontArg)
-        : ''
+
+      if (!processed && GPU_WORKER_BASE_URL) {
+        const gpuWorkerSkipReasons: string[] = []
+        if (!GPU_WORKER_SHARED_DIR) gpuWorkerSkipReasons.push('missing_shared_dir')
+        if (renderConfig.mode !== 'horizontal') gpuWorkerSkipReasons.push('mode_not_supported')
+        if (horizontalFit !== 'cover') gpuWorkerSkipReasons.push('fit_not_supported')
+        if (renderSubtitlesEnabled || subtitlePath) gpuWorkerSkipReasons.push('subtitles_enabled')
+        if (renderWatermarkEnabled) gpuWorkerSkipReasons.push('watermark_enabled')
+        if (hookOverlayEnabled) gpuWorkerSkipReasons.push('hook_overlay_enabled')
+        if (transitionsEnabledForRender) gpuWorkerSkipReasons.push('transitions_enabled')
+        if (audioFilters.length > 0) gpuWorkerSkipReasons.push('audio_filters_enabled')
+        if (finalSegments.some((seg) => Number(seg.speed ?? 1) !== 1)) gpuWorkerSkipReasons.push('segment_speed')
+        if (finalSegments.some((seg) => Number(seg.audioGain ?? 1) !== 1)) gpuWorkerSkipReasons.push('segment_audio_gain')
+        if (finalSegments.some((seg) => Boolean(seg.zoom) || Boolean(seg.reframeMode))) gpuWorkerSkipReasons.push('segment_zoom')
+        if (!sourceProbe?.width || !sourceProbe?.height) gpuWorkerSkipReasons.push('missing_source_probe')
+        if (renderFastMode && !renderFastHorizontalCutOnly) gpuWorkerSkipReasons.push('fast_mode_not_cut_only')
+
+        if (gpuWorkerSkipReasons.length && !GPU_WORKER_FORCE) {
+          console.log(`[${requestId || 'noid'}] gpu worker skipped`, { reasons: gpuWorkerSkipReasons })
+        } else {
+          try {
+            const bitrateKbps = resolveBitrateKbpsFromArgs(ffVideoBitrateArgs)
+            await renderWithGpuWorker({
+              jobId,
+              requestId,
+              inputPath: tmpIn,
+              outputPath: tmpOut,
+              segments: finalSegments,
+              targetWidth: target.width,
+              targetHeight: target.height,
+              sourceWidth: sourceProbe?.width || 0,
+              sourceHeight: sourceProbe?.height || 0,
+              horizontalFit,
+              bitrateKbps
+            })
+            processed = true
+            optimizationNotes.push('Render offloaded to GPU worker.')
+          } catch (err: any) {
+            const message = String(err?.message || err || 'gpu_worker_failed')
+            console.warn(`[${requestId || 'noid'}] gpu worker render failed`, message)
+            if (!GPU_WORKER_FALLBACK) {
+              throw err
+            }
+          }
+        }
+      }
+
+      if (!processed) {
+        const hasSegments = finalSegments.length >= 1
+        const heavyLongFormSegmentFallback = shouldPreferHeavyLongFormSegmentFallback({
+          renderMode: renderConfig.mode,
+          durationSeconds,
+          inputBytes: inStats.size,
+          fastMode: renderFastHorizontalMode,
+          segmentCount: finalSegments.length
+        })
+        const segmentFileFallbackSeekPadSeconds = resolveSegmentFileFallbackSeekPadSeconds({
+          renderMode: renderConfig.mode,
+          durationSeconds,
+          inputBytes: inStats.size,
+          fastMode: renderFastHorizontalMode
+        })
+        const argsBase = [
+          '-y',
+          '-nostdin',
+          '-hide_banner',
+          '-loglevel',
+          'error',
+          '-filter_threads',
+          String(RENDER_FILTER_THREADS),
+          '-i',
+          tmpIn,
+          '-movflags',
+          '+faststart',
+          '-c:v',
+          'libx264',
+          '-preset',
+          ffPreset,
+          '-crf',
+          ffCrf,
+          ...ffVideoBitrateArgs,
+          '-threads',
+          String(renderCodecThreads),
+          '-pix_fmt',
+          'yuv420p'
+        ]
+        if (withAudio) {
+          argsBase.push('-c:a', 'aac', '-b:a', ffAudioBitrate, '-ar', ffAudioSampleRate, '-ac', '2')
+        }
+
+        const watermarkFont = getSystemFontFile()
+        const watermarkFontArg = watermarkFont ? `:fontfile=${escapeFilterPath(watermarkFont)}` : ''
+        const hookOverlayFilter = hookOverlayEnabled
+          ? buildHookOverlayDrawtextFilter(hookBoostOverlayOutputCues, watermarkFontArg)
+          : ''
 
       // Prefer a dedicated watermark image. Keep env override support,
       // then fall back to legacy names and historical favicon behavior.
-      const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
-      const watermarkImageCandidates = [
-        configuredWatermarkImage,
-        path.join(process.cwd(), 'assets', 'watermark.png'),
-        path.join(process.cwd(), 'assets', 'watermark-free.png'),
-        path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
-        path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
-        path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
-        path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
-        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
-        path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
-        path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
-      ].filter(Boolean)
-      const watermarkImagePath = watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || ''
-      const watermarkImageExists = renderWatermarkEnabled && Boolean(watermarkImagePath)
-      const watermarkFilter = watermarkImageExists
-        ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
-        : renderWatermarkEnabled
-        ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
-        : ''
-      const transitionsEnabledForRender = Boolean(options.transitions && !renderFastMode)
-      const subtitleFilter = subtitlePath
-        ? (
-          subtitleIsAss
-            ? `subtitles=${escapeFilterPath(subtitlePath)}`
-            : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
-        )
-        : ''
-
-      const probe = sourceProbe
-      if (probe && finalSegments.length) {
-        finalSegments.forEach((seg, idx) => {
-          console.log(
-            `[${requestId || 'noid'}] segment ${idx} ${seg.start}-${seg.end} width=${probe.width} height=${probe.height} sar=${probe.sampleAspectRatio} fps=${probe.frameRate}`
+        const configuredWatermarkImage = String(process.env.WATERMARK_IMAGE_PATH || '').trim()
+        const watermarkImageCandidates = [
+          configuredWatermarkImage,
+          path.join(process.cwd(), 'assets', 'watermark.png'),
+          path.join(process.cwd(), 'assets', 'watermark-free.png'),
+          path.join(process.cwd(), 'backend', 'assets', 'watermark.png'),
+          path.join(process.cwd(), 'backend', 'assets', 'watermark-free.png'),
+          path.join(process.cwd(), 'frontend', 'public', 'watermark.png'),
+          path.join(process.cwd(), 'frontend', 'public', 'watermark-free.png'),
+          path.join(process.cwd(), 'frontend-publish', 'public', 'watermark.png'),
+          path.join(process.cwd(), 'frontend-publish', 'public', 'watermark-free.png'),
+          path.join(process.cwd(), 'frontend', 'public', 'favicon-32x32.png')
+        ].filter(Boolean)
+        const watermarkImagePath = watermarkImageCandidates.find((candidate) => fs.existsSync(candidate)) || ''
+        const watermarkImageExists = renderWatermarkEnabled && Boolean(watermarkImagePath)
+        const watermarkFilter = watermarkImageExists
+          ? `[outv][1:v]overlay=x=main_w-overlay_w-12:y=main_h-overlay_h-12:format=auto`
+          : renderWatermarkEnabled
+          ? `drawtext=text='AutoEditor'${watermarkFontArg}:x=w-tw-10:y=h-th-10:fontsize=14:fontcolor=white@0.72`
+          : ''
+        const subtitleFilter = subtitlePath
+          ? (
+            subtitleIsAss
+              ? `subtitles=${escapeFilterPath(subtitlePath)}`
+              : `subtitles=${escapeFilterPath(subtitlePath)}:force_style='${buildSubtitleStyle(subtitleStyle)}'`
           )
-        })
-      } else if (!probe) {
-        console.warn(`[${requestId || 'noid'}] segment preflight ffprobe unavailable`)
-      }
+          : ''
+
+        const probe = sourceProbe
+        if (probe && finalSegments.length) {
+          finalSegments.forEach((seg, idx) => {
+            console.log(
+              `[${requestId || 'noid'}] segment ${idx} ${seg.start}-${seg.end} width=${probe.width} height=${probe.height} sar=${probe.sampleAspectRatio} fps=${probe.frameRate}`
+            )
+          })
+        } else if (!probe) {
+          console.warn(`[${requestId || 'noid'}] segment preflight ffprobe unavailable`)
+        }
 
       const logFfmpegFailure = (label: string, args: string[], err: any) => {
         const stderr = typeof err?.stderr === 'string' ? err.stderr : ''
@@ -39131,6 +39391,7 @@ const processJob = async (
           }
         }
         if (!processed) throw err
+      }
       }
       if (
         processed &&

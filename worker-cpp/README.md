@@ -22,6 +22,38 @@ docker build -t ae-worker -f backend/worker-cpp/Dockerfile backend/worker-cpp
 docker run --gpus all -p 7001:7001 -e WORKER_PORT=7001 ae-worker
 ```
 
+Self-hosted GPU worker (recommended for production):
+
+1. Ensure the GPU host has NVIDIA drivers installed and the NVIDIA Container Toolkit configured.
+2. Build the image on the host:
+
+```
+./backend/worker-cpp/deploy/build-image.sh
+```
+
+3. Run it with Docker (foreground):
+
+```
+WORKER_THREADS=2 DATA_DIR=/var/autoeditor/data ./backend/worker-cpp/deploy/run-worker.sh
+```
+
+4. Or run it with Docker Compose:
+
+```
+cd backend/worker-cpp/deploy
+docker compose -f docker-compose.gpu.yml up -d
+```
+
+5. Or install as a systemd service:
+
+```
+sudo mkdir -p /etc/autoeditor
+sudo cp backend/worker-cpp/deploy/worker.env.example /etc/autoeditor/worker.env
+sudo cp backend/worker-cpp/deploy/ae-worker.service /etc/systemd/system/ae-worker.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now ae-worker.service
+```
+
 API:
 
 `POST /render`
@@ -70,3 +102,7 @@ The watermark file is expected to be raw RGBA (width * height * 4 bytes). The LU
 Environment variables:
 `WORKER_PORT` sets the HTTP port (default 7001).
 `WORKER_THREADS` controls concurrent job workers.
+
+Backend auto-dispatch:
+- Set `GPU_WORKER_URL` and `GPU_WORKER_SHARED_DIR` on the API service.
+- Mount the same shared directory into both the API host and GPU worker host so paths resolve.

@@ -1,0 +1,24 @@
+[Unit]
+Description=AutoEditor GPU Worker
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+EnvironmentFile=/etc/autoeditor/worker.env
+Restart=always
+RestartSec=5
+ExecStartPre=-/usr/bin/docker rm -f ae-worker
+ExecStart=/usr/bin/docker run --rm --gpus all \
+  --name ae-worker \
+  -p ${WORKER_PORT}:7001 \
+  -e WORKER_PORT=7001 \
+  -e WORKER_THREADS=${WORKER_THREADS} \
+  -e NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES} \
+  -e NVIDIA_DRIVER_CAPABILITIES=${NVIDIA_DRIVER_CAPABILITIES} \
+  -v ${DATA_DIR}:/data \
+  ae-worker:latest
+ExecStop=/usr/bin/docker stop ae-worker
+
+[Install]
+WantedBy=multi-user.target

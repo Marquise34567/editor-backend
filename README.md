@@ -109,5 +109,13 @@ Apply this JSON in Cloudflare R2 bucket CORS settings:
 
 Deployment:
 - Use Railway for the server. Set environment variables per `.env.example` in Railway.
+- Run API and worker as separate services in production:
+- API service command: `npm run start:api` (or set `FORCE_API_SERVER=1` and `JOB_PROCESSOR_ENABLED=0`).
+- Worker service command: `npm run start:worker` (or set `JOB_PROCESSOR_ENABLED=1`).
 - Set up a Stripe webhook in the Stripe dashboard pointing to your deployed `/webhooks/stripe` URL and copy the signing secret to `STRIPE_WEBHOOK_SECRET`.
 - If Railway build shows `failed to stat ... /secrets/R2_ACCESS_KEY_ID`, remove file-based secret references and set `R2_ACCESS_KEY_ID` as a normal environment variable value in Railway.
+
+GPU worker offload (optional):
+1. Set `GPU_WORKER_URL` to your GPU worker HTTP endpoint (Crow service).
+2. Set `GPU_WORKER_SHARED_DIR` to a directory mounted on both the API host and the GPU worker host.
+3. The backend will automatically offload eligible render jobs to the GPU worker and fall back to local FFmpeg when unsupported.

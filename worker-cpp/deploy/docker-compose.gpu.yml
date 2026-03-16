@@ -1,0 +1,22 @@
+services:
+  ae-worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: ae-worker:latest
+    ports:
+      - "7001:7001"
+    environment:
+      - WORKER_PORT=7001
+      - WORKER_THREADS=2
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+    volumes:
+      - ./data:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
