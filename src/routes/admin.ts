@@ -2037,6 +2037,52 @@ const buildCommandCenterPayload = async () => {
   })
 
   const gpuUtilizationPct = Number(clamp(Number(process.env.ADMIN_GPU_UTILIZATION_PCT || 0), 0, 100).toFixed(1))
+  const gpuWorkerUrl = String(process.env.GPU_WORKER_URL || '').trim()
+  const gpuWorkerSharedDir = String(process.env.GPU_WORKER_SHARED_DIR || '').trim()
+  const gpuWorkerSharedDirRemote = String(process.env.GPU_WORKER_SHARED_DIR_REMOTE || '').trim()
+  const gpuWorkerTransferMode = String(process.env.GPU_WORKER_TRANSFER_MODE || '').trim().toLowerCase()
+  const gpuWorkerUseUrls = [
+    'url',
+    'urls',
+    'signed',
+    'signed-url',
+    'signed-urls',
+    'presigned',
+    'presigned-urls',
+    'remote'
+  ].includes(gpuWorkerTransferMode)
+  const gpuWorkerIssues: string[] = []
+  if (!gpuWorkerUrl) gpuWorkerIssues.push('missing_url')
+  if (!gpuWorkerUseUrls && !gpuWorkerSharedDir) gpuWorkerIssues.push('missing_shared_dir')
+  const gpuWorkerEnabled = Boolean(gpuWorkerUrl) && (gpuWorkerUseUrls || Boolean(gpuWorkerSharedDir))
+  const gpuWorkerStatus = gpuWorkerEnabled ? 'enabled' : (gpuWorkerUrl || gpuWorkerSharedDir || gpuWorkerTransferMode ? 'partial' : 'disabled')
+  const gpuWorkerFallback = parseBool(process.env.GPU_WORKER_FALLBACK, true)
+  const gpuWorkerForce = parseBool(process.env.GPU_WORKER_FORCE, false)
+  const gpuWorkerKeepShared = parseBool(process.env.GPU_WORKER_KEEP_SHARED, false)
+  const gpuWorkerParallelSegments = (() => {
+    const raw = Number(process.env.GPU_WORKER_PARALLEL_SEGMENTS || 2)
+    if (!Number.isFinite(raw) || raw <= 0) return 2
+    return Math.min(8, Math.max(1, Math.round(raw)))
+  })()
+  const gpuWorkerPollIntervalMs = (() => {
+    const raw = Number(process.env.GPU_WORKER_POLL_INTERVAL_MS || 1500)
+    if (!Number.isFinite(raw) || raw <= 200) return 1500
+    return Math.min(10_000, Math.round(raw))
+  })()
+  const gpuWorkerTimeoutMs = (() => {
+    const raw = Number(process.env.GPU_WORKER_TIMEOUT_MS || 60 * 60_000)
+    if (!Number.isFinite(raw) || raw <= 10_000) return 60 * 60_000
+    return Math.min(6 * 60 * 60_000, Math.round(raw))
+  })()
+  const gpuWorkerUrlExpiresSec = (() => {
+    const raw = Number(process.env.GPU_WORKER_URL_EXPIRES_SEC || 0)
+    if (Number.isFinite(raw) && raw > 0) {
+      return Math.max(300, Math.min(6 * 60 * 60, Math.round(raw)))
+    }
+    const fallback = Math.ceil(gpuWorkerTimeoutMs / 1000) + 900
+    return Math.max(900, Math.min(6 * 60 * 60, fallback))
+  })()
+  const gpuWorkerUrlTmpDir = String(process.env.GPU_WORKER_URL_TMP_DIR || '/tmp/ae-worker').trim()
 
   const groupedErrors = groupErrorsBySignature(enrichedErrors)
   const commonErrorTypes = groupedErrors.slice(0, 8).map((row) => ({ type: row.type, count: row.count }))
@@ -2474,6 +2520,23 @@ const buildCommandCenterPayload = async () => {
       costPerRenderEstimateUsd,
       cpuUtilizationPct: getCpuUsagePercent(),
       gpuUtilizationPct,
+      gpuWorker: {
+        status: gpuWorkerStatus,
+        enabled: gpuWorkerEnabled,
+        url: gpuWorkerUrl || null,
+        transferMode: gpuWorkerUseUrls ? 'urls' : 'shared',
+        sharedDir: gpuWorkerSharedDir || null,
+        sharedDirRemote: gpuWorkerSharedDirRemote || null,
+        urlTmpDir: gpuWorkerUrlTmpDir || null,
+        urlExpiresSec: gpuWorkerUrlExpiresSec,
+        parallelSegments: gpuWorkerParallelSegments,
+        timeoutMs: gpuWorkerTimeoutMs,
+        pollIntervalMs: gpuWorkerPollIntervalMs,
+        fallbackEnabled: gpuWorkerFallback,
+        forceEnabled: gpuWorkerForce,
+        keepShared: gpuWorkerKeepShared,
+        issues: gpuWorkerIssues
+      },
       processingTimeSpikeAlert: processingSpikeAlert
     },
     liveErrorTerminal: {
