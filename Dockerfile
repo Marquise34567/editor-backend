@@ -12,10 +12,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY backend/package*.json ./
+COPY package*.json ./
 RUN npm ci
 
-COPY backend ./
+COPY . ./
 RUN npm run build
 
 EXPOSE 3000
