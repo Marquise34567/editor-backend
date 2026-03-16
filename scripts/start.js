@@ -1,4 +1,4 @@
-const { execSync } = require('child_process')
+const { execSync, spawn } = require('child_process')
 const { existsSync, readdirSync, statSync } = require('fs')
 const path = require('path')
 const { startWorkerSupervisor } = require('./worker-supervisor')
@@ -18,6 +18,28 @@ const run = (label, command, options = {}) => {
     console.warn(`[startup] ${message}`)
     return false
   }
+}
+
+const runAsync = (label, command, options = {}) => {
+  const { allowFailure = false } = options
+  console.log(`[startup] ${label} (async)`)
+  const child = spawn(command, {
+    stdio: 'inherit',
+    shell: true,
+    env: process.env
+  })
+  child.on('error', (error) => {
+    console.warn(`[startup] ${label} failed to start`, error)
+  })
+  child.on('exit', (code) => {
+    if (code === 0) return
+    const message = `[startup] ${label} exited with status ${code}`
+    if (allowFailure) {
+      console.warn(message)
+      return
+    }
+    console.error(message)
+  })
 }
 
 const getLatestMtimeMs = (targetPath) => {
@@ -72,30 +94,47 @@ const rawCaptionRuntimeInstallToggle = String(
 const shouldInstallCaptionRuntimeOnStartup = !/^(0|false|no|off)$/i.test(rawCaptionRuntimeInstallToggle)
 const apiDistEntryPath = path.resolve(process.cwd(), 'dist', 'index.js')
 const workerDistEntryPath = path.resolve(process.cwd(), 'dist', 'worker.js')
-const primaryDistEntryPath = shouldStartWorker ? workerDistEntryPath : apiDistEntryPath
+const distTargets = shouldStartWorker
+  ? [apiDistEntryPath, workerDistEntryPath]
+  : [apiDistEntryPath]
+const distTargetLabel = distTargets
+  .map((target) => path.relative(process.cwd(), target))
+  .join(' + ')
 const sourceMtimeMs = Math.max(
   getLatestMtimeMs(path.resolve(process.cwd(), 'src')),
   getLatestMtimeMs(path.resolve(process.cwd(), 'prisma')),
   getLatestMtimeMs(path.resolve(process.cwd(), 'tsconfig.json'))
 )
-const distMtimeMs = getLatestMtimeMs(primaryDistEntryPath)
-const distStale = sourceMtimeMs > distMtimeMs + 1000
+const distStale = distTargets.some((target) => {
+  if (!existsSync(target)) return true
+  const distMtimeMs = getLatestMtimeMs(target)
+  return sourceMtimeMs > distMtimeMs + 1000
+})
 
-if (shouldBuildOnStartup || !existsSync(primaryDistEntryPath) || distStale) {
+if (shouldBuildOnStartup || distStale) {
   run('Building backend', 'npm run build')
 } else {
-  const targetLabel = shouldStartWorker ? 'dist/worker.js' : 'dist/index.js'
-  console.log(`[startup] Skipping startup build; ${targetLabel} is up to date`)
+  console.log(`[startup] Skipping startup build; ${distTargetLabel} is up to date`)
 }
 
+if (shouldStartWorker) {
+  console.log('[startup] Starting pipeline worker supervisor')
+  startWorkerSupervisor({
+    workerEntryPath: workerDistEntryPath,
+    label: 'pipeline worker'
+  })
+}
+console.log('[startup] Starting API server')
+require('../dist/index.js')
+
 if (shouldGeneratePrismaOnStartup) {
-  run('Generating Prisma client', 'prisma generate')
+  runAsync('Generating Prisma client', 'prisma generate')
 } else {
   console.log('[startup] Skipping prisma generate on startup')
 }
 
 if (shouldInstallCaptionRuntimeOnStartup) {
-  run('Installing caption runtime', 'node scripts/install-caption-runtime.js', { allowFailure: true })
+  runAsync('Installing caption runtime', 'node scripts/install-caption-runtime.js', { allowFailure: true })
 } else {
   console.log('[startup] Skipping caption runtime install on startup')
 }
@@ -105,16 +144,5 @@ if (!hasDatabaseUrl) {
 } else if (skipMigrations) {
   console.warn('[startup] SKIP_PRISMA_MIGRATIONS is enabled, skipping prisma migrate deploy')
 } else {
-  run('Applying Prisma migrations', 'prisma migrate deploy', { allowFailure: true })
-}
-
-if (shouldStartWorker) {
-  console.log('[startup] Starting pipeline worker supervisor')
-  startWorkerSupervisor({
-    workerEntryPath: workerDistEntryPath,
-    label: 'pipeline worker'
-  })
-} else {
-  console.log('[startup] Starting API server')
-  require('../dist/index.js')
+  runAsync('Applying Prisma migrations', 'prisma migrate deploy', { allowFailure: true })
 }
