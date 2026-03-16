@@ -2167,6 +2167,7 @@ type EditOptions = {
   autoZoomMax: number
   retentionAggressionLevel: RetentionAggressionLevel
   retentionStrategyProfile: RetentionStrategyProfile
+  retentionTargetPlatform?: RetentionTargetPlatform | null
   maxCutsRequested?: number | null
   editorMode?: EditorModeSelection | null
   pipelinePowerMode?: PipelinePowerModeSelection | null
