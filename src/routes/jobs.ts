@@ -2184,6 +2184,7 @@ type EditOptions = {
   continuityFirstMode: boolean
   exploreX3Mode: boolean
   topHumanGuardMode: boolean
+  humanReviewRequired: boolean
   creatorStyleLock: number
   manualTimestampConfig?: ManualTimestampConfig | null
   editorInstructionPrompt?: string | null
@@ -4366,6 +4367,7 @@ const DEFAULT_EDIT_OPTIONS: EditOptions = {
   continuityFirstMode: false,
   exploreX3Mode: false,
   topHumanGuardMode: false,
+  humanReviewRequired: false,
   creatorStyleLock: Number((DEFAULT_CREATOR_STYLE_LOCK_PERCENT / 100).toFixed(4)),
   editorInstructionPrompt: null
 }
@@ -6234,6 +6236,17 @@ const getTopHumanGuardModeFromPayload = (payload?: any): boolean | null => {
   )
 }
 
+const getHumanReviewRequiredFromPayload = (payload?: any): boolean | null => {
+  if (!payload || typeof payload !== 'object') return null
+  return (
+    parseBooleanFlag((payload as any).humanReviewRequired) ??
+    parseBooleanFlag((payload as any).human_review_required) ??
+    parseBooleanFlag((payload as any).humanReview) ??
+    parseBooleanFlag((payload as any).human_review) ??
+    null
+  )
+}
+
 const getCreatorStyleLockPercentFromPayload = (payload?: any): number | null => {
   if (!payload || typeof payload !== 'object') return null
   return (
@@ -7983,6 +7996,47 @@ const getTopHumanGuardModeFromJob = (job?: any): boolean => {
   )
 }
 
+const getHumanReviewRequiredFromJob = (job?: any): boolean => {
+  const analysis = job?.analysis as any
+  const settings = (job as any)?.renderSettings as any
+  return (
+    parseBooleanFlag(settings?.humanReviewRequired) ??
+    parseBooleanFlag(settings?.human_review_required) ??
+    parseBooleanFlag(analysis?.humanReviewRequired) ??
+    parseBooleanFlag(analysis?.human_review_required) ??
+    false
+  )
+}
+
+type HumanReviewState = {
+  status?: string | null
+  requestedAt?: string | null
+  approvedAt?: string | null
+  previewPath?: string | null
+  previewCreatedAt?: string | null
+  previewDurationSeconds?: number | null
+  previewMode?: string | null
+  previewClipIndex?: number | null
+  previewError?: string | null
+}
+
+const readHumanReviewState = (analysis?: any): HumanReviewState | null => {
+  if (!analysis || typeof analysis !== 'object') return null
+  const raw = (analysis as any).human_review ?? (analysis as any).humanReview
+  if (!raw || typeof raw !== 'object') return null
+  return raw as HumanReviewState
+}
+
+const isHumanReviewApproved = (state?: HumanReviewState | null) => {
+  const status = String(state?.status || '').toLowerCase()
+  return status === 'approved' || status === 'accepted' || Boolean(state?.approvedAt)
+}
+
+const isHumanReviewPending = (state?: HumanReviewState | null) => {
+  const status = String(state?.status || '').toLowerCase()
+  return status === 'pending' || status === 'awaiting' || status === 'requested'
+}
+
 const getCreatorStyleLockPercentFromJob = (job?: any): number => {
   const analysis = job?.analysis as any
   const settings = (job as any)?.renderSettings as any
@@ -8289,6 +8343,7 @@ const buildPersistedRenderSettings = (
     continuityFirstMode?: boolean | null
     exploreX3Mode?: boolean | null
     topHumanGuardMode?: boolean | null
+    humanReviewRequired?: boolean | null
     creatorStyleLockPercent?: number | null
     manualTimestampConfig?: ManualTimestampConfig | null
     verticalCaptionConfig?: VerticalCaptionConfig | null
@@ -8327,6 +8382,7 @@ const buildPersistedRenderSettings = (
   const continuityFirstMode = typeof opts?.continuityFirstMode === 'boolean' ? opts.continuityFirstMode : false
   const exploreX3Mode = typeof opts?.exploreX3Mode === 'boolean' ? opts.exploreX3Mode : false
   const topHumanGuardMode = typeof opts?.topHumanGuardMode === 'boolean' ? opts.topHumanGuardMode : false
+  const humanReviewRequired = typeof opts?.humanReviewRequired === 'boolean' ? opts.humanReviewRequired : false
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(opts?.creatorStyleLockPercent) ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
   const manualTimestampConfig = parseManualTimestampConfig(opts?.manualTimestampConfig)
   const editorInstructionPrompt = normalizeEditorInstructionPrompt(opts?.editorInstructionPrompt)
@@ -8387,6 +8443,8 @@ const buildPersistedRenderSettings = (
     explore_x3_mode: exploreX3Mode,
     topHumanGuardMode,
     top_human_guard_mode: topHumanGuardMode,
+    humanReviewRequired,
+    human_review_required: humanReviewRequired,
     creatorStyleLock: creatorStyleLockPercent,
     creator_style_lock: creatorStyleLockPercent,
     ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt } : {}),
@@ -8427,6 +8485,7 @@ const buildPersistedRenderAnalysis = ({
   continuityFirstMode,
   exploreX3Mode,
   topHumanGuardMode,
+  humanReviewRequired,
   creatorStyleLockPercent,
   videoPreset,
   videoCrf,
@@ -8458,6 +8517,7 @@ const buildPersistedRenderAnalysis = ({
   continuityFirstMode?: boolean | null
   exploreX3Mode?: boolean | null
   topHumanGuardMode?: boolean | null
+  humanReviewRequired?: boolean | null
   creatorStyleLockPercent?: number | null
   videoPreset?: X264Preset | null
   videoCrf?: number | null
@@ -8600,6 +8660,14 @@ const buildPersistedRenderAnalysis = ({
         parseBooleanFlag((existing as any)?.top_human_guard_mode)
       )
   ) ?? false
+  const resolvedHumanReviewRequired = (
+    typeof humanReviewRequired === 'boolean'
+      ? humanReviewRequired
+      : (
+        parseBooleanFlag((existing as any)?.humanReviewRequired) ??
+        parseBooleanFlag((existing as any)?.human_review_required)
+      )
+  ) ?? false
   const resolvedCreatorStyleLockPercent = parseCreatorStyleLockPercent(
     creatorStyleLockPercent ??
     (existing as any)?.creatorStyleLock ??
@@ -8670,7 +8738,9 @@ const buildPersistedRenderAnalysis = ({
           mode: renderConfig.verticalMode
         }
       : null,
-    verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null
+    verticalOutputPaths: renderConfig.mode === 'vertical' ? (outputPaths || []) : null,
+    humanReviewRequired: resolvedHumanReviewRequired,
+    human_review_required: resolvedHumanReviewRequired
   }
   Object.assign(
     payload,
@@ -26599,6 +26669,124 @@ const buildConcatFilter = (
   return parts.join(';')
 }
 
+const HUMAN_REVIEW_PREVIEW_MAX_WIDTH = 1280
+const HUMAN_REVIEW_PREVIEW_MAX_HEIGHT = 720
+const HUMAN_REVIEW_PREVIEW_CRF = 32
+const HUMAN_REVIEW_PREVIEW_PRESET = 'veryfast'
+const HUMAN_REVIEW_PREVIEW_AUDIO_BITRATE = '96k'
+const HUMAN_REVIEW_PREVIEW_AUDIO_SAMPLE_RATE = '44100'
+const HUMAN_REVIEW_PREVIEW_MAX_SEGMENTS = 240
+
+const roundToEven = (value: number) => Math.max(2, Math.round(value / 2) * 2)
+
+const resolveHumanReviewPreviewTarget = (targetWidth: number, targetHeight: number) => {
+  const scale = Math.min(
+    1,
+    HUMAN_REVIEW_PREVIEW_MAX_WIDTH / Math.max(1, targetWidth),
+    HUMAN_REVIEW_PREVIEW_MAX_HEIGHT / Math.max(1, targetHeight)
+  )
+  return {
+    width: roundToEven(targetWidth * scale),
+    height: roundToEven(targetHeight * scale)
+  }
+}
+
+const renderHumanReviewPreviewHorizontal = async ({
+  inputPath,
+  outputPath,
+  segments,
+  targetWidth,
+  targetHeight,
+  fit,
+  withAudio,
+  hasAudioStream,
+  requestId
+}: {
+  inputPath: string
+  outputPath: string
+  segments: Segment[]
+  targetWidth: number
+  targetHeight: number
+  fit: HorizontalFitMode
+  withAudio: boolean
+  hasAudioStream: boolean
+  requestId?: string
+}) => {
+  const simplifiedSegments = segments
+    .map((segment) => ({
+      start: segment.start,
+      end: segment.end,
+      speed: segment.speed && segment.speed > 0 ? segment.speed : 1,
+      zoom: 0,
+      brightness: 0,
+      audioGain: segment.audioGain
+    }))
+  const cappedSegments = simplifiedSegments.length > HUMAN_REVIEW_PREVIEW_MAX_SEGMENTS
+    ? mergeSegmentsToLimitCount(simplifiedSegments, HUMAN_REVIEW_PREVIEW_MAX_SEGMENTS, { hardLimit: true })
+    : simplifiedSegments
+  const previewTarget = resolveHumanReviewPreviewTarget(targetWidth, targetHeight)
+  const filter = buildConcatFilter(cappedSegments, {
+    withAudio,
+    hasAudioStream,
+    targetWidth: previewTarget.width,
+    targetHeight: previewTarget.height,
+    fit,
+    enableFades: false,
+    enhanceVideo: {
+      enableColor: false,
+      enableDenoise: false,
+      enableSharpen: false,
+      enableStabilization: false
+    }
+  })
+  const argsPrefix = [
+    '-y',
+    '-nostdin',
+    '-hide_banner',
+    '-loglevel',
+    'error',
+    '-i',
+    inputPath,
+    '-movflags',
+    '+faststart'
+  ]
+  const mapArgs = ['-map', '[outv]']
+  if (withAudio) mapArgs.push('-map', '[outa]')
+  const outputArgs = [
+    '-c:v',
+    'libx264',
+    '-preset',
+    HUMAN_REVIEW_PREVIEW_PRESET,
+    '-crf',
+    String(HUMAN_REVIEW_PREVIEW_CRF),
+    '-pix_fmt',
+    'yuv420p'
+  ]
+  if (withAudio) {
+    outputArgs.push('-c:a', 'aac', '-b:a', HUMAN_REVIEW_PREVIEW_AUDIO_BITRATE, '-ar', HUMAN_REVIEW_PREVIEW_AUDIO_SAMPLE_RATE, '-ac', '2')
+  } else {
+    outputArgs.push('-an')
+  }
+  let filterScriptPath: string | null = null
+  try {
+    const args = [...argsPrefix]
+    if (filter.length > FILTER_COMPLEX_SCRIPT_THRESHOLD) {
+      filterScriptPath = path.join(os.tmpdir(), `review-filter-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.txt`)
+      fs.writeFileSync(filterScriptPath, filter)
+      args.push('-filter_complex_script', filterScriptPath)
+    } else {
+      args.push('-filter_complex', filter)
+    }
+    args.push(...mapArgs, ...outputArgs, outputPath)
+    await runFfmpeg(args)
+  } catch (err) {
+    console.warn(`[${requestId || 'noid'}] human review preview render failed`, err)
+    throw err
+  } finally {
+    safeUnlink(filterScriptPath)
+  }
+}
+
 const simplifySegmentsForFastHorizontalRender = (segments: Segment[]) => (
   segments.map((segment) => ({
     ...segment,
@@ -31707,6 +31895,73 @@ const resolveRuntimeRetentionProfile = ({
   }
 }
 
+const renderHumanReviewPreviewVertical = async ({
+  inputPath,
+  outputPath,
+  clipRange,
+  verticalMode,
+  sourceWidth,
+  sourceHeight,
+  withAudio,
+  autoZoomMax,
+  watermarkEnabled,
+  watermarkImagePath,
+  subtitlePath,
+  subtitleIsAss,
+  subtitleStyle,
+  requestId
+}: {
+  inputPath: string
+  outputPath: string
+  clipRange: { start: number; end: number }
+  verticalMode: VerticalModeSettings
+  sourceWidth: number
+  sourceHeight: number
+  withAudio: boolean
+  autoZoomMax: number
+  watermarkEnabled?: boolean
+  watermarkImagePath?: string | null
+  subtitlePath?: string | null
+  subtitleIsAss?: boolean
+  subtitleStyle?: string | null
+  requestId?: string
+}) => {
+  try {
+    await renderVerticalClip({
+      inputPath,
+      outputPath,
+      start: clipRange.start,
+      end: clipRange.end,
+      verticalMode,
+      sourceWidth,
+      sourceHeight,
+      withAudio,
+      videoPreset: HUMAN_REVIEW_PREVIEW_PRESET,
+      videoCrf: String(HUMAN_REVIEW_PREVIEW_CRF),
+      videoBitrateArgs: [],
+      audioBitrate: HUMAN_REVIEW_PREVIEW_AUDIO_BITRATE,
+      audioSampleRate: HUMAN_REVIEW_PREVIEW_AUDIO_SAMPLE_RATE,
+      audioFilters: [],
+      enableTransitions: false,
+      enableSmartZoom: false,
+      enableSoundFx: false,
+      applyStabilization: false,
+      enhanceVideo: { enableDenoise: false, enableSharpen: false },
+      paceMultiplier: 1,
+      autoZoomMax,
+      watermarkEnabled,
+      watermarkImagePath,
+      subtitlePath,
+      subtitleIsAss,
+      subtitleStyle,
+      codecThreads: 1
+    })
+  } catch (err) {
+    console.warn(`[${requestId || 'noid'}] human review vertical preview failed`, err)
+    throw err
+  }
+}
+
 const parseScore100 = (value: any): number | null => {
   const numeric = Number(value)
   if (!Number.isFinite(numeric)) return null
@@ -33065,6 +33320,7 @@ const getEditOptionsForUser = async (
     continuityFirstMode?: boolean | null
     exploreX3Mode?: boolean | null
     topHumanGuardMode?: boolean | null
+    humanReviewRequired?: boolean | null
     creatorStyleLockPercent?: number | null
     editorInstructionPrompt?: string | null
     videoPreset?: X264Preset | null
@@ -33112,6 +33368,14 @@ const getEditOptionsForUser = async (
       : (
         parseBooleanFlag((settings as any)?.topHumanGuardMode) ??
         parseBooleanFlag((settings as any)?.top_human_guard_mode)
+      )
+  ) ?? false
+  const humanReviewRequired = (
+    typeof overrides?.humanReviewRequired === 'boolean'
+      ? overrides.humanReviewRequired
+      : (
+        parseBooleanFlag((settings as any)?.humanReviewRequired) ??
+        parseBooleanFlag((settings as any)?.human_review_required)
       )
   ) ?? false
   const creatorStyleLockPercent = parseCreatorStyleLockPercent(
@@ -33416,6 +33680,7 @@ const getEditOptionsForUser = async (
     continuityFirstMode,
     exploreX3Mode,
     topHumanGuardMode,
+    humanReviewRequired,
     creatorStyleLock,
     videoPreset,
     videoCrf,
@@ -34745,6 +35010,76 @@ const processJob = async (
             paddingCount: verticalSelection.paddingCount
           }
         )
+      }
+
+      const reviewRequired = Boolean(options.humanReviewRequired || getHumanReviewRequiredFromJob(job))
+      const existingReviewState = readHumanReviewState(job.analysis as any)
+      const reviewApproved = isHumanReviewApproved(existingReviewState)
+      if (reviewRequired && !reviewApproved) {
+        if (isHumanReviewPending(existingReviewState) && existingReviewState?.previewPath) {
+          await updateJob(jobId, { status: 'review', progress: 78 })
+          return
+        }
+        const reviewNow = toIsoNow()
+        let previewPath: string | null = null
+        let previewDurationSeconds: number | null = null
+        let previewError: string | null = null
+        const previewLocalPath = path.join(
+          workDir,
+          `review-preview-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+        )
+        try {
+          const clipRange = clipRanges[0]
+          await renderHumanReviewPreviewVertical({
+            inputPath: tmpIn,
+            outputPath: previewLocalPath,
+            clipRange,
+            verticalMode: resolvedVerticalModeForRender,
+            sourceWidth: sourceStream.width,
+            sourceHeight: sourceStream.height,
+            withAudio: hasInputAudio,
+            autoZoomMax: options.autoZoomMax,
+            watermarkEnabled: verticalClipWatermarkEnabled,
+            watermarkImagePath,
+            subtitlePath: null,
+            subtitleIsAss: false,
+            subtitleStyle,
+            requestId
+          })
+          const stats = fs.existsSync(previewLocalPath) ? fs.statSync(previewLocalPath) : null
+          if (stats?.isFile() && stats.size > 0) {
+            const previewKey = `${job.userId}/${jobId}/previews/human-review-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+            await uploadFileToOutput({ key: previewKey, filePath: previewLocalPath, contentType: 'video/mp4' })
+            previewPath = previewKey
+            previewDurationSeconds = Number(getDurationSeconds(previewLocalPath) || 0) || null
+          } else {
+            previewError = 'preview_empty'
+          }
+        } catch (err: any) {
+          previewError = String(err?.message || err || 'preview_failed')
+        } finally {
+          safeUnlink(previewLocalPath)
+        }
+        const nextReviewState = {
+          status: 'pending',
+          requestedAt: existingReviewState?.requestedAt || reviewNow,
+          approvedAt: null,
+          previewPath,
+          previewCreatedAt: previewPath ? reviewNow : null,
+          previewDurationSeconds,
+          previewMode: renderConfig.mode,
+          previewClipIndex: 1,
+          previewError
+        }
+        const nextAnalysis = {
+          ...((job.analysis as any) || {}),
+          humanReviewRequired: reviewRequired,
+          human_review_required: reviewRequired,
+          human_review: nextReviewState,
+          humanReview: nextReviewState
+        }
+        await updateJob(jobId, { status: 'review', progress: 78, analysis: nextAnalysis })
+        return
       }
 
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
@@ -38094,6 +38429,70 @@ const processJob = async (
         }
       }
 
+      const reviewRequired = Boolean(options.humanReviewRequired || getHumanReviewRequiredFromJob(job))
+      const existingReviewState = readHumanReviewState(job.analysis as any)
+      const reviewApproved = isHumanReviewApproved(existingReviewState)
+      if (reviewRequired && !reviewApproved) {
+        if (isHumanReviewPending(existingReviewState) && existingReviewState?.previewPath) {
+          await updateJob(jobId, { status: 'review', progress: 78 })
+          return
+        }
+        const reviewNow = toIsoNow()
+        let previewPath: string | null = null
+        let previewDurationSeconds: number | null = null
+        let previewError: string | null = null
+        const previewLocalPath = path.join(
+          workDir,
+          `review-preview-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+        )
+        try {
+          await renderHumanReviewPreviewHorizontal({
+            inputPath: tmpIn,
+            outputPath: previewLocalPath,
+            segments: finalSegments,
+            targetWidth: target.width,
+            targetHeight: target.height,
+            fit: horizontalFit,
+            withAudio: Boolean(withAudio && hasAudio),
+            hasAudioStream: hasAudio,
+            requestId
+          })
+          const stats = fs.existsSync(previewLocalPath) ? fs.statSync(previewLocalPath) : null
+          if (stats?.isFile() && stats.size > 0) {
+            const previewKey = `${job.userId}/${jobId}/previews/human-review-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.mp4`
+            await uploadFileToOutput({ key: previewKey, filePath: previewLocalPath, contentType: 'video/mp4' })
+            previewPath = previewKey
+            previewDurationSeconds = Number(getDurationSeconds(previewLocalPath) || 0) || null
+          } else {
+            previewError = 'preview_empty'
+          }
+        } catch (err: any) {
+          previewError = String(err?.message || err || 'preview_failed')
+        } finally {
+          safeUnlink(previewLocalPath)
+        }
+        const nextReviewState = {
+          status: 'pending',
+          requestedAt: existingReviewState?.requestedAt || reviewNow,
+          approvedAt: null,
+          previewPath,
+          previewCreatedAt: previewPath ? reviewNow : null,
+          previewDurationSeconds,
+          previewMode: renderConfig.mode,
+          previewClipIndex: null,
+          previewError
+        }
+        const nextAnalysis = {
+          ...((job.analysis as any) || {}),
+          humanReviewRequired: reviewRequired,
+          human_review_required: reviewRequired,
+          human_review: nextReviewState,
+          humanReview: nextReviewState
+        }
+        await updateJob(jobId, { status: 'review', progress: 78, analysis: nextAnalysis })
+        return
+      }
+
       await updatePipelineStepState(jobId, 'RENDER_FINAL', {
         status: 'running',
         attempts: 1,
@@ -39689,6 +40088,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         analysis: existingAnalysis,
         lease: existingLease
       })
+      const skipAnalyzeForReview = shouldSkipAnalyzeForReview({ analysis: existingAnalysis })
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
       const progress = Number(existing.progress ?? 0)
       if ((status === 'queued' || status === 'uploading') && (!Number.isFinite(progress) || progress < 1)) {
@@ -39745,6 +40145,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         continuityFirstMode: getContinuityFirstModeFromJob(existing),
         exploreX3Mode: getExploreX3ModeFromJob(existing),
         topHumanGuardMode: getTopHumanGuardModeFromJob(existing),
+        humanReviewRequired: getHumanReviewRequiredFromJob(existing),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(existing),
         editorInstructionPrompt: getEditorInstructionPromptFromJob(existing),
         videoPreset: getVideoPresetFromJob(existing),
@@ -39757,7 +40158,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
       if (styleBlendOverride) analyzeOptions.styleArchetypeBlend = styleBlendOverride
       throwIfLeaseLost()
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
-      if (!skipAnalyzeForRecoveredJob) {
+      if (!skipAnalyzeForRecoveredJob && !skipAnalyzeForReview) {
         await analyzeJob(jobId, analyzeOptions, requestId)
       } else {
         if (status === 'queued' || status === 'uploading') {
@@ -39766,7 +40167,8 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
             : 15
           await updateJob(jobId, { status: 'analyzing', progress: resumeProgress })
         }
-        console.warn(`[queue] recovered job ${jobId} resumed at process stage (analyze skipped)`)
+        const skipReason = skipAnalyzeForRecoveredJob ? 'recovery' : (skipAnalyzeForReview ? 'review' : 'resume')
+        console.warn(`[queue] job ${jobId} resumed at process stage (analyze skipped: ${skipReason})`)
       }
       throwIfLeaseLost()
       if (isPipelineCanceled(jobId)) throw new JobCanceledError(jobId)
@@ -39795,6 +40197,7 @@ const runPipeline = async (jobId: string, user: { id: string; email?: string }, 
         continuityFirstMode: getContinuityFirstModeFromJob(latestBeforeProcess),
         exploreX3Mode: getExploreX3ModeFromJob(latestBeforeProcess),
         topHumanGuardMode: getTopHumanGuardModeFromJob(latestBeforeProcess),
+        humanReviewRequired: getHumanReviewRequiredFromJob(latestBeforeProcess),
         creatorStyleLockPercent: getCreatorStyleLockPercentFromJob(latestBeforeProcess),
         editorInstructionPrompt: getEditorInstructionPromptFromJob(latestBeforeProcess),
         videoPreset: getVideoPresetFromJob(latestBeforeProcess),
@@ -40073,6 +40476,7 @@ const CANCELABLE_PIPELINE_STATUSES = new Set([
   'subtitling',
   'audio',
   'retention',
+  'review',
   'rendering'
 ])
 let queueRecoveryRunning = false
@@ -40223,6 +40627,18 @@ const shouldSkipAnalyzeForRecoveredJob = ({
   const recoveredFromStatus = String(lease?.recoveredFromStatus || status || '').toLowerCase()
   if (!PROCESS_RESUME_FROM_RECOVERY_STATUSES.has(recoveredFromStatus)) return false
   return hasRecoveredProcessResumeSignals(analysis)
+}
+
+const shouldSkipAnalyzeForReview = ({
+  analysis
+}: {
+  analysis: Record<string, any>
+}) => {
+  const review = readHumanReviewState(analysis)
+  if (!review || !isHumanReviewApproved(review)) return false
+  const storedPlan = analysis?.editPlan
+  const segments = Array.isArray(storedPlan?.segments) ? storedPlan.segments : []
+  return segments.length > 0
 }
 
 const isPipelineLeaseFresh = (lease: PipelineRuntimeLease | null, nowMs: number) => {
@@ -40566,6 +40982,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const continuityFirstModeOverride = getContinuityFirstModeFromPayload(req.body)
     const exploreX3ModeOverride = getExploreX3ModeFromPayload(req.body)
     const topHumanGuardModeOverride = getTopHumanGuardModeFromPayload(req.body)
+    const humanReviewRequiredOverride = getHumanReviewRequiredFromPayload(req.body)
     const creatorStyleLockPercentOverride = getCreatorStyleLockPercentFromPayload(req.body)
     const retentionTuning = buildRetentionTuningFromPayload({
       payload: req.body,
@@ -40650,6 +41067,7 @@ const handleCreateJob = async (req: any, res: any) => {
     const continuityFirstMode = promptAppliedCreate.continuityFirstMode ?? continuityFirstModeOverride ?? false
     const exploreX3Mode = exploreX3ModeOverride ?? false
     const topHumanGuardMode = topHumanGuardModeOverride ?? false
+    const humanReviewRequired = humanReviewRequiredOverride ?? false
     const creatorStyleLockPercent = creatorStyleLockPercentOverride ?? DEFAULT_CREATOR_STYLE_LOCK_PERCENT
     if (coldStartAutopilot) {
       if (!retentionTuning.hasStrategyOverride) retentionStrategyProfile = 'safe'
@@ -40754,6 +41172,7 @@ const handleCreateJob = async (req: any, res: any) => {
             continuityFirstMode,
             exploreX3Mode,
             topHumanGuardMode,
+            humanReviewRequired: humanReviewRequiredOverride ?? false,
             creatorStyleLock: creatorStyleLockPercent,
             autoCaptions: autoCaptionsOverride,
             subtitleStyle: subtitleStyleOverride
@@ -40868,6 +41287,7 @@ const handleCreateJob = async (req: any, res: any) => {
             continuityFirstMode,
             exploreX3Mode,
             topHumanGuardMode,
+            humanReviewRequired,
             creatorStyleLockPercent,
             manualTimestampConfig: manualTimestampConfigOverride,
             verticalCaptionConfig: verticalCaptionConfigOverride,
@@ -40911,6 +41331,8 @@ const handleCreateJob = async (req: any, res: any) => {
             explore_x3_mode: exploreX3Mode,
             topHumanGuardMode,
             top_human_guard_mode: topHumanGuardMode,
+            humanReviewRequired,
+            human_review_required: humanReviewRequired,
             creatorStyleLock: creatorStyleLockPercent,
             creator_style_lock: creatorStyleLockPercent,
             ...(fullAutoYoutubeProfile
@@ -40964,6 +41386,7 @@ const handleCreateJob = async (req: any, res: any) => {
           continuityFirstMode,
           exploreX3Mode,
           topHumanGuardMode,
+          humanReviewRequired,
           creatorStyleLockPercent,
           manualTimestampConfig: manualTimestampConfigOverride,
           verticalCaptionConfig: verticalCaptionConfigOverride,
@@ -41262,6 +41685,7 @@ router.get('/:id', async (req: any, res) => {
       if (!s) return 'FAILED'
       if (s === 'queued') return 'QUEUED'
       if (s === 'rendering') return 'RENDERING'
+      if (s === 'review') return 'REVIEW'
       if (s === 'completed') return 'READY'
       if (s === 'failed') return 'FAILED'
       // any intermediate states are processing
@@ -41295,6 +41719,7 @@ router.get('/:id', async (req: any, res) => {
         { key: 'hooking', label: 'Hook' },
         { key: 'cutting', label: 'Cut' },
         { key: 'pacing', label: 'Binge Optimize' },
+        { key: 'review', label: 'Human Review' },
         { key: 'ready', label: 'Download Ready' }
       ]
     }
@@ -41409,6 +41834,62 @@ router.post('/:id/proxy-url', async (req: any, res) => {
     const expires = 60 * 10
     const url = await getSignedOutputUrl({ key: proxyPath, expiresIn: expires })
     return res.json({ url })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/review-preview-url', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const analysis = job.analysis as any
+    const review = readHumanReviewState(analysis)
+    const previewPath = review?.previewPath
+    if (!previewPath) return res.status(404).json({ error: 'preview_not_available' })
+    await ensureBucket(OUTPUT_BUCKET, false)
+    const expires = 60 * 10
+    const url = await getSignedOutputUrl({ key: previewPath, expiresIn: expires })
+    return res.json({ url })
+  } catch (err) {
+    res.status(500).json({ error: 'server_error' })
+  }
+})
+
+router.post('/:id/review/approve', async (req: any, res) => {
+  try {
+    const id = req.params.id
+    const job = await prisma.job.findUnique({ where: { id } })
+    if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
+    const status = String(job.status || '').toLowerCase()
+    if (status !== 'review') return res.status(409).json({ error: 'review_not_pending' })
+    const analysis = (job.analysis as any) || {}
+    const review = readHumanReviewState(analysis)
+    const nowIso = toIsoNow()
+    const nextReviewState = {
+      ...(review || {}),
+      status: 'approved',
+      approvedAt: nowIso
+    }
+    const nextAnalysis = {
+      ...analysis,
+      humanReviewRequired: getHumanReviewRequiredFromJob(job),
+      human_review_required: getHumanReviewRequiredFromJob(job),
+      human_review: nextReviewState,
+      humanReview: nextReviewState
+    }
+    const resumeProgress = Number.isFinite(Number(job.progress))
+      ? Math.max(15, Math.min(90, Math.round(Number(job.progress))))
+      : 15
+    await updateJob(id, { status: 'queued', progress: resumeProgress, error: null, analysis: nextAnalysis })
+    enqueuePipeline({
+      jobId: id,
+      user: { id: req.user.id, ...(req.user?.email ? { email: req.user.email } : {}) },
+      requestedQuality: job.requestedQuality ? normalizeQuality(job.requestedQuality) : undefined,
+      priorityLevel: Number(job.priorityLevel ?? 2) || 2
+    })
+    return res.json({ ok: true, queued: true })
   } catch (err) {
     res.status(500).json({ error: 'server_error' })
   }
@@ -41851,6 +42332,7 @@ router.post('/:id/analyze', async (req: any, res) => {
     const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
+    const requestedHumanReviewRequired = getHumanReviewRequiredFromPayload(req.body) ?? getHumanReviewRequiredFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
     const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
@@ -41938,6 +42420,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       explore_x3_mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       top_human_guard_mode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
+      human_review_required: requestedHumanReviewRequired,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
@@ -41993,6 +42477,8 @@ router.post('/:id/analyze', async (req: any, res) => {
       explore_x3_mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       top_human_guard_mode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
+      human_review_required: requestedHumanReviewRequired,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
@@ -42024,6 +42510,7 @@ router.post('/:id/analyze', async (req: any, res) => {
       continuityFirstMode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       videoPreset: requestedVideoPreset,
       videoCrf: requestedVideoCrf,
@@ -42114,6 +42601,7 @@ router.post('/:id/process', async (req: any, res) => {
     const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
+    const requestedHumanReviewRequired = getHumanReviewRequiredFromPayload(req.body) ?? getHumanReviewRequiredFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
     const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
@@ -42201,6 +42689,8 @@ router.post('/:id/process', async (req: any, res) => {
       explore_x3_mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       top_human_guard_mode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
+      human_review_required: requestedHumanReviewRequired,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
@@ -42256,6 +42746,8 @@ router.post('/:id/process', async (req: any, res) => {
       explore_x3_mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
       top_human_guard_mode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
+      human_review_required: requestedHumanReviewRequired,
       creatorStyleLock: requestedCreatorStyleLockPercent,
       creator_style_lock: requestedCreatorStyleLockPercent,
       ...(editorInstructionPrompt ? { editorInstructionPrompt, editor_instruction_prompt: editorInstructionPrompt, directorNotes: editorInstructionPrompt } : {}),
@@ -42287,6 +42779,7 @@ router.post('/:id/process', async (req: any, res) => {
       continuityFirstMode: requestedContinuityFirstMode,
       exploreX3Mode: requestedExploreX3Mode,
       topHumanGuardMode: requestedTopHumanGuardMode,
+      humanReviewRequired: requestedHumanReviewRequired,
       creatorStyleLockPercent: requestedCreatorStyleLockPercent,
       videoPreset: requestedVideoPreset,
       videoCrf: requestedVideoCrf,
@@ -42468,6 +42961,7 @@ router.patch('/:id/live-settings', async (req: any, res) => {
     const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
+    const requestedHumanReviewRequired = getHumanReviewRequiredFromPayload(req.body) ?? getHumanReviewRequiredFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
     const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
@@ -42788,7 +43282,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const job = await prisma.job.findUnique({ where: { id } })
     if (!job || job.userId !== req.user.id) return res.status(404).json({ error: 'not_found' })
     const status = String(job.status || '').toLowerCase()
-    if (status !== 'completed' && status !== 'failed') {
+    if (status !== 'completed' && status !== 'failed' && status !== 'review') {
       return res.status(409).json({ error: 'job_not_ready_for_reprocess' })
     }
 
@@ -42879,6 +43373,7 @@ router.post('/:id/reprocess', async (req: any, res) => {
     const requestedContinuityFirstModeBase = getContinuityFirstModeFromPayload(req.body) ?? getContinuityFirstModeFromJob(job)
     const requestedExploreX3Mode = getExploreX3ModeFromPayload(req.body) ?? getExploreX3ModeFromJob(job)
     const requestedTopHumanGuardMode = getTopHumanGuardModeFromPayload(req.body) ?? getTopHumanGuardModeFromJob(job)
+    const requestedHumanReviewRequired = getHumanReviewRequiredFromPayload(req.body) ?? getHumanReviewRequiredFromJob(job)
     const requestedCreatorStyleLockPercent = getCreatorStyleLockPercentFromPayload(req.body) ?? getCreatorStyleLockPercentFromJob(job)
     const requestedVideoPreset = getVideoPresetFromPayload(req.body) ?? getVideoPresetFromJob(job)
     const requestedVideoCrf = getVideoCrfFromPayload(req.body) ?? getVideoCrfFromJob(job)
@@ -42939,6 +43434,16 @@ router.post('/:id/reprocess', async (req: any, res) => {
       preferredHook: preferredHookCandidate
     })
     const resolvedPreferredHook = persistedPreferredHookState.preferredHook
+    const nowIso = toIsoNow()
+    const nextHumanReviewState = requestedHumanReviewRequired
+      ? {
+          status: 'pending',
+          requestedAt: nowIso,
+          previewPath: null,
+          previewCreatedAt: null,
+          previewDurationSeconds: null
+        }
+      : null
 
     const nextRenderSettings = {
       ...((job as any)?.renderSettings || {}),
@@ -43083,7 +43588,9 @@ router.post('/:id/reprocess', async (req: any, res) => {
       ...(effectiveReprocessFastMode === null ? {} : { fastMode: effectiveReprocessFastMode, fast_mode: effectiveReprocessFastMode }),
       ...(requestedManualTimestampConfig ? buildManualTimestampPersistenceFields(requestedManualTimestampConfig) : {}),
       preferred_hook: resolvedPreferredHook ?? null,
-      preferred_hook_updated_at: persistedPreferredHookState.preferredHookUpdatedAt ?? null
+      preferred_hook_updated_at: persistedPreferredHookState.preferredHookUpdatedAt ?? null,
+      human_review: nextHumanReviewState,
+      humanReview: nextHumanReviewState
     }
 
     const priorityLevel = Number(job.priorityLevel ?? 2) || 2

@@ -158,6 +158,7 @@ export const JOB_STATUSES = [
   'audio',
   'story',
   'retention',
+  'review',
   'rendering',
   'completed',
   'failed'
@@ -179,7 +180,8 @@ export const JOB_STATUS_TRANSITIONS: Record<JobStatusKey, Set<JobStatusKey>> = {
   subtitling: makeTransitions(['subtitling', 'queued', 'audio', 'retention', 'rendering', 'failed']),
   audio: makeTransitions(['audio', 'queued', 'retention', 'rendering', 'failed']),
   story: makeTransitions(['story', 'queued', 'hooking', 'pacing', 'subtitling', 'audio', 'retention', 'rendering', 'failed']),
-  retention: makeTransitions(['retention', 'queued', 'rendering', 'failed']),
+  retention: makeTransitions(['retention', 'queued', 'review', 'rendering', 'failed']),
+  review: makeTransitions(['review', 'queued', 'rendering', 'failed']),
   rendering: makeTransitions(['rendering', 'queued', 'completed', 'failed']),
   completed: makeTransitions(['completed', 'queued']),
   failed: makeTransitions(['failed', 'queued'])
@@ -196,6 +198,7 @@ export const JOB_STATUS_PROGRESS_ORDER: readonly JobStatusKey[] = [
   'subtitling',
   'audio',
   'retention',
+  'review',
   'rendering',
   'completed',
   'failed'
