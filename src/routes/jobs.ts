@@ -112,6 +112,18 @@ const GPU_WORKER_URL = String(process.env.GPU_WORKER_URL || '').trim()
 const GPU_WORKER_BASE_URL = GPU_WORKER_URL.replace(/\/+$/, '')
 const GPU_WORKER_SHARED_DIR = String(process.env.GPU_WORKER_SHARED_DIR || '').trim()
 const GPU_WORKER_SHARED_DIR_REMOTE = String(process.env.GPU_WORKER_SHARED_DIR_REMOTE || '').trim()
+const GPU_WORKER_TRANSFER_MODE = String(process.env.GPU_WORKER_TRANSFER_MODE || '').trim().toLowerCase()
+const GPU_WORKER_USE_URLS = [
+  'url',
+  'urls',
+  'signed',
+  'signed-url',
+  'signed-urls',
+  'presigned',
+  'presigned-urls',
+  'remote'
+].includes(GPU_WORKER_TRANSFER_MODE)
+const GPU_WORKER_URL_TMP_DIR = String(process.env.GPU_WORKER_URL_TMP_DIR || '/tmp/ae-worker').trim()
 const GPU_WORKER_FORCE = parseOptionalBool(process.env.GPU_WORKER_FORCE) ?? false
 const GPU_WORKER_FALLBACK = parseOptionalBool(process.env.GPU_WORKER_FALLBACK) ?? true
 const GPU_WORKER_KEEP_SHARED = parseOptionalBool(process.env.GPU_WORKER_KEEP_SHARED) ?? false
@@ -124,6 +136,14 @@ const GPU_WORKER_TIMEOUT_MS = (() => {
   const raw = Number(process.env.GPU_WORKER_TIMEOUT_MS || 60 * 60_000)
   if (!Number.isFinite(raw) || raw <= 10_000) return 60 * 60_000
   return Math.min(6 * 60 * 60_000, Math.round(raw))
+})()
+const GPU_WORKER_URL_EXPIRES_SEC = (() => {
+  const raw = Number(process.env.GPU_WORKER_URL_EXPIRES_SEC || 0)
+  if (Number.isFinite(raw) && raw > 0) {
+    return Math.max(300, Math.min(6 * 60 * 60, Math.round(raw)))
+  }
+  const fallback = Math.ceil(GPU_WORKER_TIMEOUT_MS / 1000) + 900
+  return Math.max(900, Math.min(6 * 60 * 60, fallback))
 })()
 const GPU_WORKER_PARALLEL_SEGMENTS = (() => {
   const raw = Number(process.env.GPU_WORKER_PARALLEL_SEGMENTS || 2)
@@ -267,6 +287,25 @@ const downloadObjectToFile = async ({ key, destPath }: { key: string; destPath: 
   })
 }
 
+const downloadOutputToFile = async ({ key, destPath }: { key: string; destPath: string }) => {
+  if (r2.isConfigured) {
+    try {
+      await withRetries(`r2_download_output:${key}`, 3, async () => {
+        await r2.getObjectToFile({ Key: key, destPath })
+      })
+      return
+    } catch (err) {
+      console.warn('R2 output download failed, trying Supabase fallback', err)
+    }
+  }
+  await withRetries(`supabase_output_download:${key}`, 3, async () => {
+    const { data, error } = await supabaseAdmin.storage.from(OUTPUT_BUCKET).download(key)
+    if (error || !data) throw error || new Error('download_failed')
+    const bytes = Buffer.from(await data.arrayBuffer())
+    fs.writeFileSync(destPath, bytes)
+  })
+}
+
 const uploadBufferToOutput = async ({ key, body, contentType }: { key: string; body: Buffer; contentType?: string }) => {
   if (r2.isConfigured) {
     await withRetries(`r2_upload:${key}`, 3, async () => {
@@ -332,6 +371,25 @@ const getSignedInputUrl = async ({ key, expiresIn }: { key: string; expiresIn: n
   if (r2.isConfigured) return r2.getPresignedGetUrl({ Key: key, expiresIn })
   const { data, error } = await supabaseAdmin.storage.from(INPUT_BUCKET).createSignedUrl(key, expiresIn)
   if (error || !data?.signedUrl) throw error || new Error('signed_url_failed')
+  return data.signedUrl
+}
+
+const getSignedOutputUploadUrl = async ({
+  key,
+  contentType,
+  expiresIn
+}: {
+  key: string
+  contentType?: string
+  expiresIn: number
+}) => {
+  if (r2.isConfigured) {
+    return r2.generateUploadUrl(key, contentType, expiresIn)
+  }
+  const { data, error } = await supabaseAdmin.storage
+    .from(OUTPUT_BUCKET)
+    .createSignedUploadUrl(key, { upsert: true })
+  if (error || !data?.signedUrl) throw error || new Error('signed_upload_failed')
   return data.signedUrl
 }
 
@@ -551,6 +609,87 @@ const renderWithGpuWorker = async ({
       }
     }
   }
+}
+
+const renderWithGpuWorkerUrls = async ({
+  jobId,
+  requestId,
+  inputKey,
+  outputKey,
+  outputPath,
+  segments,
+  targetWidth,
+  targetHeight,
+  sourceWidth,
+  sourceHeight,
+  horizontalFit,
+  bitrateKbps
+}: {
+  jobId: string
+  requestId?: string
+  inputKey: string
+  outputKey: string
+  outputPath: string
+  segments: Segment[]
+  targetWidth: number
+  targetHeight: number
+  sourceWidth: number
+  sourceHeight: number
+  horizontalFit: HorizontalFitMode
+  bitrateKbps: number
+}) => {
+  if (!GPU_WORKER_BASE_URL) {
+    throw new Error('gpu_worker_missing_url')
+  }
+  if (!inputKey) {
+    throw new Error('gpu_worker_missing_input_key')
+  }
+  if (!outputKey) {
+    throw new Error('gpu_worker_missing_output_key')
+  }
+
+  const inputUrl = await getSignedInputUrl({ key: inputKey, expiresIn: GPU_WORKER_URL_EXPIRES_SEC })
+  const uploadUrl = await getSignedOutputUploadUrl({
+    key: outputKey,
+    contentType: 'video/mp4',
+    expiresIn: GPU_WORKER_URL_EXPIRES_SEC
+  })
+  const workerTmpBase = GPU_WORKER_URL_TMP_DIR || '/tmp/ae-worker'
+  const workerInputPath = joinGpuWorkerPath(workerTmpBase, `${jobId}-input.mp4`)
+  const workerOutputPath = joinGpuWorkerPath(workerTmpBase, `${jobId}-output.mp4`)
+
+  const segmentPayload = segments.map((seg) => ({
+    start_ms: Math.max(0, Math.round(seg.start * 1000)),
+    duration_ms: Math.max(1, Math.round((seg.end - seg.start) * 1000))
+  }))
+
+  const crop = horizontalFit === 'cover'
+    ? computeCoverCrop(sourceWidth, sourceHeight, targetWidth, targetHeight)
+    : { cropX: 0, cropY: 0, cropW: 0, cropH: 0 }
+
+  const payload = {
+    input_path: workerInputPath,
+    output_path: workerOutputPath,
+    input_url: inputUrl,
+    output_upload_url: uploadUrl,
+    output_content_type: 'video/mp4',
+    codec: 'h264',
+    width: targetWidth,
+    height: targetHeight,
+    bitrate_kbps: bitrateKbps,
+    use_cuda_resize: true,
+    crop_x: crop.cropX,
+    crop_y: crop.cropY,
+    crop_w: crop.cropW,
+    crop_h: crop.cropH,
+    parallel_segments: GPU_WORKER_PARALLEL_SEGMENTS,
+    segments: segmentPayload
+  }
+
+  const workerJobId = await postGpuWorkerJob(payload, requestId)
+  await pollGpuWorkerJob(workerJobId, requestId)
+
+  await downloadOutputToFile({ key: outputKey, destPath: outputPath })
 }
 
 const pipelineJobContext = new AsyncLocalStorage<{ jobId: string }>()
@@ -34808,6 +34947,7 @@ const processJob = async (
   const tmpIn = path.join(workDir, 'input')
   const tmpOut = path.join(workDir, 'output.mp4')
   const renderArtifactTag = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`
+  const renderOutputKey = `${job.userId}/${jobId}/renders/${renderArtifactTag}/output.mp4`
   const absTmpIn = path.resolve(tmpIn)
   const absTmpOut = path.resolve(tmpOut)
   try {
@@ -34834,6 +34974,7 @@ const processJob = async (
   let subtitlePath: string | null = null
   let subtitleIsAss = false
   let outputUploadFallbackUsed = false
+  let outputAlreadyInStorage = false
   const failedOutputUploads: string[] = []
   try {
     const storedDuration = job.inputDurationSeconds && job.inputDurationSeconds > 0 ? job.inputDurationSeconds : null
@@ -38732,7 +38873,8 @@ const processJob = async (
 
       if (!processed && GPU_WORKER_BASE_URL) {
         const gpuWorkerSkipReasons: string[] = []
-        if (!GPU_WORKER_SHARED_DIR) gpuWorkerSkipReasons.push('missing_shared_dir')
+        if (!GPU_WORKER_SHARED_DIR && !GPU_WORKER_USE_URLS) gpuWorkerSkipReasons.push('missing_shared_dir')
+        if (GPU_WORKER_USE_URLS && !job.inputPath) gpuWorkerSkipReasons.push('missing_input_key')
         if (renderConfig.mode !== 'horizontal') gpuWorkerSkipReasons.push('mode_not_supported')
         if (horizontalFit !== 'cover') gpuWorkerSkipReasons.push('fit_not_supported')
         if (renderSubtitlesEnabled || subtitlePath) gpuWorkerSkipReasons.push('subtitles_enabled')
@@ -38752,19 +38894,37 @@ const processJob = async (
         } else {
           try {
             const bitrateKbps = resolveBitrateKbpsFromArgs(ffVideoBitrateArgs)
-            await renderWithGpuWorker({
-              jobId,
-              requestId,
-              inputPath: tmpIn,
-              outputPath: tmpOut,
-              segments: finalSegments,
-              targetWidth: target.width,
-              targetHeight: target.height,
-              sourceWidth: sourceProbe?.width || 0,
-              sourceHeight: sourceProbe?.height || 0,
-              horizontalFit,
-              bitrateKbps
-            })
+            if (GPU_WORKER_USE_URLS) {
+              await renderWithGpuWorkerUrls({
+                jobId,
+                requestId,
+                inputKey: String(job.inputPath || '').trim(),
+                outputKey: renderOutputKey,
+                outputPath: tmpOut,
+                segments: finalSegments,
+                targetWidth: target.width,
+                targetHeight: target.height,
+                sourceWidth: sourceProbe?.width || 0,
+                sourceHeight: sourceProbe?.height || 0,
+                horizontalFit,
+                bitrateKbps
+              })
+              outputAlreadyInStorage = true
+            } else {
+              await renderWithGpuWorker({
+                jobId,
+                requestId,
+                inputPath: tmpIn,
+                outputPath: tmpOut,
+                segments: finalSegments,
+                targetWidth: target.width,
+                targetHeight: target.height,
+                sourceWidth: sourceProbe?.width || 0,
+                sourceHeight: sourceProbe?.height || 0,
+                horizontalFit,
+                bitrateKbps
+              })
+            }
             processed = true
             optimizationNotes.push('Render offloaded to GPU worker.')
           } catch (err: any) {
@@ -39655,19 +39815,21 @@ const processJob = async (
     const outputPaths: string[] = []
     const localOutDir = path.join(process.cwd(), 'outputs', job.userId, jobId)
     fs.mkdirSync(localOutDir, { recursive: true })
-    const outPath = `${job.userId}/${jobId}/renders/${renderArtifactTag}/output.mp4`
+    const outPath = renderOutputKey
     const localOutPath = path.join(localOutDir, 'output.mp4')
     fs.copyFileSync(tmpOut, localOutPath)
     console.log(`[${requestId || 'noid'}] local output saved ${path.resolve(localOutPath)} (${tmpOutStats.size} bytes)`)
-    try {
-      await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
-    } catch (error) {
-      outputUploadFallbackUsed = true
-      failedOutputUploads.push(outPath)
-      console.warn(`[${requestId || 'noid'}] output upload failed, serving local fallback`, {
-        key: outPath,
-        error: (error as any)?.message || error
-      })
+    if (!outputAlreadyInStorage) {
+      try {
+        await uploadFileToOutput({ key: outPath, filePath: tmpOut, contentType: 'video/mp4' })
+      } catch (error) {
+        outputUploadFallbackUsed = true
+        failedOutputUploads.push(outPath)
+        console.warn(`[${requestId || 'noid'}] output upload failed, serving local fallback`, {
+          key: outPath,
+          error: (error as any)?.message || error
+        })
+      }
     }
     outputPaths.push(outPath)
     throwIfCanceled()

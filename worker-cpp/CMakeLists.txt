@@ -22,6 +22,7 @@ FetchContent_MakeAvailable(Crow)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FFMPEG REQUIRED libavcodec libavformat libavfilter libavutil libswscale libswresample)
 find_package(CUDAToolkit REQUIRED)
+find_package(CURL REQUIRED)
 
 add_executable(worker_service
   src/worker_main.cpp
@@ -37,6 +38,7 @@ target_link_libraries(worker_service PRIVATE
   ${FFMPEG_LIBRARIES}
   Crow::Crow
   CUDA::cudart
+  CURL::libcurl
 )
 
 if (UNIX)

@@ -62,6 +62,9 @@ API:
 {
   "input_path": "/app/input.mp4",
   "output_path": "/app/output.mp4",
+  "input_url": "https://signed-input-url",
+  "output_upload_url": "https://signed-output-upload-url",
+  "output_content_type": "video/mp4",
   "codec": "h264",
   "width": 1280,
   "height": 720,
@@ -94,6 +97,12 @@ API:
 `codec` accepts `h264` or `hevc` (NVENC).
 
 The watermark file is expected to be raw RGBA (width * height * 4 bytes). The LUT file is a text file with one float per entry in the range 0..1.
+
+URL-based transfer (no shared filesystem):
+- Provide `input_url` to a signed GET URL and `output_upload_url` to a signed PUT URL.
+- `input_path` and `output_path` remain required and are used as local temp paths on the worker host.
+- The worker downloads `input_url` to `input_path`, renders to `output_path`, uploads to `output_upload_url`, and cleans up the local files.
+- `output_content_type` is optional but recommended when using presigned PUT URLs.
 
 `parallel_segments` is treated as an upper bound. The worker will reduce it automatically based on available VRAM to avoid GPU OOM.
 

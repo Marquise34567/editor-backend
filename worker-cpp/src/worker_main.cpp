@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -18,6 +20,7 @@
 #include <vector>
 
 #include <cuda_runtime.h>
+#include <curl/curl.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -30,6 +33,8 @@ extern "C" {
 #include <libavutil/hwcontext.h>
 #include <libavutil/opt.h>
 }
+
+namespace fs = std::filesystem;
 
 struct SegmentPlan {
   int64_t start_ms = 0;
@@ -54,7 +59,10 @@ struct LutConfig {
 struct RenderJob {
   std::string id;
   std::string input_path;
+  std::string input_url;
   std::string output_path;
+  std::string output_upload_url;
+  std::string output_content_type;
   std::string codec = "h264";
   int width = 0;
   int height = 0;
@@ -171,6 +179,127 @@ static std::string AvErrorToString(int err) {
   char buf[AV_ERROR_MAX_STRING_SIZE];
   av_strerror(err, buf, sizeof(buf));
   return std::string(buf);
+}
+
+static bool EnsureParentDir(const std::string& file_path, std::string& error) {
+  try {
+    fs::path path(file_path);
+    if (path.has_parent_path()) {
+      fs::create_directories(path.parent_path());
+    }
+    return true;
+  } catch (const std::exception& e) {
+    error = std::string("mkdir_failed: ") + e.what();
+    return false;
+  }
+}
+
+static bool DownloadToFile(const std::string& url, const std::string& dest_path, std::string& error) {
+  if (url.empty()) {
+    return true;
+  }
+  if (!EnsureParentDir(dest_path, error)) {
+    return false;
+  }
+
+  FILE* fp = std::fopen(dest_path.c_str(), "wb");
+  if (!fp) {
+    error = "download_open_failed";
+    return false;
+  }
+
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    std::fclose(fp);
+    error = "download_curl_init_failed";
+    return false;
+  }
+
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+  curl_easy_cleanup(curl);
+  std::fclose(fp);
+
+  if (res != CURLE_OK) {
+    error = std::string("download_failed: ") + curl_easy_strerror(res);
+    return false;
+  }
+  if (status >= 400) {
+    error = "download_http_" + std::to_string(status);
+    return false;
+  }
+  return true;
+}
+
+static bool UploadFileToUrl(
+  const std::string& url,
+  const std::string& file_path,
+  const std::string& content_type,
+  std::string& error
+) {
+  if (url.empty()) {
+    return true;
+  }
+
+  std::error_code ec;
+  const auto file_size = fs::file_size(file_path, ec);
+  if (ec) {
+    error = std::string("upload_stat_failed: ") + ec.message();
+    return false;
+  }
+
+  FILE* fp = std::fopen(file_path.c_str(), "rb");
+  if (!fp) {
+    error = "upload_open_failed";
+    return false;
+  }
+
+  CURL* curl = curl_easy_init();
+  if (!curl) {
+    std::fclose(fp);
+    error = "upload_curl_init_failed";
+    return false;
+  }
+
+  struct curl_slist* headers = nullptr;
+  if (!content_type.empty()) {
+    headers = curl_slist_append(headers, ("Content-Type: " + content_type).c_str());
+  }
+
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+  curl_easy_setopt(curl, CURLOPT_READDATA, fp);
+  curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(file_size));
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  CURLcode res = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+  if (headers) {
+    curl_slist_free_all(headers);
+  }
+  curl_easy_cleanup(curl);
+  std::fclose(fp);
+
+  if (res != CURLE_OK) {
+    error = std::string("upload_failed: ") + curl_easy_strerror(res);
+    return false;
+  }
+  if (status >= 400) {
+    error = "upload_http_" + std::to_string(status);
+    return false;
+  }
+  return true;
 }
 
 static bool ProbeInputDimensions(const std::string& path, int& width, int& height, std::string& error) {
@@ -1155,6 +1284,15 @@ static bool ParseJob(const crow::json::rvalue& body, RenderJob& job, std::string
 
   job.input_path = body["input_path"].s();
   job.output_path = body["output_path"].s();
+  if (body.has("input_url")) {
+    job.input_url = body["input_url"].s();
+  }
+  if (body.has("output_upload_url")) {
+    job.output_upload_url = body["output_upload_url"].s();
+  }
+  if (body.has("output_content_type")) {
+    job.output_content_type = body["output_content_type"].s();
+  }
   job.codec = body.has("codec") ? body["codec"].s() : "h264";
   job.width = body.has("width") ? body["width"].i() : 0;
   job.height = body.has("height") ? body["height"].i() : 0;
@@ -1208,6 +1346,7 @@ static bool ParseJob(const crow::json::rvalue& body, RenderJob& job, std::string
 int main(int argc, char** argv) {
   av_log_set_level(AV_LOG_ERROR);
   avformat_network_init();
+  curl_global_init(CURL_GLOBAL_DEFAULT);
 
   JobQueue queue;
   GpuTranscoder transcoder;
@@ -1228,7 +1367,42 @@ int main(int argc, char** argv) {
           break;
         }
         std::string error;
-        if (transcoder.Transcode(job, error)) {
+        std::string cleanup_input;
+        std::string cleanup_output;
+        bool ok = true;
+        if (!job.input_url.empty()) {
+          if (!DownloadToFile(job.input_url, job.input_path, error)) {
+            ok = false;
+          } else {
+            cleanup_input = job.input_path;
+          }
+        }
+        if (ok && !EnsureParentDir(job.output_path, error)) {
+          ok = false;
+        }
+        if (ok && transcoder.Transcode(job, error)) {
+          if (!job.output_upload_url.empty()) {
+            const std::string content_type =
+              job.output_content_type.empty() ? "application/octet-stream" : job.output_content_type;
+            cleanup_output = job.output_path;
+            if (!UploadFileToUrl(job.output_upload_url, job.output_path, content_type, error)) {
+              ok = false;
+            }
+          }
+        } else if (ok) {
+          ok = false;
+        }
+
+        if (!cleanup_input.empty()) {
+          std::error_code ec;
+          fs::remove(cleanup_input, ec);
+        }
+        if (!cleanup_output.empty()) {
+          std::error_code ec;
+          fs::remove(cleanup_output, ec);
+        }
+
+        if (ok) {
           queue.Complete(job.id);
         } else {
           queue.Fail(job.id, error);
@@ -1289,5 +1463,6 @@ int main(int argc, char** argv) {
   for (auto& t : workers) {
     t.join();
   }
+  curl_global_cleanup();
   return 0;
 }

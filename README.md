@@ -117,6 +117,7 @@ Deployment:
 
 GPU worker offload (optional):
 1. Set `GPU_WORKER_URL` to your GPU worker HTTP endpoint (Crow service).
-2. Set `GPU_WORKER_SHARED_DIR` to a directory mounted on both the API host and the GPU worker host.
-3. (Optional) Set `GPU_WORKER_SHARED_DIR_REMOTE` if the GPU worker sees the shared directory at a different path (for example, Docker/WSL on Windows).
-4. The backend will automatically offload eligible render jobs to the GPU worker and fall back to local FFmpeg when unsupported.
+2. Shared filesystem mode (default): set `GPU_WORKER_SHARED_DIR` to a directory mounted on both the API host and GPU worker host.
+3. URL-based mode: set `GPU_WORKER_TRANSFER_MODE=urls` and optionally `GPU_WORKER_URL_TMP_DIR=/tmp/ae-worker`.
+4. (Optional) Set `GPU_WORKER_SHARED_DIR_REMOTE` if the GPU worker sees the shared directory at a different path (for example, Docker/WSL on Windows).
+5. The backend will automatically offload eligible render jobs to the GPU worker and fall back to local FFmpeg when unsupported.
