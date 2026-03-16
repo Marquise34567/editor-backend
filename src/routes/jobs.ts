@@ -2824,6 +2824,8 @@ const BOUNDARY_PATHOLOGY_FALLBACK_THRESHOLD = 0.7
 const BOUNDARY_REANCHOR_CANDIDATES = [0, 0.04, 0.08, 0.12, 0.16, 0.2, 0.24] as const
 const LONG_FORM_MICRO_REHOOK_MIN_SECONDS = 60
 const LONG_FORM_MICRO_REHOOK_MAX_SECONDS = 120
+const HARD_DEDUPE_WINDOW_SECONDS = 0.05
+const HARD_DEDUPE_MIN_SEGMENT_SECONDS = 0.28
 const LONG_FORM_DEFAULT_DATA_MODE = 'long_form_auto_defaults_2026_03_04'
 const MANDATORY_VARIANT_MIN = 3
 const MANDATORY_VARIANT_MAX = 5
@@ -21100,6 +21102,61 @@ const subtractRanges = (segments: Segment[], ranges: TimeRange[]) => {
   return result
 }
 
+const applyHardDedupeWindow = ({
+  segments,
+  durationSeconds,
+  minSegmentSeconds = HARD_DEDUPE_MIN_SEGMENT_SECONDS,
+  dedupeWindowSeconds = HARD_DEDUPE_WINDOW_SECONDS
+}: {
+  segments: Segment[]
+  durationSeconds: number
+  minSegmentSeconds?: number
+  dedupeWindowSeconds?: number
+}) => {
+  if (!segments.length) {
+    return { segments: [] as Segment[], dropped: 0 }
+  }
+  const safeDuration = Math.max(0.1, Number(durationSeconds || 0))
+  let usedRanges: TimeRange[] = []
+  const output: Segment[] = []
+  let dropped = 0
+  for (const segment of segments) {
+    const start = Number(clamp(Number(segment.start || 0), 0, Math.max(0, safeDuration - 0.02)).toFixed(3))
+    const end = Number(clamp(Number(segment.end || 0), start + 0.02, safeDuration).toFixed(3))
+    if (end - start < minSegmentSeconds) {
+      dropped += 1
+      continue
+    }
+    const normalized: Segment = { ...segment, start, end }
+    const paddedRanges = usedRanges.length
+      ? mergeRanges(usedRanges.map((range) => ({
+          start: Math.max(0, range.start - dedupeWindowSeconds),
+          end: Math.min(safeDuration, range.end + dedupeWindowSeconds)
+        })))
+      : []
+    const remaining = paddedRanges.length ? subtractRanges([normalized], paddedRanges) : [normalized]
+    if (!remaining.length) {
+      dropped += 1
+      continue
+    }
+    let keptAny = false
+    for (const piece of remaining) {
+      if (piece.end - piece.start < minSegmentSeconds) {
+        dropped += 1
+        continue
+      }
+      output.push({ ...piece })
+      usedRanges = mergeRanges([...usedRanges, { start: piece.start, end: piece.end }])
+      keptAny = true
+    }
+    if (!keptAny) dropped += 1
+  }
+  return {
+    segments: output.length ? output : segments.map((segment) => ({ ...segment })),
+    dropped
+  }
+}
+
 const buildFaceAbsenceFlags = (windows: EngagementWindow[], minDuration = 2) => {
   const hasSignal = windows.some((w) => w.facePresence > 0.2)
   if (!hasSignal) return windows.map(() => false)
@@ -24539,11 +24596,13 @@ const buildEditPlan = async (
     aggressionLevel: styleAdjustedAggressionLevel,
     targetIntervalSeconds: interruptTargetSeconds
   })
-  const endingSpikeSegments = enforceEndingSpike({
-    segments: interruptInjected.segments,
-    windows,
-    durationSeconds
-  })
+  const endingSpikeSegments = longFormRuntimeTuning.isLongForm
+    ? interruptInjected.segments
+    : enforceEndingSpike({
+        segments: interruptInjected.segments,
+        windows,
+        durationSeconds
+      })
   const beatAnchors = detectRhythmAnchors({
     windows,
     durationSeconds,
@@ -24761,6 +24820,13 @@ const buildEditPlan = async (
     console.warn('retention planner integration failed, continuing with base timeline', error)
   }
   finalTimelineSegments = applyLongFormSpeedGovernor(finalTimelineSegments, longFormRuntimeTuning)
+  if (longFormRuntimeTuning.isLongForm) {
+    const dedupeResult = applyHardDedupeWindow({
+      segments: finalTimelineSegments,
+      durationSeconds
+    })
+    finalTimelineSegments = dedupeResult.segments
+  }
   const storyBeatGraph = buildStoryBeatGraph({
     durationSeconds,
     windows,
@@ -24780,13 +24846,15 @@ const buildEditPlan = async (
     durationSeconds,
     targetPlatform: context?.targetPlatform ?? null
   })
-  const microRehookAnchors = buildLongFormMicroRehookAnchors({
-    durationSeconds,
-    storyBeatGraph,
-    minIntervalSeconds: youtubeLongFormFocus ? 55 : undefined,
-    maxIntervalSeconds: youtubeLongFormFocus ? 100 : undefined,
-    densityBiasSeconds: youtubeLongFormFocus ? 6 : 0
-  })
+  const microRehookAnchors = longFormRuntimeTuning.isLongForm
+    ? []
+    : buildLongFormMicroRehookAnchors({
+        durationSeconds,
+        storyBeatGraph,
+        minIntervalSeconds: youtubeLongFormFocus ? 55 : undefined,
+        maxIntervalSeconds: youtubeLongFormFocus ? 100 : undefined,
+        densityBiasSeconds: youtubeLongFormFocus ? 6 : 0
+      })
   const totalPatternInterruptCount = interruptInjected.count + autoEscalationResult.count
   const runtimeSeconds = Math.max(0.1, computeEditedRuntimeSeconds(finalTimelineSegments))
   const totalPatternInterruptDensity = Number((totalPatternInterruptCount / runtimeSeconds).toFixed(4))
@@ -35515,7 +35583,7 @@ const processJob = async (
         contentFormat: selectedContentFormat
       })
       if (youtubeLongFormFocus) {
-        optimizationNotes.push('YouTube Strategy Brain active: hook precision, arc enforcement, micro-rehooks, and cliffhanger tuning optimized for watch-time.')
+        optimizationNotes.push('YouTube Strategy Brain active: hook precision, arc enforcement, and cliffhanger tuning optimized for watch-time.')
       }
       const allowAggressiveStoryReorder = selectedContentFormat === 'tiktok_short'
       const baseSegments: Segment[] = editPlan
@@ -36135,11 +36203,13 @@ const processJob = async (
           enabled: longFormRuntimeTuning.isLongForm,
           creativeVariant: options.creativeVariant
         })
-        const microRehookResult = applyLongFormMicroRehooks({
-          segments: pacingGovernedAttempt.segments,
-          anchors: microRehookAnchorsForAnalysis,
-          durationSeconds
-        })
+        const microRehookResult = longFormRuntimeTuning.isLongForm
+          ? { segments: pacingGovernedAttempt.segments.map((segment) => ({ ...segment })), applied: 0 }
+          : applyLongFormMicroRehooks({
+              segments: pacingGovernedAttempt.segments,
+              anchors: microRehookAnchorsForAnalysis,
+              durationSeconds
+            })
         const eliteCutRefined = applyEliteCutRefinement({
           segments: microRehookResult.segments,
           windows: editPlan?.engagementWindows ?? [],
@@ -37584,7 +37654,7 @@ const processJob = async (
           visualIntelligence: visualIntelligenceForAnalysis
         })
       }
-      if (!microRehookAnchorsForAnalysis.length && storyBeatGraphForAnalysis) {
+      if (!microRehookAnchorsForAnalysis.length && storyBeatGraphForAnalysis && !longFormRuntimeTuning.isLongForm) {
         microRehookAnchorsForAnalysis = buildLongFormMicroRehookAnchors({
           durationSeconds,
           storyBeatGraph: storyBeatGraphForAnalysis,
@@ -37937,6 +38007,18 @@ const processJob = async (
         optimizationNotes.push('Hard quality bar passed after recovery remediation.')
       }
       optimizationNotes.push(hardQualityAudit.summary)
+      if (longFormRuntimeTuning.isLongForm) {
+        const dedupeResult = applyHardDedupeWindow({
+          segments: finalSegments,
+          durationSeconds
+        })
+        if (dedupeResult.dropped) {
+          optimizationNotes.push(
+            `Hard dedupe window removed ${dedupeResult.dropped} repeated segment${dedupeResult.dropped === 1 ? '' : 's'}.`
+          )
+        }
+        finalSegments = dedupeResult.segments
+      }
       if (renderFastHorizontalCutOnly && finalSegments.length) {
         finalSegments = simplifySegmentsForFastHorizontalRender(finalSegments)
       }
