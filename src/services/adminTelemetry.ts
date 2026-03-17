@@ -323,7 +323,7 @@ export const getAdminErrorLogs = async ({
             created_at AS "createdAt",
             last_seen AS "lastSeen"
           FROM admin_error_logs
-          WHERE last_seen >= $1
+          WHERE last_seen >= $1::timestamptz
             AND ($2::text IS NULL OR severity = $2)
           ORDER BY last_seen DESC
           LIMIT 250
@@ -445,7 +445,7 @@ export const getStripeWebhookEvents = async ({ rangeMs }: { rangeMs: number }) =
             user_id AS "userId",
             payload
           FROM stripe_webhook_events
-          WHERE created_at >= $1
+          WHERE created_at >= $1::timestamptz
           ORDER BY created_at DESC
           LIMIT 1000
         `,
